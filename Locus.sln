@@ -29,6 +29,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Locus.Sample.Console", "sam
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Locus.FileSystem.Tests", "tests\Locus.FileSystem.Tests\Locus.FileSystem.Tests.csproj", "{391ED617-7851-4696-950E-DEEA9D016A66}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Locus.Benchmarks", "tests\Locus.Benchmarks\Locus.Benchmarks.csproj", "{BAA18009-005F-439D-8065-48DD9430220E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -159,6 +161,18 @@ Global
 		{391ED617-7851-4696-950E-DEEA9D016A66}.Release|x64.Build.0 = Release|Any CPU
 		{391ED617-7851-4696-950E-DEEA9D016A66}.Release|x86.ActiveCfg = Release|Any CPU
 		{391ED617-7851-4696-950E-DEEA9D016A66}.Release|x86.Build.0 = Release|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Debug|x64.Build.0 = Debug|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Debug|x86.Build.0 = Debug|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Release|x64.ActiveCfg = Release|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Release|x64.Build.0 = Release|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Release|x86.ActiveCfg = Release|Any CPU
+		{BAA18009-005F-439D-8065-48DD9430220E}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -174,5 +188,6 @@ Global
 		{F2646AA7-39EC-4D8A-A469-4FB27B9A362A} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{B0F5F8DA-BD2E-4DC5-8C74-36C12AA588B3} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 		{391ED617-7851-4696-950E-DEEA9D016A66} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{BAA18009-005F-439D-8065-48DD9430220E} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal

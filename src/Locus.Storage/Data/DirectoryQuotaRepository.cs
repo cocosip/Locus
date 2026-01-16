@@ -26,6 +26,9 @@ namespace Locus.Storage.Data
         // Per-tenant LiteDB databases
         private readonly ConcurrentDictionary<string, LiteDatabase> _databases;
 
+        // Per-directory locks for atomic increment operations
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _directoryLocks;
+
         private bool _disposed;
 
         /// <summary>
@@ -45,6 +48,7 @@ namespace Locus.Storage.Data
             _quotaDirectory = quotaDirectory;
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
             _databases = new ConcurrentDictionary<string, LiteDatabase>();
+            _directoryLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
 
             // Ensure quota directory exists
             if (!_fileSystem.Directory.Exists(_quotaDirectory))
@@ -212,43 +216,66 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(directoryPath))
                 throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
 
-            var quota = await GetOrCreateAsync(tenantId, directoryPath, ct);
+            // Use per-directory lock to ensure atomic check-and-increment
+            var lockKey = $"{tenantId}:{directoryPath}";
+            var directoryLock = _directoryLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
 
-            // If quota is disabled or no limit set, allow increment
-            if (!quota.Enabled || quota.MaxCount == 0)
+            await directoryLock.WaitAsync(ct);
+            try
             {
-                quota.CurrentCount++;
-                quota.LastUpdated = DateTime.UtcNow;
+                return await Task.Run(() =>
+                {
+                    var quota = GetOrCreateAsync(tenantId, directoryPath, ct).GetAwaiter().GetResult();
 
-                // Persist to LiteDB
-                var db = GetDatabase(tenantId);
-                var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                quotas.Update(quota);
+                    // If quota is disabled or no limit set, allow increment
+                    if (!quota.Enabled || quota.MaxCount == 0)
+                    {
+                        quota.CurrentCount++;
+                        quota.LastUpdated = DateTime.UtcNow;
 
-                return true;
+                        // Persist to LiteDB
+                        var db = GetDatabase(tenantId);
+                        var quotas = db.GetCollection<DirectoryQuota>("quotas");
+                        quotas.Update(quota);
+
+                        // Update cache
+                        var cache = GetCache(tenantId);
+                        cache[directoryPath] = quota;
+
+                        return true;
+                    }
+
+                    // Check if incrementing would exceed limit
+                    if (quota.CurrentCount >= quota.MaxCount)
+                    {
+                        _logger.LogWarning("Cannot increment directory {DirectoryPath} for tenant {TenantId}: limit {MaxCount} reached",
+                            directoryPath, tenantId, quota.MaxCount);
+                        return false;
+                    }
+
+                    // Increment count
+                    quota.CurrentCount++;
+                    quota.LastUpdated = DateTime.UtcNow;
+
+                    // Persist to LiteDB
+                    var db2 = GetDatabase(tenantId);
+                    var quotas2 = db2.GetCollection<DirectoryQuota>("quotas");
+                    quotas2.Update(quota);
+
+                    // Update cache
+                    var cache2 = GetCache(tenantId);
+                    cache2[directoryPath] = quota;
+
+                    _logger.LogDebug("Incremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
+                        directoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
+
+                    return true;
+                }, ct);
             }
-
-            // Check if incrementing would exceed limit
-            if (quota.CurrentCount >= quota.MaxCount)
+            finally
             {
-                _logger.LogWarning("Cannot increment directory {DirectoryPath} for tenant {TenantId}: limit {MaxCount} reached",
-                    directoryPath, tenantId, quota.MaxCount);
-                return false;
+                directoryLock.Release();
             }
-
-            // Increment count
-            quota.CurrentCount++;
-            quota.LastUpdated = DateTime.UtcNow;
-
-            // Persist to LiteDB
-            var db2 = GetDatabase(tenantId);
-            var quotas2 = db2.GetCollection<DirectoryQuota>("quotas");
-            quotas2.Update(quota);
-
-            _logger.LogDebug("Incremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
-                directoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
-
-            return true;
         }
 
         /// <summary>
@@ -351,6 +378,20 @@ namespace Locus.Storage.Data
 
             _databases.Clear();
             _quotaCache.Clear();
+
+            // Dispose all directory locks
+            foreach (var lockSem in _directoryLocks.Values)
+            {
+                try
+                {
+                    lockSem?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error disposing directory lock");
+                }
+            }
+            _directoryLocks.Clear();
 
             _logger.LogInformation("DirectoryQuotaRepository disposed");
         }
