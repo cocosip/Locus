@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Locus.FileSystem</PackageId>
+    <Description>Local file system storage implementation for Locus. Includes LocalFileSystemVolume with path sanitization and cross-platform support.</Description>
   </PropertyGroup>
 
   <ItemGroup>

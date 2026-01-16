@@ -1,5 +1,9 @@
 # Locus - Multi-Tenant File Storage Pool System
 
+[![CI/CD](https://github.com/cocosip/Locus/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/cocosip/Locus/actions/workflows/ci-cd.yml)
+[![NuGet](https://img.shields.io/nuget/v/Locus.svg)](https://www.nuget.org/packages/Locus/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A high-performance, multi-tenant file storage pool system for .NET targeting netstandard2.0 with LiteDB-based metadata management.
 
 ## Overview
@@ -426,7 +430,7 @@ Locus/
 ### 📋 Planned (Phases 9-10)
 
 - Sample applications
-- NuGet packaging
+- ~~NuGet packaging~~ ✅ Completed - Single consolidated package
 - Documentation and guides
 
 ## Build Commands
@@ -441,8 +445,8 @@ dotnet build -c Release
 # Run tests
 dotnet test
 
-# Pack NuGet packages
-dotnet pack -c Release
+# Pack NuGet package (includes all components)
+dotnet pack src/Locus/Locus.csproj -c Release
 ```
 
 ## License

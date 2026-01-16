@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Locus.Core</PackageId>
+    <Description>Core abstractions and interfaces for Locus multi-tenant file storage pool system. Includes IStoragePool, IFileScheduler, ITenantManager interfaces and core models.</Description>
   </PropertyGroup>
 
 </Project>

@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Locus.Storage</PackageId>
+    <Description>Storage pool and metadata management for Locus. Includes StoragePool, FileScheduler, DirectoryQuotaManager with LiteDB-based persistence and active-data caching.</Description>
   </PropertyGroup>
 
   <ItemGroup>

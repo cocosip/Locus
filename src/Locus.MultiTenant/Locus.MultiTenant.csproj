@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Locus.MultiTenant</PackageId>
+    <Description>Multi-tenant management for Locus. Includes TenantManager with JSON-based metadata, in-memory caching, and auto-creation support.</Description>
   </PropertyGroup>
 
   <ItemGroup>

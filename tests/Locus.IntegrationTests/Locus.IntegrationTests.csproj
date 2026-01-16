@@ -22,6 +22,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Locus.Core\Locus.Core.csproj" />
+    <ProjectReference Include="..\..\src\Locus.FileSystem\Locus.FileSystem.csproj" />
+    <ProjectReference Include="..\..\src\Locus.Storage\Locus.Storage.csproj" />
+    <ProjectReference Include="..\..\src\Locus.MultiTenant\Locus.MultiTenant.csproj" />
     <ProjectReference Include="..\..\src\Locus\Locus.csproj" />
   </ItemGroup>
 

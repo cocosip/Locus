@@ -2,14 +2,43 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Locus</PackageId>
+    <Description>Locus - A high-performance, multi-tenant file storage pool system with queue-based processing, LiteDB metadata management, and unlimited storage expansion. This is the main package that includes all components.</Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Locus.Core\Locus.Core.csproj" />
-    <ProjectReference Include="..\Locus.FileSystem\Locus.FileSystem.csproj" />
-    <ProjectReference Include="..\Locus.Storage\Locus.Storage.csproj" />
-    <ProjectReference Include="..\Locus.MultiTenant\Locus.MultiTenant.csproj" />
+    <!-- Include all dependent projects in the main package -->
+    <ProjectReference Include="..\Locus.Core\Locus.Core.csproj">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>all</IncludeAssets>
+    </ProjectReference>
+    <ProjectReference Include="..\Locus.FileSystem\Locus.FileSystem.csproj">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>all</IncludeAssets>
+    </ProjectReference>
+    <ProjectReference Include="..\Locus.Storage\Locus.Storage.csproj">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>all</IncludeAssets>
+    </ProjectReference>
+    <ProjectReference Include="..\Locus.MultiTenant\Locus.MultiTenant.csproj">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>all</IncludeAssets>
+    </ProjectReference>
   </ItemGroup>
+
+  <PropertyGroup>
+    <!-- Ensure all dependent assemblies are included in the package -->
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);CopyProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <!-- Include all referenced project DLLs in the NuGet package -->
+  <Target Name="CopyProjectReferencesToPackage" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths->WithMetadataValue('ReferenceSourceTarget', 'ProjectReference'))">
+        <TargetPath>%(ReferenceCopyLocalPaths.DestinationSubDirectory)%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)</TargetPath>
+      </BuildOutputInPackage>
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />

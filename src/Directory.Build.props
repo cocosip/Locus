@@ -1,0 +1,31 @@
+<Project>
+  <PropertyGroup>
+    <!-- Common package metadata -->
+    <Authors>cocosip</Authors>
+    <Company>cocosip</Company>
+    <Copyright>Copyright © $(Company) $([System.DateTime]::Now.Year)</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/cocosip/Locus</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/cocosip/Locus</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>storage;file-system;queue;multi-tenant;litedb;netstandard</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and LiteDB metadata management.</Description>
+
+    <!-- Build configuration -->
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- Source Link support for debugging -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+  </PropertyGroup>
+
+  <!-- Include README in package -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
