@@ -56,7 +56,7 @@ namespace Locus.Core.Models
         /// Gets or sets the file patterns to include (e.g., "*.txt", "*.pdf").
         /// If empty, all files are included.
         /// </summary>
-        public List<string> FilePatterns { get; set; } = new List<string> { "*.*" };
+        public List<string> FilePatterns { get; set; } = ["*.*"];
 
         /// <summary>
         /// Gets or sets the action to take after a file is successfully imported.
