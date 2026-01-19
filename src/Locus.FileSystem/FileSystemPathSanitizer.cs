@@ -28,13 +28,19 @@ namespace Locus.FileSystem
 
             try
             {
-                // Get full paths
-                var fullBasePath = Path.GetFullPath(basePath);
+                // Get full paths and normalize separators
+                var fullBasePath = Path.GetFullPath(basePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 var combinedPath = Path.Combine(basePath, relativePath);
                 var fullCombinedPath = Path.GetFullPath(combinedPath);
 
                 // Ensure the combined path starts with the base path (prevents traversal)
-                return fullCombinedPath.StartsWith(fullBasePath, StringComparison.OrdinalIgnoreCase);
+                // Use case-sensitive comparison on Unix, case-insensitive on Windows
+                var comparison = Path.DirectorySeparatorChar == '/'
+                    ? StringComparison.Ordinal
+                    : StringComparison.OrdinalIgnoreCase;
+
+                return fullCombinedPath.StartsWith(fullBasePath + Path.DirectorySeparatorChar, comparison) ||
+                       fullCombinedPath.Equals(fullBasePath, comparison);
             }
             catch
             {
@@ -132,10 +138,16 @@ namespace Locus.FileSystem
 
             try
             {
-                var fullBasePath = Path.GetFullPath(basePath);
+                var fullBasePath = Path.GetFullPath(basePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 var normalizedFullPath = Path.GetFullPath(fullPath);
 
-                return normalizedFullPath.StartsWith(fullBasePath, StringComparison.OrdinalIgnoreCase);
+                // Use case-sensitive comparison on Unix, case-insensitive on Windows
+                var comparison = Path.DirectorySeparatorChar == '/'
+                    ? StringComparison.Ordinal
+                    : StringComparison.OrdinalIgnoreCase;
+
+                return normalizedFullPath.StartsWith(fullBasePath + Path.DirectorySeparatorChar, comparison) ||
+                       normalizedFullPath.Equals(fullBasePath, comparison);
             }
             catch
             {
