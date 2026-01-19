@@ -89,5 +89,13 @@ namespace Locus.Core.Models
         /// Default is 5 minutes.
         /// </summary>
         public TimeSpan TenantDiscoveryInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+        /// <summary>
+        /// Gets or sets whether to automatically create tenant subdirectories in multi-tenant mode.
+        /// When enabled, a subdirectory will be created for each existing tenant in the system.
+        /// Only applicable when MultiTenantMode is true.
+        /// Default is false.
+        /// </summary>
+        public bool AutoCreateTenantDirectories { get; set; } = false;
     }
 }

@@ -329,6 +329,32 @@ namespace Locus.Storage
 
         private async Task ScanMultiTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct)
         {
+            // Auto-create tenant directories if enabled
+            if (configuration.AutoCreateTenantDirectories)
+            {
+                try
+                {
+                    _logger.LogDebug("Auto-creating tenant directories in {WatchPath}", configuration.WatchPath);
+
+                    // Get all tenants from the system
+                    var allTenants = await _tenantManager.GetAllTenantsAsync(ct);
+
+                    foreach (var tenant in allTenants)
+                    {
+                        var tenantDir = _fileSystem.Path.Combine(configuration.WatchPath, tenant.TenantId);
+                        if (!_fileSystem.Directory.Exists(tenantDir))
+                        {
+                            _fileSystem.Directory.CreateDirectory(tenantDir);
+                            _logger.LogInformation("Auto-created tenant directory: {TenantDirectory}", tenantDir);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to auto-create tenant directories in {WatchPath}", configuration.WatchPath);
+                }
+            }
+
             // Get all immediate subdirectories (each represents a tenant)
             var tenantDirectories = _fileSystem.Directory.GetDirectories(configuration.WatchPath);
 

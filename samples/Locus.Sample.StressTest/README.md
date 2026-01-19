@@ -32,6 +32,14 @@
 - 按租户和存储卷显示文件分布
 - 显示错误统计
 
+### 自动文件监控（FileWatcher）
+- **多租户模式文件监控**
+- **自动创建租户目录** - 首次扫描时自动为所有租户创建子目录
+- 自动扫描监控目录并导入文件
+- 根据子目录名称识别租户ID
+- 导入成功后自动删除源文件
+- 支持并发导入（最多 8 个文件同时导入）
+
 ## 运行方法
 
 ### 1. 构建项目
@@ -50,6 +58,73 @@ dotnet run
 ### 3. 停止测试
 
 按 `Ctrl+C` 优雅停止测试，程序会显示最终统计报告。
+
+## 使用 FileWatcher 自动导入文件
+
+程序运行时会自动创建文件监控目录，你可以通过拖放文件到监控目录来测试自动导入功能。
+
+### 监控目录结构
+
+程序启动后会显示监控目录位置：
+```
+[SETUP] Added multi-tenant file watcher monitoring: C:\Users\...\locus-stress-test\...\watch
+[SETUP] Drop files into subdirectories (tenant-001, tenant-002, etc.) for automatic import
+```
+
+目录结构如下（**自动创建**）：
+```
+watch\
+  ├── tenant-001\    # 租户 001 的监控目录（自动创建）
+  ├── tenant-002\    # 租户 002 的监控目录（自动创建）
+  ├── tenant-003\    # 租户 003 的监控目录（自动创建）
+  ├── tenant-004\    # 租户 004 的监控目录（自动创建）
+  └── tenant-005\    # 租户 005 的监控目录（自动创建）
+```
+
+**注意**：这些租户子目录在 FileWatcher 首次扫描时自动创建，无需手动创建。
+
+### 如何使用
+
+1. **复制文件到监控目录**：
+   ```bash
+   # Windows PowerShell 示例
+   Copy-Item "C:\some\file.txt" "C:\Users\...\locus-stress-test\...\watch\tenant-001\"
+
+   # 或者直接用资源管理器拖放文件到对应租户目录
+   ```
+
+2. **自动导入流程**：
+   - FileWatcher 每隔 **5 秒**扫描一次监控目录
+   - 检测到的文件必须存在至少 **2 秒**才会被导入（避免导入正在写入的文件）
+   - 根据文件所在子目录识别租户ID（如 `tenant-001`）
+   - 自动将文件导入到对应租户的存储池
+   - 导入成功后**自动删除**源文件
+
+3. **验证导入成功**：
+   - 观察程序输出中的"Files Written"计数增加
+   - 源文件应该已被删除
+   - 文件会被读取线程自动处理
+
+### 配置参数
+
+FileWatcher 的配置（在 `Program.cs` 中）：
+```csharp
+watcher.MultiTenantMode = true;                      // 启用多租户模式
+watcher.AutoCreateTenantDirectories = true;          // 自动创建租户子目录
+watcher.PollingInterval = TimeSpan.FromSeconds(5);   // 扫描间隔 5 秒
+watcher.MinFileAge = TimeSpan.FromSeconds(2);        // 最小文件年龄 2 秒
+watcher.MaxConcurrentImports = 8;                    // 最大并发导入数
+watcher.PostImportAction = PostImportAction.Delete;  // 导入后删除文件
+```
+
+### 注意事项
+
+- **多租户模式**：一个 FileWatcher 监控所有租户，通过子目录名称识别租户
+- **✨ 自动创建目录**：当 `AutoCreateTenantDirectories = true` 时，FileWatcher 在首次扫描时会自动为系统中所有已创建的租户创建对应的子目录（见 Program.cs:153）
+- **租户目录名称**：自动创建的目录名称与租户ID完全匹配（如 `tenant-001`）
+- **未知租户**：如果手动创建的子目录名称不是有效的租户ID，文件将被跳过
+- **文件锁定**：确保文件完全写入后再复制到监控目录，或者等待至少 2 秒
+- **性能影响**：大量文件导入可能影响写入线程的性能
 
 ## 输出示例
 

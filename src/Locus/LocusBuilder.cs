@@ -123,6 +123,22 @@ namespace Locus
         }
 
         /// <summary>
+        /// Adds a file watcher configuration.
+        /// </summary>
+        /// <param name="configure">Configuration action for the file watcher.</param>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder AddFileWatcher(Action<FileWatcherConfiguration> configure)
+        {
+            if (configure == null)
+                throw new ArgumentNullException(nameof(configure));
+
+            var watcher = new FileWatcherConfiguration();
+            configure(watcher);
+            _options.FileWatchers.Add(watcher);
+            return this;
+        }
+
+        /// <summary>
         /// Builds and registers Locus services with the service collection.
         /// </summary>
         /// <returns>The service collection for further configuration.</returns>

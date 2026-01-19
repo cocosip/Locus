@@ -100,11 +100,13 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task GetNextFileForProcessingAsync_ThrowsWhenNoFilesAvailable()
+        public async Task GetNextFileForProcessingAsync_ReturnsNullWhenNoFilesAvailable()
         {
-            // Act & Assert
-            await Assert.ThrowsAsync<NoFilesAvailableException>(() =>
-                _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None));
+            // Act
+            var result = await _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+
+            // Assert
+            Assert.Null(result);
         }
 
         [Fact]
@@ -153,9 +155,11 @@ namespace Locus.Storage.Tests
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
-            // Act & Assert
-            await Assert.ThrowsAsync<NoFilesAvailableException>(() =>
-                _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None));
+            // Act
+            var result = await _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+
+            // Assert
+            Assert.Null(result);
         }
 
         [Fact]

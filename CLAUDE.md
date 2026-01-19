@@ -661,3 +661,51 @@ public async Task MarkAsCompletedAndDeleteAsync(string fileKey, CancellationToke
     await transaction.CommitAsync(ct);
 }
 ```
+
+### File Watcher Configuration
+
+FileWatcher 支持自动监控目录并导入文件到存储池。
+
+**多租户模式示例（推荐）：**
+```csharp
+services.AddLocus(builder => builder
+    .AddFileWatcher(watcher =>
+    {
+        watcher.WatchPath = "/path/to/watch";
+        watcher.MultiTenantMode = true;              // 启用多租户模式
+        watcher.AutoCreateTenantDirectories = true;  // 自动创建租户子目录
+        watcher.PollingInterval = TimeSpan.FromSeconds(30);
+        watcher.PostImportAction = PostImportAction.Delete;
+    })
+);
+```
+
+**关键配置说明：**
+- `MultiTenantMode = true`: 启用多租户模式，子目录名称作为租户ID
+- `AutoCreateTenantDirectories = true`: 首次扫描时自动为所有已创建的租户创建子目录
+  - 从 `ITenantManager.GetAllTenantsAsync()` 获取所有租户
+  - 为每个租户在 WatchPath 下创建对应子目录（如果不存在）
+  - 只在多租户模式下生效
+- `PostImportAction`: 导入后的操作（Delete/Move/Keep）
+- `PollingInterval`: 扫描间隔
+- `MinFileAge`: 最小文件年龄（避免导入正在写入的文件）
+- `MaxConcurrentImports`: 最大并发导入数
+
+**目录结构示例：**
+```
+/path/to/watch/
+  ├── tenant-001/     # 自动创建（如果 AutoCreateTenantDirectories = true）
+  ├── tenant-002/     # 自动创建
+  └── tenant-003/     # 自动创建
+```
+
+**工作流程：**
+1. FileWatcher 扫描时检测到 `AutoCreateTenantDirectories = true`
+2. 调用 `_tenantManager.GetAllTenantsAsync()` 获取所有租户
+3. 为每个租户创建子目录（如果不存在）
+4. 扫描所有子目录并导入文件到对应租户
+
+**注意事项：**
+- 租户必须先通过 `ITenantManager.CreateTenantAsync()` 创建
+- 自动创建的目录名称与租户ID完全匹配
+- 如果手动创建的子目录名称不是有效租户ID，文件将被跳过

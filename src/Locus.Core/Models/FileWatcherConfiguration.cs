@@ -28,6 +28,14 @@ namespace Locus.Core.Models
         public bool MultiTenantMode { get; set; } = false;
 
         /// <summary>
+        /// Gets or sets whether to automatically create tenant subdirectories in multi-tenant mode.
+        /// When enabled, the watcher will create a subdirectory for each existing tenant in the system.
+        /// Only applies when MultiTenantMode is true.
+        /// Default is false.
+        /// </summary>
+        public bool AutoCreateTenantDirectories { get; set; } = false;
+
+        /// <summary>
         /// Gets or sets the root directory path to monitor.
         /// This directory and all subdirectories will be scanned recursively.
         /// </summary>

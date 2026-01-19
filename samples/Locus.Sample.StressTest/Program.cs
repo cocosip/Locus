@@ -57,7 +57,16 @@ class Program
         Console.WriteLine($"  - Writer Threads: {WRITER_THREAD_COUNT}");
         Console.WriteLine($"  - Reader/Processor Threads: {READER_THREAD_COUNT}");
         Console.WriteLine($"  - Files per Writer Batch: {FILES_PER_WRITER_BATCH}");
+        Console.WriteLine($"  - File Watchers: {TENANT_COUNT} (one per tenant)");
         Console.WriteLine();
+        Console.WriteLine("File Watcher Directories:");
+        for (int i = 1; i <= TENANT_COUNT; i++)
+        {
+            var watchPath = Path.Combine(TestDirectory, "watch", $"tenant-{i:D3}");
+            Console.WriteLine($"  - tenant-{i:D3}: {watchPath}");
+        }
+        Console.WriteLine();
+        Console.WriteLine("TIP: Drop files into the watch directories above to test automatic import!");
         Console.WriteLine("Press Ctrl+C to stop the test gracefully...");
         Console.WriteLine();
 
@@ -131,7 +140,30 @@ class Program
                     options.ProcessingTimeout = TimeSpan.FromMinutes(30);
                     options.FailedFileRetentionPeriod = TimeSpan.FromDays(7);
                 })
-                .DisableBackgroundCleanup(); // We'll manage cleanup manually for this test
+                .DisableBackgroundCleanup() // We'll manage cleanup manually for this test
+                .AddFileWatcher(watcher =>
+                {
+                    // Create watch root directory
+                    var watchRoot = Path.Combine(TestDirectory, "watch");
+                    Directory.CreateDirectory(watchRoot);
+
+                    watcher.WatcherId = "multi-tenant-watcher";
+                    watcher.WatchPath = watchRoot;
+                    watcher.MultiTenantMode = true; // Enable multi-tenant mode
+                    watcher.AutoCreateTenantDirectories = true; // Auto-create tenant subdirectories
+                    watcher.TenantId = string.Empty; // Must be empty in multi-tenant mode
+                    watcher.Enabled = true;
+                    watcher.IncludeSubdirectories = true;
+                    watcher.FilePatterns = new List<string> { "*.*" };
+                    watcher.PostImportAction = Core.Models.PostImportAction.Delete;
+                    watcher.PollingInterval = TimeSpan.FromSeconds(5);
+                    watcher.MinFileAge = TimeSpan.FromSeconds(2);
+                    watcher.MaxConcurrentImports = 8; // Increased for multi-tenant
+
+                    Console.WriteLine($"[SETUP] Added multi-tenant file watcher monitoring: {watchRoot}");
+                    Console.WriteLine($"[SETUP] Auto-create tenant directories: Enabled");
+                    Console.WriteLine($"[SETUP] Tenant subdirectories will be created automatically on first scan");
+                });
         });
 
         var serviceProvider = services.BuildServiceProvider();
