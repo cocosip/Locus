@@ -26,8 +26,8 @@ namespace Locus.Storage.Data
         // Per-tenant in-memory cache (only active files: Pending/Processing/Failed)
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
 
-        // Per-tenant LiteDB databases
-        private readonly ConcurrentDictionary<string, LiteDatabase> _databases;
+        // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
+        private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
 
         // Per-tenant locks for concurrent file allocation
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
@@ -50,7 +50,7 @@ namespace Locus.Storage.Data
 
             _metadataDirectory = metadataDirectory;
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
-            _databases = new ConcurrentDictionary<string, LiteDatabase>();
+            _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
 
             // Ensure metadata directory exists
@@ -67,7 +67,9 @@ namespace Locus.Storage.Data
         /// </summary>
         private LiteDatabase GetDatabase(string tenantId)
         {
-            return _databases.GetOrAdd(tenantId, tid =>
+            // Use Lazy<LiteDatabase> to ensure thread-safe initialization
+            // This prevents multiple threads from simultaneously creating the database instance
+            var lazyDb = _databases.GetOrAdd(tenantId, tid => new Lazy<LiteDatabase>(() =>
             {
                 // Ensure metadata directory exists (thread-safe in case of concurrent access)
                 if (!_fileSystem.Directory.Exists(_metadataDirectory))
@@ -76,7 +78,9 @@ namespace Locus.Storage.Data
                 }
 
                 var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tid}.db");
-                var db = new LiteDatabase(dbPath);
+                // Use Shared mode for concurrent access support
+                var connectionString = $"Filename={dbPath};Mode=Shared";
+                var db = new LiteDatabase(connectionString);
 
                 var files = db.GetCollection<FileMetadata>("files");
                 // FileKey is already BsonId, no need to create additional index
@@ -90,7 +94,10 @@ namespace Locus.Storage.Data
                 LoadActiveFilesForTenant(tid, files);
 
                 return db;
-            });
+            }, LazyThreadSafetyMode.ExecutionAndPublication));
+
+            // Access the Value property to trigger initialization if needed
+            return lazyDb.Value;
         }
 
         /// <summary>
@@ -452,11 +459,15 @@ namespace Locus.Storage.Data
             _disposed = true;
 
             // Close all databases
-            foreach (var db in _databases.Values)
+            foreach (var lazyDb in _databases.Values)
             {
                 try
                 {
-                    db?.Dispose();
+                    // Only dispose if the Lazy value was actually created
+                    if (lazyDb.IsValueCreated)
+                    {
+                        lazyDb.Value?.Dispose();
+                    }
                 }
                 catch (Exception ex)
                 {

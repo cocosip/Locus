@@ -136,7 +136,11 @@ namespace Locus.IntegrationTests
             Assert.Equal(FileProcessingStatus.Processing, file1.Status);
 
             // Act - Process successfully
-            using var stream1 = await storagePool.ReadFileAsync(tenant!, file1.FileKey, default);
+            // Use explicit scope to ensure stream is disposed before deletion
+            {
+                using var stream1 = await storagePool.ReadFileAsync(tenant!, file1.FileKey, default);
+                // Read and process the stream here if needed
+            }
             await fileScheduler.MarkAsCompletedAsync(file1.FileKey, default);
 
             // Assert - File deleted
@@ -145,6 +149,7 @@ namespace Locus.IntegrationTests
 
             // Act - Get second file and fail it
             var file2 = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);
+            Assert.NotNull(file2);
             await fileScheduler.MarkAsFailedAsync(file2.FileKey, "Test failure", default);
 
             // Assert - File goes back to pending
@@ -196,6 +201,7 @@ namespace Locus.IntegrationTests
             await storagePool.WriteFileAsync(tenant!, content, default);
 
             var file = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);
+            Assert.NotNull(file);
 
             // Simulate timeout by running cleanup with very short timeout
             await cleanupService.CleanupTimedOutProcessingFilesAsync(TimeSpan.FromMilliseconds(1), default);

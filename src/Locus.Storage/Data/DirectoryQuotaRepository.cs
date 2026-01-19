@@ -23,8 +23,8 @@ namespace Locus.Storage.Data
         // Per-tenant in-memory cache
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>> _quotaCache;
 
-        // Per-tenant LiteDB databases
-        private readonly ConcurrentDictionary<string, LiteDatabase> _databases;
+        // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
+        private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
 
         // Per-directory locks for atomic increment operations
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _directoryLocks;
@@ -47,7 +47,7 @@ namespace Locus.Storage.Data
 
             _quotaDirectory = quotaDirectory;
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
-            _databases = new ConcurrentDictionary<string, LiteDatabase>();
+            _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _directoryLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
 
             // Ensure quota directory exists
@@ -64,7 +64,9 @@ namespace Locus.Storage.Data
         /// </summary>
         private LiteDatabase GetDatabase(string tenantId)
         {
-            return _databases.GetOrAdd(tenantId, tid =>
+            // Use Lazy<LiteDatabase> to ensure thread-safe initialization
+            // This prevents multiple threads from simultaneously creating the database instance
+            var lazyDb = _databases.GetOrAdd(tenantId, tid => new Lazy<LiteDatabase>(() =>
             {
                 // Ensure quota directory exists (thread-safe in case of concurrent access)
                 if (!_fileSystem.Directory.Exists(_quotaDirectory))
@@ -73,7 +75,9 @@ namespace Locus.Storage.Data
                 }
 
                 var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tid}-quotas.db");
-                var db = new LiteDatabase(dbPath);
+                // Use Shared mode for concurrent access support
+                var connectionString = $"Filename={dbPath};Mode=Shared";
+                var db = new LiteDatabase(connectionString);
 
                 var quotas = db.GetCollection<DirectoryQuota>("quotas");
                 quotas.EnsureIndex(x => x.DirectoryPath, unique: true);
@@ -85,7 +89,10 @@ namespace Locus.Storage.Data
                 LoadQuotasForTenant(tid, quotas);
 
                 return db;
-            });
+            }, LazyThreadSafetyMode.ExecutionAndPublication));
+
+            // Access the Value property to trigger initialization if needed
+            return lazyDb.Value;
         }
 
         /// <summary>
@@ -364,11 +371,15 @@ namespace Locus.Storage.Data
             _disposed = true;
 
             // Close all databases
-            foreach (var db in _databases.Values)
+            foreach (var lazyDb in _databases.Values)
             {
                 try
                 {
-                    db?.Dispose();
+                    // Only dispose if the Lazy value was actually created
+                    if (lazyDb.IsValueCreated)
+                    {
+                        lazyDb.Value?.Dispose();
+                    }
                 }
                 catch (Exception ex)
                 {

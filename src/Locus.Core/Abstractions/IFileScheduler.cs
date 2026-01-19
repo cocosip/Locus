@@ -16,7 +16,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenant">The tenant context.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file location, or null if no files are available.</returns>
-        Task<FileLocation> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct);
+        Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct);
 
         /// <summary>
         /// Gets a batch of files for processing in a thread-safe manner.

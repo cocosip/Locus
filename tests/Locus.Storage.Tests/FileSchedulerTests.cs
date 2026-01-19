@@ -88,6 +88,7 @@ namespace Locus.Storage.Tests
             var location = await _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
 
             // Assert
+            Assert.NotNull(location);
             Assert.Equal("file-001", location.FileKey);
             Assert.Equal(FileProcessingStatus.Processing, location.Status);
 
@@ -133,6 +134,7 @@ namespace Locus.Storage.Tests
             var location = await _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
 
             // Assert
+            Assert.NotNull(location);
             Assert.Equal("file-002", location.FileKey);
         }
 
@@ -409,7 +411,7 @@ namespace Locus.Storage.Tests
             }
 
             // Act - simulate 5 threads concurrently getting files
-            var tasks = new List<Task<FileLocation>>();
+            var tasks = new List<Task<FileLocation?>>();
             for (int i = 0; i < 5; i++)
             {
                 tasks.Add(Task.Run(async () =>
@@ -419,12 +421,14 @@ namespace Locus.Storage.Tests
             var locations = await Task.WhenAll(tasks);
 
             // Assert - all file keys should be unique
-            var fileKeys = locations.Select(l => l.FileKey).ToList();
+            var nonNullLocations = locations.Where(l => l != null).ToList();
+            var fileKeys = nonNullLocations.Select(l => l!.FileKey).ToList();
             Assert.Equal(5, fileKeys.Distinct().Count());
 
             // All should be marked as processing
-            foreach (var location in locations)
+            foreach (var location in nonNullLocations)
             {
+                Assert.NotNull(location);
                 Assert.Equal(FileProcessingStatus.Processing, location.Status);
             }
         }
@@ -488,6 +492,7 @@ namespace Locus.Storage.Tests
             var location = await _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
 
             // Assert - should get file2, and file1 metadata should be removed
+            Assert.NotNull(location);
             Assert.Equal("file-002", location.FileKey);
 
             var orphanedMetadata = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);

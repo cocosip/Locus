@@ -39,7 +39,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileLocation> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct)
+        public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -50,7 +50,8 @@ namespace Locus.Storage
 
                 if (metadata == null)
                 {
-                    throw new NoFilesAvailableException($"No pending files available for tenant: {tenant.TenantId}");
+                    // No files available - return null instead of throwing exception
+                    return null;
                 }
 
                 // Verify physical file exists (self-healing)
