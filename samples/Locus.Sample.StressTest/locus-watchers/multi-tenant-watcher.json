@@ -3,7 +3,7 @@
   "tenantId": "",
   "multiTenantMode": true,
   "autoCreateTenantDirectories": true,
-  "watchPath": "C:\\Users\\11855\\AppData\\Local\\Temp\\locus-stress-test\\20260119-113438\\watch",
+  "watchPath": "C:\\Users\\11855\\AppData\\Local\\Temp\\locus-stress-test\\20260119-135605\\watch",
   "enabled": true,
   "includeSubdirectories": true,
   "filePatterns": [
@@ -15,6 +15,6 @@
   "maxFileSizeBytes": 0,
   "minFileAge": "00:00:02",
   "maxConcurrentImports": 8,
-  "createdAt": "2026-01-19T03:34:38.5584956Z",
-  "updatedAt": "2026-01-19T03:34:38.5585309Z"
+  "createdAt": "2026-01-19T05:56:05.5632412Z",
+  "updatedAt": "2026-01-19T05:56:05.563277Z"
 }

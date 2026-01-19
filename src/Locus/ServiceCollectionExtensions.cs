@@ -1,5 +1,6 @@
 using System;
 using System.IO.Abstractions;
+using System.Linq;
 using Locus.Core.Abstractions;
 using Locus.FileSystem;
 using Locus.MultiTenant;
@@ -181,11 +182,40 @@ namespace Locus
                 return cleanupService;
             });
 
+            // Register database recovery service
+            services.AddSingleton<IDatabaseRecoveryService, Locus.Storage.Data.DatabaseRecoveryService>(sp =>
+            {
+                var metadataRepo = sp.GetRequiredService<MetadataRepository>();
+                var quotaRepo = sp.GetRequiredService<DirectoryQuotaRepository>();
+                var fileSystem = sp.GetRequiredService<IFileSystem>();
+                var logger = sp.GetRequiredService<ILogger<Locus.Storage.Data.DatabaseRecoveryService>>();
+
+                return new Locus.Storage.Data.DatabaseRecoveryService(
+                    metadataRepo,
+                    quotaRepo,
+                    fileSystem,
+                    logger,
+                    options.MetadataDirectory,
+                    options.QuotaDirectory);
+            });
+
             // Register background cleanup service if enabled
             if (options.EnableBackgroundCleanup)
             {
                 services.AddSingleton(options.CleanupOptions);
                 services.AddHostedService<BackgroundCleanupService>();
+            }
+
+            // Register database health check service if enabled
+            if (options.EnableDatabaseHealthCheck)
+            {
+                var volumePaths = options.Volumes.Select(v => v.MountPath).ToList();
+                services.AddHostedService(sp => new DatabaseHealthCheckService(
+                    sp.GetRequiredService<IDatabaseRecoveryService>(),
+                    sp.GetRequiredService<IFileSystem>(),
+                    sp.GetRequiredService<ILogger<DatabaseHealthCheckService>>(),
+                    options.MetadataDirectory,
+                    volumePaths));
             }
 
             // Store LocusOptions for runtime access (e.g., AutoCreateTenants)

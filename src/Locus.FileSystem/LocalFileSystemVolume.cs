@@ -269,8 +269,9 @@ namespace Locus.FileSystem
 
         /// <summary>
         /// Builds the physical path for a file with automatic directory sharding.
-        /// Uses the first N characters of fileKey as subdirectories based on sharding depth.
-        /// Example with depth=2 and fileKey="a1b2c3...": {mountPath}/{tenantId}/a/1/a1b2c3...
+        /// Uses 2-character hex segments from fileKey as subdirectories (similar to FastDFS).
+        /// Each sharding level creates a 2-character directory (00-FF), allowing 256 subdirectories per level.
+        /// Example with depth=2 and fileKey="a1b2c3d4...": {mountPath}/{tenantId}/a1/b2/a1b2c3d4...
         /// </summary>
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="fileKey">The file key (hex string).</param>
@@ -285,15 +286,32 @@ namespace Locus.FileSystem
 
             var pathParts = new List<string> { _mountPath, tenantId };
 
-            // Add shard directories based on fileKey
+            // Add shard directories based on fileKey (2 characters per level)
             // ShardingDepth=0: {mount}/{tenant}/{fileKey}
-            // ShardingDepth=1: {mount}/{tenant}/a/{fileKey}
-            // ShardingDepth=2: {mount}/{tenant}/a/1/{fileKey}
-            // ShardingDepth=3: {mount}/{tenant}/a/1/b/{fileKey}
-            int shardCount = Math.Min(_shardingDepth, fileKey.Length);
-            for (int i = 0; i < shardCount; i++)
+            // ShardingDepth=1: {mount}/{tenant}/a1/{fileKey}
+            // ShardingDepth=2: {mount}/{tenant}/a1/b2/{fileKey}
+            // ShardingDepth=3: {mount}/{tenant}/a1/b2/c3/{fileKey}
+            for (int i = 0; i < _shardingDepth; i++)
             {
-                pathParts.Add(fileKey[i].ToString().ToLowerInvariant());
+                int startIndex = i * 2;
+
+                // Ensure we have at least 2 characters remaining
+                if (startIndex + 1 < fileKey.Length)
+                {
+                    var shardDir = fileKey.Substring(startIndex, 2).ToLowerInvariant();
+                    pathParts.Add(shardDir);
+                }
+                else if (startIndex < fileKey.Length)
+                {
+                    // If only 1 character remains, pad with '0'
+                    var shardDir = (fileKey[startIndex].ToString() + "0").ToLowerInvariant();
+                    pathParts.Add(shardDir);
+                }
+                else
+                {
+                    // Not enough characters, stop creating shard directories
+                    break;
+                }
             }
 
             pathParts.Add(fileKey);

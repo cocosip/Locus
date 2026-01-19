@@ -489,6 +489,93 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Prepares for database rebuild by safely disposing connections and backing up the database.
+        /// Thread-safe: Acquires exclusive lock for this tenant, blocking all operations.
+        /// IMPORTANT: Caller must call FinishDatabaseRebuildAsync() to release the lock.
+        /// </summary>
+        /// <param name="tenantId">The tenant ID.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Path to the backup file, or null if no database exists.</returns>
+        public async Task<string?> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+
+            // Get or create tenant lock (same lock used for all operations)
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+
+            // Acquire exclusive lock - this will block all operations for this tenant
+            await tenantLock.WaitAsync(ct);
+
+            try
+            {
+                // If database doesn't exist, nothing to backup
+                if (!_fileSystem.File.Exists(dbPath))
+                {
+                    _logger.LogInformation("No database file to rebuild for tenant {TenantId}", tenantId);
+                    return null;
+                }
+
+                _logger.LogWarning("Beginning database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
+
+                // Step 1: Dispose existing database connection
+                if (_databases.TryGetValue(tenantId, out var lazyDb) && lazyDb.IsValueCreated)
+                {
+                    try
+                    {
+                        lazyDb.Value?.Dispose();
+                        _logger.LogDebug("Disposed database connection for rebuild: {TenantId}", tenantId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error disposing database connection for tenant {TenantId}", tenantId);
+                    }
+                }
+
+                // Step 2: Remove from cache to prevent reconnection
+                _databases.TryRemove(tenantId, out _);
+
+                // Step 3: Clear in-memory cache
+                _activeFiles.TryRemove(tenantId, out _);
+
+                // Step 4: Backup corrupted database
+                var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+                _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+                _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
+
+                // Step 5: Delete corrupted database
+                _fileSystem.File.Delete(dbPath);
+                _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
+
+                return backupPath;
+            }
+            catch
+            {
+                // If anything fails, release the lock immediately
+                tenantLock.Release();
+                throw;
+            }
+
+            // NOTE: Lock is NOT released here - it will be released in FinishDatabaseRebuildAsync()
+        }
+
+        /// <summary>
+        /// Finishes database rebuild by releasing the tenant lock.
+        /// IMPORTANT: Must be called after BeginDatabaseRebuildAsync() to unblock operations.
+        /// </summary>
+        /// <param name="tenantId">The tenant ID.</param>
+        public void FinishDatabaseRebuild(string tenantId)
+        {
+            if (_tenantLocks.TryGetValue(tenantId, out var tenantLock))
+            {
+                tenantLock.Release();
+                _logger.LogInformation("Database rebuild completed for tenant {TenantId}. Operations unblocked.", tenantId);
+            }
+        }
+
+        /// <summary>
         /// Disposes the repository and closes all databases.
         /// </summary>
         public void Dispose()

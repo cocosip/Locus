@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using Locus.Core.Abstractions;
 using Locus.Core.Models;
 
 namespace Locus
@@ -36,7 +35,7 @@ namespace Locus
         /// <summary>
         /// Gets the list of storage volumes to mount.
         /// </summary>
-        public List<VolumeConfiguration> Volumes { get; } = new List<VolumeConfiguration>();
+        public List<VolumeConfiguration> Volumes { get; } = [];
 
         /// <summary>
         /// Gets or sets the cleanup options.
@@ -50,10 +49,18 @@ namespace Locus
         public bool EnableBackgroundCleanup { get; set; } = true;
 
         /// <summary>
+        /// Gets or sets whether to enable database health check on startup.
+        /// When enabled, all databases will be checked for corruption on application startup.
+        /// Corrupted databases will be logged with instructions for recovery.
+        /// Default: true
+        /// </summary>
+        public bool EnableDatabaseHealthCheck { get; set; } = true;
+
+        /// <summary>
         /// Gets the list of pre-configured tenants to initialize on startup.
         /// If empty, tenants can still be created dynamically if AutoCreateTenants is true.
         /// </summary>
-        public List<TenantConfiguration> Tenants { get; } = new List<TenantConfiguration>();
+        public List<TenantConfiguration> Tenants { get; } = [];
 
         /// <summary>
         /// Gets or sets whether to automatically create tenants on first use.
@@ -75,7 +82,7 @@ namespace Locus
         /// Gets the list of file watcher configurations.
         /// File watchers automatically monitor directories and import files into the storage pool.
         /// </summary>
-        public List<Core.Models.FileWatcherConfiguration> FileWatchers { get; } = new List<Core.Models.FileWatcherConfiguration>();
+        public List<FileWatcherConfiguration> FileWatchers { get; } = [];
 
         /// <summary>
         /// Gets or sets the directory where file watcher configurations will be stored.
@@ -107,9 +114,12 @@ namespace Locus
 
         /// <summary>
         /// Gets or sets the sharding depth for automatic directory sharding.
-        /// 1 = Single level (16 directories: 0-f)
-        /// 2 = Two levels (256 directories: 0/0 to f/f) - RECOMMENDED
-        /// 3 = Three levels (4096 directories: 0/0/0 to f/f/f)
+        /// Uses 2-character hex format (00-FF) similar to FastDFS.
+        /// 0 = No sharding (all files in tenant root)
+        /// 1 = Single level (256 directories: 00-ff)
+        /// 2 = Two levels (65,536 directories: 00/00 to ff/ff) - RECOMMENDED
+        /// 3 = Three levels (16,777,216 directories: 00/00/00 to ff/ff/ff)
+        /// Example with depth=2: {volume}/{tenant}/a1/b2/{fileKey}
         /// Default: 2
         /// </summary>
         public int ShardingDepth { get; set; } = 2;

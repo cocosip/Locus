@@ -213,9 +213,9 @@ namespace Locus.Storage
         /// <summary>
         /// Gets or sets the interval between database optimization runs.
         /// Database optimization is independent of the regular cleanup interval.
-        /// Recommended: Weekly (7 days) or monthly (30 days) depending on delete frequency.
-        /// Default: 7 days (weekly).
+        /// Recommended: Daily (1 day) for high-frequency delete operations, weekly (7 days) for normal usage.
+        /// Default: 1 day.
         /// </summary>
-        public TimeSpan? DatabaseOptimizationInterval { get; set; } = TimeSpan.FromDays(7);
+        public TimeSpan? DatabaseOptimizationInterval { get; set; } = TimeSpan.FromDays(1);
     }
 }

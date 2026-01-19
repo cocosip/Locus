@@ -209,5 +209,150 @@ namespace Locus.FileSystem.Tests
             Assert.Contains(_mountPath, result);
             Assert.Contains("LocalFileSystemVolume", result);
         }
+
+        [Fact]
+        public void BuildPhysicalPath_WithShardingDepth0_NoSharding()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 0);
+
+            // Act
+            var path = volume.BuildPhysicalPath("tenant-001", "a1b2c3d4e5f6");
+
+            // Assert
+            var expected = Path.Combine(_mountPath, "tenant-001", "a1b2c3d4e5f6");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_WithShardingDepth1_OneLevelSharding()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 1);
+
+            // Act
+            var path = volume.BuildPhysicalPath("tenant-001", "a1b2c3d4e5f6");
+
+            // Assert - Should be: {mount}/tenant-001/a1/a1b2c3d4e5f6
+            var expected = Path.Combine(_mountPath, "tenant-001", "a1", "a1b2c3d4e5f6");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_WithShardingDepth2_TwoLevelSharding()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 2);
+
+            // Act
+            var path = volume.BuildPhysicalPath("tenant-001", "a1b2c3d4e5f6");
+
+            // Assert - Should be: {mount}/tenant-001/a1/b2/a1b2c3d4e5f6
+            var expected = Path.Combine(_mountPath, "tenant-001", "a1", "b2", "a1b2c3d4e5f6");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_WithShardingDepth3_ThreeLevelSharding()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 3);
+
+            // Act
+            var path = volume.BuildPhysicalPath("tenant-001", "a1b2c3d4e5f6");
+
+            // Assert - Should be: {mount}/tenant-001/a1/b2/c3/a1b2c3d4e5f6
+            var expected = Path.Combine(_mountPath, "tenant-001", "a1", "b2", "c3", "a1b2c3d4e5f6");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_WithUpperCaseFileKey_ConvertsToLowerCase()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 2);
+
+            // Act
+            var path = volume.BuildPhysicalPath("tenant-001", "FF00AA55BB");
+
+            // Assert - Should convert to lowercase: ff/00/FF00AA55BB
+            var expected = Path.Combine(_mountPath, "tenant-001", "ff", "00", "FF00AA55BB");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_WithShortFileKey_PadsWithZero()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 2);
+
+            // Act - FileKey with only 3 characters
+            var path = volume.BuildPhysicalPath("tenant-001", "abc");
+
+            // Assert - Should create ab/c0/abc
+            var expected = Path.Combine(_mountPath, "tenant-001", "ab", "c0", "abc");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_WithVeryShortFileKey_StopsWhenNotEnoughCharacters()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 3);
+
+            // Act - FileKey with only 1 character
+            var path = volume.BuildPhysicalPath("tenant-001", "a");
+
+            // Assert - Should only create one level: a0/a (can't create more levels)
+            var expected = Path.Combine(_mountPath, "tenant-001", "a0", "a");
+            Assert.Equal(Path.GetFullPath(expected), path);
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_ThrowsWhenTenantIdIsEmpty()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+
+            // Act & Assert
+            Assert.Throws<ArgumentException>(() => volume.BuildPhysicalPath("", "a1b2c3"));
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_ThrowsWhenFileKeyIsEmpty()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+
+            // Act & Assert
+            Assert.Throws<ArgumentException>(() => volume.BuildPhysicalPath("tenant-001", ""));
+        }
+
+        [Fact]
+        public void BuildPhysicalPath_FastDFSStyleExamples()
+        {
+            // Arrange
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 2);
+
+            // Test case 1: Standard hex string
+            var path1 = volume.BuildPhysicalPath("tenant-001", "a1b2c3d4e5f6");
+            var expected1 = Path.Combine(_mountPath, "tenant-001", "a1", "b2", "a1b2c3d4e5f6");
+            Assert.Equal(Path.GetFullPath(expected1), path1);
+
+            // Test case 2: All same digits
+            var path2 = volume.BuildPhysicalPath("tenant-002", "00000000");
+            var expected2 = Path.Combine(_mountPath, "tenant-002", "00", "00", "00000000");
+            Assert.Equal(Path.GetFullPath(expected2), path2);
+
+            // Test case 3: All F's
+            var path3 = volume.BuildPhysicalPath("tenant-003", "ffffffff");
+            var expected3 = Path.Combine(_mountPath, "tenant-003", "ff", "ff", "ffffffff");
+            Assert.Equal(Path.GetFullPath(expected3), path3);
+
+            // Test case 4: Mixed case
+            var path4 = volume.BuildPhysicalPath("tenant-004", "AaBbCcDd");
+            var expected4 = Path.Combine(_mountPath, "tenant-004", "aa", "bb", "AaBbCcDd");
+            Assert.Equal(Path.GetFullPath(expected4), path4);
+        }
     }
 }
