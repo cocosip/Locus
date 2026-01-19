@@ -163,7 +163,13 @@ namespace Locus
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
 
-                var cleanupService = new StorageCleanupService(metadataRepo, quotaRepo, fileSystem, logger);
+                var cleanupService = new StorageCleanupService(
+                    metadataRepo,
+                    quotaRepo,
+                    fileSystem,
+                    logger,
+                    options.MetadataDirectory,
+                    options.QuotaDirectory);
 
                 // Register volumes with cleanup service
                 foreach (var volumeConfig in options.Volumes)

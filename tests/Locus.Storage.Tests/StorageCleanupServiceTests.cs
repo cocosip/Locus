@@ -51,7 +51,9 @@ namespace Locus.Storage.Tests
                 _metadataRepository,
                 _quotaRepository,
                 _fileSystem,
-                _logger.Object);
+                _logger.Object,
+                _metadataDir,
+                _quotaDir);
 
             // Setup mock volume
             _volumePath = Path.Combine(Path.GetTempPath(), $"locus-test-cleanup-vol-{testId}");

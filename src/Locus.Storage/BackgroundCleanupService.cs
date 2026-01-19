@@ -15,6 +15,7 @@ namespace Locus.Storage
         private readonly IStorageCleanupService _cleanupService;
         private readonly ILogger<BackgroundCleanupService> _logger;
         private readonly CleanupOptions _options;
+        private DateTime _lastDatabaseOptimization = DateTime.MinValue;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BackgroundCleanupService"/> class.
@@ -70,6 +71,35 @@ namespace Locus.Storage
                             _options.CompletedRecordRetentionPeriod.Value, stoppingToken);
                     }
 
+                    // 5. Optimize databases (if enabled and due)
+                    if (_options.OptimizeDatabases && ShouldOptimizeDatabases())
+                    {
+                        _logger.LogInformation("Starting scheduled database optimization...");
+
+                        try
+                        {
+                            var optimizationResult = await _cleanupService.OptimizeDatabasesAsync(stoppingToken);
+                            _lastDatabaseOptimization = DateTime.UtcNow;
+
+                            _logger.LogInformation(
+                                "Database optimization completed: " +
+                                "Databases={TotalDatabases} (Metadata={Metadata}, Quota={Quota}), " +
+                                "SpaceReclaimed={SpaceReclaimedMB:F2} MB ({PercentageReclaimed:F1}%), " +
+                                "Before={BeforeMB:F2} MB, After={AfterMB:F2} MB",
+                                optimizationResult.MetadataDatabasesOptimized + optimizationResult.QuotaDatabasesOptimized,
+                                optimizationResult.MetadataDatabasesOptimized,
+                                optimizationResult.QuotaDatabasesOptimized,
+                                optimizationResult.SpaceReclaimedMB,
+                                optimizationResult.PercentageReclaimed,
+                                optimizationResult.SizeBefore / 1024.0 / 1024.0,
+                                optimizationResult.SizeAfter / 1024.0 / 1024.0);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error during database optimization");
+                        }
+                    }
+
                     // Get and log statistics
                     var stats = await _cleanupService.GetCleanupStatisticsAsync(stoppingToken);
                     _logger.LogInformation(
@@ -97,6 +127,18 @@ namespace Locus.Storage
             }
 
             _logger.LogInformation("BackgroundCleanupService stopped");
+        }
+
+        /// <summary>
+        /// Determines whether database optimization should run based on the configured interval.
+        /// </summary>
+        private bool ShouldOptimizeDatabases()
+        {
+            if (!_options.DatabaseOptimizationInterval.HasValue)
+                return false;
+
+            var timeSinceLastOptimization = DateTime.UtcNow - _lastDatabaseOptimization;
+            return timeSinceLastOptimization >= _options.DatabaseOptimizationInterval.Value;
         }
     }
 
@@ -159,5 +201,21 @@ namespace Locus.Storage
         /// Default: 30 days.
         /// </summary>
         public TimeSpan? CompletedRecordRetentionPeriod { get; set; } = TimeSpan.FromDays(30);
+
+        /// <summary>
+        /// Gets or sets whether to optimize (shrink) LiteDB databases periodically.
+        /// Database optimization reclaims space from deleted records by rebuilding the database files.
+        /// This is a heavy operation and should be run during low-activity periods.
+        /// Default: true.
+        /// </summary>
+        public bool OptimizeDatabases { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the interval between database optimization runs.
+        /// Database optimization is independent of the regular cleanup interval.
+        /// Recommended: Weekly (7 days) or monthly (30 days) depending on delete frequency.
+        /// Default: 7 days (weekly).
+        /// </summary>
+        public TimeSpan? DatabaseOptimizationInterval { get; set; } = TimeSpan.FromDays(7);
     }
 }

@@ -64,5 +64,15 @@ namespace Locus.Core.Abstractions
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Cleanup statistics.</returns>
         Task<CleanupStatistics> GetCleanupStatisticsAsync(CancellationToken ct);
+
+        /// <summary>
+        /// Optimizes (shrinks) all LiteDB databases by rebuilding them.
+        /// This reclaims space from deleted records and reduces file size.
+        /// WARNING: This operation can be time-consuming for large databases.
+        /// Should be run during maintenance windows.
+        /// </summary>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Database optimization statistics.</returns>
+        Task<DatabaseOptimizationResult> OptimizeDatabasesAsync(CancellationToken ct);
     }
 }

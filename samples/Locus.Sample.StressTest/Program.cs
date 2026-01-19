@@ -183,6 +183,23 @@ class Program
             Console.WriteLine($"[SETUP] Created tenant: {tenantId}");
         }
 
+        // Manually trigger FileWatcher registration and initial scan
+        // (Since we're not using IHost, FileWatcherInitializationService won't run automatically)
+        var fileWatcher = serviceProvider.GetRequiredService<IFileWatcher>();
+        var locusOptions = serviceProvider.GetRequiredService<LocusOptions>();
+
+        Console.WriteLine();
+        Console.WriteLine("[SETUP] Registering FileWatcher configurations...");
+        foreach (var watcherConfig in locusOptions.FileWatchers)
+        {
+            await fileWatcher.RegisterWatcherAsync(watcherConfig, default);
+            Console.WriteLine($"[SETUP] Registered FileWatcher: {watcherConfig.WatcherId}");
+        }
+
+        Console.WriteLine("[SETUP] Triggering FileWatcher initial scan to create tenant directories...");
+        var importedFiles = await fileWatcher.ScanNowAsync("multi-tenant-watcher", default);
+        Console.WriteLine($"[SETUP] FileWatcher scan completed. Imported {importedFiles} files. Tenant directories created.");
+
         Console.WriteLine();
         Console.WriteLine("╔════════════════════════════════════════════════════════════════╗");
         Console.WriteLine("║                    Starting Stress Test                        ║");

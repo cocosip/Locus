@@ -449,6 +449,46 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Optimizes (rebuilds) a specific tenant's metadata database to reclaim space.
+        /// This method is thread-safe and will block all operations for this tenant during optimization.
+        /// WARNING: This is a heavy operation. Should be called during maintenance windows.
+        /// </summary>
+        /// <param name="tenantId">The tenant ID whose database should be optimized.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Tuple of (size before, size after) in bytes.</returns>
+        public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
+        {
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+
+            return LiteDbOptimizationHelper.OptimizeDatabaseAsync(
+                tenantId,
+                dbPath,
+                _databases,
+                _tenantLocks,
+                _fileSystem,
+                _logger,
+                "metadata",
+                ct);
+        }
+
+        /// <summary>
+        /// Gets all tenant IDs that have metadata databases.
+        /// </summary>
+        public Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
+        {
+            if (!_fileSystem.Directory.Exists(_metadataDirectory))
+                return Task.FromResult<IEnumerable<string>>(Array.Empty<string>());
+
+            var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
+            var tenantIds = dbFiles
+                .Select(f => _fileSystem.Path.GetFileNameWithoutExtension(f))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .ToList();
+
+            return Task.FromResult<IEnumerable<string>>(tenantIds);
+        }
+
+        /// <summary>
         /// Disposes the repository and closes all databases.
         /// </summary>
         public void Dispose()

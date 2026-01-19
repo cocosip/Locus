@@ -81,7 +81,13 @@ watch\
   └── tenant-005\    # 租户 005 的监控目录（自动创建）
 ```
 
-**注意**：这些租户子目录在 FileWatcher 首次扫描时自动创建，无需手动创建。
+**注意**：这些租户子目录在程序启动时通过 FileWatcher 首次扫描自动创建（见 Program.cs:186-201），无需手动创建。
+
+**工作原理**：
+1. 程序启动后创建所有租户（通过 `ITenantManager.CreateTenantAsync`）
+2. 手动注册 FileWatcher 配置
+3. 触发首次扫描（`ScanNowAsync`），此时会自动为所有租户创建监控子目录
+4. 之后 FileWatcher 每 5 秒自动扫描一次
 
 ### 如何使用
 

@@ -24,6 +24,8 @@ namespace Locus.Storage
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
         private readonly CleanupStatistics _statistics;
+        private readonly string _metadataDirectory;
+        private readonly string _quotaDirectory;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StorageCleanupService"/> class.
@@ -32,7 +34,9 @@ namespace Locus.Storage
             MetadataRepository metadataRepository,
             DirectoryQuotaRepository quotaRepository,
             IFileSystem fileSystem,
-            ILogger<StorageCleanupService> logger)
+            ILogger<StorageCleanupService> logger,
+            string metadataDirectory,
+            string quotaDirectory)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
@@ -40,6 +44,14 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
             _statistics = new CleanupStatistics();
+
+            if (string.IsNullOrWhiteSpace(metadataDirectory))
+                throw new ArgumentException("Metadata directory cannot be empty", nameof(metadataDirectory));
+            if (string.IsNullOrWhiteSpace(quotaDirectory))
+                throw new ArgumentException("Quota directory cannot be empty", nameof(quotaDirectory));
+
+            _metadataDirectory = metadataDirectory;
+            _quotaDirectory = quotaDirectory;
         }
 
         /// <summary>
@@ -274,6 +286,83 @@ namespace Locus.Storage
                 TimedOutFilesReset = _statistics.TimedOutFilesReset,
                 SpaceFreed = _statistics.SpaceFreed
             });
+        }
+
+        /// <inheritdoc/>
+        public async Task<DatabaseOptimizationResult> OptimizeDatabasesAsync(CancellationToken ct)
+        {
+            _logger.LogWarning("Starting database optimization. This operation can be time-consuming for large databases.");
+            _logger.LogWarning("Tenant operations will be BLOCKED during optimization. Run during low-activity periods.");
+
+            var result = new DatabaseOptimizationResult
+            {
+                MetadataDatabasesOptimized = 0,
+                QuotaDatabasesOptimized = 0,
+                SpaceReclaimed = 0,
+                SizeBefore = 0,
+                SizeAfter = 0
+            };
+
+            // Get all tenant IDs from metadata databases
+            var metadataTenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+
+            // Optimize metadata databases (per-tenant, thread-safe)
+            foreach (var tenantId in metadataTenantIds)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                try
+                {
+                    var (sizeBefore, sizeAfter) = await _metadataRepository.OptimizeDatabaseAsync(tenantId, ct);
+
+                    if (sizeBefore > 0) // Only count if database exists
+                    {
+                        result.SizeBefore += sizeBefore;
+                        result.SizeAfter += sizeAfter;
+                        result.SpaceReclaimed += (sizeBefore - sizeAfter);
+                        result.MetadataDatabasesOptimized++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to optimize metadata database for tenant {TenantId}", tenantId);
+                }
+            }
+
+            // Get all tenant IDs from quota databases
+            var quotaTenantIds = await _quotaRepository.GetAllTenantIdsAsync(ct);
+
+            // Optimize quota databases (per-tenant, thread-safe)
+            foreach (var tenantId in quotaTenantIds)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                try
+                {
+                    var (sizeBefore, sizeAfter) = await _quotaRepository.OptimizeDatabaseAsync(tenantId, ct);
+
+                    if (sizeBefore > 0) // Only count if database exists
+                    {
+                        result.SizeBefore += sizeBefore;
+                        result.SizeAfter += sizeAfter;
+                        result.SpaceReclaimed += (sizeBefore - sizeAfter);
+                        result.QuotaDatabasesOptimized++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to optimize quota database for tenant {TenantId}", tenantId);
+                }
+            }
+
+            _logger.LogInformation("Database optimization completed. Total databases: {Total}, Metadata: {Metadata}, Quota: {Quota}, Space reclaimed: {SpaceMB:F2} MB ({Percentage:F1}%)",
+                result.MetadataDatabasesOptimized + result.QuotaDatabasesOptimized,
+                result.MetadataDatabasesOptimized,
+                result.QuotaDatabasesOptimized,
+                result.SpaceReclaimedMB,
+                result.PercentageReclaimed);
+
+            return result;
         }
 
         /// <summary>

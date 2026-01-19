@@ -361,6 +361,51 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Optimizes (rebuilds) a specific tenant's quota database to reclaim space.
+        /// This method is thread-safe and will block all operations for this tenant during optimization.
+        /// WARNING: This is a heavy operation. Should be called during maintenance windows.
+        /// </summary>
+        /// <param name="tenantId">The tenant ID whose database should be optimized.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Tuple of (size before, size after) in bytes.</returns>
+        public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
+        {
+            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tenantId}-quotas.db");
+
+            return LiteDbOptimizationHelper.OptimizeDatabaseAsync(
+                tenantId,
+                dbPath,
+                _databases,
+                _directoryLocks,
+                _fileSystem,
+                _logger,
+                "quota",
+                ct);
+        }
+
+        /// <summary>
+        /// Gets all tenant IDs that have quota databases.
+        /// </summary>
+        public Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
+        {
+            if (!_fileSystem.Directory.Exists(_quotaDirectory))
+                return Task.FromResult<IEnumerable<string>>(Array.Empty<string>());
+
+            var dbFiles = _fileSystem.Directory.GetFiles(_quotaDirectory, "*-quotas.db");
+            var tenantIds = dbFiles
+                .Select(f =>
+                {
+                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(f);
+                    // Remove "-quotas" suffix
+                    return fileName.EndsWith("-quotas") ? fileName.Substring(0, fileName.Length - 7) : fileName;
+                })
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .ToList();
+
+            return Task.FromResult<IEnumerable<string>>(tenantIds);
+        }
+
+        /// <summary>
         /// Disposes the repository and closes all databases.
         /// </summary>
         public void Dispose()
