@@ -29,6 +29,9 @@ namespace Locus.Storage.Data
         // Per-tenant LiteDB databases
         private readonly ConcurrentDictionary<string, LiteDatabase> _databases;
 
+        // Per-tenant locks for concurrent file allocation
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
+
         private bool _disposed;
 
         /// <summary>
@@ -48,6 +51,7 @@ namespace Locus.Storage.Data
             _metadataDirectory = metadataDirectory;
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _databases = new ConcurrentDictionary<string, LiteDatabase>();
+            _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
 
             // Ensure metadata directory exists
             if (!_fileSystem.Directory.Exists(_metadataDirectory))
@@ -238,52 +242,64 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Gets the next pending file for processing (atomic operation).
         /// Returns null if no files are available.
-        /// Thread-safe: Updates LiteDB with rollback on failure.
+        /// Thread-safe: Uses per-tenant lock to prevent concurrent access.
         /// </summary>
-        public Task<FileMetadata?> GetNextPendingFileAsync(string tenantId, CancellationToken ct)
+        public async Task<FileMetadata?> GetNextPendingFileAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var cache = GetCache(tenantId);
-            var now = DateTime.UtcNow;
+            // Get or create tenant-specific lock
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
-            // Find the oldest pending file that is available for processing
-            var file = cache.Values
-                .Where(m => m.Status == FileProcessingStatus.Pending
-                         && (m.AvailableForProcessingAt == null || m.AvailableForProcessingAt <= now))
-                .OrderBy(m => m.CreatedAt)
-                .FirstOrDefault();
-
-            if (file != null)
+            // Acquire lock to ensure atomic find-and-update
+            await tenantLock.WaitAsync(ct);
+            try
             {
-                // Save original state for rollback
-                var originalStatus = file.Status;
-                var originalProcessingStartTime = file.ProcessingStartTime;
+                var cache = GetCache(tenantId);
+                var now = DateTime.UtcNow;
 
-                try
+                // Find the oldest pending file that is available for processing
+                var file = cache.Values
+                    .Where(m => m.Status == FileProcessingStatus.Pending
+                             && (m.AvailableForProcessingAt == null || m.AvailableForProcessingAt <= now))
+                    .OrderBy(m => m.CreatedAt)
+                    .FirstOrDefault();
+
+                if (file != null)
                 {
-                    // Update both memory and persistence atomically
-                    file.Status = FileProcessingStatus.Processing;
-                    file.ProcessingStartTime = DateTime.UtcNow;
+                    // Save original state for rollback
+                    var originalStatus = file.Status;
+                    var originalProcessingStartTime = file.ProcessingStartTime;
 
-                    // Persist to LiteDB
-                    var db = GetDatabase(tenantId);
-                    var files = db.GetCollection<FileMetadata>("files");
-                    files.Update(file);
+                    try
+                    {
+                        // Update both memory and persistence atomically
+                        file.Status = FileProcessingStatus.Processing;
+                        file.ProcessingStartTime = DateTime.UtcNow;
 
-                    _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", file.FileKey, tenantId);
+                        // Persist to LiteDB
+                        var db = GetDatabase(tenantId);
+                        var files = db.GetCollection<FileMetadata>("files");
+                        files.Update(file);
+
+                        _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", file.FileKey, tenantId);
+                    }
+                    catch
+                    {
+                        // Rollback memory state on persistence failure
+                        file.Status = originalStatus;
+                        file.ProcessingStartTime = originalProcessingStartTime;
+                        throw;
+                    }
                 }
-                catch
-                {
-                    // Rollback memory state on persistence failure
-                    file.Status = originalStatus;
-                    file.ProcessingStartTime = originalProcessingStartTime;
-                    throw;
-                }
+
+                return file;
             }
-
-            return Task.FromResult(file);
+            finally
+            {
+                tenantLock.Release();
+            }
         }
 
         /// <summary>
@@ -450,6 +466,20 @@ namespace Locus.Storage.Data
 
             _databases.Clear();
             _activeFiles.Clear();
+
+            // Dispose all tenant locks
+            foreach (var semaphore in _tenantLocks.Values)
+            {
+                try
+                {
+                    semaphore?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error disposing tenant lock");
+                }
+            }
+            _tenantLocks.Clear();
 
             _logger.LogInformation("MetadataRepository disposed");
         }
