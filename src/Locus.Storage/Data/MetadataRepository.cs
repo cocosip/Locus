@@ -79,7 +79,7 @@ namespace Locus.Storage.Data
                 var db = new LiteDatabase(dbPath);
 
                 var files = db.GetCollection<FileMetadata>("files");
-                files.EnsureIndex(x => x.FileKey, unique: true);
+                // FileKey is already BsonId, no need to create additional index
                 files.EnsureIndex(x => x.Status);
                 files.EnsureIndex(x => x.CreatedAt);
                 files.EnsureIndex(x => x.AvailableForProcessingAt);

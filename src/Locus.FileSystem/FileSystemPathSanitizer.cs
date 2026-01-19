@@ -10,7 +10,20 @@ namespace Locus.FileSystem
     public static class FileSystemPathSanitizer
     {
         private static readonly char[] InvalidPathChars = Path.GetInvalidPathChars();
-        private static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
+
+        // Use a cross-platform set of invalid filename characters
+        // Path.GetInvalidFileNameChars() returns different chars on Windows vs Linux
+        // Windows: <>:"/\|?*  Linux: /\0
+        // We use the union of both to ensure consistency across platforms
+        private static readonly char[] InvalidFileNameChars = new char[]
+        {
+            '<', '>', ':', '"', '/', '\\', '|', '?', '*', '\0',
+            '\u0001', '\u0002', '\u0003', '\u0004', '\u0005', '\u0006', '\u0007',
+            '\u0008', '\u0009', '\u000A', '\u000B', '\u000C', '\u000D', '\u000E',
+            '\u000F', '\u0010', '\u0011', '\u0012', '\u0013', '\u0014', '\u0015',
+            '\u0016', '\u0017', '\u0018', '\u0019', '\u001A', '\u001B', '\u001C',
+            '\u001D', '\u001E', '\u001F'
+        };
 
         /// <summary>
         /// Validates that a path is safe and does not contain directory traversal attempts.
