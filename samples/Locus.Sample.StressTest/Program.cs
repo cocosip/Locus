@@ -26,7 +26,7 @@ class Program
     // Simulate failures to test retry mechanism (0-100, 0 = no failures, 10 = 10% failure rate)
     private const int SIMULATED_FAILURE_PERCENTAGE = 0;
 
-    private static readonly string TestDirectory = Path.Combine(Path.GetTempPath(), "locus-stress-test", DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+    private static readonly string TestDirectory = Path.Combine(Path.GetTempPath(), "locus-stress-test", DateTime.Now.ToString("yyyyMMdd-HH"));
 
     // Thread-safe statistics
     private static long _totalFilesWritten = 0;
@@ -140,6 +140,7 @@ class Program
                     options.ProcessingTimeout = TimeSpan.FromMinutes(30);
                     options.FailedFileRetentionPeriod = TimeSpan.FromDays(7);
                 })
+                .EnableDatabaseHealthCheck() 
                 .DisableBackgroundCleanup() // We'll manage cleanup manually for this test
                 .AddFileWatcher(watcher =>
                 {
@@ -176,11 +177,21 @@ class Program
         for (int i = 1; i <= TENANT_COUNT; i++)
         {
             var tenantId = $"tenant-{i:D3}";
-            await tenantManager.CreateTenantAsync(tenantId, default);
+
+            // Try to create tenant, ignore if already exists
+            try
+            {
+                await tenantManager.CreateTenantAsync(tenantId, default);
+                Console.WriteLine($"[SETUP] Created tenant: {tenantId}");
+            }
+            catch (Exception ex) when (ex.Message.Contains("already exists"))
+            {
+                Console.WriteLine($"[SETUP] Tenant already exists, using existing: {tenantId}");
+            }
+
             var tenant = await tenantManager.GetTenantAsync(tenantId, default);
             tenants.Add(tenant!);
             _filesPerTenant[tenantId] = 0;
-            Console.WriteLine($"[SETUP] Created tenant: {tenantId}");
         }
 
         // Manually trigger FileWatcher registration and initial scan
@@ -264,7 +275,7 @@ class Program
 
                         // Write file
                         using var stream = new MemoryStream(contentBytes);
-                        var fileKey = await storagePool.WriteFileAsync(tenant, stream, CancellationToken.None);
+                        var fileKey = await storagePool.WriteFileAsync(tenant, stream, null, CancellationToken.None);
 
                         // Update statistics
                         Interlocked.Increment(ref _totalFilesWritten);
