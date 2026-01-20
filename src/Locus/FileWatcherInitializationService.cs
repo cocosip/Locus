@@ -30,12 +30,24 @@ namespace Locus
         {
             _logger.LogInformation("Initializing file watchers...");
 
+            var registeredCount = 0;
+
             try
             {
                 foreach (var watcherConfig in _options.FileWatchers)
                 {
                     try
                     {
+                        // Skip disabled watchers during initialization
+                        if (!watcherConfig.Enabled)
+                        {
+                            _logger.LogInformation("Skipping disabled file watcher: {WatcherId}", watcherConfig.WatcherId);
+                            continue;
+                        }
+
+                        _logger.LogDebug("Initializing file watcher: {WatcherId}, Enabled: {Enabled}, WatchPath: {WatchPath}, TenantId: {TenantId}, MultiTenantMode: {MultiTenantMode}",
+                            watcherConfig.WatcherId, watcherConfig.Enabled, watcherConfig.WatchPath, watcherConfig.TenantId, watcherConfig.MultiTenantMode);
+
                         // Register the file watcher configuration
                         await _fileWatcher.RegisterWatcherAsync(watcherConfig, cancellationToken);
 
@@ -44,22 +56,27 @@ namespace Locus
                             watcherConfig.WatchPath,
                             watcherConfig.MultiTenantMode);
 
-                        // Perform initial scan if enabled
-                        if (watcherConfig.Enabled)
-                        {
-                            var importedCount = await _fileWatcher.ScanNowAsync(watcherConfig.WatcherId, cancellationToken);
-                            _logger.LogInformation("Initial scan completed for watcher {WatcherId}: {Count} files imported",
-                                watcherConfig.WatcherId, importedCount);
-                        }
+                        // Perform initial scan
+                        var importedCount = await _fileWatcher.ScanNowAsync(watcherConfig.WatcherId, cancellationToken);
+                        _logger.LogInformation("Initial scan completed for watcher {WatcherId}: {Count} files imported",
+                            watcherConfig.WatcherId, importedCount);
+
+                        registeredCount++;
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Failed to initialize file watcher: {WatcherId}", watcherConfig.WatcherId);
+                        _logger.LogError(ex,
+                            "Failed to initialize file watcher: {WatcherId}. Exception Type: {ExceptionType}, Message: {Message}, InnerException: {InnerException}",
+                            watcherConfig.WatcherId,
+                            ex.GetType().FullName,
+                            ex.Message,
+                            ex.InnerException?.Message ?? "None");
                         // Continue with other watchers
                     }
                 }
 
-                _logger.LogInformation("File watcher initialization completed. {Count} watchers registered.", _options.FileWatchers.Count);
+                _logger.LogInformation("File watcher initialization completed. {EnabledCount}/{TotalCount} watchers registered.",
+                    registeredCount, _options.FileWatchers.Count);
             }
             catch (Exception ex)
             {

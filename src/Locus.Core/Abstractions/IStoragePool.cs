@@ -77,7 +77,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenant">The tenant context.</param>
         /// <param name="batchSize">The maximum number of files to retrieve.</param>
         /// <param name="ct">Cancellation token.</param>
-        /// <returns>A collection of files available for processing (may be less than batchSize).</returns>
+        /// <returns>A collection of files available for processing. May contain fewer files than requested or be empty if no files are available.</returns>
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
         Task<System.Collections.Generic.IEnumerable<Models.FileLocation>> GetNextBatchForProcessingAsync(
             ITenantContext tenant,

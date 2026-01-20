@@ -22,9 +22,9 @@ namespace Locus.Core.Abstractions
         /// Gets a batch of files for processing in a thread-safe manner.
         /// </summary>
         /// <param name="tenant">The tenant context.</param>
-        /// <param name="batchSize">The number of files to retrieve.</param>
+        /// <param name="batchSize">The maximum number of files to retrieve.</param>
         /// <param name="ct">Cancellation token.</param>
-        /// <returns>A collection of file locations.</returns>
+        /// <returns>A collection of file locations. May contain fewer files than requested or be empty if no files are available.</returns>
         Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(ITenantContext tenant, int batchSize, CancellationToken ct);
 
         /// <summary>

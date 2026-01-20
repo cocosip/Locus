@@ -100,9 +100,10 @@ namespace Locus.Storage
                 locations.Add(MapToFileLocation(metadata));
             }
 
+            // Return empty collection if no files available (instead of throwing exception)
             if (locations.Count == 0)
             {
-                throw new NoFilesAvailableException($"No pending files available for tenant: {tenant.TenantId}");
+                _logger.LogDebug("No pending files available for tenant: {TenantId}", tenant.TenantId);
             }
 
             return locations;

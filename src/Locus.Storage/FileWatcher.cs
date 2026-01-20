@@ -148,10 +148,11 @@ namespace Locus.Storage
                     }
                 }
 
-                // Validate watch path exists
+                // Ensure watch path exists (auto-create if missing)
                 if (!_fileSystem.Directory.Exists(configuration.WatchPath))
                 {
-                    throw new DirectoryNotFoundException($"Watch path '{configuration.WatchPath}' does not exist.");
+                    _fileSystem.Directory.CreateDirectory(configuration.WatchPath);
+                    _logger.LogInformation("Created watch path directory: {WatchPath}", configuration.WatchPath);
                 }
 
                 configuration.CreatedAt = DateTime.UtcNow;
