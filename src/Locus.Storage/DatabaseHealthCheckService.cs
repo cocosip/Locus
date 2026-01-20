@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -43,9 +44,14 @@ namespace Locus.Storage
         {
             _logger.LogInformation("Starting database health check...");
 
+            // Add delay to avoid startup timing conflicts
+            // Other services (MetadataRepository, etc.) need time to initialize
+            _logger.LogDebug("Waiting 2 seconds for other services to initialize...");
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+
             try
             {
-                var report = await _recoveryService.CheckAllDatabasesAsync(cancellationToken);
+                var report = await CheckWithRetryAsync(cancellationToken);
 
                 // Check for orphaned files if no databases exist
                 if (report.HealthyDatabases == 0 && report.CorruptedDatabases.Count == 0)
@@ -80,6 +86,53 @@ namespace Locus.Storage
             {
                 _logger.LogError(ex, "Error during database health check");
             }
+        }
+
+        /// <summary>
+        /// Checks all databases with retry mechanism to handle startup timing conflicts.
+        /// </summary>
+        private async Task<DatabaseHealthReport> CheckWithRetryAsync(CancellationToken cancellationToken)
+        {
+            const int maxRetries = 3;
+            const int retryDelayMs = 1000;
+
+            DatabaseHealthReport? lastReport = null;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                lastReport = await _recoveryService.CheckAllDatabasesAsync(cancellationToken);
+
+                // If all healthy, no need to retry
+                if (lastReport.AllHealthy)
+                {
+                    if (attempt > 1)
+                    {
+                        _logger.LogInformation(
+                            "Database health check succeeded on attempt {Attempt}/{MaxRetries}",
+                            attempt, maxRetries);
+                    }
+                    return lastReport;
+                }
+
+                // If this is not the last attempt, retry
+                if (attempt < maxRetries)
+                {
+                    _logger.LogDebug(
+                        "Database health check found {CorruptedCount} potentially locked databases on attempt {Attempt}/{MaxRetries}. " +
+                        "Retrying in {DelayMs}ms to rule out startup timing conflicts...",
+                        lastReport.CorruptedDatabases.Count, attempt, maxRetries, retryDelayMs);
+
+                    await Task.Delay(retryDelayMs, cancellationToken);
+                }
+            }
+
+            // After all retries, return the last report (guaranteed to be non-null after loop)
+            _logger.LogWarning(
+                "Database health check completed after {MaxRetries} attempts. " +
+                "Still found {CorruptedCount} corrupted database(s).",
+                maxRetries, lastReport!.CorruptedDatabases.Count);
+
+            return lastReport;
         }
 
         /// <summary>

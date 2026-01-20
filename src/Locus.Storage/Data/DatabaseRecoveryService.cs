@@ -65,13 +65,43 @@ namespace Locus.Storage.Data
             }
             catch (LiteException ex)
             {
-                _logger.LogWarning(ex, "Database corruption detected: {DatabasePath}", dbPath);
-                return true;
+                // Distinguish between file locking and actual corruption
+                var errorMessage = ex.Message.ToLowerInvariant();
+
+                _logger.LogDebug(
+                    "LiteException when checking database: {DatabasePath}. " +
+                    "ErrorCode: {ErrorCode}, Message: {Message}",
+                    dbPath, ex.ErrorCode, ex.Message);
+
+                // Check for file locking issues (NOT corruption)
+                if (errorMessage.Contains("being used by another process") ||
+                    errorMessage.Contains("sharing violation") ||
+                    ex.ErrorCode == 32 || // Win32: ERROR_SHARING_VIOLATION
+                    ex.ErrorCode == 33)   // Win32: ERROR_LOCK_VIOLATION
+                {
+                    _logger.LogDebug(
+                        "Database is temporarily locked (not corrupted): {DatabasePath}. " +
+                        "This is normal during startup when multiple services initialize.",
+                        dbPath);
+                    return false; // NOT corrupted, just locked
+                }
+
+                // Any other LiteException indicates corruption or invalid database
+                _logger.LogError(ex,
+                    "Database corruption or invalid format detected: {DatabasePath}. " +
+                    "ErrorCode: {ErrorCode}",
+                    dbPath, ex.ErrorCode);
+                return true; // Assume corruption for all other LiteDB errors
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Error checking database: {DatabasePath}", dbPath);
-                return true;
+                // Non-LiteDB exceptions (e.g., IOException) also indicate problems
+                // This could be file corruption, permission issues, or file system errors
+                _logger.LogWarning(ex,
+                    "Exception when checking database: {DatabasePath}. " +
+                    "Exception type: {ExceptionType}. Assuming corrupted.",
+                    dbPath, ex.GetType().Name);
+                return true; // If we can't open the database, assume it's corrupted
             }
         }
 
