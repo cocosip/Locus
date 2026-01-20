@@ -101,7 +101,7 @@ namespace Locus.Benchmarks
                 tasks.Add(Task.Run(async () =>
                 {
                     var content = new MemoryStream(Encoding.UTF8.GetBytes($"Content {index}"));
-                    await _storagePool.WriteFileAsync(_tenant, content, CancellationToken.None);
+                    await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
                 }));
             }
             await Task.WhenAll(tasks);
@@ -129,7 +129,7 @@ namespace Locus.Benchmarks
             for (int i = 0; i < 10; i++)
             {
                 var content = new MemoryStream(Encoding.UTF8.GetBytes($"Read content {i}"));
-                var key = await _storagePool.WriteFileAsync(_tenant, content, CancellationToken.None);
+                var key = await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
                 fileKeys.Add(key);
             }
 
@@ -152,7 +152,7 @@ namespace Locus.Benchmarks
             for (int i = 0; i < 5; i++)
             {
                 var content = new MemoryStream(Encoding.UTF8.GetBytes($"Existing {i}"));
-                var key = await _storagePool.WriteFileAsync(_tenant, content, CancellationToken.None);
+                var key = await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
                 fileKeys.Add(key);
             }
 
@@ -166,7 +166,7 @@ namespace Locus.Benchmarks
                 tasks.Add(Task.Run(async () =>
                 {
                     var content = new MemoryStream(Encoding.UTF8.GetBytes($"New {index}"));
-                    await _storagePool.WriteFileAsync(_tenant, content, CancellationToken.None);
+                    await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
                 }));
             }
 

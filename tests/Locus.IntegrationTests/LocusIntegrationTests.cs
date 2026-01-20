@@ -94,7 +94,7 @@ namespace Locus.IntegrationTests
             var content = new MemoryStream(Encoding.UTF8.GetBytes("Hello, Locus!"));
 
             // Act - Write
-            var fileKey = await storagePool.WriteFileAsync(tenant!, content, default);
+            var fileKey = await storagePool.WriteFileAsync(tenant!, content, null, default);
             Assert.False(string.IsNullOrEmpty(fileKey));
 
             // Act - Read
@@ -127,7 +127,7 @@ namespace Locus.IntegrationTests
             for (int i = 1; i <= 3; i++)
             {
                 var content = new MemoryStream(Encoding.UTF8.GetBytes($"File {i}"));
-                await storagePool.WriteFileAsync(tenant!, content, default);
+                await storagePool.WriteFileAsync(tenant!, content, null, default);
             }
 
             // Act - Get next file for processing
@@ -175,13 +175,13 @@ namespace Locus.IntegrationTests
             var content1 = new MemoryStream(Encoding.UTF8.GetBytes("File 1"));
             var content2 = new MemoryStream(Encoding.UTF8.GetBytes("File 2"));
 
-            await storagePool.WriteFileAsync(tenant!, content1, default);
-            await storagePool.WriteFileAsync(tenant!, content2, default);
+            await storagePool.WriteFileAsync(tenant!, content1, null, default);
+            await storagePool.WriteFileAsync(tenant!, content2, null, default);
 
             // Assert - Third file should fail
             var content3 = new MemoryStream(Encoding.UTF8.GetBytes("File 3"));
             await Assert.ThrowsAsync<Core.Exceptions.TenantQuotaExceededException>(() =>
-                storagePool.WriteFileAsync(tenant!, content3, default));
+                storagePool.WriteFileAsync(tenant!, content3, null, default));
         }
 
         [Fact]
@@ -198,7 +198,7 @@ namespace Locus.IntegrationTests
 
             // Write a file and start processing it
             var content = new MemoryStream(Encoding.UTF8.GetBytes("Test file"));
-            await storagePool.WriteFileAsync(tenant!, content, default);
+            await storagePool.WriteFileAsync(tenant!, content, null, default);
 
             var file = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);
             Assert.NotNull(file);
@@ -225,7 +225,7 @@ namespace Locus.IntegrationTests
             for (int i = 1; i <= 10; i++)
             {
                 var content = new MemoryStream(Encoding.UTF8.GetBytes($"File {i}"));
-                await storagePool.WriteFileAsync(tenant!, content, default);
+                await storagePool.WriteFileAsync(tenant!, content, null, default);
             }
 
             // Assert - Verify total capacity includes both volumes

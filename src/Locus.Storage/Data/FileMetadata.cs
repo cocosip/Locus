@@ -77,6 +77,18 @@ namespace Locus.Storage.Data
         public DateTime? AvailableForProcessingAt { get; set; }
 
         /// <summary>
+        /// Gets or sets the original file name (e.g., "invoice.pdf").
+        /// This is the file name provided by the user when uploading or importing the file.
+        /// </summary>
+        public string? OriginalFileName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the file extension (e.g., ".pdf", ".docx").
+        /// Extracted from the original file name and applied to the physical file name.
+        /// </summary>
+        public string? FileExtension { get; set; }
+
+        /// <summary>
         /// Gets or sets additional metadata as key-value pairs.
         /// </summary>
         public System.Collections.Generic.Dictionary<string, string>? Metadata { get; set; }

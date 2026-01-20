@@ -20,12 +20,13 @@ namespace Locus.Core.Abstractions
         /// </summary>
         /// <param name="tenant">The tenant context.</param>
         /// <param name="content">A stream containing the file contents.</param>
+        /// <param name="originalFileName">The original file name (e.g., "invoice.pdf"). If provided, the file extension will be preserved in the physical file name.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The system-generated unique file key for retrieving the file later.</returns>
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
         /// <exception cref="Core.Exceptions.TenantQuotaExceededException">Thrown when tenant file count limit is exceeded.</exception>
         /// <exception cref="Core.Exceptions.InsufficientStorageException">Thrown when no volume has sufficient space.</exception>
-        Task<string> WriteFileAsync(ITenantContext tenant, Stream content, CancellationToken ct);
+        Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct);
 
         /// <summary>
         /// Reads a file from the storage pool asynchronously using its file key.

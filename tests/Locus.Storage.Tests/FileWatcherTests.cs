@@ -149,6 +149,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -173,6 +174,7 @@ namespace Locus.Storage.Tests
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Exactly(2));
         }
 
@@ -218,6 +220,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -243,10 +246,12 @@ namespace Locus.Storage.Tests
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.Is<ITenantContext>(t => t.TenantId == "tenant-001"),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Once);
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.Is<ITenantContext>(t => t.TenantId == "tenant-002"),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Once);
         }
 
@@ -286,6 +291,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -308,10 +314,12 @@ namespace Locus.Storage.Tests
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.Is<ITenantContext>(t => t.TenantId == "tenant-001"),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Once);
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.Is<ITenantContext>(t => t.TenantId == "tenant-002"),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Never);
         }
 
@@ -341,6 +349,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -366,6 +375,7 @@ namespace Locus.Storage.Tests
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Once);
         }
 
@@ -389,6 +399,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -432,6 +443,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -594,6 +606,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -620,6 +633,7 @@ namespace Locus.Storage.Tests
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Once);
         }
 
@@ -649,6 +663,7 @@ namespace Locus.Storage.Tests
             _storagePool.Setup(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
                 .ReturnsAsync("generated-key");
 
@@ -676,6 +691,7 @@ namespace Locus.Storage.Tests
             _storagePool.Verify(s => s.WriteFileAsync(
                 It.IsAny<ITenantContext>(),
                 It.IsAny<Stream>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Once);
         }
 

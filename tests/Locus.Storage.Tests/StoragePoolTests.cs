@@ -214,7 +214,7 @@ namespace Locus.Storage.Tests
             var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
 
             // Act
-            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, default);
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
 
             // Assert
             Assert.False(string.IsNullOrEmpty(fileKey));
@@ -242,7 +242,7 @@ namespace Locus.Storage.Tests
 
             // Act & Assert
             await Assert.ThrowsAsync<TenantDisabledException>(() =>
-                _storagePool.WriteFileAsync(_tenant.Object, content, default));
+                _storagePool.WriteFileAsync(_tenant.Object, content, null, default));
         }
 
         [Fact]
@@ -256,7 +256,7 @@ namespace Locus.Storage.Tests
 
             // Act & Assert
             await Assert.ThrowsAsync<TenantQuotaExceededException>(() =>
-                _storagePool.WriteFileAsync(_tenant.Object, content, default));
+                _storagePool.WriteFileAsync(_tenant.Object, content, null, default));
         }
 
         [Fact]
@@ -264,7 +264,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
-            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, default);
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
 
             // Act
             using var readStream = await _storagePool.ReadFileAsync(_tenant.Object, fileKey, default);
@@ -288,7 +288,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
-            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, default);
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
 
             // Setup GetTenantAsync to return a disabled tenant
             var disabledTenantContext = new Mock<ITenantContext>();
@@ -308,7 +308,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
-            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, default);
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
 
             var otherTenant = new Mock<ITenantContext>();
             otherTenant.Setup(t => t.TenantId).Returns("tenant-002");
@@ -328,7 +328,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
-            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, default);
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
 
             // Act
             var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
@@ -356,7 +356,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
-            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, default);
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
 
             var otherTenant = new Mock<ITenantContext>();
             otherTenant.Setup(t => t.TenantId).Returns("tenant-002");
@@ -399,8 +399,8 @@ namespace Locus.Storage.Tests
             var content2 = new MemoryStream(Encoding.UTF8.GetBytes("content 2"));
 
             // Act
-            var fileKey1 = await _storagePool.WriteFileAsync(_tenant.Object, content1, default);
-            var fileKey2 = await _storagePool.WriteFileAsync(_tenant.Object, content2, default);
+            var fileKey1 = await _storagePool.WriteFileAsync(_tenant.Object, content1, null, default);
+            var fileKey2 = await _storagePool.WriteFileAsync(_tenant.Object, content2, null, default);
 
             // Assert
             var location1 = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey1, default);
@@ -422,10 +422,77 @@ namespace Locus.Storage.Tests
 
             // Act & Assert
             await Assert.ThrowsAsync<ArgumentNullException>(() =>
-                _storagePool.WriteFileAsync(_tenant.Object, invalidContent, default));
+                _storagePool.WriteFileAsync(_tenant.Object, invalidContent, null, default));
 
             // Verify quota was not incremented (mock should not have been called)
             _tenantQuotaManager.Verify(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_PreservesFileExtension()
+        {
+            // Arrange
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("PDF content"));
+
+            // Act
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "invoice.pdf", default);
+
+            // Assert
+            Assert.False(string.IsNullOrEmpty(fileKey));
+
+            // Verify file metadata contains original file name and extension
+            var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
+            Assert.NotNull(location);
+
+            // Physical path should contain the extension
+            Assert.EndsWith(".pdf", location.PhysicalPath);
+
+            // Verify file exists on disk with extension
+            Assert.True(_fileSystem.File.Exists(location.PhysicalPath));
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_WithoutFileName_NoExtension()
+        {
+            // Arrange
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("content without extension"));
+
+            // Act
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+
+            // Assert
+            Assert.False(string.IsNullOrEmpty(fileKey));
+
+            // Verify physical path does not have an extension
+            var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
+            Assert.NotNull(location);
+            Assert.DoesNotContain(".", Path.GetFileName(location.PhysicalPath));
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_DifferentExtensions_PreservesCorrectly()
+        {
+            // Arrange & Act
+            var pdfContent = new MemoryStream(Encoding.UTF8.GetBytes("PDF"));
+            var docxContent = new MemoryStream(Encoding.UTF8.GetBytes("DOCX"));
+            var jpgContent = new MemoryStream(Encoding.UTF8.GetBytes("JPG"));
+
+            var pdfKey = await _storagePool.WriteFileAsync(_tenant.Object, pdfContent, "document.pdf", default);
+            var docxKey = await _storagePool.WriteFileAsync(_tenant.Object, docxContent, "report.docx", default);
+            var jpgKey = await _storagePool.WriteFileAsync(_tenant.Object, jpgContent, "photo.jpg", default);
+
+            // Assert
+            var pdfLocation = await _storagePool.GetFileLocationAsync(_tenant.Object, pdfKey, default);
+            var docxLocation = await _storagePool.GetFileLocationAsync(_tenant.Object, docxKey, default);
+            var jpgLocation = await _storagePool.GetFileLocationAsync(_tenant.Object, jpgKey, default);
+
+            Assert.NotNull(pdfLocation);
+            Assert.NotNull(docxLocation);
+            Assert.NotNull(jpgLocation);
+
+            Assert.EndsWith(".pdf", pdfLocation.PhysicalPath);
+            Assert.EndsWith(".docx", docxLocation.PhysicalPath);
+            Assert.EndsWith(".jpg", jpgLocation.PhysicalPath);
         }
     }
 }

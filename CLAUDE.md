@@ -93,6 +93,7 @@ Locus is a file storage pool system targeting .NET netstandard2.0 that provides:
 ### File Operations API
 - Stream-based operations for memory efficiency
 - Metadata management (file size, created date, modified date)
+- **File extension preservation**: Original file names can be provided to preserve extensions in physical storage
 - Support for chunked uploads/downloads for large files
 - File scheduler/allocator for concurrent read scenarios
 - Return file metadata and location instead of direct content
@@ -272,9 +273,14 @@ public interface ITenantManager
 
 public interface IStoragePool
 {
+    // Write file with optional original file name to preserve extension
+    Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct);
+
     Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
-    Task WriteFileAsync(ITenantContext tenant, string fileKey, Stream content, CancellationToken ct);
-    Task DeleteFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
+
+    // Internal: DeleteFileAsync is now internal and accessed via MarkAsCompletedAsync
+    // Task DeleteFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
+
     Task MountVolumeAsync(IStorageVolume volume, CancellationToken ct);
     Task UnmountVolumeAsync(string volumeId, CancellationToken ct);
     Task<IEnumerable<IStorageVolume>> GetVolumesAsync(CancellationToken ct);
@@ -320,6 +326,8 @@ public class FileLocation
     public int RetryCount { get; set; }  // 当前重试次数
     public DateTime? LastFailedAt { get; set; }  // 最后失败时间
     public string LastError { get; set; }  // 最后错误信息
+    public string? OriginalFileName { get; set; }  // 原始文件名（如 "invoice.pdf"）
+    public string? FileExtension { get; set; }  // 文件扩展名（如 ".pdf"）
 }
 
 public interface IFileScheduler
@@ -532,7 +540,37 @@ Before any file operation (read/write/delete), validate in order:
 ### Path Management
 - Sanitize file paths to prevent directory traversal attacks
 - Use Path.Combine for cross-platform compatibility
-- Generate deterministic paths: `{VolumeMount}/{TenantId}/{FileKey}`
+- Generate deterministic paths: `{VolumeMount}/{TenantId}/{Shard1}/{Shard2}/{FileKey}{Extension}`
+- **File extension preservation**: When `originalFileName` is provided, the extension is extracted and appended to the physical file name
+
+### File Extension Preservation
+
+**功能说明：**
+从版本 0.3.0 开始，Locus 支持在物理存储中保留文件扩展名。
+
+**使用方法：**
+```csharp
+// 传入完整文件名（推荐）
+var fileKey = await storagePool.WriteFileAsync(tenant, stream, "invoice.pdf", ct);
+// 物理文件：./storage/vol-001/tenant-001/a1/b2/a1b2c3d4....pdf ✅
+
+// 不传文件名（向后兼容）
+var fileKey = await storagePool.WriteFileAsync(tenant, stream, null, ct);
+// 物理文件：./storage/vol-001/tenant-001/a1/b2/a1b2c3d4.... （无扩展名）
+```
+
+**实现细节：**
+- `originalFileName` 参数是可选的（`string?`），确保向后兼容
+- 系统自动从文件名中提取扩展名（使用 `Path.GetExtension()`）
+- 扩展名附加到 GUID 生成的文件键后面
+- 元数据中记录 `OriginalFileName` 和 `FileExtension` 字段
+- FileWatcher 自动提取导入文件的扩展名
+
+**优点：**
+1. **易于识别**：在文件系统中可以直观看到文件类型
+2. **工具兼容**：某些工具和编辑器可以正确识别文件格式
+3. **调试友好**：运维和调试时更容易理解文件内容
+4. **向后兼容**：不传文件名时行为不变
 
 ### Error Handling
 Define custom exceptions:
@@ -616,7 +654,10 @@ public async Task ProcessFilesInParallelAsync(ITenantContext tenant, int threadC
                     if (fileLocation == null)
                         break; // 没有更多待处理文件
 
+                    // 显示文件信息（包括原始文件名和扩展名）
                     Console.WriteLine($"[Thread {threadId}] Processing file: {fileLocation.FileKey}");
+                    if (!string.IsNullOrEmpty(fileLocation.OriginalFileName))
+                        Console.WriteLine($"  Original: {fileLocation.OriginalFileName}, Extension: {fileLocation.FileExtension}");
 
                     try
                     {

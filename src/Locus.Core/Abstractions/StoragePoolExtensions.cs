@@ -30,7 +30,20 @@ namespace Locus.Core.Abstractions
             Stream content,
             CancellationToken ct)
         {
-            return storagePool.WriteFileAsync(CreateDefaultTenantContext(), content, ct);
+            return storagePool.WriteFileAsync(CreateDefaultTenantContext(), content, null, ct);
+        }
+
+        /// <summary>
+        /// Writes a file without specifying a tenant (uses default tenant) but with original file name.
+        /// For single-tenant scenarios only.
+        /// </summary>
+        public static Task<string> WriteFileAsync(
+            this IStoragePool storagePool,
+            Stream content,
+            string? originalFileName,
+            CancellationToken ct)
+        {
+            return storagePool.WriteFileAsync(CreateDefaultTenantContext(), content, originalFileName, ct);
         }
 
         /// <summary>

@@ -275,8 +275,9 @@ namespace Locus.FileSystem
         /// </summary>
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="fileKey">The file key (hex string).</param>
+        /// <param name="fileExtension">The file extension (e.g., ".pdf", ".docx"). If provided, it will be appended to the file key.</param>
         /// <returns>The full physical path with sharding.</returns>
-        public string BuildPhysicalPath(string tenantId, string fileKey)
+        public string BuildPhysicalPath(string tenantId, string fileKey, string? fileExtension = null)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -314,7 +315,9 @@ namespace Locus.FileSystem
                 }
             }
 
-            pathParts.Add(fileKey);
+            // Append file extension to the file key
+            var fileNameWithExtension = string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension;
+            pathParts.Add(fileNameWithExtension);
 
             return Path.Combine(pathParts.ToArray());
         }

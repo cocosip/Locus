@@ -38,8 +38,14 @@ Users **never** need to know:
 var tenant = await tenantManager.GetTenantAsync("tenant-001", ct);
 
 // Write a file - system generates unique fileKey
-string fileKey = await storagePool.WriteFileAsync(tenant, fileStream, ct);
+// Optional: provide original file name to preserve extension
+string fileKey = await storagePool.WriteFileAsync(tenant, fileStream, "invoice.pdf", ct);
 // Returns: "f7b3c9d2-4a1e-4f8b-9c3d-2e1a4b5c6d7e"
+// Physical file: ./storage/vol-001/tenant-001/f7/b3/f7b3c9d2...pdf ✅
+
+// Without original file name (backward compatible)
+string fileKey2 = await storagePool.WriteFileAsync(tenant, fileStream, null, ct);
+// Physical file: ./storage/vol-001/tenant-001/a1/b2/a1b2c3d4... (no extension)
 
 // Read file content directly
 using var stream = await storagePool.ReadFileAsync(tenant, fileKey, ct);
@@ -104,7 +110,8 @@ public interface IStoragePool
     // ===== File Storage Operations =====
 
     // Write file → returns system-generated fileKey
-    Task<string> WriteFileAsync(ITenantContext tenant, Stream content, CancellationToken ct);
+    // Optional: provide originalFileName (e.g., "invoice.pdf") to preserve file extension
+    Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct);
 
     // Read file by fileKey
     Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
@@ -175,8 +182,9 @@ public interface ITenantManager
 var tenant = await tenantManager.GetTenantAsync("tenant-001", ct);
 
 // Producer: Write files to the queue
-var fileKey1 = await storagePool.WriteFileAsync(tenant, stream1, ct);
-var fileKey2 = await storagePool.WriteFileAsync(tenant, stream2, ct);
+// Provide original file names to preserve extensions
+var fileKey1 = await storagePool.WriteFileAsync(tenant, stream1, "document.pdf", ct);
+var fileKey2 = await storagePool.WriteFileAsync(tenant, stream2, "invoice.xlsx", ct);
 // Files are automatically queued as "Pending" status
 
 // Consumer: Process files from the queue (10 concurrent workers)
@@ -367,10 +375,10 @@ Locus/
 
 ## Test Coverage
 
-**All tests passing: 160/160 ✅**
+**All tests passing: 194/194 ✅**
 
-- ✅ FileSystem.Tests: 40 tests
-- ✅ Storage.Tests: 103 tests
+- ✅ FileSystem.Tests: 50 tests
+- ✅ Storage.Tests: 127 tests
 - ✅ MultiTenant.Tests: 11 tests
 - ✅ IntegrationTests: 6 tests
 
@@ -464,6 +472,7 @@ dotnet pack src/Locus/Locus.csproj -c Release
 - Tenant isolation with enable/disable controls
 - Per-tenant LiteDB databases for metadata
 - Active-data caching for high concurrency
+- **File extension preservation** - Original file extensions are preserved in physical storage
 
 🔄 **File Queue Processing**
 - System-generated file keys

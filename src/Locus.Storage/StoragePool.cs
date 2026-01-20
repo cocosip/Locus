@@ -73,7 +73,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<string> WriteFileAsync(ITenantContext tenant, Stream content, CancellationToken ct)
+        public async Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -99,16 +99,24 @@ namespace Locus.Storage
                 // 4. Generate unique file key
                 var fileKey = GenerateFileKey();
 
-                // 5. Build physical file path with automatic sharding
+                // 5. Extract file extension from original file name
+                var fileExtension = string.Empty;
+                if (!string.IsNullOrWhiteSpace(originalFileName))
+                {
+                    fileExtension = Path.GetExtension(originalFileName);
+                }
+
+                // 6. Build physical file path with automatic sharding
                 // Use volume's BuildPhysicalPath if available (LocalFileSystemVolume)
                 if (volume is FileSystem.LocalFileSystemVolume localVolume)
                 {
-                    physicalPath = localVolume.BuildPhysicalPath(tenant.TenantId, fileKey);
+                    physicalPath = localVolume.BuildPhysicalPath(tenant.TenantId, fileKey, fileExtension);
                 }
                 else
                 {
                     // Fallback for other volume types
-                    var relativePath = Path.Combine(tenant.TenantId, fileKey);
+                    var fileNameWithExtension = fileKey + fileExtension;
+                    var relativePath = Path.Combine(tenant.TenantId, fileNameWithExtension);
                     physicalPath = Path.Combine(volume.MountPath, relativePath);
                 }
 
@@ -134,7 +142,9 @@ namespace Locus.Storage
                     ProcessingStartTime = null,
                     AvailableForProcessingAt = null,
                     LastError = null,
-                    LastFailedAt = null
+                    LastFailedAt = null,
+                    OriginalFileName = originalFileName,
+                    FileExtension = fileExtension
                 };
 
                 try

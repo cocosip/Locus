@@ -524,7 +524,8 @@ namespace Locus.Storage
                 // Import file
                 using (var stream = _fileSystem.File.OpenRead(filePath))
                 {
-                    var fileKey = await _storagePool.WriteFileAsync(tenant, stream, ct);
+                    var fileName = Path.GetFileName(filePath);
+                    var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
                     _importedFiles[filePath] = fileKey;
 
                     fileResult.FilesImported++;
