@@ -94,7 +94,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task RegisterWatcherAsync_ThrowsWhenWatchPathNotExists()
+        public async Task RegisterWatcherAsync_AutoCreatesWatchPathIfNotExists()
         {
             // Arrange
             var tenantId = "tenant-001";
@@ -112,9 +112,14 @@ namespace Locus.Storage.Tests
                 MultiTenantMode = false
             };
 
-            // Act & Assert
-            await Assert.ThrowsAsync<DirectoryNotFoundException>(() =>
-                _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None));
+            // Ensure directory doesn't exist before test
+            Assert.False(_fileSystem.Directory.Exists(watchPath));
+
+            // Act
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+
+            // Assert - directory should be auto-created
+            Assert.True(_fileSystem.Directory.Exists(watchPath));
         }
 
         [Fact]
