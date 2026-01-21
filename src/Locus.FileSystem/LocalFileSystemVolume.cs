@@ -44,15 +44,23 @@ namespace Locus.FileSystem
                 throw new ArgumentException("Sharding depth must be between 0 and 3", nameof(shardingDepth));
 
             _volumeId = volumeId;
-            _mountPath = Path.GetFullPath(mountPath);
+            _mountPath = _fileSystem.Path.GetFullPath(mountPath);
             _shardingDepth = shardingDepth;
 
             // Ensure mount path exists
             if (!_fileSystem.Directory.Exists(_mountPath))
             {
-                _fileSystem.Directory.CreateDirectory(_mountPath);
-                _logger.LogInformation("Created mount path: {MountPath} with sharding depth {ShardingDepth}",
-                    _mountPath, _shardingDepth);
+                try
+                {
+                    _fileSystem.Directory.CreateDirectory(_mountPath);
+                    _logger.LogInformation("Created mount path: {MountPath} with sharding depth {ShardingDepth}",
+                        _mountPath, _shardingDepth);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to create mount path: {MountPath}", _mountPath);
+                    throw;
+                }
             }
         }
 
@@ -121,7 +129,7 @@ namespace Locus.FileSystem
                     }
 
                     // Try to create and delete a test file
-                    var testFilePath = Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
+                    var testFilePath = _fileSystem.Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
                     try
                     {
                         _fileSystem.File.WriteAllText(testFilePath, "health check");
@@ -192,7 +200,7 @@ namespace Locus.FileSystem
             try
             {
                 // Ensure directory exists
-                var directory = Path.GetDirectoryName(path);
+                var directory = _fileSystem.Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory) && !_fileSystem.Directory.Exists(directory))
                 {
                     _fileSystem.Directory.CreateDirectory(directory);
@@ -252,7 +260,7 @@ namespace Locus.FileSystem
             try
             {
                 // Get the root drive for the mount path
-                var root = Path.GetPathRoot(_mountPath);
+                var root = _fileSystem.Path.GetPathRoot(_mountPath);
                 if (string.IsNullOrEmpty(root))
                     return null;
 
@@ -319,7 +327,7 @@ namespace Locus.FileSystem
             var fileNameWithExtension = string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension;
             pathParts.Add(fileNameWithExtension);
 
-            return Path.Combine(pathParts.ToArray());
+            return _fileSystem.Path.Combine(pathParts.ToArray());
         }
 
         /// <summary>
