@@ -203,7 +203,7 @@ namespace Locus.FileSystem
                 var directory = _fileSystem.Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory) && !_fileSystem.Directory.Exists(directory))
                 {
-                    _fileSystem.Directory.CreateDirectory(directory);
+                    _fileSystem.Directory.CreateDirectory(directory!);
                 }
 
                 // Write content to file

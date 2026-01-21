@@ -21,7 +21,13 @@ namespace Locus.FileSystem.Tests
         {
             _fileSystem = new MockFileSystem();
             _logger = new Mock<ILogger<LocalFileSystemVolume>>();
-            _mountPath = Path.Combine("test-volume");
+            
+            // Use Path.GetFullPath to get a valid absolute path for the current OS/Environment.
+            // This ensures that the path is consistent whether resolved by System.IO (in tests/Sanitizer)
+            // or by MockFileSystem (in LocalFileSystemVolume), avoiding mismatches.
+            _mountPath = Path.GetFullPath("test-volume");
+            
+            // Ensure the directory exists in the MockFileSystem
             _fileSystem.Directory.CreateDirectory(_mountPath);
         }
 
