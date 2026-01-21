@@ -399,7 +399,7 @@ namespace Locus.Storage.Data
                     // Remove "-quotas" suffix
                     return fileName.EndsWith("-quotas") ? fileName.Substring(0, fileName.Length - 7) : fileName;
                 })
-                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Where(name => !string.IsNullOrWhiteSpace(name) && !name.EndsWith("-backup", StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
             return Task.FromResult<IEnumerable<string>>(tenantIds);

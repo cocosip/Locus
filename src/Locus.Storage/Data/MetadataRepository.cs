@@ -474,18 +474,19 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Gets all tenant IDs that have metadata databases.
         /// </summary>
-        public Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
+        public async Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
         {
             if (!_fileSystem.Directory.Exists(_metadataDirectory))
-                return Task.FromResult<IEnumerable<string>>(Array.Empty<string>());
+                return [];
 
+            // Use the file system directly to get the database files
             var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
             var tenantIds = dbFiles
                 .Select(f => _fileSystem.Path.GetFileNameWithoutExtension(f))
-                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Where(name => !string.IsNullOrWhiteSpace(name) && !name.EndsWith("-backup", StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
-            return Task.FromResult<IEnumerable<string>>(tenantIds);
+            return await Task.FromResult(tenantIds);
         }
 
         /// <summary>
