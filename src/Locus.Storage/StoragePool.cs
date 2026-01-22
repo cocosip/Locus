@@ -47,20 +47,59 @@ namespace Locus.Storage
 
         /// <summary>
         /// Adds a storage volume to the pool. Can be called during startup or at runtime.
+        /// Uses multiple health check attempts with delays to handle transient failures
+        /// (especially important for network storage in Kubernetes/Docker environments).
         /// </summary>
         /// <param name="volume">The storage volume to add.</param>
         /// <exception cref="ArgumentNullException">Thrown when volume is null.</exception>
-        /// <exception cref="StorageVolumeUnavailableException">Thrown when the volume is not healthy.</exception>
+        /// <exception cref="StorageVolumeUnavailableException">Thrown when the volume fails health checks after all retries.</exception>
         /// <exception cref="InvalidOperationException">Thrown when the volume is already mounted.</exception>
         public void AddVolume(IStorageVolume volume)
         {
             if (volume == null)
                 throw new ArgumentNullException(nameof(volume));
 
-            if (!volume.IsHealthy)
+            // Perform multiple health checks with delays to handle transient failures
+            // This is critical for network storage (NFS, Ceph, K8s PVC) where newly created
+            // directories might need time to fully synchronize
+            const int maxHealthCheckAttempts = 5;
+            const int healthCheckDelayMs = 200;
+            int healthyAttempts = 0;
+
+            for (int attempt = 1; attempt <= maxHealthCheckAttempts; attempt++)
             {
-                _logger.LogWarning("Volume {VolumeId} is not healthy, skipping mount", volume.VolumeId);
-                throw new StorageVolumeUnavailableException($"Volume {volume.VolumeId} is not healthy");
+                if (volume.IsHealthy)
+                {
+                    healthyAttempts++;
+                    _logger.LogDebug("Volume {VolumeId} health check passed (attempt {Attempt}/{MaxAttempts})",
+                        volume.VolumeId, attempt, maxHealthCheckAttempts);
+
+                    // Require at least 2 consecutive successful checks for confidence
+                    if (healthyAttempts >= 2)
+                    {
+                        break; // Volume is stable and healthy
+                    }
+                }
+                else
+                {
+                    healthyAttempts = 0; // Reset counter on failure
+                    _logger.LogDebug("Volume {VolumeId} health check failed (attempt {Attempt}/{MaxAttempts})",
+                        volume.VolumeId, attempt, maxHealthCheckAttempts);
+                }
+
+                // Wait before next attempt (except after last attempt)
+                if (attempt < maxHealthCheckAttempts)
+                {
+                    System.Threading.Thread.Sleep(healthCheckDelayMs);
+                }
+            }
+
+            // Final health check evaluation
+            if (healthyAttempts < 2)
+            {
+                _logger.LogWarning("Volume {VolumeId} is not healthy after {MaxAttempts} attempts, skipping mount",
+                    volume.VolumeId, maxHealthCheckAttempts);
+                throw new StorageVolumeUnavailableException($"Volume {volume.VolumeId} is not healthy after {maxHealthCheckAttempts} attempts");
             }
 
             if (!_volumes.TryAdd(volume.VolumeId, volume))
@@ -69,7 +108,8 @@ namespace Locus.Storage
                 throw new InvalidOperationException($"Volume {volume.VolumeId} is already mounted");
             }
 
-            _logger.LogInformation("Mounted volume {VolumeId} at {MountPath}", volume.VolumeId, volume.MountPath);
+            _logger.LogInformation("Mounted volume {VolumeId} at {MountPath} (healthy checks: {HealthyAttempts}/{MaxAttempts})",
+                volume.VolumeId, volume.MountPath, healthyAttempts, maxHealthCheckAttempts);
         }
 
         /// <inheritdoc/>

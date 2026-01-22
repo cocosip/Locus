@@ -128,20 +128,37 @@ namespace Locus.FileSystem
                         return false;
                     }
 
-                    // Try to create and delete a test file
+                    // Try to create and delete a test file with retry mechanism
+                    // This is important for network storage (NFS, Ceph, etc.) where directory
+                    // creation might need a moment to fully synchronize
                     var testFilePath = _fileSystem.Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
-                    try
+                    const int maxRetries = 3;
+                    const int retryDelayMs = 100;
+
+                    for (int attempt = 1; attempt <= maxRetries; attempt++)
                     {
-                        _fileSystem.File.WriteAllText(testFilePath, "health check");
-                        _fileSystem.File.Delete(testFilePath);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Health check write/delete test failed for volume {VolumeId}", _volumeId);
-                        return false;
+                        try
+                        {
+                            _fileSystem.File.WriteAllText(testFilePath, "health check");
+                            _fileSystem.File.Delete(testFilePath);
+                            return true; // Success
+                        }
+                        catch (Exception ex) when (attempt < maxRetries)
+                        {
+                            _logger.LogDebug(ex, "Health check write/delete test failed for volume {VolumeId} (attempt {Attempt}/{MaxRetries}), retrying...",
+                                _volumeId, attempt, maxRetries);
+                            System.Threading.Thread.Sleep(retryDelayMs);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Final attempt failed
+                            _logger.LogWarning(ex, "Health check write/delete test failed for volume {VolumeId} after {MaxRetries} attempts",
+                                _volumeId, maxRetries);
+                            return false;
+                        }
                     }
 
-                    return true;
+                    return false;
                 }
                 catch (Exception ex)
                 {
@@ -254,6 +271,7 @@ namespace Locus.FileSystem
 
         /// <summary>
         /// Gets the DriveInfo for the mount path.
+        /// Cross-platform compatible: uses RootDirectory.FullName for matching on Linux.
         /// </summary>
         private IDriveInfo? GetDriveInfo()
         {
@@ -265,8 +283,21 @@ namespace Locus.FileSystem
                     return null;
 
                 var drives = _fileSystem.DriveInfo.GetDrives();
-                return drives.FirstOrDefault(d =>
-                    d.Name.Equals(root, StringComparison.OrdinalIgnoreCase) && d.IsReady);
+
+                // Try to match by RootDirectory.FullName first (works on both Windows and Linux)
+                // On Windows: Name="C:\", RootDirectory.FullName="C:\"
+                // On Linux: Name="/dev/sda1", RootDirectory.FullName="/"
+                var drive = drives.FirstOrDefault(d =>
+                    d.IsReady && d.RootDirectory.FullName.Equals(root, StringComparison.OrdinalIgnoreCase));
+
+                // Fallback to Name matching for backwards compatibility
+                if (drive == null)
+                {
+                    drive = drives.FirstOrDefault(d =>
+                        d.IsReady && d.Name.Equals(root, StringComparison.OrdinalIgnoreCase));
+                }
+
+                return drive;
             }
             catch (Exception ex)
             {
