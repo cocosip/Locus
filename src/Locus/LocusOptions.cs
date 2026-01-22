@@ -89,6 +89,13 @@ namespace Locus
         /// Default: "./locus-watchers"
         /// </summary>
         public string FileWatcherConfigurationDirectory { get; set; } = "./locus-watchers";
+
+        /// <summary>
+        /// Gets or sets the LiteDB configuration options.
+        /// These settings control database performance and reliability, especially important
+        /// for Kubernetes + network storage (NFS/Ceph) environments.
+        /// </summary>
+        public LiteDBOptions LiteDB { get; set; } = new LiteDBOptions();
     }
 
     /// <summary>

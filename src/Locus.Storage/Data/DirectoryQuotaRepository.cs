@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using LiteDB;
 using Microsoft.Extensions.Logging;
+using LiteDBOptions = Locus.Core.Models.LiteDBOptions;
 
 namespace Locus.Storage.Data
 {
@@ -19,6 +20,7 @@ namespace Locus.Storage.Data
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<DirectoryQuotaRepository> _logger;
         private readonly string _quotaDirectory;
+        private readonly LiteDBOptions _liteDbOptions;
 
         // Per-tenant in-memory cache
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>> _quotaCache;
@@ -37,7 +39,8 @@ namespace Locus.Storage.Data
         public DirectoryQuotaRepository(
             IFileSystem fileSystem,
             ILogger<DirectoryQuotaRepository> logger,
-            string quotaDirectory)
+            string quotaDirectory,
+            LiteDBOptions? liteDbOptions = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -46,6 +49,7 @@ namespace Locus.Storage.Data
                 throw new ArgumentException("Quota directory cannot be empty", nameof(quotaDirectory));
 
             _quotaDirectory = quotaDirectory;
+            _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _directoryLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
@@ -56,7 +60,12 @@ namespace Locus.Storage.Data
                 _fileSystem.Directory.CreateDirectory(_quotaDirectory);
             }
 
-            _logger.LogInformation("DirectoryQuotaRepository initialized with per-tenant LiteDB storage at {Directory}", _quotaDirectory);
+            _logger.LogInformation(
+                "DirectoryQuotaRepository initialized at {Directory} with LiteDB: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s",
+                _quotaDirectory,
+                _liteDbOptions.EnableJournal,
+                _liteDbOptions.CheckpointInterval,
+                _liteDbOptions.TimeoutSeconds);
         }
 
         /// <summary>
@@ -75,8 +84,8 @@ namespace Locus.Storage.Data
                 }
 
                 var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tid}-quotas.db");
-                // Use Shared mode for concurrent access support
-                var connectionString = $"Filename={dbPath};Mode=Shared";
+                // Use configured LiteDB options (WAL mode strongly recommended for K8s/network storage)
+                var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
                 var db = new LiteDatabase(connectionString);
 
                 var quotas = db.GetCollection<DirectoryQuota>("quotas");
@@ -180,8 +189,9 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Updates a directory quota.
         /// Thread-safe: Persists to LiteDB first, then updates memory cache.
+        /// Auto-recovery: Rebuilds corrupted database and retries on LiteDB errors.
         /// </summary>
-        public Task UpdateAsync(string tenantId, DirectoryQuota quota, CancellationToken ct)
+        public async Task UpdateAsync(string tenantId, DirectoryQuota quota, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -194,21 +204,52 @@ namespace Locus.Storage.Data
 
             quota.LastUpdated = DateTime.UtcNow;
 
-            // 1. Persist to LiteDB FIRST (persistence is critical)
-            // If this fails, exception is thrown and memory won't be corrupted
-            var db = GetDatabase(tenantId);
-            var quotas = db.GetCollection<DirectoryQuota>("quotas");
-            quotas.Upsert(quota);
+            // Try to update with automatic corruption recovery
+            try
+            {
+                // 1. Persist to LiteDB FIRST (persistence is critical)
+                // If this fails, exception is thrown and memory won't be corrupted
+                var db = GetDatabase(tenantId);
+                var quotas = db.GetCollection<DirectoryQuota>("quotas");
+                quotas.Upsert(quota);
 
-            // 2. Update memory cache AFTER successful persistence
-            // This operation is local and virtually guaranteed to succeed
-            var cache = GetCache(tenantId);
-            cache[quota.DirectoryPath] = quota;
+                // 2. Update memory cache AFTER successful persistence
+                // This operation is local and virtually guaranteed to succeed
+                var cache = GetCache(tenantId);
+                cache[quota.DirectoryPath] = quota;
 
-            _logger.LogDebug("Updated quota for directory: {DirectoryPath}, Tenant: {TenantId}, Current: {Current}, Max: {Max}",
-                quota.DirectoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
+                _logger.LogDebug("Updated quota for directory: {DirectoryPath}, Tenant: {TenantId}, Current: {Current}, Max: {Max}",
+                    quota.DirectoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
+            }
+            catch (LiteException ex) when (ex.Message.Contains("ReadFull") || ex.Message.Contains("PAGE_SIZE") || ex.Message.Contains("Checkpoint"))
+            {
+                // Database is corrupted - attempt automatic recovery
+                _logger.LogError(ex, "CORRUPTED QUOTA DATABASE DETECTED for tenant {TenantId}. Attempting automatic recovery...", tenantId);
 
-            return Task.CompletedTask;
+                try
+                {
+                    // Rebuild database
+                    var backupPath = await BeginDatabaseRebuildAsync(tenantId, ct);
+                    FinishDatabaseRebuild(tenantId);
+
+                    _logger.LogWarning("Quota database rebuilt for tenant {TenantId}. Backup saved at: {BackupPath}", tenantId, backupPath ?? "N/A");
+
+                    // Retry the operation with new database
+                    var db = GetDatabase(tenantId);
+                    var quotas = db.GetCollection<DirectoryQuota>("quotas");
+                    quotas.Upsert(quota);
+
+                    var cache = GetCache(tenantId);
+                    cache[quota.DirectoryPath] = quota;
+
+                    _logger.LogInformation("Successfully recovered and updated quota after database rebuild for tenant {TenantId}", tenantId);
+                }
+                catch (Exception recoveryEx)
+                {
+                    _logger.LogError(recoveryEx, "Failed to recover corrupted quota database for tenant {TenantId}", tenantId);
+                    throw; // Re-throw if recovery fails
+                }
+            }
         }
 
         /// <summary>

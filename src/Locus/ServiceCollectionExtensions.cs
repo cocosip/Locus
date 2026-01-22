@@ -76,14 +76,14 @@ namespace Locus
             {
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<MetadataRepository>>();
-                return new MetadataRepository(fileSystem, logger, options.MetadataDirectory);
+                return new MetadataRepository(fileSystem, logger, options.MetadataDirectory, options.LiteDB);
             });
 
             services.AddSingleton(sp =>
             {
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<DirectoryQuotaRepository>>();
-                return new DirectoryQuotaRepository(fileSystem, logger, options.QuotaDirectory);
+                return new DirectoryQuotaRepository(fileSystem, logger, options.QuotaDirectory, options.LiteDB);
             });
 
             // Register tenant manager

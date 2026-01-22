@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using LiteDB;
 using Locus.Core.Models;
 using Microsoft.Extensions.Logging;
+using LiteDBOptions = Locus.Core.Models.LiteDBOptions;
 
 namespace Locus.Storage.Data
 {
@@ -22,6 +23,7 @@ namespace Locus.Storage.Data
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<MetadataRepository> _logger;
         private readonly string _metadataDirectory;
+        private readonly LiteDBOptions _liteDbOptions;
 
         // Per-tenant in-memory cache (only active files: Pending/Processing/Failed)
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
@@ -40,7 +42,8 @@ namespace Locus.Storage.Data
         public MetadataRepository(
             IFileSystem fileSystem,
             ILogger<MetadataRepository> logger,
-            string metadataDirectory)
+            string metadataDirectory,
+            LiteDBOptions? liteDbOptions = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -49,6 +52,7 @@ namespace Locus.Storage.Data
                 throw new ArgumentException("Metadata directory cannot be empty", nameof(metadataDirectory));
 
             _metadataDirectory = metadataDirectory;
+            _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
@@ -59,11 +63,17 @@ namespace Locus.Storage.Data
                 _fileSystem.Directory.CreateDirectory(_metadataDirectory);
             }
 
-            _logger.LogInformation("MetadataRepository initialized with per-tenant LiteDB storage at {Directory}", _metadataDirectory);
+            _logger.LogInformation(
+                "MetadataRepository initialized at {Directory} with LiteDB: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s",
+                _metadataDirectory,
+                _liteDbOptions.EnableJournal,
+                _liteDbOptions.CheckpointInterval,
+                _liteDbOptions.TimeoutSeconds);
         }
 
         /// <summary>
         /// Gets or creates a LiteDB database for a tenant.
+        /// Auto-recovery: Rebuilds corrupted database on initialization failure.
         /// </summary>
         private LiteDatabase GetDatabase(string tenantId)
         {
@@ -71,29 +81,69 @@ namespace Locus.Storage.Data
             // This prevents multiple threads from simultaneously creating the database instance
             var lazyDb = _databases.GetOrAdd(tenantId, tid => new Lazy<LiteDatabase>(() =>
             {
-                // Ensure metadata directory exists (thread-safe in case of concurrent access)
-                if (!_fileSystem.Directory.Exists(_metadataDirectory))
+                try
                 {
-                    _fileSystem.Directory.CreateDirectory(_metadataDirectory);
+                    // Ensure metadata directory exists (thread-safe in case of concurrent access)
+                    if (!_fileSystem.Directory.Exists(_metadataDirectory))
+                    {
+                        _fileSystem.Directory.CreateDirectory(_metadataDirectory);
+                    }
+
+                    var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tid}.db");
+                    // Use configured LiteDB options (WAL mode strongly recommended for K8s/network storage)
+                    var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
+                    var db = new LiteDatabase(connectionString);
+
+                    var files = db.GetCollection<FileMetadata>("files");
+                    // FileKey is already BsonId, no need to create additional index
+                    files.EnsureIndex(x => x.Status);
+                    files.EnsureIndex(x => x.CreatedAt);
+                    files.EnsureIndex(x => x.AvailableForProcessingAt);
+
+                    _logger.LogDebug("Created/opened LiteDB database for tenant {TenantId} at {Path}", tid, dbPath);
+
+                    // Load active files into memory on first access
+                    LoadActiveFilesForTenant(tid, files);
+
+                    return db;
                 }
+                catch (LiteException ex) when (ex.Message.Contains("ReadFull") || ex.Message.Contains("PAGE_SIZE") || ex.Message.Contains("Checkpoint"))
+                {
+                    // Database is corrupted during initialization - attempt automatic recovery
+                    _logger.LogError(ex, "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...", tid);
 
-                var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tid}.db");
-                // Use Shared mode for concurrent access support
-                var connectionString = $"Filename={dbPath};Mode=Shared";
-                var db = new LiteDatabase(connectionString);
+                    try
+                    {
+                        // Remove from cache to force rebuild
+                        _databases.TryRemove(tid, out _);
+                        _activeFiles.TryRemove(tid, out _);
 
-                var files = db.GetCollection<FileMetadata>("files");
-                // FileKey is already BsonId, no need to create additional index
-                files.EnsureIndex(x => x.Status);
-                files.EnsureIndex(x => x.CreatedAt);
-                files.EnsureIndex(x => x.AvailableForProcessingAt);
+                        // Rebuild database synchronously (we're in Lazy initialization)
+                        var backupPath = BeginDatabaseRebuildAsync(tid, CancellationToken.None).GetAwaiter().GetResult();
+                        FinishDatabaseRebuild(tid);
 
-                _logger.LogDebug("Created/opened LiteDB database for tenant {TenantId} at {Path}", tid, dbPath);
+                        _logger.LogWarning("Metadata database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}", tid, backupPath ?? "N/A");
 
-                // Load active files into memory on first access
-                LoadActiveFilesForTenant(tid, files);
+                        // Retry initialization with configured LiteDB options
+                        var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tid}.db");
+                        var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
+                        var db = new LiteDatabase(connectionString);
 
-                return db;
+                        var files = db.GetCollection<FileMetadata>("files");
+                        files.EnsureIndex(x => x.Status);
+                        files.EnsureIndex(x => x.CreatedAt);
+                        files.EnsureIndex(x => x.AvailableForProcessingAt);
+
+                        _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
+
+                        return db;
+                    }
+                    catch (Exception recoveryEx)
+                    {
+                        _logger.LogError(recoveryEx, "Failed to recover corrupted metadata database for tenant {TenantId} during initialization", tid);
+                        throw; // Re-throw if recovery fails
+                    }
+                }
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
             // Access the Value property to trigger initialization if needed
