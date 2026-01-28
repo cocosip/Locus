@@ -13,7 +13,7 @@
     <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and LiteDB metadata management.</Description>
 
     <!-- Version information -->
-    <Version>0.7.0</Version>
+    <Version>0.8.0</Version>
 
     <!-- Build configuration -->
     <LangVersion>latest</LangVersion>

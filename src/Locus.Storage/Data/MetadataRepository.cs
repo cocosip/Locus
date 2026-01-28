@@ -533,7 +533,10 @@ namespace Locus.Storage.Data
             var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
             var tenantIds = dbFiles
                 .Select(f => _fileSystem.Path.GetFileNameWithoutExtension(f))
-                .Where(name => !string.IsNullOrWhiteSpace(name) && !name.EndsWith("-backup", StringComparison.OrdinalIgnoreCase))
+                .Where(name => !string.IsNullOrWhiteSpace(name)
+                    && !name.Contains("-backup", StringComparison.OrdinalIgnoreCase)    // Filter LiteDB backup files: "tenant-001.db-backup-1"
+                    && !name.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase) // Filter corruption backups
+                    && !name.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))   // Filter LiteDB journal files
                 .ToList();
 
             return await Task.FromResult(tenantIds);

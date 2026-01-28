@@ -89,6 +89,11 @@ namespace Locus.Storage.Data
                     }
                 }, ct);
 
+                // Step 4: Cleanup LiteDB temporary backup files
+                // LiteDB Rebuild() creates temporary backup files like "database.db-backup-1"
+                // These should be automatically deleted, but we clean them up explicitly to avoid accumulation
+                CleanupLiteDbBackupFiles(dbPath, fileSystem, logger);
+
                 long sizeAfter = fileSystem.FileInfo.New(dbPath).Length;
                 long spaceSaved = sizeBefore - sizeAfter;
 
@@ -96,13 +101,54 @@ namespace Locus.Storage.Data
                     "Optimized {DbType} database for tenant {TenantId}. Before: {BeforeMB:F2} MB, After: {AfterMB:F2} MB, Saved: {SavedMB:F2} MB",
                     dbTypeName, tenantId, sizeBefore / 1024.0 / 1024.0, sizeAfter / 1024.0 / 1024.0, spaceSaved / 1024.0 / 1024.0);
 
-                // Step 4: Database connection will be reloaded on next access
+                // Step 5: Database connection will be reloaded on next access
 
                 return (sizeBefore, sizeAfter);
             }
             finally
             {
                 tenantLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Cleans up LiteDB temporary backup files created during Rebuild().
+        /// LiteDB creates files like "database.db-backup-1", "database.db-backup-2", etc.
+        /// These files should be automatically deleted after Rebuild completes, but we clean them explicitly.
+        /// </summary>
+        /// <param name="dbPath">The database file path.</param>
+        /// <param name="fileSystem">File system abstraction.</param>
+        /// <param name="logger">Logger instance.</param>
+        private static void CleanupLiteDbBackupFiles(string dbPath, IFileSystem fileSystem, ILogger logger)
+        {
+            try
+            {
+                var directory = fileSystem.Path.GetDirectoryName(dbPath);
+                var fileName = fileSystem.Path.GetFileName(dbPath);
+
+                if (string.IsNullOrWhiteSpace(directory) || !fileSystem.Directory.Exists(directory))
+                    return;
+
+                // Search for backup files with pattern: "database.db-backup-*"
+                var backupPattern = $"{fileName}-backup-*";
+                var backupFiles = fileSystem.Directory.GetFiles(directory, backupPattern);
+
+                foreach (var backupFile in backupFiles)
+                {
+                    try
+                    {
+                        fileSystem.File.Delete(backupFile);
+                        logger.LogDebug("Deleted LiteDB temporary backup file: {BackupFile}", fileSystem.Path.GetFileName(backupFile));
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Failed to delete LiteDB backup file: {BackupFile}", backupFile);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Error during LiteDB backup files cleanup for {DbPath}", dbPath);
             }
         }
     }

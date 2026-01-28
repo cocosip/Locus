@@ -440,7 +440,10 @@ namespace Locus.Storage.Data
                     // Remove "-quotas" suffix
                     return fileName.EndsWith("-quotas") ? fileName.Substring(0, fileName.Length - 7) : fileName;
                 })
-                .Where(name => !string.IsNullOrWhiteSpace(name) && !name.EndsWith("-backup", StringComparison.OrdinalIgnoreCase))
+                .Where(name => !string.IsNullOrWhiteSpace(name)
+                    && !name.Contains("-backup", StringComparison.OrdinalIgnoreCase)    // Filter LiteDB backup files: "tenant-001-quotas.db-backup-1"
+                    && !name.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase) // Filter corruption backups
+                    && !name.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))   // Filter LiteDB journal files
                 .ToList();
 
             return Task.FromResult<IEnumerable<string>>(tenantIds);

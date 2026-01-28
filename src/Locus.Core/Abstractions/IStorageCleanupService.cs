@@ -74,5 +74,14 @@ namespace Locus.Core.Abstractions
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Database optimization statistics.</returns>
         Task<DatabaseOptimizationResult> OptimizeDatabasesAsync(CancellationToken ct);
+
+        /// <summary>
+        /// Cleans up incorrectly created database files that were mistakenly identified as tenants.
+        /// This includes files created from LiteDB backup files like "tenant-001.db-backup-1.db".
+        /// WARNING: This is a one-time cleanup operation. Only run if you have backup files incorrectly treated as tenants.
+        /// </summary>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Number of invalid database files removed and space freed in bytes.</returns>
+        Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct);
     }
 }

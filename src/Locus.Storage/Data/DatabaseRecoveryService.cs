@@ -364,6 +364,12 @@ namespace Locus.Storage.Data
                     ct.ThrowIfCancellationRequested();
 
                     var tenantId = _fileSystem.Path.GetFileNameWithoutExtension(dbPath);
+
+                    // Skip backup files created by LiteDB Rebuild() or corruption recovery
+                    // Examples: "tenant-001.db-backup-1", "tenant-001.db.corrupted.20240122120000"
+                    if (IsBackupFile(tenantId))
+                        continue;
+
                     var isCorrupted = IsDatabaseCorrupted(dbPath);
 
                     if (isCorrupted)
@@ -392,6 +398,12 @@ namespace Locus.Storage.Data
                     ct.ThrowIfCancellationRequested();
 
                     var fileName = _fileSystem.Path.GetFileNameWithoutExtension(dbPath);
+
+                    // Skip backup files before extracting tenant ID
+                    // Examples: "tenant-001-quotas.db-backup-1", "tenant-001-quotas.db.corrupted.20240122120000"
+                    if (IsBackupFile(fileName))
+                        continue;
+
                     var tenantId = fileName.EndsWith("-quotas")
                         ? fileName.Substring(0, fileName.Length - 7)
                         : fileName;
@@ -416,6 +428,33 @@ namespace Locus.Storage.Data
             }
 
             return await Task.FromResult(report);
+        }
+
+        /// <summary>
+        /// Checks if a tenant ID represents a backup file rather than a real tenant.
+        /// LiteDB Rebuild() creates temporary backup files like "tenant-001.db-backup-1".
+        /// Corruption recovery creates backups like "tenant-001.db.corrupted.20240122120000".
+        /// </summary>
+        private static bool IsBackupFile(string tenantId)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                return true;
+
+            // LiteDB Rebuild backup pattern: ends with "-backup" or "-backup-N"
+            // Examples: "tenant-001.db-backup-1", "tenant-001.db-backup-2"
+            if (tenantId.Contains("-backup", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Corruption recovery backup pattern: contains ".corrupted."
+            // Examples: "tenant-001.db.corrupted.20240122120000"
+            if (tenantId.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // LiteDB journal files
+            if (tenantId.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
         }
     }
 }
