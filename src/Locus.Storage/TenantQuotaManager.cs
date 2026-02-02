@@ -52,23 +52,27 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            // Check quota before incrementing
-            var canAdd = await CanAddFileAsync(tenantId, ct);
-            if (!canAdd)
+            // Atomically check and increment in a single operation
+            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
+
+            // Get effective limit without re-reading the quota
+            var effectiveLimit = quota.MaxCount > 0
+                ? quota.MaxCount
+                : await GetGlobalLimitAsync(ct);
+
+            // 0 means unlimited
+            if (effectiveLimit > 0 && quota.CurrentCount >= effectiveLimit)
             {
-                var currentCount = await GetFileCountAsync(tenantId, ct);
-                var limit = await GetEffectiveLimitAsync(tenantId, ct);
-                throw new TenantQuotaExceededException(tenantId, currentCount, limit);
+                throw new TenantQuotaExceededException(tenantId, quota.CurrentCount, effectiveLimit);
             }
 
             // Increment count
-            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
             quota.CurrentCount++;
             quota.LastUpdated = DateTime.UtcNow;
             await _repository.UpdateAsync(tenantId, quota, ct);
 
             _logger.LogDebug("Incremented file count for tenant {TenantId}: {CurrentCount}/{EffectiveLimit}",
-                tenantId, quota.CurrentCount, await GetEffectiveLimitAsync(tenantId, ct));
+                tenantId, quota.CurrentCount, effectiveLimit);
         }
 
         /// <inheritdoc/>
