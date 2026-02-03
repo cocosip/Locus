@@ -62,9 +62,13 @@ namespace Locus.Storage
             // Perform multiple health checks with delays to handle transient failures
             // This is critical for network storage (NFS, Ceph, K8s PVC) where newly created
             // directories might need time to fully synchronize
-            const int maxHealthCheckAttempts = 5;
-            const int healthCheckDelayMs = 200;
+            const int maxHealthCheckAttempts = 10;
+            const int healthCheckDelayMs = 500;
+            const int initialDelayMs = 2000;
             int healthyAttempts = 0;
+
+            // Initial delay to allow K8s PVC mount and file system synchronization
+            System.Threading.Thread.Sleep(initialDelayMs);
 
             for (int attempt = 1; attempt <= maxHealthCheckAttempts; attempt++)
             {
