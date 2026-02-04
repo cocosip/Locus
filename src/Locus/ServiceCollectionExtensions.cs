@@ -179,6 +179,19 @@ namespace Locus
                     cleanupService.RegisterVolume(volume);
                 }
 
+                // Register FileWatcher configuration directory as protected
+                cleanupService.RegisterProtectedDirectory(options.FileWatcherConfigurationDirectory);
+
+                // Register FileWatcher paths as protected directories
+                foreach (var watcherConfig in options.FileWatchers)
+                {
+                    cleanupService.RegisterProtectedDirectory(watcherConfig.WatchPath);
+                    if (watcherConfig.MoveToDirectory != null && !string.IsNullOrWhiteSpace(watcherConfig.MoveToDirectory))
+                    {
+                        cleanupService.RegisterProtectedDirectory(watcherConfig.MoveToDirectory);
+                    }
+                }
+
                 return cleanupService;
             });
 

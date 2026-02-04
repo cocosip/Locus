@@ -164,6 +164,104 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupAllEmptyDirectoriesAsync_ShouldNotDeleteVolumeMountPath()
+        {
+            // Arrange
+            // Create empty tenant directories under the volume mount path
+            var tenant1Path = Path.Combine(_volumePath, "tenant-001");
+            var tenant2Path = Path.Combine(_volumePath, "tenant-002");
+            _fileSystem.Directory.CreateDirectory(tenant1Path);
+            _fileSystem.Directory.CreateDirectory(tenant2Path);
+
+            // Verify mount path exists before cleanup
+            Assert.True(_fileSystem.Directory.Exists(_volumePath));
+
+            // Act
+            await _cleanupService.CleanupAllEmptyDirectoriesAsync(default);
+
+            // Assert
+            // CRITICAL: Volume mount path must NEVER be deleted, even when empty
+            Assert.True(_fileSystem.Directory.Exists(_volumePath),
+                "Volume MountPath should NOT be deleted by cleanup service");
+
+            // Empty tenant directories should be removed
+            Assert.False(_fileSystem.Directory.Exists(tenant1Path));
+            Assert.False(_fileSystem.Directory.Exists(tenant2Path));
+        }
+
+        [Fact]
+        public async Task CleanupAllEmptyDirectoriesAsync_ShouldNotDeleteSystemDirectories()
+        {
+            // Arrange
+            // MetadataDirectory and QuotaDirectory are automatically protected by the cleanup service
+            // They should NEVER be deleted even if empty
+
+            // Verify system directories exist and are empty
+            Assert.True(_fileSystem.Directory.Exists(_metadataDir));
+            Assert.True(_fileSystem.Directory.Exists(_quotaDir));
+            Assert.Empty(_fileSystem.Directory.GetFiles(_metadataDir));
+            Assert.Empty(_fileSystem.Directory.GetFiles(_quotaDir));
+
+            // Act
+            await _cleanupService.CleanupAllEmptyDirectoriesAsync(default);
+
+            // Assert
+            // CRITICAL: System directories must NEVER be deleted
+            Assert.True(_fileSystem.Directory.Exists(_metadataDir),
+                "MetadataDirectory should NOT be deleted by cleanup service");
+            Assert.True(_fileSystem.Directory.Exists(_quotaDir),
+                "QuotaDirectory should NOT be deleted by cleanup service");
+        }
+
+        [Fact]
+        public async Task RegisterProtectedDirectory_ShouldPreventDeletion()
+        {
+            // Arrange
+            var protectedDir = Path.Combine(_volumePath, "protected-watch-path");
+            _fileSystem.Directory.CreateDirectory(protectedDir);
+
+            // Register the directory as protected
+            _cleanupService.RegisterProtectedDirectory(protectedDir);
+
+            // Verify it's empty
+            Assert.True(_fileSystem.Directory.Exists(protectedDir));
+            Assert.Empty(_fileSystem.Directory.GetFiles(protectedDir));
+            Assert.Empty(_fileSystem.Directory.GetDirectories(protectedDir));
+
+            // Act
+            await _cleanupService.CleanupAllEmptyDirectoriesAsync(default);
+
+            // Assert
+            // Protected directory should NOT be deleted even though it's empty
+            Assert.True(_fileSystem.Directory.Exists(protectedDir),
+                "Protected directory should NOT be deleted by cleanup service");
+        }
+
+        [Fact]
+        public async Task RegisterProtectedDirectory_ShouldAllowSubdirectoryCleanup()
+        {
+            // Arrange
+            var protectedDir = Path.Combine(_volumePath, "protected-root");
+            var emptySubdir = Path.Combine(protectedDir, "empty-subdir");
+            _fileSystem.Directory.CreateDirectory(emptySubdir);
+
+            // Register only the root as protected
+            _cleanupService.RegisterProtectedDirectory(protectedDir);
+
+            // Act
+            await _cleanupService.CleanupAllEmptyDirectoriesAsync(default);
+
+            // Assert
+            // Protected root should exist
+            Assert.True(_fileSystem.Directory.Exists(protectedDir),
+                "Protected root directory should NOT be deleted");
+
+            // But its empty subdirectory should be cleaned up
+            Assert.False(_fileSystem.Directory.Exists(emptySubdir),
+                "Empty subdirectories inside protected directories should still be cleaned up");
+        }
+
+        [Fact]
         public async Task CleanupTimedOutProcessingFilesAsync_ResetsTimedOutFiles()
         {
             // Arrange

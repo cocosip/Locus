@@ -26,6 +26,7 @@ namespace Locus.Storage
         private readonly CleanupStatistics _statistics;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
+        private readonly HashSet<string> _protectedDirectories;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StorageCleanupService"/> class.
@@ -52,6 +53,16 @@ namespace Locus.Storage
 
             _metadataDirectory = metadataDirectory;
             _quotaDirectory = quotaDirectory;
+
+            // Initialize protected directories that should NEVER be deleted
+            // These are system configuration directories essential for Locus operation
+            _protectedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                Path.GetFullPath(metadataDirectory),      // Metadata storage
+                Path.GetFullPath(quotaDirectory)          // Quota management
+            };
+
+            _logger.LogDebug("Initialized cleanup service with {Count} protected directories", _protectedDirectories.Count);
         }
 
         /// <summary>
@@ -66,7 +77,28 @@ namespace Locus.Storage
                 throw new ArgumentNullException(nameof(volume));
 
             _volumes.TryAdd(volume.VolumeId, volume);
-            _logger.LogDebug("Registered volume {VolumeId} with cleanup service", volume.VolumeId);
+
+            // Protect the volume's MountPath from being deleted
+            var mountPath = Path.GetFullPath(volume.MountPath);
+            _protectedDirectories.Add(mountPath);
+
+            _logger.LogDebug("Registered volume {VolumeId} with cleanup service, protected path: {MountPath}",
+                volume.VolumeId, mountPath);
+        }
+
+        /// <summary>
+        /// Registers additional protected directories that should never be deleted during cleanup.
+        /// This should be called for system directories like FileWatcher paths.
+        /// </summary>
+        /// <param name="directoryPath">The directory path to protect.</param>
+        public void RegisterProtectedDirectory(string directoryPath)
+        {
+            if (string.IsNullOrWhiteSpace(directoryPath))
+                return;
+
+            var fullPath = Path.GetFullPath(directoryPath);
+            _protectedDirectories.Add(fullPath);
+            _logger.LogDebug("Registered protected directory: {Path}", fullPath);
         }
 
         /// <inheritdoc/>
@@ -112,7 +144,13 @@ namespace Locus.Storage
             {
                 if (_fileSystem.Directory.Exists(volume.MountPath))
                 {
-                    removedCount += await CleanupEmptyDirectoriesRecursiveAsync(volume.MountPath, ct);
+                    // IMPORTANT: Clean up subdirectories ONLY, never delete the MountPath itself
+                    // This prevents the volume root directory from being removed when empty
+                    var subdirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
+                    foreach (var subdirectory in subdirectories)
+                    {
+                        removedCount += await CleanupEmptyDirectoriesRecursiveAsync(subdirectory, ct);
+                    }
                 }
             }
 
@@ -535,6 +573,14 @@ namespace Locus.Storage
                 removedCount += await CleanupEmptyDirectoriesRecursiveAsync(subdirectory, ct);
             }
 
+            // Check if this directory is protected (system directories must never be deleted)
+            var fullPath = Path.GetFullPath(directoryPath);
+            if (IsProtectedDirectory(fullPath))
+            {
+                _logger.LogDebug("Skipping protected directory: {DirectoryPath}", directoryPath);
+                return removedCount;
+            }
+
             // Then check if this directory is now empty
             var hasFiles = _fileSystem.Directory.GetFiles(directoryPath).Any();
             var hasSubdirs = _fileSystem.Directory.GetDirectories(directoryPath).Any();
@@ -554,6 +600,16 @@ namespace Locus.Storage
             }
 
             return removedCount;
+        }
+
+        /// <summary>
+        /// Checks if a directory is protected and should not be deleted.
+        /// </summary>
+        /// <param name="directoryPath">The full directory path to check.</param>
+        /// <returns>True if the directory is protected; otherwise, false.</returns>
+        private bool IsProtectedDirectory(string directoryPath)
+        {
+            return _protectedDirectories.Contains(directoryPath);
         }
     }
 }
