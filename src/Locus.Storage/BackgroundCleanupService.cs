@@ -44,11 +44,9 @@ namespace Locus.Storage
                 {
                     _logger.LogInformation("Starting scheduled cleanup tasks");
 
-                    // 1. Cleanup empty directories (if enabled)
-                    if (_options.CleanupEmptyDirectories)
-                    {
-                        await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
-                    }
+                    // 1. Cleanup junk files (Thumbs.db, .DS_Store, etc.)
+                    // Note: This no longer deletes empty directories, only the junk files within them.
+                    await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
                     // 2. Cleanup timed-out processing files (if enabled)
                     if (_options.CleanupTimedOutFiles && _options.ProcessingTimeout.HasValue)
@@ -158,12 +156,6 @@ namespace Locus.Storage
         /// Default: 1 minute.
         /// </summary>
         public TimeSpan InitialDelay { get; set; } = TimeSpan.FromMinutes(1);
-
-        /// <summary>
-        /// Gets or sets whether to cleanup empty directories.
-        /// Default: true.
-        /// </summary>
-        public bool CleanupEmptyDirectories { get; set; } = true;
 
         /// <summary>
         /// Gets or sets whether to cleanup timed-out processing files.

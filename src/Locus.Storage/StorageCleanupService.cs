@@ -26,7 +26,17 @@ namespace Locus.Storage
         private readonly CleanupStatistics _statistics;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
-        private readonly HashSet<string> _protectedDirectories;
+        
+        /// <summary>
+        /// System files that should be ignored when checking if a directory is empty.
+        /// If a directory contains only these files, they will be deleted and the directory removed.
+        /// </summary>
+        private static readonly HashSet<string> _ignoredFilenames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Thumbs.db",
+            ".DS_Store",
+            "desktop.ini"
+        };
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StorageCleanupService"/> class.
@@ -53,16 +63,6 @@ namespace Locus.Storage
 
             _metadataDirectory = metadataDirectory;
             _quotaDirectory = quotaDirectory;
-
-            // Initialize protected directories that should NEVER be deleted
-            // These are system configuration directories essential for Locus operation
-            _protectedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                Path.GetFullPath(metadataDirectory),      // Metadata storage
-                Path.GetFullPath(quotaDirectory)          // Quota management
-            };
-
-            _logger.LogDebug("Initialized cleanup service with {Count} protected directories", _protectedDirectories.Count);
         }
 
         /// <summary>
@@ -78,27 +78,8 @@ namespace Locus.Storage
 
             _volumes.TryAdd(volume.VolumeId, volume);
 
-            // Protect the volume's MountPath from being deleted
-            var mountPath = Path.GetFullPath(volume.MountPath);
-            _protectedDirectories.Add(mountPath);
-
-            _logger.LogDebug("Registered volume {VolumeId} with cleanup service, protected path: {MountPath}",
-                volume.VolumeId, mountPath);
-        }
-
-        /// <summary>
-        /// Registers additional protected directories that should never be deleted during cleanup.
-        /// This should be called for system directories like FileWatcher paths.
-        /// </summary>
-        /// <param name="directoryPath">The directory path to protect.</param>
-        public void RegisterProtectedDirectory(string directoryPath)
-        {
-            if (string.IsNullOrWhiteSpace(directoryPath))
-                return;
-
-            var fullPath = Path.GetFullPath(directoryPath);
-            _protectedDirectories.Add(fullPath);
-            _logger.LogDebug("Registered protected directory: {Path}", fullPath);
+            _logger.LogDebug("Registered volume {VolumeId} with cleanup service, mount path: {MountPath}",
+                volume.VolumeId, volume.MountPath);
         }
 
         /// <inheritdoc/>
@@ -116,7 +97,7 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
 
-            _logger.LogInformation("Starting empty directory cleanup for tenant: {TenantId}", tenantId);
+            _logger.LogInformation("Starting junk file cleanup for tenant: {TenantId}", tenantId);
 
             var removedCount = 0;
 
@@ -125,18 +106,20 @@ namespace Locus.Storage
                 var tenantPath = Path.Combine(volume.MountPath, tenantId);
                 if (_fileSystem.Directory.Exists(tenantPath))
                 {
-                    removedCount += await CleanupEmptyDirectoriesRecursiveAsync(tenantPath, ct);
+                    removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct);
                 }
             }
 
+            // Note: We still use the metric name EmptyDirectoriesRemoved for compatibility, 
+            // but it now represents the number of junk files removed.
             _statistics.EmptyDirectoriesRemoved += removedCount;
-            _logger.LogInformation("Cleaned up {Count} empty directories for tenant {TenantId}", removedCount, tenantId);
+            _logger.LogInformation("Cleaned up {Count} junk files for tenant {TenantId}", removedCount, tenantId);
         }
 
         /// <inheritdoc/>
         public async Task CleanupAllEmptyDirectoriesAsync(CancellationToken ct)
         {
-            _logger.LogInformation("Starting empty directory cleanup for all tenants");
+            _logger.LogInformation("Starting junk file cleanup for all tenants");
 
             var removedCount = 0;
 
@@ -144,18 +127,16 @@ namespace Locus.Storage
             {
                 if (_fileSystem.Directory.Exists(volume.MountPath))
                 {
-                    // IMPORTANT: Clean up subdirectories ONLY, never delete the MountPath itself
-                    // This prevents the volume root directory from being removed when empty
                     var subdirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
                     foreach (var subdirectory in subdirectories)
                     {
-                        removedCount += await CleanupEmptyDirectoriesRecursiveAsync(subdirectory, ct);
+                        removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct);
                     }
                 }
             }
 
             _statistics.EmptyDirectoriesRemoved += removedCount;
-            _logger.LogInformation("Cleaned up {Count} empty directories across all tenants", removedCount);
+            _logger.LogInformation("Cleaned up {Count} junk files across all tenants", removedCount);
         }
 
         /// <inheritdoc/>
@@ -500,11 +481,11 @@ namespace Locus.Storage
                 return false;
 
             // LiteDB backup pattern: contains "-backup"
-            if (fileName.Contains("-backup", StringComparison.OrdinalIgnoreCase))
+            if (fileName.IndexOf("-backup", StringComparison.OrdinalIgnoreCase) >= 0)
                 return true;
 
             // Corruption backup pattern: contains ".corrupted."
-            if (fileName.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
+            if (fileName.IndexOf(".corrupted.", StringComparison.OrdinalIgnoreCase) >= 0)
                 return true;
 
             // LiteDB journal files
@@ -535,8 +516,8 @@ namespace Locus.Storage
                 // Match LiteDB backup patterns:
                 // - *.db-backup-* (e.g., "tenant-001.db-backup-1")
                 // - *.db.corrupted.* (e.g., "tenant-001.db.corrupted.20240122120000")
-                if (fileName.Contains("-backup-", StringComparison.OrdinalIgnoreCase) ||
-                    fileName.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
+                if (fileName.IndexOf("-backup-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    fileName.IndexOf(".corrupted.", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     try
                     {
@@ -557,59 +538,45 @@ namespace Locus.Storage
         }
 
         /// <summary>
-        /// Recursively cleans up empty directories.
+        /// Recursively cleans up junk files in directories but preserves the directory structure.
         /// </summary>
-        private async Task<int> CleanupEmptyDirectoriesRecursiveAsync(string directoryPath, CancellationToken ct)
+        private async Task<int> CleanupJunkFilesRecursiveAsync(string directoryPath, CancellationToken ct)
         {
             if (!_fileSystem.Directory.Exists(directoryPath))
                 return 0;
 
             var removedCount = 0;
 
-            // First, recursively clean up subdirectories
+            // 1. Recursively process subdirectories
             var subdirectories = _fileSystem.Directory.GetDirectories(directoryPath);
             foreach (var subdirectory in subdirectories)
             {
-                removedCount += await CleanupEmptyDirectoriesRecursiveAsync(subdirectory, ct);
+                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct);
             }
 
-            // Check if this directory is protected (system directories must never be deleted)
-            var fullPath = Path.GetFullPath(directoryPath);
-            if (IsProtectedDirectory(fullPath))
+            // 2. Process files in current directory
+            var files = _fileSystem.Directory.GetFiles(directoryPath);
+            foreach (var file in files)
             {
-                _logger.LogDebug("Skipping protected directory: {DirectoryPath}", directoryPath);
-                return removedCount;
-            }
-
-            // Then check if this directory is now empty
-            var hasFiles = _fileSystem.Directory.GetFiles(directoryPath).Any();
-            var hasSubdirs = _fileSystem.Directory.GetDirectories(directoryPath).Any();
-
-            if (!hasFiles && !hasSubdirs)
-            {
-                try
+                var fileName = _fileSystem.Path.GetFileName(file);
+                
+                // Only delete files if they are in the ignored list (junk files)
+                if (_ignoredFilenames.Contains(fileName))
                 {
-                    _fileSystem.Directory.Delete(directoryPath);
-                    removedCount++;
-                    _logger.LogDebug("Deleted empty directory: {DirectoryPath}", directoryPath);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to delete empty directory {DirectoryPath}", directoryPath);
+                    try
+                    {
+                        _fileSystem.File.Delete(file);
+                        removedCount++;
+                        _logger.LogDebug("Deleted junk file: {FilePath}", file);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to delete junk file {FilePath}", file);
+                    }
                 }
             }
 
             return removedCount;
-        }
-
-        /// <summary>
-        /// Checks if a directory is protected and should not be deleted.
-        /// </summary>
-        /// <param name="directoryPath">The full directory path to check.</param>
-        /// <returns>True if the directory is protected; otherwise, false.</returns>
-        private bool IsProtectedDirectory(string directoryPath)
-        {
-            return _protectedDirectories.Contains(directoryPath);
         }
     }
 }
