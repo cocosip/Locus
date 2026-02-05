@@ -79,7 +79,7 @@ namespace Locus.IntegrationTests
         }
 
         [Fact]
-        public void LocalFileSystemVolume_Can_Write_File_After_AutoCreate()
+        public async System.Threading.Tasks.Task LocalFileSystemVolume_Can_Write_File_After_AutoCreate()
         {
             // Arrange
             var mountPath = Path.Combine(_testRoot, "auto-created", "volume");
@@ -94,7 +94,7 @@ namespace Locus.IntegrationTests
             // 尝试写入文件
             var testFilePath = Path.Combine(mountPath, "test.txt");
             using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("test content"));
-            volume.WriteAsync(testFilePath, stream, default).Wait();
+            await volume.WriteAsync(testFilePath, stream, default);
 
             // Assert
             Assert.True(File.Exists(testFilePath), "文件应该被成功写入");
