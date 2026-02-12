@@ -242,10 +242,12 @@ namespace Locus.Storage.Data
 
             _logger.LogWarning("Starting THREAD-SAFE quota database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
+            var rebuildLockHeld = false;
             try
             {
                 // Step 1: Begin rebuild (acquires lock, backs up and deletes corrupted DB)
                 result.BackupPath = await _quotaRepository.BeginDatabaseRebuildAsync(tenantId, ct);
+                rebuildLockHeld = true;
 
                 if (result.BackupPath == null)
                 {
@@ -253,6 +255,11 @@ namespace Locus.Storage.Data
                     result.Errors.Add("No database file found to rebuild");
                     return result;
                 }
+
+                // Lock is only needed for backup/delete stage.
+                // Rebuilding records uses normal repository APIs (which take tenant locks internally).
+                _quotaRepository.FinishDatabaseRebuild(tenantId);
+                rebuildLockHeld = false;
 
                 // Step 2: Scan directories and rebuild quotas
                 var directoryCounts = new Dictionary<string, int>();
@@ -309,7 +316,10 @@ namespace Locus.Storage.Data
             finally
             {
                 // Step 3: Always release the lock
-                _quotaRepository.FinishDatabaseRebuild(tenantId);
+                if (rebuildLockHeld)
+                {
+                    _quotaRepository.FinishDatabaseRebuild(tenantId);
+                }
             }
 
             return result;

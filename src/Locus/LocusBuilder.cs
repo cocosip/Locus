@@ -165,6 +165,46 @@ namespace Locus
         }
 
         /// <summary>
+        /// Enables automatic rebuild of corrupted databases during startup health check.
+        /// </summary>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder EnableStartupAutoRecovery()
+        {
+            _options.AutoRecoverCorruptedDatabasesOnStartup = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Disables automatic rebuild of corrupted databases during startup health check.
+        /// </summary>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder DisableStartupAutoRecovery()
+        {
+            _options.AutoRecoverCorruptedDatabasesOnStartup = false;
+            return this;
+        }
+
+        /// <summary>
+        /// Enables fail-fast startup behavior when automatic database recovery fails.
+        /// </summary>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder EnableFailFastOnStartupRecoveryFailure()
+        {
+            _options.FailFastOnStartupRecoveryFailure = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Disables fail-fast startup behavior when automatic database recovery fails.
+        /// </summary>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder DisableFailFastOnStartupRecoveryFailure()
+        {
+            _options.FailFastOnStartupRecoveryFailure = false;
+            return this;
+        }
+
+        /// <summary>
         /// Adds a pre-configured tenant to initialize on startup.
         /// </summary>
         /// <param name="tenantId">The tenant identifier.</param>

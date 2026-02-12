@@ -44,10 +44,8 @@ namespace Locus.Storage.Data
             if (!fileSystem.File.Exists(dbPath))
                 return (0, 0);
 
-            // Get or create tenant-specific lock with special prefix to avoid conflicts
-            // (e.g., DirectoryQuotaRepository uses _directoryLocks for both directory and tenant operations)
-            var lockKey = $"__DB_OPTIMIZATION__{tenantId}";
-            var tenantLock = locks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+            // Use the tenant lock directly so optimization shares the same lock as normal operations.
+            var tenantLock = locks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
             // Acquire exclusive lock to block all operations for this tenant
             await tenantLock.WaitAsync(ct);

@@ -385,5 +385,102 @@ namespace Locus.Storage.Tests
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.Once);
         }
+
+        [Fact]
+        public async Task StartAsync_AutoRecoversCorruptedQuotaDatabase_WhenEnabled()
+        {
+            // Arrange
+            var tenantId = $"tenant-auto-recover-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
+
+            // Create a valid quota database first
+            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir))
+            {
+                await tempRepo.GetOrCreateAsync(tenantId, "/", default);
+            }
+
+            await Task.Delay(100);
+
+            // Corrupt it
+            var garbage = new byte[512];
+            new Random().NextBytes(garbage);
+            using (var stream = _fileSystem.File.Open(dbPath, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write(garbage, 0, garbage.Length);
+            }
+
+            var recoveryService = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _recoveryLogger.Object,
+                _metadataDir,
+                _quotaDir);
+
+            var healthCheckService = new DatabaseHealthCheckService(
+                recoveryService,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                new[] { _volumePath },
+                autoRecoverCorruptedDatabases: true,
+                failFastOnRecoveryFailure: false);
+
+            // Act
+            await healthCheckService.StartAsync(default);
+
+            // Assert
+            var report = await recoveryService.CheckAllDatabasesAsync(default);
+            Assert.Empty(report.CorruptedDatabases);
+        }
+
+        [Fact]
+        public async Task StartAsync_ThrowsWhenFailFastEnabledAndRecoveryFails()
+        {
+            // Arrange
+            var corruptedReport = new DatabaseHealthReport
+            {
+                HealthyDatabases = 0,
+                CorruptedDatabases = new List<DatabaseHealthInfo>
+                {
+                    new DatabaseHealthInfo
+                    {
+                        DatabaseType = "Quota",
+                        TenantId = "tenant-fail-fast",
+                        DatabasePath = "/tmp/tenant-fail-fast-quotas.db",
+                        IsCorrupted = true
+                    }
+                }
+            };
+
+            var mockRecoveryService = new Mock<IDatabaseRecoveryService>();
+            mockRecoveryService
+                .Setup(x => x.CheckAllDatabasesAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(corruptedReport);
+            mockRecoveryService
+                .Setup(x => x.RebuildQuotaDatabaseAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<IEnumerable<string>>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new DatabaseRebuildResult
+                {
+                    DatabaseType = "Quota",
+                    TenantId = "tenant-fail-fast",
+                    Success = false,
+                    Errors = new List<string> { "Rebuild failed" }
+                });
+
+            var healthCheckService = new DatabaseHealthCheckService(
+                mockRecoveryService.Object,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                new[] { _volumePath },
+                autoRecoverCorruptedDatabases: true,
+                failFastOnRecoveryFailure: true);
+
+            // Act & Assert
+            await Assert.ThrowsAnyAsync<Exception>(() => healthCheckService.StartAsync(default));
+        }
     }
 }

@@ -57,6 +57,21 @@ namespace Locus
         public bool EnableDatabaseHealthCheck { get; set; } = true;
 
         /// <summary>
+        /// Gets or sets whether startup health check should automatically rebuild corrupted databases.
+        /// When enabled, corrupted metadata/quota databases detected at startup will be rebuilt before
+        /// the application begins serving requests.
+        /// Default: true.
+        /// </summary>
+        public bool AutoRecoverCorruptedDatabasesOnStartup { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether startup should fail if automatic database recovery fails.
+        /// When true, startup throws after recovery attempts still leave corrupted databases.
+        /// Default: false.
+        /// </summary>
+        public bool FailFastOnStartupRecoveryFailure { get; set; } = false;
+
+        /// <summary>
         /// Gets the list of pre-configured tenants to initialize on startup.
         /// If empty, tenants can still be created dynamically if AutoCreateTenants is true.
         /// </summary>

@@ -21,6 +21,8 @@ namespace Locus.Storage
         private readonly ILogger<DatabaseHealthCheckService> _logger;
         private readonly string _metadataDirectory;
         private readonly IEnumerable<string> _volumePaths;
+        private readonly bool _autoRecoverCorruptedDatabases;
+        private readonly bool _failFastOnRecoveryFailure;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DatabaseHealthCheckService"/> class.
@@ -30,13 +32,17 @@ namespace Locus.Storage
             IFileSystem fileSystem,
             ILogger<DatabaseHealthCheckService> logger,
             string metadataDirectory,
-            IEnumerable<string> volumePaths)
+            IEnumerable<string> volumePaths,
+            bool autoRecoverCorruptedDatabases = true,
+            bool failFastOnRecoveryFailure = false)
         {
             _recoveryService = recoveryService ?? throw new ArgumentNullException(nameof(recoveryService));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _metadataDirectory = metadataDirectory ?? throw new ArgumentNullException(nameof(metadataDirectory));
             _volumePaths = volumePaths ?? throw new ArgumentNullException(nameof(volumePaths));
+            _autoRecoverCorruptedDatabases = autoRecoverCorruptedDatabases;
+            _failFastOnRecoveryFailure = failFastOnRecoveryFailure;
         }
 
         /// <inheritdoc/>
@@ -53,6 +59,30 @@ namespace Locus.Storage
             {
                 var report = await CheckWithRetryAsync(cancellationToken);
 
+                if (!report.AllHealthy)
+                {
+                    LogCorruptionReport(report);
+
+                    if (_autoRecoverCorruptedDatabases && report.CorruptedDatabases.Count > 0)
+                    {
+                        var (attempted, failed) = await RecoverCorruptedDatabasesAsync(report, cancellationToken);
+
+                        if (attempted > 0)
+                        {
+                            _logger.LogInformation(
+                                "Startup database auto-recovery completed. Attempted={Attempted}, Failed={Failed}. Re-running health check...",
+                                attempted, failed);
+                            report = await CheckWithRetryAsync(cancellationToken);
+                        }
+
+                        if (_failFastOnRecoveryFailure && (failed > 0 || !report.AllHealthy))
+                        {
+                            throw new InvalidOperationException(
+                                "Database auto-recovery failed during startup and fail-fast mode is enabled.");
+                        }
+                    }
+                }
+
                 // Check for orphaned files if no databases exist
                 if (report.HealthyDatabases == 0 && report.CorruptedDatabases.Count == 0)
                 {
@@ -65,27 +95,112 @@ namespace Locus.Storage
                 }
                 else
                 {
-                    _logger.LogWarning(
-                        "Database health check completed. Healthy: {Healthy}, Corrupted: {Corrupted}",
-                        report.HealthyDatabases,
-                        report.CorruptedDatabases.Count);
-
-                    foreach (var corruptedDb in report.CorruptedDatabases)
-                    {
-                        _logger.LogError(
-                            "CORRUPTED DATABASE DETECTED: Type={Type}, Tenant={TenantId}, Path={Path}. " +
-                            "Use DatabaseRecoveryService.Rebuild{Type}DatabaseAsync() to recover.",
-                            corruptedDb.DatabaseType,
-                            corruptedDb.TenantId,
-                            corruptedDb.DatabasePath,
-                            corruptedDb.DatabaseType);
-                    }
+                    LogCorruptionReport(report);
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error during database health check");
+
+                if (_failFastOnRecoveryFailure)
+                    throw;
             }
+        }
+
+        /// <summary>
+        /// Logs a detailed corruption report.
+        /// </summary>
+        private void LogCorruptionReport(DatabaseHealthReport report)
+        {
+            _logger.LogWarning(
+                "Database health check completed. Healthy: {Healthy}, Corrupted: {Corrupted}",
+                report.HealthyDatabases,
+                report.CorruptedDatabases.Count);
+
+            foreach (var corruptedDb in report.CorruptedDatabases)
+            {
+                _logger.LogError(
+                    "CORRUPTED DATABASE DETECTED: Type={Type}, Tenant={TenantId}, Path={Path}. " +
+                    "Use DatabaseRecoveryService.Rebuild{Type}DatabaseAsync() to recover.",
+                    corruptedDb.DatabaseType,
+                    corruptedDb.TenantId,
+                    corruptedDb.DatabasePath,
+                    corruptedDb.DatabaseType);
+            }
+        }
+
+        /// <summary>
+        /// Attempts to recover all corrupted databases in the report.
+        /// </summary>
+        private async Task<(int Attempted, int Failed)> RecoverCorruptedDatabasesAsync(
+            DatabaseHealthReport report,
+            CancellationToken cancellationToken)
+        {
+            var attempted = 0;
+            var failed = 0;
+
+            foreach (var corruptedDb in report.CorruptedDatabases)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                attempted++;
+
+                try
+                {
+                    DatabaseRebuildResult result;
+                    if (string.Equals(corruptedDb.DatabaseType, "Metadata", StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = await _recoveryService.RebuildMetadataDatabaseAsync(
+                            corruptedDb.TenantId,
+                            _volumePaths,
+                            cancellationToken);
+                    }
+                    else if (string.Equals(corruptedDb.DatabaseType, "Quota", StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = await _recoveryService.RebuildQuotaDatabaseAsync(
+                            corruptedDb.TenantId,
+                            _volumePaths,
+                            cancellationToken);
+                    }
+                    else
+                    {
+                        failed++;
+                        _logger.LogError(
+                            "Unsupported database type for auto-recovery: {Type}, Tenant={TenantId}",
+                            corruptedDb.DatabaseType,
+                            corruptedDb.TenantId);
+                        continue;
+                    }
+
+                    if (result.Success)
+                    {
+                        _logger.LogWarning(
+                            "Auto-recovered {Type} database for tenant {TenantId}. RebuiltRecords={Records}, Backup={BackupPath}",
+                            result.DatabaseType,
+                            result.TenantId,
+                            result.RecordsRebuilt,
+                            result.BackupPath ?? "N/A");
+                    }
+                    else
+                    {
+                        failed++;
+                        _logger.LogError(
+                            "Failed to auto-recover {Type} database for tenant {TenantId}. Errors={Errors}",
+                            result.DatabaseType,
+                            result.TenantId,
+                            string.Join("; ", result.Errors));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    _logger.LogError(ex,
+                        "Exception during auto-recovery for {Type} database, tenant {TenantId}",
+                        corruptedDb.DatabaseType,
+                        corruptedDb.TenantId);
+                }
+            }
+
+            return (attempted, failed);
         }
 
         /// <summary>

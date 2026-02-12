@@ -215,7 +215,9 @@ namespace Locus
                     sp.GetRequiredService<IFileSystem>(),
                     sp.GetRequiredService<ILogger<DatabaseHealthCheckService>>(),
                     options.MetadataDirectory,
-                    volumePaths));
+                    volumePaths,
+                    options.AutoRecoverCorruptedDatabasesOnStartup,
+                    options.FailFastOnStartupRecoveryFailure));
             }
 
             // Store LocusOptions for runtime access (e.g., AutoCreateTenants)
