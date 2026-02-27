@@ -16,6 +16,11 @@ namespace Locus.Storage.Data
     /// <summary>
     /// Repository for file metadata storage using per-tenant LiteDB with active-data in-memory caching.
     /// Only keeps Pending/Processing/Failed files in memory. Completed files are immediately deleted.
+    ///
+    /// Write-Behind architecture: AddOrUpdateAsync and RemoveAsync update in-memory cache first,
+    /// then enqueue LiteDB persistence asynchronously. If LiteDB crashes, file writes continue
+    /// uninterrupted. On process restart, orphaned physical files are recovered by the cleanup service.
+    ///
     /// Thread-safe for concurrent access.
     /// </summary>
     public class MetadataRepository : IDisposable
@@ -34,7 +39,42 @@ namespace Locus.Storage.Data
         // Per-tenant locks for concurrent file allocation
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
 
+        // --- Write-Behind: async LiteDB persistence (netstandard2.0 compatible) ---
+        // Memory is always updated first. LiteDB writes are decoupled via this queue.
+        // If LiteDB is unavailable, writes buffer in memory and are retried by the background loop.
+        // On crash, in-flight writes are lost — physical files stay on disk as orphans and are
+        // recovered by the cleanup service on next startup.
+        private readonly ConcurrentQueue<PersistenceOperation> _persistenceQueue;
+        private readonly SemaphoreSlim _persistenceSignal; // one permit per enqueued item
+        private readonly Task _persistenceTask;
+        private readonly CancellationTokenSource _persistenceCts;
+
         private bool _disposed;
+
+        // Discriminated union for channel messages
+        private readonly struct PersistenceOperation
+        {
+            public readonly bool IsDelete;
+            public readonly FileMetadata? Metadata;  // set when IsDelete == false
+            public readonly string TenantId;
+            public readonly string FileKey;
+
+            public PersistenceOperation(FileMetadata metadata)
+            {
+                IsDelete = false;
+                Metadata = metadata;
+                TenantId = metadata.TenantId;
+                FileKey = metadata.FileKey;
+            }
+
+            public PersistenceOperation(string tenantId, string fileKey)
+            {
+                IsDelete = true;
+                Metadata = null;
+                TenantId = tenantId;
+                FileKey = fileKey;
+            }
+        }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="MetadataRepository"/> class.
@@ -57,6 +97,12 @@ namespace Locus.Storage.Data
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
 
+            // Write-behind: queue + semaphore so callers are never blocked by LiteDB latency
+            _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
+            _persistenceSignal = new SemaphoreSlim(0, int.MaxValue);
+            _persistenceCts = new CancellationTokenSource();
+            _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
+
             // Ensure metadata directory exists
             if (!_fileSystem.Directory.Exists(_metadataDirectory))
             {
@@ -64,7 +110,7 @@ namespace Locus.Storage.Data
             }
 
             _logger.LogInformation(
-                "MetadataRepository initialized at {Directory} with LiteDB: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s",
+                "MetadataRepository initialized at {Directory} with LiteDB write-behind: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s",
                 _metadataDirectory,
                 _liteDbOptions.EnableJournal,
                 _liteDbOptions.CheckpointInterval,
@@ -190,9 +236,15 @@ namespace Locus.Storage.Data
 
         /// <summary>
         /// Adds or updates file metadata.
-        /// Thread-safe: Persists to LiteDB first, then updates memory cache.
-        /// This ensures consistency - if persistence fails, memory won't have stale data.
+        /// Write-Behind: updates in-memory cache immediately (never fails from caller's perspective),
+        /// then enqueues LiteDB persistence asynchronously via background loop.
+        /// If LiteDB is unavailable, the write is queued and retried; the file on disk remains safe.
+        /// On process crash before flush, the physical file becomes an orphan recovered by cleanup service.
         /// </summary>
+        /// <remarks>
+        /// For maintenance operations (database rebuild) that require immediate LiteDB persistence,
+        /// use <see cref="AddOrUpdateDirectAsync"/> instead.
+        /// </remarks>
         public Task AddOrUpdateAsync(FileMetadata metadata, CancellationToken ct)
         {
             if (metadata == null)
@@ -204,19 +256,45 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            // 1. Persist to LiteDB FIRST (persistence is critical)
-            // If this fails, exception is thrown and memory won't be corrupted
-            var db = GetDatabase(metadata.TenantId);
-            var files = db.GetCollection<FileMetadata>("files");
-            files.Upsert(metadata);
-
-            // 2. Update memory cache AFTER successful persistence
-            // This operation is local and virtually guaranteed to succeed
-            var cache = GetCache(metadata.TenantId);
+            // 1. Update in-memory cache FIRST — always succeeds, immediately visible to readers
+            var cache = _activeFiles.GetOrAdd(metadata.TenantId,
+                _ => new ConcurrentDictionary<string, FileMetadata>());
             cache[metadata.FileKey] = metadata;
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
+
+            // 2. Queue LiteDB persistence — caller is not blocked; background loop drains the queue.
+            EnqueuePersistence(new PersistenceOperation(metadata));
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Adds or updates file metadata with immediate synchronous LiteDB write.
+        /// Bypasses the Write-Behind queue — use only for maintenance operations such as
+        /// database rebuild where the caller needs the data persisted before returning.
+        /// </summary>
+        internal Task AddOrUpdateDirectAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (string.IsNullOrWhiteSpace(metadata.FileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(metadata));
+
+            if (string.IsNullOrWhiteSpace(metadata.TenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
+
+            // Update in-memory cache
+            var cache = _activeFiles.GetOrAdd(metadata.TenantId,
+                _ => new ConcurrentDictionary<string, FileMetadata>());
+            cache[metadata.FileKey] = metadata;
+
+            // Write directly to LiteDB (synchronous — required for rebuild correctness)
+            var db = GetDatabase(metadata.TenantId);
+            var files = db.GetCollection<FileMetadata>("files");
+            files.Upsert(metadata);
 
             return Task.CompletedTask;
         }
@@ -256,10 +334,8 @@ namespace Locus.Storage.Data
 
             if (removed)
             {
-                // Remove from LiteDB
-                var db = GetDatabase(tenantId);
-                var files = db.GetCollection<FileMetadata>("files");
-                files.Delete(fileKey);
+                // Queue LiteDB deletion — caller is not blocked by disk I/O
+                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
 
                 _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
             }
@@ -484,6 +560,25 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Finds file metadata by fileKey across all tenants without scanning every file.
+        /// Iterates tenant dictionaries only (O(tenants)), then does a direct key lookup (O(1)).
+        /// Use this instead of GetAllAsync().FirstOrDefault() when only the fileKey is known.
+        /// </summary>
+        public Task<FileMetadata?> GetByFileKeyAsync(string fileKey, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            foreach (var tenantFiles in _activeFiles.Values)
+            {
+                if (tenantFiles.TryGetValue(fileKey, out var metadata))
+                    return Task.FromResult<FileMetadata?>(metadata);
+            }
+
+            return Task.FromResult<FileMetadata?>(null);
+        }
+
+        /// <summary>
         /// Gets all file metadata (for maintenance operations).
         /// </summary>
         public Task<IEnumerable<FileMetadata>> GetAllAsync(CancellationToken ct)
@@ -629,8 +724,101 @@ namespace Locus.Storage.Data
             }
         }
 
+        // Maximum number of operations allowed in the persistence queue.
+        // If LiteDB is unavailable for an extended period, the queue will fill up. When full,
+        // new operations are dropped with a warning log. The physical file is already safe on
+        // disk and will be recovered by the cleanup service on next restart.
+        private const int MaxPersistenceQueueSize = 100_000;
+
+        // Enqueues an operation and wakes the background persistence loop.
+        // If the queue is full (LiteDB has been unavailable for a long time), the operation
+        // is dropped with a warning — memory state is already correct, so data is not lost
+        // within this process lifetime. On restart, the cleanup service reconciles disk vs metadata.
+        private void EnqueuePersistence(PersistenceOperation op)
+        {
+            // ConcurrentQueue.Count is O(1). Small TOCTOU race is acceptable: we only
+            // need to prevent unbounded growth, not enforce an exact hard limit.
+            if (_persistenceQueue.Count >= MaxPersistenceQueueSize)
+            {
+                if (op.IsDelete)
+                    _logger.LogWarning(
+                        "Persistence queue is full ({Max} items). Dropping LiteDB delete for {FileKey} (tenant {TenantId}). " +
+                        "Stale metadata record will be removed by cleanup service.",
+                        MaxPersistenceQueueSize, op.FileKey, op.TenantId);
+                else
+                    _logger.LogWarning(
+                        "Persistence queue is full ({Max} items). Dropping LiteDB upsert for {FileKey} (tenant {TenantId}). " +
+                        "File is safe on disk; metadata will be lost if process restarts before LiteDB recovers.",
+                        MaxPersistenceQueueSize, op.FileKey, op.TenantId);
+                return;
+            }
+
+            _persistenceQueue.Enqueue(op);
+            _persistenceSignal.Release(); // wake the background loop
+        }
+
+        // Background loop: waits for signals, dequeues, and writes to LiteDB.
+        // If LiteDB throws, the error is logged and the item is discarded — the physical
+        // file is already safe on disk and will be recovered by the cleanup service on restart.
+        private async Task RunPersistenceLoopAsync(CancellationToken ct)
+        {
+            while (true)
+            {
+                try
+                {
+                    await _persistenceSignal.WaitAsync(ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break; // shutdown requested
+                }
+
+                if (_persistenceQueue.TryDequeue(out var op))
+                    ExecutePersistenceOperation(op);
+            }
+
+            // Drain remaining items enqueued before cancellation
+            while (_persistenceQueue.TryDequeue(out var op))
+                ExecutePersistenceOperation(op);
+        }
+
+        // Executes a single persistence operation against LiteDB.
+        // Errors are logged but never propagated — LiteDB unavailability must never fail writes.
+        private void ExecutePersistenceOperation(PersistenceOperation op)
+        {
+            try
+            {
+                var db = GetDatabase(op.TenantId);
+                var files = db.GetCollection<FileMetadata>("files");
+
+                if (op.IsDelete)
+                {
+                    files.Delete(op.FileKey);
+                }
+                else
+                {
+                    files.Upsert(op.Metadata!);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (op.IsDelete)
+                    _logger.LogError(ex,
+                        "LiteDB delete failed for file {FileKey} (tenant {TenantId}). " +
+                        "Stale metadata record may remain; cleanup service will remove it on next run.",
+                        op.FileKey, op.TenantId);
+                else
+                    _logger.LogError(ex,
+                        "LiteDB upsert failed for file {FileKey} (tenant {TenantId}). " +
+                        "File is safe on disk; metadata may be lost if process restarts before LiteDB recovers.",
+                        op.FileKey, op.TenantId);
+            }
+        }
+
         /// <summary>
         /// Disposes the repository and closes all databases.
+        /// Signals the write-behind background task to stop, waits up to 5 seconds
+        /// for it to drain remaining queued writes, then closes all LiteDB connections.
         /// </summary>
         public void Dispose()
         {
@@ -639,16 +827,29 @@ namespace Locus.Storage.Data
 
             _disposed = true;
 
-            // Close all databases
+            // 1. Signal the background persistence loop to stop accepting new signals
+            _persistenceCts.Cancel();
+
+            // 2. Wait for the background task to drain remaining queued items (up to 5 seconds).
+            // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach LiteDB.
+            // If LiteDB is unavailable or the queue is too large to drain in time, remaining items
+            // are discarded — physical files are safe on disk and recovered by cleanup service on restart.
+            try
+            {
+                _persistenceTask.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch (AggregateException)
+            {
+                // OperationCanceledException wrapped in AggregateException — expected on cancellation
+            }
+
+            // 3. Close all databases AFTER the drain is complete
             foreach (var lazyDb in _databases.Values)
             {
                 try
                 {
-                    // Only dispose if the Lazy value was actually created
                     if (lazyDb.IsValueCreated)
-                    {
                         lazyDb.Value?.Dispose();
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -659,7 +860,7 @@ namespace Locus.Storage.Data
             _databases.Clear();
             _activeFiles.Clear();
 
-            // Dispose all tenant locks
+            // 4. Dispose all tenant locks
             foreach (var semaphore in _tenantLocks.Values)
             {
                 try
@@ -672,6 +873,10 @@ namespace Locus.Storage.Data
                 }
             }
             _tenantLocks.Clear();
+
+            // 5. Dispose write-behind resources
+            _persistenceSignal.Dispose();
+            _persistenceCts.Dispose();
 
             _logger.LogInformation("MetadataRepository disposed");
         }

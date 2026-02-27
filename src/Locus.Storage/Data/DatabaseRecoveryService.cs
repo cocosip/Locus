@@ -181,7 +181,9 @@ namespace Locus.Storage.Data
                                 AvailableForProcessingAt = DateTime.UtcNow
                             };
 
-                            await _metadataRepository.AddOrUpdateAsync(metadata, ct);
+                            // Use direct write — rebuild must be persisted synchronously so the
+                            // new DB file exists and is fully populated when this method returns.
+                            await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
                             rebuiltFiles++;
 
                             _logger.LogDebug("Rebuilt metadata for file: {FilePath}", filePath);

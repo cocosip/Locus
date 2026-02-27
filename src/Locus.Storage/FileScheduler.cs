@@ -143,9 +143,8 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Need to find the metadata across all tenants to get tenantId
-            var allMetadata = await _repository.GetAllAsync(ct);
-            var metadata = allMetadata.FirstOrDefault(m => m.FileKey == fileKey);
+            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
             {
@@ -154,12 +153,16 @@ namespace Locus.Storage
             }
 
             // Delete physical file if it exists
-            if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath) && _fileSystem.File.Exists(metadata.PhysicalPath))
+            if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath))
             {
                 try
                 {
                     _fileSystem.File.Delete(metadata.PhysicalPath);
                     _logger.LogDebug("Deleted physical file: {PhysicalPath}", metadata.PhysicalPath);
+                }
+                catch (Exception ex) when (ex is System.IO.FileNotFoundException || ex is System.IO.DirectoryNotFoundException)
+                {
+                    // File already gone — idempotent, proceed to metadata removal
                 }
                 catch (Exception ex)
                 {
@@ -168,10 +171,10 @@ namespace Locus.Storage
                 }
             }
 
-            // Remove metadata
+            // Remove metadata (Write-Behind: memory removed immediately, LiteDB delete queued)
             await _repository.RemoveAsync(metadata.TenantId, fileKey, ct);
 
-            _logger.LogInformation("Completed and deleted file: {FileKey}", fileKey);
+            _logger.LogDebug("Completed and deleted file: {FileKey}", fileKey);
         }
 
         /// <inheritdoc/>
@@ -180,9 +183,8 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Need to find the metadata across all tenants to get tenantId
-            var allMetadata = await _repository.GetAllAsync(ct);
-            var metadata = allMetadata.FirstOrDefault(m => m.FileKey == fileKey);
+            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
             {

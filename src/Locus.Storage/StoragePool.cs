@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -26,6 +27,13 @@ namespace Locus.Storage
         private readonly ITenantManager _tenantManager;
         private readonly ILogger<StoragePool> _logger;
         private readonly IFileScheduler _fileScheduler;
+
+        // --- Optimization 2: Volume selection cache ---
+        // SelectVolumeForWrite() previously iterated all volumes and called IsHealthy+AvailableSpace
+        // on every write. Cache the selected volume for a short window.
+        private volatile IStorageVolume? _cachedSelectedVolume;
+        private long _lastVolumeSelectionTicks;
+        private static readonly long VolumeSelectionCacheTicks = 10L * Stopwatch.Frequency; // 10 seconds
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StoragePool"/> class.
@@ -112,6 +120,10 @@ namespace Locus.Storage
                 throw new InvalidOperationException($"Volume {volume.VolumeId} is already mounted");
             }
 
+            // Invalidate volume selection cache so the new volume is considered immediately
+            _cachedSelectedVolume = null;
+            Interlocked.Exchange(ref _lastVolumeSelectionTicks, 0);
+
             _logger.LogInformation("Mounted volume {VolumeId} at {MountPath} (healthy checks: {HealthyAttempts}/{MaxAttempts})",
                 volume.VolumeId, volume.MountPath, healthyAttempts, maxHealthCheckAttempts);
         }
@@ -171,7 +183,9 @@ namespace Locus.Storage
                 // 7. Get file size
                 var fileSize = content.CanSeek ? content.Length : 0;
 
-                // 8. Create file metadata (MUST succeed or we rollback the physical file)
+                // 8. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
+                // AddOrUpdateAsync never throws from the caller's perspective. If LiteDB is unavailable,
+                // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
                 {
                     FileKey = fileKey,
@@ -191,33 +205,9 @@ namespace Locus.Storage
                     FileExtension = fileExtension
                 };
 
-                try
-                {
-                    await _metadataRepository.AddOrUpdateAsync(metadata, ct);
-                }
-                catch (Exception metadataEx)
-                {
-                    // Metadata write failed - delete the physical file to maintain consistency
-                    _logger.LogError(metadataEx, "Metadata write failed for {FileKey}, rolling back physical file at {PhysicalPath}",
-                        fileKey, physicalPath);
+                await _metadataRepository.AddOrUpdateAsync(metadata, ct);
 
-                    try
-                    {
-                        await volume.DeleteAsync(physicalPath, ct);
-                        fileWritten = false; // Physical file deleted successfully
-                        _logger.LogWarning("Rolled back physical file {PhysicalPath} due to metadata write failure", physicalPath);
-                    }
-                    catch (Exception deleteEx)
-                    {
-                        _logger.LogError(deleteEx, "Failed to delete physical file {PhysicalPath} during rollback - orphaned file created",
-                            physicalPath);
-                        // Physical file remains - will be cleaned up by orphaned file cleanup service
-                    }
-
-                    throw; // Re-throw the original metadata exception
-                }
-
-                _logger.LogInformation("File written successfully: {FileKey} for tenant {TenantId} at {PhysicalPath}",
+                _logger.LogDebug("File written successfully: {FileKey} for tenant {TenantId} at {PhysicalPath}",
                     fileKey, tenant.TenantId, physicalPath);
 
                 return fileKey;
@@ -481,9 +471,22 @@ namespace Locus.Storage
         /// <summary>
         /// Selects the best storage volume for writing a file.
         /// Prioritizes volumes with the most available space.
+        /// Result is cached for 10 seconds to avoid calling IsHealthy (which probes disk) on every write.
+        /// Cache is invalidated when volumes are added.
         /// </summary>
         private IStorageVolume SelectVolumeForWrite()
         {
+            // Fast path: return cached volume if still within TTL and still healthy.
+            // IsHealthy is now itself cached (30 s TTL), so this check is very cheap.
+            var now = Stopwatch.GetTimestamp();
+            var last = Interlocked.Read(ref _lastVolumeSelectionTicks);
+            var cached = _cachedSelectedVolume;
+
+            if (cached != null && last != 0 && (now - last) < VolumeSelectionCacheTicks && cached.IsHealthy)
+                return cached;
+
+            // Slow path: re-evaluate all volumes.
+            // AvailableSpace is cached per-volume (30 s TTL), so this is still cheap.
             var healthyVolumes = _volumes.Values
                 .Where(v => v.IsHealthy)
                 .OrderByDescending(v => v.AvailableSpace)
@@ -496,6 +499,10 @@ namespace Locus.Storage
 
             if (selectedVolume.AvailableSpace <= 0)
                 throw new InsufficientStorageException("All storage volumes are full");
+
+            // Update cache (not CAS — last-writer-wins is fine here)
+            _cachedSelectedVolume = selectedVolume;
+            Interlocked.Exchange(ref _lastVolumeSelectionTicks, now);
 
             return selectedVolume;
         }

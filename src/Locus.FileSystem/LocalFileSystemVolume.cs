@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -21,15 +23,45 @@ namespace Locus.FileSystem
         private readonly string _volumeId;
         private readonly int _shardingDepth;
 
+        // --- Optimization 1: IsHealthy TTL cache ---
+        // Avoid file write+delete on every WriteFileAsync call.
+        // Only one thread performs the real check per TTL window (singleflight via CAS).
+        private volatile bool _cachedIsHealthy = true;
+        private long _lastHealthCheckTicks;          // Stopwatch ticks, Interlocked access
+        private readonly long _healthCacheDurationTicks;
+
+        // --- Optimization 1: AvailableSpace TTL cache ---
+        // Avoid DriveInfo.GetDrives() on every WriteFileAsync call.
+        private long _cachedAvailableSpace;          // Interlocked access
+        private long _cachedTotalCapacity;           // Interlocked access
+        private long _lastSpaceCheckTicks;           // Stopwatch ticks, Interlocked access
+        private readonly long _spaceCacheDurationTicks;
+
+        // --- Optimization 4: Known-directory cache ---
+        // Avoid Directory.Exists() stat on every write for already-created shard directories.
+        // Directories are permanent once created, so this cache never expires.
+        private readonly ConcurrentDictionary<string, byte> _knownDirectories;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="LocalFileSystemVolume"/> class.
         /// </summary>
+        /// <param name="fileSystem">The file system abstraction.</param>
+        /// <param name="logger">The logger.</param>
+        /// <param name="volumeId">Unique volume identifier.</param>
+        /// <param name="mountPath">Root directory of this volume.</param>
+        /// <param name="shardingDepth">Number of directory sharding levels (0–3). Default 2.</param>
+        /// <param name="healthCheckCacheDuration">
+        /// How long to cache IsHealthy and AvailableSpace results.
+        /// Eliminates the file-write+delete health probe and DriveInfo syscall on every write.
+        /// Default: 30 seconds. Pass <see cref="TimeSpan.Zero"/> to disable caching (original behavior).
+        /// </param>
         public LocalFileSystemVolume(
             IFileSystem fileSystem,
             ILogger<LocalFileSystemVolume> logger,
             string volumeId,
             string mountPath,
-            int shardingDepth = 2)
+            int shardingDepth = 2,
+            TimeSpan healthCheckCacheDuration = default)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -47,6 +79,19 @@ namespace Locus.FileSystem
             _mountPath = _fileSystem.Path.GetFullPath(mountPath);
             _shardingDepth = shardingDepth;
 
+            // Default TTL: 30 seconds
+            var cacheDuration = healthCheckCacheDuration == default
+                ? TimeSpan.FromSeconds(30)
+                : healthCheckCacheDuration;
+
+            // TimeSpan.Zero means no caching — set ticks to 0 so every call checks
+            _healthCacheDurationTicks = cacheDuration == TimeSpan.Zero
+                ? 0
+                : (long)(cacheDuration.TotalSeconds * Stopwatch.Frequency);
+            _spaceCacheDurationTicks = _healthCacheDurationTicks;
+
+            _knownDirectories = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+
             // Ensure mount path exists
             if (!_fileSystem.Directory.Exists(_mountPath))
             {
@@ -62,6 +107,9 @@ namespace Locus.FileSystem
                     throw;
                 }
             }
+
+            // Pre-populate mount path in known-directory cache
+            _knownDirectories.TryAdd(_mountPath, 0);
         }
 
         /// <inheritdoc/>
@@ -75,16 +123,9 @@ namespace Locus.FileSystem
         {
             get
             {
-                try
-                {
-                    var driveInfo = GetDriveInfo();
-                    return driveInfo?.TotalSize ?? 0;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to get total capacity for volume {VolumeId}", _volumeId);
-                    return 0;
-                }
+                // TotalCapacity shares the same cache refresh window as AvailableSpace
+                EnsureSpaceCacheRefreshed();
+                return Interlocked.Read(ref _cachedTotalCapacity);
             }
         }
 
@@ -93,16 +134,8 @@ namespace Locus.FileSystem
         {
             get
             {
-                try
-                {
-                    var driveInfo = GetDriveInfo();
-                    return driveInfo?.AvailableFreeSpace ?? 0;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to get available space for volume {VolumeId}", _volumeId);
-                    return 0;
-                }
+                EnsureSpaceCacheRefreshed();
+                return Interlocked.Read(ref _cachedAvailableSpace);
             }
         }
 
@@ -111,62 +144,131 @@ namespace Locus.FileSystem
         {
             get
             {
-                try
-                {
-                    // Check if mount path exists and is accessible
-                    if (!_fileSystem.Directory.Exists(_mountPath))
-                    {
-                        _logger.LogWarning("Mount path does not exist: {MountPath}", _mountPath);
-                        return false;
-                    }
+                if (_healthCacheDurationTicks == 0)
+                    return PerformHealthCheckInternal();
 
-                    // Check if we have available space
-                    var availableSpace = AvailableSpace;
-                    if (availableSpace <= 0)
-                    {
-                        _logger.LogWarning("No available space on volume {VolumeId}", _volumeId);
-                        return false;
-                    }
+                var now = Stopwatch.GetTimestamp();
+                var last = Interlocked.Read(ref _lastHealthCheckTicks);
 
-                    // Try to create and delete a test file with retry mechanism
-                    // This is important for network storage (NFS, Ceph, etc.) where directory
-                    // creation might need a moment to fully synchronize
-                    var testFilePath = _fileSystem.Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
-                    const int maxRetries = 3;
-                    const int retryDelayMs = 100;
+                // Within TTL: return cached result immediately (no I/O)
+                if (last != 0 && (now - last) < _healthCacheDurationTicks)
+                    return _cachedIsHealthy;
 
-                    for (int attempt = 1; attempt <= maxRetries; attempt++)
-                    {
-                        try
-                        {
-                            _fileSystem.File.WriteAllText(testFilePath, "health check");
-                            _fileSystem.File.Delete(testFilePath);
-                            return true; // Success
-                        }
-                        catch (Exception ex) when (attempt < maxRetries)
-                        {
-                            _logger.LogDebug(ex, "Health check write/delete test failed for volume {VolumeId} (attempt {Attempt}/{MaxRetries}), retrying...",
-                                _volumeId, attempt, maxRetries);
-                            System.Threading.Thread.Sleep(retryDelayMs);
-                        }
-                        catch (Exception ex)
-                        {
-                            // Final attempt failed
-                            _logger.LogWarning(ex, "Health check write/delete test failed for volume {VolumeId} after {MaxRetries} attempts",
-                                _volumeId, maxRetries);
-                            return false;
-                        }
-                    }
+                // Singleflight: only the CAS winner performs the real check.
+                // Losers return the (slightly stale) cached value — acceptable.
+                if (Interlocked.CompareExchange(ref _lastHealthCheckTicks, now, last) != last)
+                    return _cachedIsHealthy;
 
-                    return false;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Health check failed for volume {VolumeId}", _volumeId);
-                    return false;
-                }
+                var result = PerformHealthCheckInternal();
+                _cachedIsHealthy = result; // volatile write — visible to all threads
+                return result;
             }
         }
+
+        // ---------------------------------------------------------------------------
+        // Private helpers
+        // ---------------------------------------------------------------------------
+
+        /// <summary>
+        /// Refreshes cached AvailableSpace/TotalCapacity if the TTL has expired.
+        /// Uses singleflight: only one thread calls DriveInfo.GetDrives() per window.
+        /// </summary>
+        private void EnsureSpaceCacheRefreshed()
+        {
+            if (_spaceCacheDurationTicks == 0)
+            {
+                RefreshSpaceFromDrive();
+                return;
+            }
+
+            var now = Stopwatch.GetTimestamp();
+            var last = Interlocked.Read(ref _lastSpaceCheckTicks);
+
+            if (last != 0 && (now - last) < _spaceCacheDurationTicks)
+                return; // Still within TTL
+
+            if (Interlocked.CompareExchange(ref _lastSpaceCheckTicks, now, last) != last)
+                return; // Another thread is refreshing — use stale values for now
+
+            RefreshSpaceFromDrive();
+        }
+
+        private void RefreshSpaceFromDrive()
+        {
+            try
+            {
+                var driveInfo = GetDriveInfo();
+                Interlocked.Exchange(ref _cachedAvailableSpace, driveInfo?.AvailableFreeSpace ?? 0);
+                Interlocked.Exchange(ref _cachedTotalCapacity, driveInfo?.TotalSize ?? 0);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to get drive info for volume {VolumeId}", _volumeId);
+                // Leave cached values unchanged — use last known values
+            }
+        }
+
+        /// <summary>
+        /// Performs the real health check: directory exists + write/delete probe.
+        /// Result is cached by the caller for <see cref="_healthCacheDurationTicks"/>.
+        /// </summary>
+        private bool PerformHealthCheckInternal()
+        {
+            try
+            {
+                if (!_fileSystem.Directory.Exists(_mountPath))
+                {
+                    _logger.LogWarning("Mount path does not exist: {MountPath}", _mountPath);
+                    return false;
+                }
+
+                EnsureSpaceCacheRefreshed();
+                if (Interlocked.Read(ref _cachedAvailableSpace) <= 0)
+                {
+                    _logger.LogWarning("No available space on volume {VolumeId}", _volumeId);
+                    return false;
+                }
+
+                var testFilePath = _fileSystem.Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
+                const int maxRetries = 3;
+                const int retryDelayMs = 100;
+
+                for (int attempt = 1; attempt <= maxRetries; attempt++)
+                {
+                    try
+                    {
+                        _fileSystem.File.WriteAllText(testFilePath, "health check");
+                        _fileSystem.File.Delete(testFilePath);
+                        return true;
+                    }
+                    catch (Exception ex) when (attempt < maxRetries)
+                    {
+                        _logger.LogDebug(ex,
+                            "Health check write/delete test failed for volume {VolumeId} (attempt {Attempt}/{MaxRetries}), retrying...",
+                            _volumeId, attempt, maxRetries);
+                        System.Threading.Thread.Sleep(retryDelayMs);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Health check write/delete test failed for volume {VolumeId} after {MaxRetries} attempts",
+                            _volumeId, maxRetries);
+                        return false;
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Health check failed for volume {VolumeId}", _volumeId);
+                return false;
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // IStorageVolume I/O methods
+        // ---------------------------------------------------------------------------
 
         /// <inheritdoc/>
         public async Task<Stream> ReadAsync(string path, CancellationToken ct)
@@ -174,20 +276,14 @@ namespace Locus.FileSystem
             if (string.IsNullOrWhiteSpace(path))
                 throw new ArgumentException("Path cannot be empty", nameof(path));
 
-            // Validate path safety
             if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
-            {
                 throw new InvalidOperationException($"Path is outside volume mount path: {path}");
-            }
 
             if (!_fileSystem.File.Exists(path))
-            {
                 throw new FileNotFoundException($"File not found: {path}");
-            }
 
             try
             {
-                // Return a stream that can be read asynchronously
                 var stream = _fileSystem.File.OpenRead(path);
                 _logger.LogDebug("Opened file for reading: {Path}", path);
                 return await Task.FromResult(stream);
@@ -208,25 +304,25 @@ namespace Locus.FileSystem
             if (content == null)
                 throw new ArgumentNullException(nameof(content));
 
-            // Validate path safety
             if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
-            {
                 throw new InvalidOperationException($"Path is outside volume mount path: {path}");
-            }
 
             try
             {
-                // Ensure directory exists
+                // Optimization 4: skip Directory.Exists() for directories we already know exist.
+                // Shard directories are created once and never deleted during normal operation.
                 var directory = _fileSystem.Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(directory) && !_fileSystem.Directory.Exists(directory))
+                if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory))
                 {
-                    _fileSystem.Directory.CreateDirectory(directory!);
+                    if (!_fileSystem.Directory.Exists(directory))
+                        _fileSystem.Directory.CreateDirectory(directory!);
+
+                    _knownDirectories.TryAdd(directory, 0);
                 }
 
-                // Write content to file
                 using (var fileStream = _fileSystem.File.Create(path))
                 {
-                    await content.CopyToAsync(fileStream, 81920, ct); // 80KB buffer
+                    await content.CopyToAsync(fileStream, 81920, ct); // 80 KB buffer
                 }
 
                 _logger.LogDebug("Wrote file: {Path}, Size: {Size} bytes", path, content.Length);
@@ -244,16 +340,13 @@ namespace Locus.FileSystem
             if (string.IsNullOrWhiteSpace(path))
                 throw new ArgumentException("Path cannot be empty", nameof(path));
 
-            // Validate path safety
             if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
-            {
                 throw new InvalidOperationException($"Path is outside volume mount path: {path}");
-            }
 
             if (!_fileSystem.File.Exists(path))
             {
                 _logger.LogWarning("Attempted to delete non-existent file: {Path}", path);
-                return; // File doesn't exist, consider it deleted
+                return;
             }
 
             try
@@ -269,6 +362,10 @@ namespace Locus.FileSystem
             }
         }
 
+        // ---------------------------------------------------------------------------
+        // Drive info helper
+        // ---------------------------------------------------------------------------
+
         /// <summary>
         /// Gets the DriveInfo for the mount path.
         /// Cross-platform compatible: uses RootDirectory.FullName for matching on Linux.
@@ -277,20 +374,16 @@ namespace Locus.FileSystem
         {
             try
             {
-                // Get the root drive for the mount path
                 var root = _fileSystem.Path.GetPathRoot(_mountPath);
                 if (string.IsNullOrEmpty(root))
                     return null;
 
                 var drives = _fileSystem.DriveInfo.GetDrives();
 
-                // Try to match by RootDirectory.FullName first (works on both Windows and Linux)
-                // On Windows: Name="C:\", RootDirectory.FullName="C:\"
-                // On Linux: Name="/dev/sda1", RootDirectory.FullName="/"
+                // Try RootDirectory.FullName first (works on both Windows and Linux)
                 var drive = drives.FirstOrDefault(d =>
                     d.IsReady && d.RootDirectory.FullName.Equals(root, StringComparison.OrdinalIgnoreCase));
 
-                // Fallback to Name matching for backwards compatibility
                 if (drive == null)
                 {
                     drive = drives.FirstOrDefault(d =>
@@ -306,6 +399,10 @@ namespace Locus.FileSystem
             }
         }
 
+        // ---------------------------------------------------------------------------
+        // Path building
+        // ---------------------------------------------------------------------------
+
         /// <summary>
         /// Builds the physical path for a file with automatic directory sharding.
         /// Uses 2-character hex segments from fileKey as subdirectories (similar to FastDFS).
@@ -314,7 +411,7 @@ namespace Locus.FileSystem
         /// </summary>
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="fileKey">The file key (hex string).</param>
-        /// <param name="fileExtension">The file extension (e.g., ".pdf", ".docx"). If provided, it will be appended to the file key.</param>
+        /// <param name="fileExtension">The file extension (e.g., ".pdf"). If provided, appended to the file key.</param>
         /// <returns>The full physical path with sharding.</returns>
         public string BuildPhysicalPath(string tenantId, string fileKey, string? fileExtension = null)
         {
@@ -326,35 +423,24 @@ namespace Locus.FileSystem
 
             var pathParts = new List<string> { _mountPath, tenantId };
 
-            // Add shard directories based on fileKey (2 characters per level)
-            // ShardingDepth=0: {mount}/{tenant}/{fileKey}
-            // ShardingDepth=1: {mount}/{tenant}/a1/{fileKey}
-            // ShardingDepth=2: {mount}/{tenant}/a1/b2/{fileKey}
-            // ShardingDepth=3: {mount}/{tenant}/a1/b2/c3/{fileKey}
             for (int i = 0; i < _shardingDepth; i++)
             {
                 int startIndex = i * 2;
 
-                // Ensure we have at least 2 characters remaining
                 if (startIndex + 1 < fileKey.Length)
                 {
-                    var shardDir = fileKey.Substring(startIndex, 2).ToLowerInvariant();
-                    pathParts.Add(shardDir);
+                    pathParts.Add(fileKey.Substring(startIndex, 2).ToLowerInvariant());
                 }
                 else if (startIndex < fileKey.Length)
                 {
-                    // If only 1 character remains, pad with '0'
-                    var shardDir = (fileKey[startIndex].ToString() + "0").ToLowerInvariant();
-                    pathParts.Add(shardDir);
+                    pathParts.Add((fileKey[startIndex].ToString() + "0").ToLowerInvariant());
                 }
                 else
                 {
-                    // Not enough characters, stop creating shard directories
                     break;
                 }
             }
 
-            // Append file extension to the file key
             var fileNameWithExtension = string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension;
             pathParts.Add(fileNameWithExtension);
 
