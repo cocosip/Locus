@@ -97,13 +97,13 @@ namespace Locus.Storage.Data
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
 
-            // Write-behind: queue + semaphore so callers are never blocked by LiteDB latency
+            // Write-behind queue + semaphore (fields initialized here, task started LAST)
             _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
             _persistenceSignal = new SemaphoreSlim(0, int.MaxValue);
             _persistenceCts = new CancellationTokenSource();
-            _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
 
-            // Ensure metadata directory exists
+            // Ensure metadata directory exists before starting the background task,
+            // so that if CreateDirectory throws, the task is never started and cannot be orphaned.
             if (!_fileSystem.Directory.Exists(_metadataDirectory))
             {
                 _fileSystem.Directory.CreateDirectory(_metadataDirectory);
@@ -115,6 +115,12 @@ namespace Locus.Storage.Data
                 _liteDbOptions.EnableJournal,
                 _liteDbOptions.CheckpointInterval,
                 _liteDbOptions.TimeoutSeconds);
+
+            // Start background persistence loop LAST — all fields are fully initialized at this point.
+            // The task immediately blocks on _persistenceSignal.WaitAsync() and consumes no CPU
+            // until EnqueuePersistence() is called. Dispose() cancels _persistenceCts and waits
+            // for the task to drain remaining items before closing databases.
+            _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
         }
 
         /// <summary>
@@ -401,30 +407,17 @@ namespace Locus.Storage.Data
 
                 if (file != null)
                 {
-                    // Save original state for rollback
-                    var originalStatus = file.Status;
-                    var originalProcessingStartTime = file.ProcessingStartTime;
+                    // Update memory immediately (other threads polling under this same lock will
+                    // now see the file as Processing and skip it).
+                    file.Status = FileProcessingStatus.Processing;
+                    file.ProcessingStartTime = DateTime.UtcNow;
 
-                    try
-                    {
-                        // Update both memory and persistence atomically
-                        file.Status = FileProcessingStatus.Processing;
-                        file.ProcessingStartTime = DateTime.UtcNow;
+                    // Write-Behind: LiteDB updated asynchronously. If the process crashes before
+                    // the flush, the file's status in LiteDB is still Pending. On restart the
+                    // cleanup service will pick it up again (correct behavior — no data loss).
+                    EnqueuePersistence(new PersistenceOperation(file));
 
-                        // Persist to LiteDB
-                        var db = GetDatabase(tenantId);
-                        var files = db.GetCollection<FileMetadata>("files");
-                        files.Update(file);
-
-                        _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", file.FileKey, tenantId);
-                    }
-                    catch
-                    {
-                        // Rollback memory state on persistence failure
-                        file.Status = originalStatus;
-                        file.ProcessingStartTime = originalProcessingStartTime;
-                        throw;
-                    }
+                    _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", file.FileKey, tenantId);
                 }
 
                 return file;
@@ -465,41 +458,17 @@ namespace Locus.Storage.Data
             if (candidates.Count == 0)
                 return Task.FromResult<IEnumerable<FileMetadata>>(results);
 
-            var db = GetDatabase(tenantId);
-            var files = db.GetCollection<FileMetadata>("files");
-
-            // Save original states for rollback
-            var originalStates = new Dictionary<string, (FileProcessingStatus Status, DateTime? ProcessingStartTime)>();
-
-            try
+            // Write-Behind: update memory immediately, persist async.
+            // On crash, stuck Processing files are reset to Pending by the cleanup service.
+            foreach (var file in candidates)
             {
-                // Atomically mark all files as Processing
-                foreach (var file in candidates)
-                {
-                    originalStates[file.FileKey] = (file.Status, file.ProcessingStartTime);
-
-                    file.Status = FileProcessingStatus.Processing;
-                    file.ProcessingStartTime = DateTime.UtcNow;
-                    files.Update(file);
-                    results.Add(file);
-                }
-
-                _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
+                file.Status = FileProcessingStatus.Processing;
+                file.ProcessingStartTime = DateTime.UtcNow;
+                EnqueuePersistence(new PersistenceOperation(file));
+                results.Add(file);
             }
-            catch
-            {
-                // Rollback all memory states on any failure
-                foreach (var kvp in originalStates)
-                {
-                    var file = cache.Values.FirstOrDefault(f => f.FileKey == kvp.Key);
-                    if (file != null)
-                    {
-                        file.Status = kvp.Value.Status;
-                        file.ProcessingStartTime = kvp.Value.ProcessingStartTime;
-                    }
-                }
-                throw;
-            }
+
+            _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
 
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
         }

@@ -115,9 +115,8 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Need to find the metadata across all tenants to get tenantId
-            var allMetadata = await _repository.GetAllAsync(ct);
-            var metadata = allMetadata.FirstOrDefault(m => m.FileKey == fileKey);
+            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
             {

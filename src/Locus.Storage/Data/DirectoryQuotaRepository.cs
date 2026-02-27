@@ -14,6 +14,8 @@ namespace Locus.Storage.Data
 {
     /// <summary>
     /// Repository for directory quota storage using per-tenant LiteDB with in-memory caching.
+    /// Hot path (TryIncrementAsync / DecrementAsync) is lock-free using CAS atomic counters.
+    /// LiteDB writes are deferred via a Write-Behind timer (every 5 seconds) for performance.
     /// Thread-safe for concurrent access.
     /// </summary>
     public class DirectoryQuotaRepository : IDisposable
@@ -23,15 +25,42 @@ namespace Locus.Storage.Data
         private readonly string _quotaDirectory;
         private readonly LiteDBOptions _liteDbOptions;
 
-        // Per-tenant in-memory cache
+        // Per-tenant in-memory cache (source of truth for MaxCount / Enabled config)
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>> _quotaCache;
 
         // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
 
-        // Per-tenant operation locks (shared by normal operations, optimization, and rebuild)
+        // Per-tenant operation locks (used for config operations; NOT used in hot path)
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
         private static readonly AsyncLocal<HashSet<string>> _tenantLockBypass = new AsyncLocal<HashSet<string>>();
+
+        // --- Write-Behind: atomic counters + background flush timer ---
+
+        /// <summary>
+        /// Per-tenant atomic counter state for lock-free hot path.
+        /// Count is the authoritative live value; LiteDB is updated asynchronously.
+        /// </summary>
+        private sealed class AtomicQuotaState
+        {
+            /// <summary>Live file count. Use Interlocked operations only.</summary>
+            public int Count;
+
+            /// <summary>Maximum allowed count (0 = unlimited). Updated by UpdateAsync.</summary>
+            public volatile int MaxCount;
+
+            /// <summary>Whether quota enforcement is active. Updated by UpdateAsync.</summary>
+            public volatile bool Enabled;
+
+            /// <summary>True when Count has changed since last LiteDB flush.</summary>
+            public volatile bool Dirty;
+        }
+
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>> _atomicCounters;
+        private readonly Timer _flushTimer;
+        private const int FlushIntervalMs = 5_000; // 5 seconds
+
+        // ---
 
         private bool _disposed;
 
@@ -55,6 +84,7 @@ namespace Locus.Storage.Data
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _atomicCounters = new ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>>();
 
             // Ensure quota directory exists
             if (!_fileSystem.Directory.Exists(_quotaDirectory))
@@ -68,6 +98,9 @@ namespace Locus.Storage.Data
                 _liteDbOptions.EnableJournal,
                 _liteDbOptions.CheckpointInterval,
                 _liteDbOptions.TimeoutSeconds);
+
+            // Start the Write-Behind flush timer (non-reentrant: fires once then reschedules)
+            _flushTimer = new Timer(FlushDirtyCounters, null, FlushIntervalMs, Timeout.Infinite);
         }
 
         /// <summary>
@@ -182,7 +215,8 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Gets or creates a tenant-specific lock shared by all quota operations.
+        /// Gets or creates a tenant-specific lock shared by config operations.
+        /// NOT used in the hot path (TryIncrementAsync / DecrementAsync).
         /// </summary>
         private SemaphoreSlim GetTenantLock(string tenantId)
         {
@@ -369,8 +403,175 @@ namespace Locus.Storage.Data
             });
         }
 
+        // -----------------------------------------------------------------
+        // Write-Behind: atomic counter state helpers
+        // -----------------------------------------------------------------
+
+        /// <summary>
+        /// Gets or creates the <see cref="AtomicQuotaState"/> for a directory.
+        /// Initializes Count / MaxCount / Enabled from the persisted cache on first access.
+        /// This is lock-free and safe for concurrent calls.
+        /// </summary>
+        private AtomicQuotaState GetOrCreateAtomicState(string tenantId, string directoryPath)
+        {
+            // Ensure the database is open and _quotaCache is populated.
+            // (No-op after first call per tenant due to Lazy.)
+            GetDatabase(tenantId);
+
+            var tenantCounters = _atomicCounters.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, AtomicQuotaState>());
+
+            return tenantCounters.GetOrAdd(directoryPath, path =>
+            {
+                // Initialize from the persisted cache so restarts pick up the last flushed count.
+                int initialCount = 0;
+                int maxCount = 0;
+                bool enabled = true;
+
+                if (_quotaCache.TryGetValue(tenantId, out var tenantCache)
+                    && tenantCache.TryGetValue(path, out var existing))
+                {
+                    initialCount = existing.CurrentCount;
+                    maxCount = existing.MaxCount;
+                    enabled = existing.Enabled;
+                }
+
+                return new AtomicQuotaState
+                {
+                    Count = initialCount,
+                    MaxCount = maxCount,
+                    Enabled = enabled,
+                    Dirty = false
+                };
+            });
+        }
+
+        /// <summary>
+        /// Returns a <see cref="DirectoryQuota"/> snapshot where CurrentCount reflects the
+        /// live atomic count if available, falling back to the cached (possibly stale) count.
+        /// MaxCount and Enabled are also taken from atomic state when present.
+        /// </summary>
+        private DirectoryQuota MergeWithLiveCount(string tenantId, DirectoryQuota quota)
+        {
+            if (_atomicCounters.TryGetValue(tenantId, out var tenantCounters)
+                && tenantCounters.TryGetValue(quota.DirectoryPath, out var state))
+            {
+                return new DirectoryQuota
+                {
+                    DirectoryPath = quota.DirectoryPath,
+                    CurrentCount = Volatile.Read(ref state.Count),
+                    MaxCount = state.MaxCount,
+                    Enabled = state.Enabled,
+                    CreatedAt = quota.CreatedAt,
+                    LastUpdated = quota.LastUpdated
+                };
+            }
+
+            return quota;
+        }
+
+        // -----------------------------------------------------------------
+        // Write-Behind: background flush timer
+        // -----------------------------------------------------------------
+
+        /// <summary>
+        /// Timer callback: flushes all dirty atomic counters to LiteDB.
+        /// Non-reentrant: uses Timeout.Infinite period and reschedules after completion.
+        /// </summary>
+        private void FlushDirtyCounters(object? state)
+        {
+            if (_disposed)
+                return;
+
+            try
+            {
+                DoFlushAllDirtyCounters();
+            }
+            finally
+            {
+                if (!_disposed)
+                    _flushTimer.Change(FlushIntervalMs, Timeout.Infinite);
+            }
+        }
+
+        /// <summary>
+        /// Core flush logic: iterates all tenants and writes dirty counter states to LiteDB.
+        /// Safe to call from Dispose for a final drain.
+        /// </summary>
+        private void DoFlushAllDirtyCounters()
+        {
+            foreach (var tenantPair in _atomicCounters)
+            {
+                var tenantId = tenantPair.Key;
+                var tenantCounters = tenantPair.Value;
+
+                foreach (var dirPair in tenantCounters)
+                {
+                    var directoryPath = dirPair.Key;
+                    var atomicState = dirPair.Value;
+
+                    if (!atomicState.Dirty)
+                        continue;
+
+                    try
+                    {
+                        // Clear dirty BEFORE reading count so any concurrent increments that
+                        // happen during the LiteDB write will mark Dirty=true again and be
+                        // captured in the next flush cycle.
+                        atomicState.Dirty = false;
+                        var count = Volatile.Read(ref atomicState.Count);
+
+                        // Get or create the cache entry; if it doesn't exist yet (first-ever
+                        // increment for this directory before GetOrCreateAsync was called),
+                        // create a minimal entry so we can persist it.
+                        var cache = _quotaCache.GetOrAdd(
+                            tenantId,
+                            _ => new ConcurrentDictionary<string, DirectoryQuota>());
+
+                        var quota = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
+                        {
+                            DirectoryPath = path,
+                            CurrentCount = count,
+                            MaxCount = atomicState.MaxCount,
+                            Enabled = atomicState.Enabled,
+                            CreatedAt = DateTime.UtcNow,
+                            LastUpdated = DateTime.UtcNow
+                        });
+
+                        // Update the cached entry in-place with the live count.
+                        quota.CurrentCount = count;
+                        quota.LastUpdated = DateTime.UtcNow;
+
+                        // Persist to LiteDB.
+                        var db = GetDatabase(tenantId);
+                        var quotas = db.GetCollection<DirectoryQuota>("quotas");
+                        quotas.Upsert(quota);
+
+                        _logger.LogDebug(
+                            "Flushed quota counter for {TenantId}/{DirectoryPath}: count={Count}",
+                            tenantId, directoryPath, count);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Failed to flush quota counter for {TenantId}/{DirectoryPath}; will retry on next flush",
+                            tenantId, directoryPath);
+
+                        // Re-mark dirty so the next flush retries.
+                        atomicState.Dirty = true;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Public API
+        // -----------------------------------------------------------------
+
         /// <summary>
         /// Gets or creates a directory quota.
+        /// Returns a snapshot with the live current count from the atomic state.
         /// </summary>
         public async Task<DirectoryQuota> GetOrCreateAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
@@ -383,7 +584,8 @@ namespace Locus.Storage.Data
             var tenantLock = await AcquireTenantLockIfNeededAsync(tenantId, ct);
             try
             {
-                return GetOrCreateNoLock(tenantId, directoryPath);
+                var quota = GetOrCreateNoLock(tenantId, directoryPath);
+                return MergeWithLiveCount(tenantId, quota);
             }
             finally
             {
@@ -393,6 +595,7 @@ namespace Locus.Storage.Data
 
         /// <summary>
         /// Gets a directory quota by path.
+        /// Returns a snapshot with the live current count from the atomic state.
         /// </summary>
         public async Task<DirectoryQuota?> GetAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
@@ -406,8 +609,10 @@ namespace Locus.Storage.Data
             try
             {
                 var cache = GetCache(tenantId);
-                cache.TryGetValue(directoryPath, out var quota);
-                return quota;
+                if (!cache.TryGetValue(directoryPath, out var quota))
+                    return null;
+
+                return MergeWithLiveCount(tenantId, quota);
             }
             finally
             {
@@ -416,9 +621,9 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Updates a directory quota.
-        /// Thread-safe: Persists to LiteDB first, then updates memory cache.
-        /// Auto-recovery: Rebuilds corrupted database and retries on LiteDB errors.
+        /// Updates a directory quota config (MaxCount, Enabled).
+        /// Persists to LiteDB immediately and syncs the atomic state so the hot path
+        /// picks up the new limit without waiting for the next flush.
         /// </summary>
         public async Task UpdateAsync(string tenantId, DirectoryQuota quota, CancellationToken ct)
         {
@@ -437,7 +642,17 @@ namespace Locus.Storage.Data
                 quota.LastUpdated = DateTime.UtcNow;
                 PersistQuotaWithRecoveryNoLock(tenantId, quota, useUpsert: true);
 
-                _logger.LogDebug("Updated quota for directory: {DirectoryPath}, Tenant: {TenantId}, Current: {Current}, Max: {Max}",
+                // Propagate config changes to atomic state so the hot-path CAS check
+                // uses the updated limit immediately (without waiting for restart).
+                if (_atomicCounters.TryGetValue(tenantId, out var tenantCounters)
+                    && tenantCounters.TryGetValue(quota.DirectoryPath, out var state))
+                {
+                    state.MaxCount = quota.MaxCount;
+                    state.Enabled = quota.Enabled;
+                }
+
+                _logger.LogDebug(
+                    "Updated quota for directory: {DirectoryPath}, Tenant: {TenantId}, Current: {Current}, Max: {Max}",
                     quota.DirectoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
             }
             finally
@@ -448,9 +663,11 @@ namespace Locus.Storage.Data
 
         /// <summary>
         /// Atomically increments the file count for a directory.
-        /// Returns false if the increment would exceed the maximum count.
+        /// Lock-free hot path: uses CAS (compare-and-swap) on the atomic counter.
+        /// LiteDB is updated asynchronously by the Write-Behind timer.
+        /// Returns false if the increment would exceed the configured maximum count.
         /// </summary>
-        public async Task<bool> TryIncrementAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task<bool> TryIncrementAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -458,50 +675,52 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(directoryPath))
                 throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
 
-            var tenantLock = await AcquireTenantLockIfNeededAsync(tenantId, ct);
-            try
+            var state = GetOrCreateAtomicState(tenantId, directoryPath);
+
+            // Fast-path: no limit configured or quota disabled — always allow.
+            if (!state.Enabled || state.MaxCount == 0)
             {
-                var quota = GetOrCreateNoLock(tenantId, directoryPath);
+                Interlocked.Increment(ref state.Count);
+                state.Dirty = true;
+                return Task.FromResult(true);
+            }
 
-                // If quota is disabled or no limit set, allow increment
-                if (!quota.Enabled || quota.MaxCount == 0)
+            // CAS check-and-increment: ensures no two threads can both read the same
+            // count and both succeed when the count is already at the limit.
+            SpinWait spin = default;
+            while (true)
+            {
+                int cur = Volatile.Read(ref state.Count);
+
+                if (cur >= state.MaxCount)
                 {
-                    quota.CurrentCount++;
-                    quota.LastUpdated = DateTime.UtcNow;
-
-                    PersistQuotaWithRecoveryNoLock(tenantId, quota, useUpsert: false);
-                    return true;
+                    _logger.LogWarning(
+                        "Cannot increment directory {DirectoryPath} for tenant {TenantId}: limit {MaxCount} reached",
+                        directoryPath, tenantId, state.MaxCount);
+                    return Task.FromResult(false);
                 }
 
-                // Check if incrementing would exceed limit
-                if (quota.CurrentCount >= quota.MaxCount)
-                {
-                    _logger.LogWarning("Cannot increment directory {DirectoryPath} for tenant {TenantId}: limit {MaxCount} reached",
-                        directoryPath, tenantId, quota.MaxCount);
-                    return false;
-                }
+                if (Interlocked.CompareExchange(ref state.Count, cur + 1, cur) == cur)
+                    break;
 
-                // Increment count
-                quota.CurrentCount++;
-                quota.LastUpdated = DateTime.UtcNow;
-
-                PersistQuotaWithRecoveryNoLock(tenantId, quota, useUpsert: false);
-
-                _logger.LogDebug("Incremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
-                    directoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
-
-                return true;
+                spin.SpinOnce();
             }
-            finally
-            {
-                tenantLock?.Release();
-            }
+
+            state.Dirty = true;
+
+            _logger.LogDebug(
+                "Incremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
+                directoryPath, tenantId, Volatile.Read(ref state.Count), state.MaxCount);
+
+            return Task.FromResult(true);
         }
 
         /// <summary>
         /// Atomically decrements the file count for a directory.
+        /// Lock-free hot path: uses CAS on the atomic counter.
+        /// LiteDB is updated asynchronously by the Write-Behind timer.
         /// </summary>
-        public async Task DecrementAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task DecrementAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -509,36 +728,40 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(directoryPath))
                 throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
 
-            var tenantLock = await AcquireTenantLockIfNeededAsync(tenantId, ct);
-            try
+            var state = GetOrCreateAtomicState(tenantId, directoryPath);
+
+            // CAS decrement: don't go below 0.
+            SpinWait spin = default;
+            while (true)
             {
-                var quota = GetOrCreateNoLock(tenantId, directoryPath);
+                int cur = Volatile.Read(ref state.Count);
 
-                // Decrement count (don't go below 0)
-                if (quota.CurrentCount > 0)
+                if (cur <= 0)
                 {
-                    quota.CurrentCount--;
-                    quota.LastUpdated = DateTime.UtcNow;
-
-                    PersistQuotaWithRecoveryNoLock(tenantId, quota, useUpsert: false);
-
-                    _logger.LogDebug("Decremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
-                        directoryPath, tenantId, quota.CurrentCount, quota.MaxCount);
-                }
-                else
-                {
-                    _logger.LogWarning("Attempted to decrement count for directory {DirectoryPath}, Tenant: {TenantId} but count is already 0",
+                    _logger.LogWarning(
+                        "Attempted to decrement count for directory {DirectoryPath}, Tenant: {TenantId} but count is already 0",
                         directoryPath, tenantId);
+                    return Task.CompletedTask;
                 }
+
+                if (Interlocked.CompareExchange(ref state.Count, cur - 1, cur) == cur)
+                    break;
+
+                spin.SpinOnce();
             }
-            finally
-            {
-                tenantLock?.Release();
-            }
+
+            state.Dirty = true;
+
+            _logger.LogDebug(
+                "Decremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
+                directoryPath, tenantId, Volatile.Read(ref state.Count), state.MaxCount);
+
+            return Task.CompletedTask;
         }
 
         /// <summary>
         /// Gets all directory quotas for a tenant.
+        /// Each entry's CurrentCount reflects the live atomic value.
         /// </summary>
         public async Task<IEnumerable<DirectoryQuota>> GetAllAsync(string tenantId, CancellationToken ct)
         {
@@ -549,7 +772,14 @@ namespace Locus.Storage.Data
             try
             {
                 var cache = GetCache(tenantId);
-                return cache.Values.ToList();
+                var result = new List<DirectoryQuota>(cache.Count);
+
+                foreach (var quota in cache.Values)
+                {
+                    result.Add(MergeWithLiveCount(tenantId, quota));
+                }
+
+                return result;
             }
             finally
             {
@@ -577,6 +807,10 @@ namespace Locus.Storage.Data
 
                 if (removed)
                 {
+                    // Also remove atomic state so a future GetOrCreateAtomicState reinitializes cleanly.
+                    if (_atomicCounters.TryGetValue(tenantId, out var tenantCounters))
+                        tenantCounters.TryRemove(directoryPath, out _);
+
                     // Remove from LiteDB
                     var db = GetDatabase(tenantId);
                     var quotas = db.GetCollection<DirectoryQuota>("quotas");
@@ -598,9 +832,6 @@ namespace Locus.Storage.Data
         /// This method is thread-safe and will block all operations for this tenant during optimization.
         /// WARNING: This is a heavy operation. Should be called during maintenance windows.
         /// </summary>
-        /// <param name="tenantId">The tenant ID whose database should be optimized.</param>
-        /// <param name="ct">Cancellation token.</param>
-        /// <returns>Tuple of (size before, size after) in bytes.</returns>
         public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
         {
             var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tenantId}-quotas.db");
@@ -646,9 +877,6 @@ namespace Locus.Storage.Data
         /// Thread-safe: Acquires exclusive lock for this tenant, blocking all operations.
         /// IMPORTANT: Caller must call FinishDatabaseRebuild() to release the lock.
         /// </summary>
-        /// <param name="tenantId">The tenant ID.</param>
-        /// <param name="ct">Cancellation token.</param>
-        /// <returns>Path to the backup file, or null if no database exists.</returns>
         public async Task<string?> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
@@ -679,7 +907,6 @@ namespace Locus.Storage.Data
         /// Finishes database rebuild by releasing the tenant lock.
         /// IMPORTANT: Must be called after BeginDatabaseRebuildAsync() to unblock operations.
         /// </summary>
-        /// <param name="tenantId">The tenant ID.</param>
         public void FinishDatabaseRebuild(string tenantId)
         {
             if (_tenantLocks.TryGetValue(tenantId, out var tenantLock))
@@ -691,7 +918,8 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Disposes the repository and closes all databases.
+        /// Disposes the repository: stops the flush timer, performs a final LiteDB flush of all
+        /// dirty counters, and closes all database connections.
         /// </summary>
         public void Dispose()
         {
@@ -700,16 +928,26 @@ namespace Locus.Storage.Data
 
             _disposed = true;
 
+            // Stop the timer to prevent new callbacks from being scheduled.
+            _flushTimer.Dispose();
+
+            // Final flush: persist any remaining dirty counters before closing databases.
+            try
+            {
+                DoFlushAllDirtyCounters();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during final quota counter flush on dispose");
+            }
+
             // Close all databases
             foreach (var lazyDb in _databases.Values)
             {
                 try
                 {
-                    // Only dispose if the Lazy value was actually created
                     if (lazyDb.IsValueCreated)
-                    {
                         lazyDb.Value?.Dispose();
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -719,6 +957,7 @@ namespace Locus.Storage.Data
 
             _databases.Clear();
             _quotaCache.Clear();
+            _atomicCounters.Clear();
 
             // Dispose all tenant locks
             foreach (var lockSem in _tenantLocks.Values)
