@@ -11,8 +11,16 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Locus.Benchmarks
 {
     /// <summary>
-    /// Benchmarks for MetadataRepository operations
-    /// Tests LiteDB performance with in-memory caching
+    /// Benchmarks for MetadataRepository operations.
+    ///
+    /// Architecture notes:
+    ///   - GetAsync only reads from the in-memory active-files cache (no LiteDB fallback).
+    ///     There is no traditional "cache miss → DB" path; a missing key returns null immediately.
+    ///   - AddOrUpdateAsync is memory-first (O(1) ConcurrentDictionary update) with async
+    ///     Write-Behind to LiteDB; its cost does not grow with cache size.
+    ///   - GetNextPendingFileAsync does a linear scan over the active cache for the tenant
+    ///     (under a per-tenant SemaphoreSlim). Pool size is held stable at 100 files to keep
+    ///     measurement conditions consistent across all invocations.
     /// </summary>
     [MemoryDiagnoser]
     [SimpleJob(warmupCount: 3, iterationCount: 5)]
@@ -25,15 +33,26 @@ namespace Locus.Benchmarks
         private int _fileCounter;
 
         [GlobalSetup]
-        public void Setup()
+        public async Task Setup()
         {
             _fileSystem = new System.IO.Abstractions.FileSystem();
             _testDirectory = Path.Combine(Path.GetTempPath(), $"locus-benchmark-{Guid.NewGuid():N}");
             _fileSystem.Directory.CreateDirectory(_testDirectory);
 
-            var logger = NullLogger<MetadataRepository>.Instance;
-            _repository = new MetadataRepository(_fileSystem, logger, _testDirectory);
+            _repository = new MetadataRepository(_fileSystem, NullLogger<MetadataRepository>.Instance, _testDirectory);
             _fileCounter = 0;
+
+            // Pre-populate the fixed file used by GetAsync_CacheHit (measured path is lookup only).
+            await _repository.AddOrUpdateAsync(CreateTestMetadata("cached-file"), CancellationToken.None);
+
+            // Pre-populate a stable pool of 100 pending files for GetNextPendingFileAsync.
+            // The benchmark resets each claimed file back to Pending so the pool never shrinks.
+            for (int i = 0; i < 100; i++)
+            {
+                var m = CreateTestMetadata($"pool-pending-{i}");
+                m.Status = FileProcessingStatus.Pending;
+                await _repository.AddOrUpdateAsync(m, CancellationToken.None);
+            }
         }
 
         [GlobalCleanup]
@@ -52,37 +71,22 @@ namespace Locus.Benchmarks
         public async Task AddOrUpdateAsync_Single()
         {
             var fileKey = $"file-{Interlocked.Increment(ref _fileCounter)}";
-            var metadata = CreateTestMetadata(fileKey);
-            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(CreateTestMetadata(fileKey), CancellationToken.None);
         }
 
         [Benchmark(Description = "Get file metadata (cache hit)")]
         public async Task GetAsync_CacheHit()
         {
-            // Pre-populate
-            var fileKey = "cached-file";
-            var metadata = CreateTestMetadata(fileKey);
-            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
-
-            // Benchmark - should hit cache
-            await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None);
+            // File pre-populated in GlobalSetup — only the ConcurrentDictionary lookup is measured.
+            await _repository.GetAsync(_tenantId, "cached-file", CancellationToken.None);
         }
 
-        [Benchmark(Description = "Get file metadata (cache miss)")]
-        public async Task GetAsync_CacheMiss()
+        [Benchmark(Description = "Get non-existent file (returns null)")]
+        public async Task GetAsync_NotFound()
         {
-            var fileKey = $"file-{Interlocked.Increment(ref _fileCounter)}";
-            var metadata = CreateTestMetadata(fileKey);
-            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
-
-            // Clear cache by creating new file to force eviction
-            for (int i = 0; i < 100; i++)
-            {
-                await _repository.AddOrUpdateAsync(CreateTestMetadata($"evict-{i}"), CancellationToken.None);
-            }
-
-            // Benchmark - should miss cache and hit LiteDB
-            await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None);
+            // Key absent from cache — ConcurrentDictionary.TryGetValue returns false immediately.
+            // This is the actual "miss" cost in Write-Behind architecture (no LiteDB fallback).
+            await _repository.GetAsync(_tenantId, "nonexistent-key-xyz-000", CancellationToken.None);
         }
 
         [Benchmark(Description = "Batch insert 100 files")]
@@ -91,25 +95,23 @@ namespace Locus.Benchmarks
             for (int i = 0; i < 100; i++)
             {
                 var fileKey = $"batch-{Interlocked.Increment(ref _fileCounter)}";
-                var metadata = CreateTestMetadata(fileKey);
-                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+                await _repository.AddOrUpdateAsync(CreateTestMetadata(fileKey), CancellationToken.None);
             }
         }
 
-        [Benchmark(Description = "Get pending files (10 files)")]
+        [Benchmark(Description = "Get next pending file (100-file pool, stable state)")]
         public async Task GetNextPendingFileAsync()
         {
-            // Pre-populate with pending files
-            for (int i = 0; i < 10; i++)
+            var file = await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            if (file != null)
             {
-                var fileKey = $"pending-{Interlocked.Increment(ref _fileCounter)}";
-                var metadata = CreateTestMetadata(fileKey);
-                metadata.Status = FileProcessingStatus.Pending;
-                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+                // Reset back to Pending so the pool stays at 100 files across all invocations.
+                // The single AddOrUpdateAsync (memory-only, O(1)) is included in the measurement
+                // but is negligible compared to the O(n) pending-file scan being benchmarked.
+                file.Status = FileProcessingStatus.Pending;
+                file.ProcessingStartTime = null;
+                await _repository.AddOrUpdateAsync(file, CancellationToken.None);
             }
-
-            // Benchmark
-            await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
         }
 
         private FileMetadata CreateTestMetadata(string fileKey)

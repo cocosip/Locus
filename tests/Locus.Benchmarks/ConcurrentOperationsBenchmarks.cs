@@ -22,7 +22,7 @@ namespace Locus.Benchmarks
     /// Tests multi-threaded read/write performance
     /// </summary>
     [MemoryDiagnoser]
-    [SimpleJob(warmupCount: 2, iterationCount: 3)]
+    [SimpleJob(warmupCount: 3, iterationCount: 10)]
     public class ConcurrentOperationsBenchmarks : IDisposable
     {
         private IFileSystem _fileSystem;

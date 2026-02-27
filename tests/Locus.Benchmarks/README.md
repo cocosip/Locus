@@ -51,12 +51,12 @@ dotnet run -c Release --filter "*AddOrUpdateAsync_Single*"
 ## 基准测试类说明
 
 ### 1. MetadataRepositoryBenchmarks
-测试文件元数据仓库的性能:
-- **AddOrUpdate single file metadata**: 单个文件元数据的添加/更新性能
-- **Get file metadata (cache hit)**: 缓存命中时的元数据查询性能
-- **Get file metadata (cache miss)**: 缓存未命中时的元数据查询性能
+测试文件元数据仓库的性能（Write-Behind + `_pendingKeys` 索引架构）:
+- **AddOrUpdate single file metadata**: 单个文件元数据的添加/更新性能（内存优先，O(1)）
+- **Get file metadata (cache hit)**: 缓存命中时的元数据查询性能（纯 ConcurrentDictionary 查找）
+- **Get non-existent file (returns null)**: 查询不存在的 key 的性能（无 LiteDB fallback，直接返回 null）
 - **Batch insert 100 files**: 批量插入100个文件的性能
-- **Get pending files**: 获取待处理文件的性能
+- **Get next pending file (100-file pool, stable state)**: 从固定100文件池中获取下一个待处理文件（`_pendingKeys` O(n_pending) 扫描）
 
 ### 2. DirectoryQuotaBenchmarks
 测试目录配额管理的性能:
@@ -125,24 +125,24 @@ BenchmarkDotNet 会输出以下关键指标:
 | 1 MB | 1.296 ms | 0.023 ms | 7.34 KB |
 | 10 MB | 4.736 ms | 0.400 ms | 12.55 KB |
 
-### StoragePool 并发写入扩展性（100 KB/文件）
+### StoragePool 并发写入扩展性（1 MB/文件，iterationCount=10）
 
 | Concurrency | Mean | StdDev | Allocated |
 |-------------|------|--------|-----------|
-| 1 writer (baseline) | 2.950 ms | 0.737 ms | 33.39 KB |
-| 10 concurrent writers | 17.304 ms | 15.308 ms | 188.12 KB |
-| 50 concurrent writers | 116.147 ms | 20.466 ms | 764.13 KB |
-| 100 concurrent writers | 236.413 ms | 10.763 ms | 1363.16 KB |
+| 1 writer (baseline) | 2.839 ms | 0.350 ms | 77.04 KB |
+| 10 concurrent writers | 26.368 ms | 6.849 ms | 273.52 KB |
+| 50 concurrent writers | 113.463 ms | 10.608 ms | 701.02 KB |
+| 100 concurrent writers | 228.952 ms | 11.859 ms | 1163.76 KB |
 
-### 端到端并发场景
+### 端到端并发场景（iterationCount=10）
 
 | Method | threadCount | Mean | StdDev | Allocated |
 |--------|-------------|------|--------|-----------|
-| 10 concurrent reads | — | 9.749 ms | 0.924 ms | 1506.16 KB |
-| Mixed read/write (20 ops) | — | 8.510 ms | 0.696 ms | 1087.96 KB |
-| Concurrent writes | 10 | 3.019 ms | 0.123 ms | 430.14 KB |
-| Concurrent writes | 50 | 15.550 ms | 1.594 ms | 1881.82 KB |
-| Concurrent writes | 100 | 26.749 ms | 3.188 ms | 3127.94 KB |
+| 10 concurrent reads | — | 14.413 ms | 4.913 ms | 1520.69 KB |
+| Mixed read/write (20 ops) | — | 8.312 ms | 0.469 ms | 1157.40 KB |
+| Concurrent writes | 10 | 3.076 ms | 0.174 ms | 380.72 KB |
+| Concurrent writes | 50 | 14.249 ms | 1.270 ms | 1644.43 KB |
+| Concurrent writes | 100 | 25.319 ms | 1.970 ms | 2781.31 KB |
 
 ### 目录配额操作（Lock-Free CAS）
 
@@ -163,15 +163,15 @@ BenchmarkDotNet 会输出以下关键指标:
 | AvailableSpace (cached) | 22.33 ns | 0.029 ns | 0 B |
 | TotalCapacity (cached) | 22.32 ns | 0.022 ns | 0 B |
 
-### 元数据操作（Write-Behind 架构）
+### 元数据操作（Write-Behind + `_pendingKeys` 索引）
 
 | Method | Mean | StdDev | Allocated |
 |--------|------|--------|-----------|
-| AddOrUpdate single file | 1.376 μs | 17.36 ns | 1.4 KB |
-| Get file (cache hit) | 317.7 ns | 2.23 ns | 455 B |
-| Get file (cache miss) | 37.68 μs | 1.17 μs | 41.8 KB |
-| Batch insert 100 files | 162.9 μs | 15.63 μs | 55.5 KB |
-| Get pending files (10) | 5.886 ms | 1.369 ms | 1.89 MB |
+| AddOrUpdate single file | 1.878 μs | 121.9 ns | 2.4 KB |
+| Get file (cache hit) | 40.91 ns | 0.062 ns | 72 B |
+| Get non-existent file (returns null) | 34.87 ns | 0.017 ns | 0 B |
+| Batch insert 100 files | 237.9 μs | 17.73 μs | 63.4 KB |
+| Get next pending file (100-file pool) | 2.975 μs | 316.1 ns | 1.4 KB |
 
 ### 租户管理（5分钟缓存）
 
@@ -189,23 +189,27 @@ BenchmarkDotNet 会输出以下关键指标:
 
 - ⚡ **目录配额 CAS 无锁**: 94.80 ns 每次计数递增（vs 旧版 SemaphoreSlim + LiteDB 同步写入 ~200 μs，提升约 **2000x**）
 - ⚡ **Volume 健康/空间缓存**: 17–22 ns，消除每次写入的额外磁盘 I/O（旧版每次写入触发临时文件创建+删除）
-- ⚡ **元数据 Write-Behind**: 1.376 μs 每文件（内存优先，LiteDB 后台异步落盘）
+- ⚡ **元数据缓存命中**: 40.91 ns（纯 ConcurrentDictionary 查找，旧测量值 317.7 ns 因错误地把 AddOrUpdateAsync 计入测量范围而虚高）
+- ⚡ **元数据 Write-Behind**: 1.878 μs 每文件（内存优先，LiteDB 后台异步落盘）
+- ⚡ **`_pendingKeys` 索引**: GetNextPendingFileAsync 从 O(n_active) 全量扫描降为 O(n_pending) 线性扫描，旧测量值 5.886 ms 因状态累积严重失真，实际为 2.975 μs（100 文件池）
 - ⚡ **租户缓存**: 82–90 ns（5分钟缓存，远低于旧版 JSON 文件读取 ~24 μs）
 - ✅ **100 KB 文件写入**: ~1.1 ms 端到端（配额检查 + 磁盘写入 + 元数据）
-- ✅ **100 并发写入**: 236 ms 完成全部 100 个 100 KB 写入
+- ✅ **100 并发写入（1 MB/文件）**: 229 ms，StdDev 5.2%（iterationCount=10，统计更可靠）
 
-> **注意**: StoragePool 并发写入的 StdDev 较大，主要原因是 100 KB 文件写入时间本身较短（~1 ms），
-> 系统调度抖动对相对误差影响显著。绝对误差在可接受范围内。实际性能取决于硬件配置（CPU、磁盘类型: HDD vs SSD）。
+> **注意**: 并发写入 StdDev 受系统调度抖动影响。实际性能取决于硬件配置（CPU、磁盘类型: HDD vs SSD）。
+> `ConcurrentOperationsBenchmarks` 的 "10 concurrent reads" StdDev 较大（4.9 ms），
+> 原因是读取场景涉及磁盘 I/O，受操作系统缓存和调度影响较大；绝对误差仍在可接受范围。
 
 ## 优化建议
 
 根据基准测试结果，如遇到性能问题可考虑以下方向:
 
-1. **如果元数据查询慢**（缓存未命中 37 μs 过高）:
-   - 增大 MetadataRepository 的内存缓存容量，减少 LiteDB 读取频率
+1. **如果元数据查询慢**（cache hit > 100 ns，或 GetNextPendingFileAsync > 10 μs）:
+   - 检查 `_pendingKeys` 索引是否正常工作（应只扫描 Pending 文件，而非全量 active 文件）
+   - 如果 active 文件数量巨大（>10 万），考虑加快清理服务运行频率，及时清理 PermanentlyFailed 文件
    - 检查是否有大量 Completed 文件未及时清理，导致 LiteDB 数据库过大
 
-2. **如果并发写入慢**（> 236 ms / 100 写入）:
+2. **如果并发写入慢**（> 250 ms / 100 写入）:
    - 首要检查磁盘 I/O 吞吐量（100 KB 文件顺序写入 < 1.1 ms 是正常水平）
    - 考虑挂载多个存储 Volume 以分散 I/O 压力
    - 考虑使用 SSD 存储

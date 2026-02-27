@@ -132,7 +132,7 @@ namespace Locus.Benchmarks
     ///   dotnet run -c Release -- --filter "StoragePoolConcurrency*"
     /// </summary>
     [MemoryDiagnoser]
-    [SimpleJob(warmupCount: 2, iterationCount: 3)]
+    [SimpleJob(warmupCount: 3, iterationCount: 10)]
     public class StoragePoolConcurrencyBenchmarks : IDisposable
     {
         private const int FileSizeBytes = 1048576; // 1 MB — typical DICOM CT slice

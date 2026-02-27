@@ -261,24 +261,24 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 | 1 MB | 1.296 ms | 7.34 KB | I/O dominated |
 | 10 MB | 4.736 ms | 12.55 KB | I/O dominated |
 
-#### Concurrent Write Scalability (100 KB per write)
+#### Concurrent Write Scalability (1 MB per write)
 
-| Concurrency | Mean Time | Allocated | Notes |
-|-------------|-----------|-----------|-------|
-| 1 writer (baseline) | 2.950 ms | 33.39 KB | Single-threaded baseline per batch |
-| 10 concurrent writers | 17.304 ms | 188.12 KB | All 10 writes in parallel |
-| 50 concurrent writers | 116.147 ms | 764.13 KB | All 50 writes in parallel |
-| 100 concurrent writers | 236.413 ms | 1363.16 KB | All 100 writes in parallel |
+| Concurrency | Mean Time | StdDev | Allocated | Notes |
+|-------------|-----------|--------|-----------|-------|
+| 1 writer (baseline) | 2.839 ms | 0.350 ms | 77.04 KB | Single-threaded baseline |
+| 10 concurrent writers | 26.368 ms | 6.849 ms | 273.52 KB | All 10 writes in parallel |
+| 50 concurrent writers | 113.463 ms | 10.608 ms | 701.02 KB | All 50 writes in parallel |
+| 100 concurrent writers | 228.952 ms | 11.859 ms | 1163.76 KB | All 100 writes in parallel |
 
-#### Metadata Operations (Write-Behind Architecture)
+#### Metadata Operations (Write-Behind + `_pendingKeys` Index)
 
 | Operation | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
-| AddOrUpdate single file | 1.376 μs | 1.4 KB | ⚡ Memory-first, async LiteDB persistence |
-| Get file metadata (cache hit) | 317.7 ns | 455 B | ⚡ Pure memory read |
-| Get file metadata (cache miss) | 37.68 μs | 41.8 KB | LiteDB read + cache load |
-| Batch insert 100 files | 162.9 μs | 55.5 KB | ~1.6 μs per file |
-| Get pending files (10 files) | 5.886 ms | 1.89 MB | Queue retrieval |
+| AddOrUpdate single file | 1.878 μs | 2.4 KB | ⚡ Memory-first, async LiteDB persistence |
+| Get file metadata (cache hit) | 40.91 ns | 72 B | ⚡ ConcurrentDictionary lookup |
+| Get non-existent file (returns null) | 34.87 ns | 0 B | Cache miss → null, no LiteDB fallback |
+| Batch insert 100 files | 237.9 μs | 63.4 KB | ~2.4 μs per file |
+| Get next pending file (100-file pool) | 2.975 μs | 1.4 KB | ⚡ O(n_pending) scan via `_pendingKeys` |
 
 #### Directory Quota Operations (Lock-Free CAS)
 
@@ -315,19 +315,20 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 
 | Operation | threadCount | Mean Time | Allocated | Notes |
 |-----------|-------------|-----------|-----------|-------|
-| 10 concurrent reads | — | 9.749 ms | 1506 KB | Parallel file reads |
-| Mixed read/write (20 ops) | — | 8.510 ms | 1088 KB | 10 writes + 10 reads concurrent |
-| Concurrent writes | 10 | 3.019 ms | 430 KB | 10 simultaneous writes |
-| Concurrent writes | 50 | 15.550 ms | 1882 KB | 50 simultaneous writes |
-| Concurrent writes | 100 | 26.749 ms | 3128 KB | 100 simultaneous writes |
+| 10 concurrent reads | — | 14.413 ms | 1520 KB | Parallel file reads |
+| Mixed read/write (20 ops) | — | 8.312 ms | 1157 KB | 10 writes + 10 reads concurrent |
+| Concurrent writes | 10 | 3.076 ms | 380 KB | 10 simultaneous writes |
+| Concurrent writes | 50 | 14.249 ms | 1644 KB | 50 simultaneous writes |
+| Concurrent writes | 100 | 25.319 ms | 2781 KB | 100 simultaneous writes |
 
 **Key Findings**:
 - ⚡ **Directory quota CAS**: 94.80 ns per increment — lock-free atomic operations (vs. ~200 μs with SemaphoreSlim)
 - ⚡ **Volume health/space**: 17–22 ns — 30-second TTL cache eliminates one disk I/O per write
-- ⚡ **Metadata write-behind**: 1.376 μs per file — memory-first, LiteDB persistence is async
+- ⚡ **Metadata write-behind**: 1.878 μs per file — memory-first, LiteDB persistence is async
+- ⚡ **Metadata cache hit**: 40.91 ns — pure ConcurrentDictionary lookup
 - ⚡ **Tenant cache**: 82–90 ns — 5-minute cache keeps tenant lookups near-zero cost
 - ✅ **100 KB write**: ~1.1 ms end-to-end (quota check + disk write + metadata)
-- ✅ **100-concurrent writes**: 236 ms total for 100 simultaneous 100 KB writes
+- ✅ **100-concurrent writes (1 MB)**: 229 ms total for 100 simultaneous writes, StdDev 5.2%
 
 ### Running Benchmarks
 

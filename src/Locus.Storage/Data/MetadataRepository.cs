@@ -39,6 +39,12 @@ namespace Locus.Storage.Data
         // Per-tenant locks for concurrent file allocation
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
 
+        // Per-tenant index of Pending files (fileKey → byte) for O(n_pending) allocation scans.
+        // Maintained in sync with _activeFiles: entries are added when status becomes Pending,
+        // removed when status leaves Pending. Always validated against _activeFiles on read
+        // to tolerate the rare race with concurrent AddOrUpdateAsync calls.
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _pendingKeys;
+
         // --- Write-Behind: async LiteDB persistence (netstandard2.0 compatible) ---
         // Memory is always updated first. LiteDB writes are decoupled via this queue.
         // If LiteDB is unavailable, writes buffer in memory and are retried by the background loop.
@@ -96,6 +102,7 @@ namespace Locus.Storage.Data
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _pendingKeys = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>();
 
             // Write-behind queue + semaphore (fields initialized here, task started LAST)
             _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
@@ -220,9 +227,12 @@ namespace Locus.Storage.Data
             if (activeFiles.Count > 0)
             {
                 var cache = _activeFiles.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, FileMetadata>());
+                var pendingIdx = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, byte>());
                 foreach (var file in activeFiles)
                 {
                     cache[file.FileKey] = file;
+                    if (file.Status == FileProcessingStatus.Pending)
+                        pendingIdx[file.FileKey] = 0;
                 }
 
                 _logger.LogInformation("Loaded {Count} active files for tenant {TenantId} into memory",
@@ -267,10 +277,17 @@ namespace Locus.Storage.Data
                 _ => new ConcurrentDictionary<string, FileMetadata>());
             cache[metadata.FileKey] = metadata;
 
+            // 2. Maintain pending index
+            var pendingIdx = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentDictionary<string, byte>());
+            if (metadata.Status == FileProcessingStatus.Pending)
+                pendingIdx[metadata.FileKey] = 0;
+            else
+                pendingIdx.TryRemove(metadata.FileKey, out _);
+
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
 
-            // 2. Queue LiteDB persistence — caller is not blocked; background loop drains the queue.
+            // Queue LiteDB persistence — caller is not blocked; background loop drains the queue.
             EnqueuePersistence(new PersistenceOperation(metadata));
 
             return Task.CompletedTask;
@@ -296,6 +313,13 @@ namespace Locus.Storage.Data
             var cache = _activeFiles.GetOrAdd(metadata.TenantId,
                 _ => new ConcurrentDictionary<string, FileMetadata>());
             cache[metadata.FileKey] = metadata;
+
+            // Maintain pending index
+            var pendingIdx = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentDictionary<string, byte>());
+            if (metadata.Status == FileProcessingStatus.Pending)
+                pendingIdx[metadata.FileKey] = 0;
+            else
+                pendingIdx.TryRemove(metadata.FileKey, out _);
 
             // Write directly to LiteDB (synchronous — required for rebuild correctness)
             var db = GetDatabase(metadata.TenantId);
@@ -340,6 +364,10 @@ namespace Locus.Storage.Data
 
             if (removed)
             {
+                // Remove from pending index (no-op if not pending)
+                if (_pendingKeys.TryGetValue(tenantId, out var pendingIdx))
+                    pendingIdx.TryRemove(fileKey, out _);
+
                 // Queue LiteDB deletion — caller is not blocked by disk I/O
                 EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
 
@@ -398,15 +426,34 @@ namespace Locus.Storage.Data
                 var cache = GetCache(tenantId);
                 var now = DateTime.UtcNow;
 
-                // Find the oldest pending file that is available for processing
-                var file = cache.Values
-                    .Where(m => m.Status == FileProcessingStatus.Pending
-                             && (m.AvailableForProcessingAt == null || m.AvailableForProcessingAt <= now))
-                    .OrderBy(m => m.CreatedAt)
-                    .FirstOrDefault();
+                // Use pending index for O(n_pending) scan instead of O(n_active) full-cache scan.
+                // Always validate against _activeFiles because AddOrUpdateAsync can race outside
+                // this lock and leave stale entries in the index.
+                var pendingIdx = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, byte>());
+                FileMetadata? file = null;
+                foreach (var key in pendingIdx.Keys)
+                {
+                    if (!cache.TryGetValue(key, out var candidate))
+                    {
+                        pendingIdx.TryRemove(key, out _); // stale — file removed from cache
+                        continue;
+                    }
+                    if (candidate.Status != FileProcessingStatus.Pending)
+                    {
+                        pendingIdx.TryRemove(key, out _); // stale — status changed outside lock
+                        continue;
+                    }
+                    if (candidate.AvailableForProcessingAt.HasValue && candidate.AvailableForProcessingAt.Value > now)
+                        continue;
+                    if (file == null || candidate.CreatedAt < file.CreatedAt)
+                        file = candidate;
+                }
 
                 if (file != null)
                 {
+                    // Remove from pending index before mutating status to keep index consistent.
+                    pendingIdx.TryRemove(file.FileKey, out _);
+
                     // Update memory immediately (other threads polling under this same lock will
                     // now see the file as Processing and skip it).
                     file.Status = FileProcessingStatus.Processing;
@@ -430,9 +477,10 @@ namespace Locus.Storage.Data
 
         /// <summary>
         /// Gets a batch of pending files for processing (atomic operation).
-        /// Thread-safe: Updates LiteDB with rollback on failure.
+        /// Thread-safe: Uses the same per-tenant SemaphoreSlim as GetNextPendingFileAsync
+        /// to ensure concurrent callers cannot receive the same files.
         /// </summary>
-        public Task<IEnumerable<FileMetadata>> GetNextPendingBatchAsync(
+        public async Task<IEnumerable<FileMetadata>> GetNextPendingBatchAsync(
             string tenantId,
             int batchSize,
             CancellationToken ct)
@@ -443,34 +491,67 @@ namespace Locus.Storage.Data
             if (batchSize <= 0)
                 throw new ArgumentException("Batch size must be greater than zero", nameof(batchSize));
 
-            var cache = GetCache(tenantId);
-            var now = DateTime.UtcNow;
-            var results = new List<FileMetadata>();
+            // Get or create tenant-specific lock (shared with GetNextPendingFileAsync)
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
-            // Find pending files
-            var candidates = cache.Values
-                .Where(m => m.Status == FileProcessingStatus.Pending
-                         && (m.AvailableForProcessingAt == null || m.AvailableForProcessingAt <= now))
-                .OrderBy(m => m.CreatedAt)
-                .Take(batchSize)
-                .ToList();
-
-            if (candidates.Count == 0)
-                return Task.FromResult<IEnumerable<FileMetadata>>(results);
-
-            // Write-Behind: update memory immediately, persist async.
-            // On crash, stuck Processing files are reset to Pending by the cleanup service.
-            foreach (var file in candidates)
+            // Acquire lock to ensure atomic find-and-update across concurrent callers
+            await tenantLock.WaitAsync(ct);
+            try
             {
-                file.Status = FileProcessingStatus.Processing;
-                file.ProcessingStartTime = DateTime.UtcNow;
-                EnqueuePersistence(new PersistenceOperation(file));
-                results.Add(file);
+                var cache = GetCache(tenantId);
+                var now = DateTime.UtcNow;
+
+                // Use pending index for O(n_pending) scan instead of O(n_active) full-cache scan.
+                var pendingIdx = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, byte>());
+                var candidates = new List<FileMetadata>();
+                foreach (var key in pendingIdx.Keys)
+                {
+                    if (!cache.TryGetValue(key, out var candidate))
+                    {
+                        pendingIdx.TryRemove(key, out _); // stale — file removed from cache
+                        continue;
+                    }
+                    if (candidate.Status != FileProcessingStatus.Pending)
+                    {
+                        pendingIdx.TryRemove(key, out _); // stale — status changed outside lock
+                        continue;
+                    }
+                    if (candidate.AvailableForProcessingAt.HasValue && candidate.AvailableForProcessingAt.Value > now)
+                        continue;
+                    candidates.Add(candidate);
+                }
+
+                if (candidates.Count == 0)
+                    return [];
+
+                // Sort pending candidates by CreatedAt to honour FIFO order, then take batchSize.
+                // Sorting n_pending (typically small) is much cheaper than sorting n_active.
+                candidates.Sort((a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
+
+                var results = new List<FileMetadata>();
+                foreach (var file in candidates)
+                {
+                    if (results.Count >= batchSize) break;
+
+                    // Remove from pending index before mutating status.
+                    pendingIdx.TryRemove(file.FileKey, out _);
+
+                    // Write-Behind: update memory immediately, persist async.
+                    // On crash, stuck Processing files are reset to Pending by the cleanup service.
+                    file.Status = FileProcessingStatus.Processing;
+                    file.ProcessingStartTime = DateTime.UtcNow;
+                    EnqueuePersistence(new PersistenceOperation(file));
+                    results.Add(file);
+                }
+
+                _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
+
+                return results;
             }
-
-            _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
-
-            return Task.FromResult<IEnumerable<FileMetadata>>(results);
+            finally
+            {
+                tenantLock.Release();
+            }
         }
 
         /// <summary>
@@ -508,6 +589,9 @@ namespace Locus.Storage.Data
                             file.ProcessingStartTime = null;
                             file.AvailableForProcessingAt = null;
                             files.Update(file);
+
+                            // Add back to pending index so the next allocation scan finds it
+                            _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, byte>())[file.FileKey] = 0;
                             count++;
 
                             _logger.LogWarning("Reset timed-out file: {FileKey}, Tenant: {TenantId}, was processing for {Duration}",
@@ -655,8 +739,9 @@ namespace Locus.Storage.Data
                 // Step 2: Remove from cache to prevent reconnection
                 _databases.TryRemove(tenantId, out _);
 
-                // Step 3: Clear in-memory cache
+                // Step 3: Clear in-memory cache and pending index
                 _activeFiles.TryRemove(tenantId, out _);
+                _pendingKeys.TryRemove(tenantId, out _);
 
                 // Step 4: Backup corrupted database
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
@@ -828,6 +913,7 @@ namespace Locus.Storage.Data
 
             _databases.Clear();
             _activeFiles.Clear();
+            _pendingKeys.Clear();
 
             // 4. Dispose all tenant locks
             foreach (var semaphore in _tenantLocks.Values)
