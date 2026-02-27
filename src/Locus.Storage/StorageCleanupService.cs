@@ -222,6 +222,13 @@ namespace Locus.Storage
             var removedCount = 0;
             long spaceFreed = 0;
 
+            // Build a HashSet of known physical paths once — O(N) — so each file lookup is O(1)
+            // instead of calling GetAllAsync inside the per-file loop (which would be O(P × N)).
+            var allMetadata = await _metadataRepository.GetAllAsync(ct);
+            var knownPaths = new HashSet<string>(
+                allMetadata.Select(m => m.PhysicalPath).Where(p => !string.IsNullOrEmpty(p)),
+                StringComparer.Ordinal);
+
             foreach (var volume in _volumes.Values)
             {
                 var tenantPath = Path.Combine(volume.MountPath, tenant.TenantId);
@@ -233,11 +240,8 @@ namespace Locus.Storage
 
                 foreach (var physicalPath in physicalFiles)
                 {
-                    // Check if metadata exists
-                    var allMetadata = await _metadataRepository.GetAllAsync(ct);
-                    var hasMetadata = allMetadata.Any(m => m.PhysicalPath == physicalPath);
-
-                    if (!hasMetadata)
+                    // O(1) HashSet lookup instead of O(N) linear scan per file
+                    if (!knownPaths.Contains(physicalPath))
                     {
                         // Orphaned file - delete it
                         try

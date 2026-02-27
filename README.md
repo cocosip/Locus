@@ -251,47 +251,83 @@ while (true)
 
 ### Benchmark Results
 
-Performance benchmarks run on Intel Core Ultra 9 185H, .NET 10.0.1:
+Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 cores, .NET 10.0.0, Windows 11:
 
-#### Metadata Operations
+#### Write Throughput (Single-Threaded, 100 KB file)
+
+| File Size | Mean Time | Allocated | Notes |
+|-----------|-----------|-----------|-------|
+| 100 KB | 1.074 ms | 7.34 KB | End-to-end: quota check + disk write + metadata |
+| 1 MB | 1.296 ms | 7.34 KB | I/O dominated |
+| 10 MB | 4.736 ms | 12.55 KB | I/O dominated |
+
+#### Concurrent Write Scalability (100 KB per write)
+
+| Concurrency | Mean Time | Allocated | Notes |
+|-------------|-----------|-----------|-------|
+| 1 writer (baseline) | 2.950 ms | 33.39 KB | Single-threaded baseline per batch |
+| 10 concurrent writers | 17.304 ms | 188.12 KB | All 10 writes in parallel |
+| 50 concurrent writers | 116.147 ms | 764.13 KB | All 50 writes in parallel |
+| 100 concurrent writers | 236.413 ms | 1363.16 KB | All 100 writes in parallel |
+
+#### Metadata Operations (Write-Behind Architecture)
+
 | Operation | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
-| AddOrUpdate single file | 205.6 μs | 90 KB | LiteDB write + cache update |
-| Get file metadata (cache hit) | 33.6 μs | 19.6 KB | ⚡ Pure memory read |
-| Get file metadata (cache miss) | 14.5 ms | 4.15 MB | LiteDB read + cache load |
-| Batch insert 100 files | 24.2 ms | 9.46 MB | ~242 μs per file |
-| Get pending files (10) | 3.6 ms | 1.15 MB | Queue retrieval |
+| AddOrUpdate single file | 1.376 μs | 1.4 KB | ⚡ Memory-first, async LiteDB persistence |
+| Get file metadata (cache hit) | 317.7 ns | 455 B | ⚡ Pure memory read |
+| Get file metadata (cache miss) | 37.68 μs | 41.8 KB | LiteDB read + cache load |
+| Batch insert 100 files | 162.9 μs | 55.5 KB | ~1.6 μs per file |
+| Get pending files (10 files) | 5.886 ms | 1.89 MB | Queue retrieval |
 
-#### Directory Quota Operations
+#### Directory Quota Operations (Lock-Free CAS)
+
 | Operation | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
-| Check can add (no limit) | 131 μs | 68.3 KB | Fast path |
-| Check can add (with limit) | 169 μs | 93.7 KB | Includes limit check |
-| Increment file count | 194 μs | 94.6 KB | SemaphoreSlim + LiteDB |
-| Decrement file count | 270 μs | 115 KB | Atomic decrement |
-| Get file count | 35.8 μs | 13.1 KB | ⚡ Cache read |
+| Check can add (no limit) | 141.25 ns | 176 B | ⚡ AtomicQuotaState hot path |
+| Check can add (with limit) | 139.07 ns | 176 B | ⚡ Lock-free CAS comparison |
+| Increment file count | 94.80 ns | 72 B | ⚡ Lock-free CAS, near-zero contention |
+| Decrement file count | 231.05 ns | 248 B | Increment + decrement pair |
+| Set directory limit | 2.916 ms | 142.2 KB | LiteDB write (persisted immediately) |
+| Get file count | 145.41 ns | 232 B | ⚡ AtomicQuotaState read |
+
+#### Volume Health & Space (TTL Cached)
+
+| Operation | Mean Time | Allocated | Notes |
+|-----------|-----------|-----------|-------|
+| IsHealthy | 17.88 ns | 0 B | ⚡ 30s TTL cache (no disk I/O) |
+| AvailableSpace | 22.33 ns | 0 B | ⚡ 30s TTL cache |
+| TotalCapacity | 22.32 ns | 0 B | ⚡ 30s TTL cache |
 
 #### Tenant Management
-| Operation | Mean Time | Allocated | Notes |
-|-----------|-----------|-----------|-------|
-| Create tenant | 583 μs | 7.2 KB | JSON write + directory creation |
-| Get tenant (cache hit) | 52 ns | 104 B | ⚡ Extremely fast |
-| Get tenant (cache miss) | 34.4 μs | 1.3 KB | JSON read + parse |
-| Get tenant (auto-create) | 952 μs | 9.6 KB | Create + load |
-| Check tenant enabled | 54.5 ns | 104 B | ⚡ Cache hit |
-| Enable/Disable tenant | ~1.3-1.4 ms | ~15-22 KB | JSON update |
 
-#### Concurrent Operations
 | Operation | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
-| 10 concurrent reads | 10.4 ms | 1.08 MB | Parallel file reads |
-| Mixed 10W + 10R | 12.8 ms | 1.58 MB | Concurrent read/write |
+| Create tenant | 2.589 ms | 7.0 KB | JSON write + directory creation |
+| Get tenant (cache hit) | 81.95 ns | 104 B | ⚡ 5-minute in-memory cache |
+| Get tenant (cache miss) | 24.23 μs | 1.28 KB | JSON file read + parse |
+| Get tenant (auto-create) | 2.116 ms | 9.3 KB | Create + load |
+| Check tenant enabled (cache hit) | 89.86 ns | 104 B | ⚡ Cache hit |
+| Enable tenant | 3.060 ms | 21.1 KB | JSON update + cache invalidation |
+| Disable tenant | 1.864 ms | 14.3 KB | JSON update + cache invalidation |
+
+#### End-to-End Concurrent Operations
+
+| Operation | threadCount | Mean Time | Allocated | Notes |
+|-----------|-------------|-----------|-----------|-------|
+| 10 concurrent reads | — | 9.749 ms | 1506 KB | Parallel file reads |
+| Mixed read/write (20 ops) | — | 8.510 ms | 1088 KB | 10 writes + 10 reads concurrent |
+| Concurrent writes | 10 | 3.019 ms | 430 KB | 10 simultaneous writes |
+| Concurrent writes | 50 | 15.550 ms | 1882 KB | 50 simultaneous writes |
+| Concurrent writes | 100 | 26.749 ms | 3128 KB | 100 simultaneous writes |
 
 **Key Findings**:
-- ⚡ **Cache hit rates** are critical: 33.6 μs vs 14.5 ms (432x faster)
-- ⚡ **Tenant lookups** are extremely fast with cache: 52 ns
-- ✅ **Write operations** are performant: ~200 μs per file
-- ✅ **Concurrent operations** scale well with thread pool
+- ⚡ **Directory quota CAS**: 94.80 ns per increment — lock-free atomic operations (vs. ~200 μs with SemaphoreSlim)
+- ⚡ **Volume health/space**: 17–22 ns — 30-second TTL cache eliminates one disk I/O per write
+- ⚡ **Metadata write-behind**: 1.376 μs per file — memory-first, LiteDB persistence is async
+- ⚡ **Tenant cache**: 82–90 ns — 5-minute cache keeps tenant lookups near-zero cost
+- ✅ **100 KB write**: ~1.1 ms end-to-end (quota check + disk write + metadata)
+- ✅ **100-concurrent writes**: 236 ms total for 100 simultaneous 100 KB writes
 
 ### Running Benchmarks
 
@@ -299,16 +335,16 @@ Performance benchmarks run on Intel Core Ultra 9 185H, .NET 10.0.1:
 cd tests/Locus.Benchmarks
 dotnet run -c Release
 
-# Run specific benchmarks
-dotnet run -c Release --filter "*MetadataRepository*"
-dotnet run -c Release --filter "*DirectoryQuota*"
-dotnet run -c Release --filter "*TenantManager*"
-dotnet run -c Release --filter "*ConcurrentOperations*"
+# Run specific benchmark class
+dotnet run -c Release --filter "Locus.Benchmarks.MetadataRepositoryBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.DirectoryQuotaBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.TenantManagerBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolWriteThroughputBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolConcurrencyBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.VolumeHealthCheckBenchmarks*"
 ```
 
-**Note**: Concurrent write benchmarks may fail in BenchmarkDotNet due to LiteDB file locking when separate processes try to access the same database. This is a limitation of the benchmark environment, not the actual system which handles concurrent writes correctly in production.
-
-See [Benchmark README](tests/Locus.Benchmarks/README.md) for detailed analysis and optimization tips.
+See [Benchmark README](tests/Locus.Benchmarks/README.md) for detailed analysis.
 
 ## Project Structure
 

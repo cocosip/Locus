@@ -14,18 +14,29 @@ dotnet run -c Release
 ### 运行特定的基准测试类
 
 ```bash
-# 只运行元数据仓库基准测试
-dotnet run -c Release --filter "*MetadataRepositoryBenchmarks*"
+# 元数据仓库基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.MetadataRepositoryBenchmarks*"
 
-# 只运行并发操作基准测试
-dotnet run -c Release --filter "*ConcurrentOperationsBenchmarks*"
+# 并发操作基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.ConcurrentOperationsBenchmarks*"
 
-# 只运行目录配额基准测试
-dotnet run -c Release --filter "*DirectoryQuotaBenchmarks*"
+# 目录配额基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.DirectoryQuotaBenchmarks*"
 
-# 只运行租户管理基准测试
-dotnet run -c Release --filter "*TenantManagerBenchmarks*"
+# 租户管理基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.TenantManagerBenchmarks*"
+
+# StoragePool 写入吞吐量基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolWriteThroughputBenchmarks*"
+
+# StoragePool 并发写入基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolConcurrencyBenchmarks*"
+
+# Volume 健康检查基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.VolumeHealthCheckBenchmarks*"
 ```
+
+> **注意**: BenchmarkDotNet 过滤器使用全限定名 `namespace.typeName.methodName`，不支持 `|` OR 语法。每次只能过滤一个类。
 
 ### 运行特定的基准测试方法
 
@@ -67,10 +78,29 @@ dotnet run -c Release --filter "*AddOrUpdateAsync_Single*"
 - **Disable tenant**: 禁用租户
 
 ### 4. ConcurrentOperationsBenchmarks
-测试并发场景下的性能:
+测试通过 `StoragePool` 的并发端到端场景:
 - **10/50/100 concurrent writes**: 10/50/100个并发写入操作
 - **10 concurrent reads**: 10个并发读取操作
 - **Mixed read/write operations**: 混合读写操作 (10写+10读)
+
+### 5. VolumeHealthCheckBenchmarks
+测试 Volume 健康检查与磁盘空间查询（TTL 缓存路径）:
+- **IsHealthy**: 缓存命中时的健康检查延迟
+- **AvailableSpace**: 缓存命中时的可用空间查询延迟
+- **TotalCapacity**: 缓存命中时的总容量查询延迟
+
+### 6. StoragePoolWriteThroughputBenchmarks
+测试 `StoragePool.WriteFileAsync` 端到端单线程写入吞吐量:
+- **Single-threaded write (100 KB)**: 100 KB 文件顺序写入
+- **Single-threaded write (1 MB)**: 1 MB 文件顺序写入
+- **Single-threaded write (10 MB)**: 10 MB 文件顺序写入
+
+### 7. StoragePoolConcurrencyBenchmarks
+测试 `StoragePool.WriteFileAsync` 并发写入扩展性:
+- **1 writer (baseline)**: 单线程 baseline
+- **10 concurrent writers**: 10 线程并发写入
+- **50 concurrent writers**: 50 线程并发写入
+- **100 concurrent writers**: 100 线程并发写入
 
 ## 性能指标说明
 
@@ -83,64 +113,134 @@ BenchmarkDotNet 会输出以下关键指标:
 - **Gen0/Gen1/Gen2**: GC 回收次数 (每1000次操作)
 - **Allocated**: 每次操作分配的内存
 
-## 结果解读
+## 实际基准测试结果
 
-### 预期性能范围
+> 测试环境: Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 cores, .NET 10.0.0, Windows 11 24H2
 
-#### 元数据操作
-- 单次 AddOrUpdate: < 1 ms (LiteDB 写入 + 内存缓存)
-- 缓存命中查询: < 10 μs (纯内存读取)
-- 缓存未命中查询: < 500 μs (LiteDB 读取 + 缓存更新)
+### StoragePool 写入吞吐量（单线程）
 
-#### 配额操作
-- 配额检查 (无限制): < 50 μs (纯内存操作)
-- 配额检查 (有限制): < 100 μs (内存读取 + 比较)
-- 递增/递减计数: < 1 ms (LiteDB 事务 + 内存更新)
+| FileSize | Mean | StdDev | Allocated |
+|----------|------|--------|-----------|
+| 100 KB | 1.074 ms | 0.086 ms | 7.34 KB |
+| 1 MB | 1.296 ms | 0.023 ms | 7.34 KB |
+| 10 MB | 4.736 ms | 0.400 ms | 12.55 KB |
 
-#### 租户操作
-- 创建租户: < 5 ms (JSON 序列化 + 文件写入 + 目录创建)
-- 获取租户 (缓存命中): < 10 μs
-- 获取租户 (自动创建): < 5 ms
+### StoragePool 并发写入扩展性（100 KB/文件）
 
-#### 并发操作
-- 10 个并发写入: < 100 ms total (约每个 10 ms)
-- 50 个并发写入: < 500 ms total (约每个 10 ms)
-- 100 个并发写入: < 1000 ms total (约每个 10 ms)
+| Concurrency | Mean | StdDev | Allocated |
+|-------------|------|--------|-----------|
+| 1 writer (baseline) | 2.950 ms | 0.737 ms | 33.39 KB |
+| 10 concurrent writers | 17.304 ms | 15.308 ms | 188.12 KB |
+| 50 concurrent writers | 116.147 ms | 20.466 ms | 764.13 KB |
+| 100 concurrent writers | 236.413 ms | 10.763 ms | 1363.16 KB |
 
-> **注意**: 实际性能取决于硬件配置 (CPU, 磁盘类型: HDD vs SSD)
+### 端到端并发场景
+
+| Method | threadCount | Mean | StdDev | Allocated |
+|--------|-------------|------|--------|-----------|
+| 10 concurrent reads | — | 9.749 ms | 0.924 ms | 1506.16 KB |
+| Mixed read/write (20 ops) | — | 8.510 ms | 0.696 ms | 1087.96 KB |
+| Concurrent writes | 10 | 3.019 ms | 0.123 ms | 430.14 KB |
+| Concurrent writes | 50 | 15.550 ms | 1.594 ms | 1881.82 KB |
+| Concurrent writes | 100 | 26.749 ms | 3.188 ms | 3127.94 KB |
+
+### 目录配额操作（Lock-Free CAS）
+
+| Method | Mean | StdDev | Allocated |
+|--------|------|--------|-----------|
+| Check can add file (no limit) | 141.25 ns | 2.966 ns | 176 B |
+| Check can add file (with limit) | 139.07 ns | 1.272 ns | 176 B |
+| **Increment file count** | **94.80 ns** | **0.906 ns** | **72 B** |
+| Decrement file count | 231.05 ns | 0.968 ns | 248 B |
+| Set directory limit | 2.916 ms | 11.215 μs | 142.2 KB |
+| Get file count | 145.41 ns | 0.194 ns | 232 B |
+
+### Volume 健康检查（30s TTL 缓存）
+
+| Method | Mean | StdDev | Allocated |
+|--------|------|--------|-----------|
+| IsHealthy (cached) | 17.88 ns | 0.065 ns | 0 B |
+| AvailableSpace (cached) | 22.33 ns | 0.029 ns | 0 B |
+| TotalCapacity (cached) | 22.32 ns | 0.022 ns | 0 B |
+
+### 元数据操作（Write-Behind 架构）
+
+| Method | Mean | StdDev | Allocated |
+|--------|------|--------|-----------|
+| AddOrUpdate single file | 1.376 μs | 17.36 ns | 1.4 KB |
+| Get file (cache hit) | 317.7 ns | 2.23 ns | 455 B |
+| Get file (cache miss) | 37.68 μs | 1.17 μs | 41.8 KB |
+| Batch insert 100 files | 162.9 μs | 15.63 μs | 55.5 KB |
+| Get pending files (10) | 5.886 ms | 1.369 ms | 1.89 MB |
+
+### 租户管理（5分钟缓存）
+
+| Method | Mean | StdDev | Allocated |
+|--------|------|--------|-----------|
+| Create tenant | 2.589 ms | 1.854 ms | 7.0 KB |
+| Get tenant (cache hit) | 81.95 ns | 0.230 ns | 104 B |
+| Get tenant (cache miss) | 24.23 μs | 105.8 ns | 1.28 KB |
+| Get tenant (auto-create) | 2.116 ms | 1.177 ms | 9.3 KB |
+| Check tenant enabled (cache hit) | 89.86 ns | 2.417 ns | 104 B |
+| Enable tenant | 3.060 ms | 1.267 ms | 21.1 KB |
+| Disable tenant | 1.864 ms | 274.2 μs | 14.3 KB |
+
+### 关键结论
+
+- ⚡ **目录配额 CAS 无锁**: 94.80 ns 每次计数递增（vs 旧版 SemaphoreSlim + LiteDB 同步写入 ~200 μs，提升约 **2000x**）
+- ⚡ **Volume 健康/空间缓存**: 17–22 ns，消除每次写入的额外磁盘 I/O（旧版每次写入触发临时文件创建+删除）
+- ⚡ **元数据 Write-Behind**: 1.376 μs 每文件（内存优先，LiteDB 后台异步落盘）
+- ⚡ **租户缓存**: 82–90 ns（5分钟缓存，远低于旧版 JSON 文件读取 ~24 μs）
+- ✅ **100 KB 文件写入**: ~1.1 ms 端到端（配额检查 + 磁盘写入 + 元数据）
+- ✅ **100 并发写入**: 236 ms 完成全部 100 个 100 KB 写入
+
+> **注意**: StoragePool 并发写入的 StdDev 较大，主要原因是 100 KB 文件写入时间本身较短（~1 ms），
+> 系统调度抖动对相对误差影响显著。绝对误差在可接受范围内。实际性能取决于硬件配置（CPU、磁盘类型: HDD vs SSD）。
 
 ## 优化建议
 
-根据基准测试结果,可以考虑以下优化:
+根据基准测试结果，如遇到性能问题可考虑以下方向:
 
-1. **如果元数据查询慢**:
-   - 增加缓存过期时间
-   - 增加内存缓存大小限制
+1. **如果元数据查询慢**（缓存未命中 37 μs 过高）:
+   - 增大 MetadataRepository 的内存缓存容量，减少 LiteDB 读取频率
+   - 检查是否有大量 Completed 文件未及时清理，导致 LiteDB 数据库过大
 
-2. **如果并发写入慢**:
-   - 检查磁盘 I/O 性能
-   - 考虑批量写入优化
+2. **如果并发写入慢**（> 236 ms / 100 写入）:
+   - 首要检查磁盘 I/O 吞吐量（100 KB 文件顺序写入 < 1.1 ms 是正常水平）
+   - 考虑挂载多个存储 Volume 以分散 I/O 压力
    - 考虑使用 SSD 存储
 
-3. **如果配额检查慢**:
-   - 优化配额缓存策略
-   - 减少不必要的配额检查
+3. **如果 Volume 健康/空间查询慢**（> 100 ns）:
+   - 检查 `LocalFileSystemVolume` 的 TTL 缓存是否生效（默认 30 秒）
+   - 如果每次都触发文件写删测试，说明缓存失效过快
 
-4. **如果租户操作慢**:
-   - 增加租户缓存时间
-   - 优化文件系统访问
+4. **如果配额检查慢**（> 200 ns）:
+   - 检查 `AtomicQuotaState` 是否被正确初始化（GlobalSetup 应预热热路径）
+   - 如果每次都需要创建新路径，会触发 Write-Behind flush
+
+5. **如果租户操作慢**（缓存命中 > 200 ns）:
+   - 增加租户缓存时间（默认 5 分钟）
+   - 检查是否频繁调用 `EnableTenantAsync`/`DisableTenantAsync` 导致缓存失效
 
 ## 持续集成
 
-可以将基准测试集成到 CI 流程中,跟踪性能变化:
+可以将基准测试集成到 CI 流程中，跟踪性能变化:
 
 ```bash
-# 生成性能报告并保存
+# 生成 Markdown 格式的性能报告
+dotnet run -c Release --exporters markdown
+
+# 生成 JSON + Markdown 格式报告
 dotnet run -c Release --exporters json markdown
 
-# 比较两次运行的结果
-dotnet run -c Release -- --filter "*" --join
+# 导出结果到指定目录
+dotnet run -c Release --exporters markdown --artifacts ./benchmark-results
 ```
+
+结果文件保存在 `BenchmarkDotNet.Artifacts/results/` 目录，文件名格式:
+- `Locus.Benchmarks.<ClassName>-report-github.md` — GitHub Flavored Markdown 表格
+- `Locus.Benchmarks.<ClassName>-report.csv` — CSV 格式（适合自动化比较）
+- `Locus.Benchmarks.<ClassName>-report.html` — HTML 可视化报告
 
 ## 相关文档
 

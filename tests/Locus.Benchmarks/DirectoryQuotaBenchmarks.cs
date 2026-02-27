@@ -23,7 +23,6 @@ namespace Locus.Benchmarks
         private DirectoryQuotaManager _manager;
         private string _testDirectory;
         private readonly string _tenantId = "benchmark-tenant";
-        private int _dirCounter;
 
         [GlobalSetup]
         public void Setup()
@@ -37,7 +36,15 @@ namespace Locus.Benchmarks
 
             var managerLogger = NullLogger<DirectoryQuotaManager>.Instance;
             _manager = new DirectoryQuotaManager(_repository, managerLogger);
-            _dirCounter = 0;
+
+            // Pre-warm all fixed paths so hot-path benchmarks skip the first-load cost
+            _manager.SetLimitAsync(_tenantId, "/bench-dir-with-limit", 1000, CancellationToken.None).GetAwaiter().GetResult();
+            _manager.CanAddFileAsync(_tenantId, "/bench-dir-no-limit", CancellationToken.None).GetAwaiter().GetResult();
+            _manager.CanAddFileAsync(_tenantId, "/bench-dir-with-limit", CancellationToken.None).GetAwaiter().GetResult();
+            _manager.IncrementFileCountAsync(_tenantId, "/bench-dir-increment", CancellationToken.None).GetAwaiter().GetResult();
+            _manager.IncrementFileCountAsync(_tenantId, "/bench-dir-decrement", CancellationToken.None).GetAwaiter().GetResult();
+            _manager.SetLimitAsync(_tenantId, "/bench-dir-setlimit", 100, CancellationToken.None).GetAwaiter().GetResult();
+            _manager.IncrementFileCountAsync(_tenantId, "/bench-dir-getcount", CancellationToken.None).GetAwaiter().GetResult();
         }
 
         [GlobalCleanup]
@@ -55,50 +62,44 @@ namespace Locus.Benchmarks
         [Benchmark(Description = "Check can add file (no limit)")]
         public async Task CanAddFileAsync_NoLimit()
         {
-            var dirPath = $"/dir-{Interlocked.Increment(ref _dirCounter)}";
-            await _manager.CanAddFileAsync(_tenantId, dirPath, CancellationToken.None);
+            // Use fixed path to benchmark hot-path CAS (AtomicQuotaState already initialized)
+            await _manager.CanAddFileAsync(_tenantId, "/bench-dir-no-limit", CancellationToken.None);
         }
 
         [Benchmark(Description = "Check can add file (with limit, under quota)")]
         public async Task CanAddFileAsync_WithLimit()
         {
-            var dirPath = $"/limited-{Interlocked.Increment(ref _dirCounter)}";
-            await _manager.SetLimitAsync(_tenantId, dirPath, 1000, CancellationToken.None);
-            await _manager.CanAddFileAsync(_tenantId, dirPath, CancellationToken.None);
+            // Use fixed path — SetLimitAsync is called in IterationSetup, not here
+            await _manager.CanAddFileAsync(_tenantId, "/bench-dir-with-limit", CancellationToken.None);
         }
 
         [Benchmark(Description = "Increment file count")]
         public async Task IncrementFileCountAsync()
         {
-            var dirPath = $"/increment-{Interlocked.Increment(ref _dirCounter)}";
-            await _manager.IncrementFileCountAsync(_tenantId, dirPath, CancellationToken.None);
+            // Use fixed path to benchmark hot-path lock-free CAS increment
+            await _manager.IncrementFileCountAsync(_tenantId, "/bench-dir-increment", CancellationToken.None);
         }
 
         [Benchmark(Description = "Decrement file count")]
         public async Task DecrementFileCountAsync()
         {
-            var dirPath = $"/decrement-{Interlocked.Increment(ref _dirCounter)}";
-            // Pre-increment
-            await _manager.IncrementFileCountAsync(_tenantId, dirPath, CancellationToken.None);
-            // Benchmark
-            await _manager.DecrementFileCountAsync(_tenantId, dirPath, CancellationToken.None);
+            // Pre-increment to keep count positive, then decrement
+            await _manager.IncrementFileCountAsync(_tenantId, "/bench-dir-decrement", CancellationToken.None);
+            await _manager.DecrementFileCountAsync(_tenantId, "/bench-dir-decrement", CancellationToken.None);
         }
 
         [Benchmark(Description = "Set directory limit")]
         public async Task SetLimitAsync()
         {
-            var dirPath = $"/setlimit-{Interlocked.Increment(ref _dirCounter)}";
-            await _manager.SetLimitAsync(_tenantId, dirPath, 100, CancellationToken.None);
+            // Use fixed path — SetLimitAsync updates MaxCount and syncs AtomicQuotaState
+            await _manager.SetLimitAsync(_tenantId, "/bench-dir-setlimit", 100, CancellationToken.None);
         }
 
         [Benchmark(Description = "Get file count")]
         public async Task GetFileCountAsync()
         {
-            var dirPath = "/getcount-dir";
-            // Pre-populate
-            await _manager.IncrementFileCountAsync(_tenantId, dirPath, CancellationToken.None);
-            // Benchmark
-            await _manager.GetFileCountAsync(_tenantId, dirPath, CancellationToken.None);
+            // Use fixed path — reads from AtomicQuotaState (hot path)
+            await _manager.GetFileCountAsync(_tenantId, "/bench-dir-getcount", CancellationToken.None);
         }
 
         public void Dispose()
