@@ -33,6 +33,9 @@ namespace Locus.Storage.Data
         // Per-tenant in-memory cache (only active files: Pending/Processing/Failed)
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
 
+        // Global fileKey -> tenantId index for O(1) cross-tenant lookup by file key.
+        private readonly ConcurrentDictionary<string, string> _fileKeyTenantIndex;
+
         // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
 
@@ -115,6 +118,7 @@ namespace Locus.Storage.Data
             _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
             _enableBackgroundPersistence = enableBackgroundPersistence;
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
+            _fileKeyTenantIndex = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
@@ -203,7 +207,8 @@ namespace Locus.Storage.Data
                     {
                         // Remove from cache to force rebuild
                         _databases.TryRemove(tid, out _);
-                        _activeFiles.TryRemove(tid, out _);
+                        if (_activeFiles.TryRemove(tid, out var staleTenantCache))
+                            RemoveTenantFromGlobalIndex(staleTenantCache);
 
                         // Rebuild database without acquiring the tenant lock (we may be called
                         // from within the Lazy factory which is already locked via ExecutionAndPublication).
@@ -258,7 +263,10 @@ namespace Locus.Storage.Data
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>());
 
                 foreach (var file in activeFiles)
+                {
                     cache[file.FileKey] = file;
+                    _fileKeyTenantIndex[file.FileKey] = tenantId;
+                }
 
                 // Enqueue Pending files in CreatedAt order to restore FIFO scheduling after restart.
                 int pendingCount = 0;
@@ -316,6 +324,7 @@ namespace Locus.Storage.Data
 
             cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
+            _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
 
             // 2. Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
             //    This keeps CompactPendingQueues O(1) instead of O(N).
@@ -368,6 +377,7 @@ namespace Locus.Storage.Data
                 _ => new ConcurrentDictionary<string, FileMetadata>());
             cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
+            _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
 
             bool wasP = previous?.Status == FileProcessingStatus.Pending;
             bool isP  = metadata.Status == FileProcessingStatus.Pending;
@@ -426,6 +436,8 @@ namespace Locus.Storage.Data
 
             if (removed)
             {
+                _fileKeyTenantIndex.TryRemove(fileKey, out _);
+
                 // Maintain _pendingFileCounts: if the removed file was Pending, decrement.
                 if (removedMetadata?.Status == FileProcessingStatus.Pending)
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
@@ -682,21 +694,32 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Finds file metadata by fileKey across all tenants without scanning every file.
-        /// Iterates tenant dictionaries only (O(tenants)), then does a direct key lookup (O(1)).
-        /// Use this instead of GetAllAsync().FirstOrDefault() when only the fileKey is known.
+        /// Finds file metadata by fileKey using a global O(1) index.
+        /// Falls back to a tenant scan only to self-heal stale index entries.
         /// </summary>
         public Task<FileMetadata?> GetByFileKeyAsync(string fileKey, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            foreach (var tenantFiles in _activeFiles.Values)
+            if (_fileKeyTenantIndex.TryGetValue(fileKey, out var tenantId)
+                && _activeFiles.TryGetValue(tenantId, out var indexedTenantFiles)
+                && indexedTenantFiles.TryGetValue(fileKey, out var indexedMetadata))
             {
-                if (tenantFiles.TryGetValue(fileKey, out var metadata))
-                    return Task.FromResult<FileMetadata?>(metadata);
+                return Task.FromResult<FileMetadata?>(indexedMetadata);
             }
 
+            // Fallback: recover from stale/missing index entries (rare, e.g. after crash recovery).
+            foreach (var tenantEntry in _activeFiles)
+            {
+                if (!tenantEntry.Value.TryGetValue(fileKey, out var metadata))
+                    continue;
+
+                _fileKeyTenantIndex[fileKey] = tenantEntry.Key;
+                return Task.FromResult<FileMetadata?>(metadata);
+            }
+
+            _fileKeyTenantIndex.TryRemove(fileKey, out _);
             return Task.FromResult<FileMetadata?>(null);
         }
 
@@ -792,6 +815,12 @@ namespace Locus.Storage.Data
             return true;
         }
 
+        private void RemoveTenantFromGlobalIndex(ConcurrentDictionary<string, FileMetadata> tenantCache)
+        {
+            foreach (var fileKey in tenantCache.Keys)
+                _fileKeyTenantIndex.TryRemove(fileKey, out _);
+        }
+
         private static bool IsMetadataLogSidecar(string fileName, HashSet<string> diskNameSet)
         {
             if (!fileName.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
@@ -829,7 +858,8 @@ namespace Locus.Storage.Data
             }
 
             _databases.TryRemove(tenantId, out _);
-            _activeFiles.TryRemove(tenantId, out _);
+            if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
+                RemoveTenantFromGlobalIndex(staleTenantCache);
             _pendingKeys.TryRemove(tenantId, out _);
             _pendingFileCounts.TryRemove(tenantId, out _);
 
@@ -893,7 +923,8 @@ namespace Locus.Storage.Data
                 _databases.TryRemove(tenantId, out _);
 
                 // Step 3: Clear in-memory cache and pending index
-                _activeFiles.TryRemove(tenantId, out _);
+                if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
+                    RemoveTenantFromGlobalIndex(staleTenantCache);
                 _pendingKeys.TryRemove(tenantId, out _);
                 _pendingFileCounts.TryRemove(tenantId, out _);
 
@@ -1186,6 +1217,7 @@ namespace Locus.Storage.Data
 
             _databases.Clear();
             _activeFiles.Clear();
+            _fileKeyTenantIndex.Clear();
             _pendingKeys.Clear();
             _pendingFileCounts.Clear();
 

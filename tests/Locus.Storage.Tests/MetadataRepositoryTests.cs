@@ -104,6 +104,30 @@ namespace Locus.Storage.Tests
             Assert.DoesNotContain($"{tenantId}-log", tenantIds);
         }
 
+        [Fact]
+        public async Task GetByFileKeyAsync_ReturnsMetadataAcrossTenants()
+        {
+            await _repository.AddOrUpdateAsync(CreateMetadata("file-tenant-1", FileProcessingStatus.Pending, "tenant-001"), CancellationToken.None);
+            await _repository.AddOrUpdateAsync(CreateMetadata("file-tenant-2", FileProcessingStatus.Pending, "tenant-002"), CancellationToken.None);
+
+            var result = await _repository.GetByFileKeyAsync("file-tenant-2", CancellationToken.None);
+
+            Assert.NotNull(result);
+            Assert.Equal("tenant-002", result!.TenantId);
+            Assert.Equal("file-tenant-2", result.FileKey);
+        }
+
+        [Fact]
+        public async Task GetByFileKeyAsync_ReturnsNullAfterRemove()
+        {
+            await _repository.AddOrUpdateAsync(CreateMetadata("file-remove", FileProcessingStatus.Pending), CancellationToken.None);
+            await _repository.RemoveAsync(_tenantId, "file-remove", CancellationToken.None);
+
+            var result = await _repository.GetByFileKeyAsync("file-remove", CancellationToken.None);
+
+            Assert.Null(result);
+        }
+
         public void Dispose()
         {
             _repository.Dispose();
@@ -119,12 +143,12 @@ namespace Locus.Storage.Tests
             }
         }
 
-        private FileMetadata CreateMetadata(string fileKey, FileProcessingStatus status)
+        private FileMetadata CreateMetadata(string fileKey, FileProcessingStatus status, string? tenantId = null)
         {
             return new FileMetadata
             {
                 FileKey = fileKey,
-                TenantId = _tenantId,
+                TenantId = tenantId ?? _tenantId,
                 VolumeId = "vol-001",
                 PhysicalPath = $"/test/{fileKey}.dat",
                 DirectoryPath = "/",

@@ -20,8 +20,12 @@ namespace Locus.FileSystem
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<LocalFileSystemVolume> _logger;
         private readonly string _mountPath;
+        private readonly string _mountPathWithTrailingSeparator;
         private readonly string _volumeId;
         private readonly int _shardingDepth;
+        private readonly StringComparison _pathComparison;
+        private readonly int _writeBufferSize;
+        private readonly int _knownDirectoryCacheMaxEntries;
 
         // --- Optimization 1: IsHealthy TTL cache ---
         // Avoid file write+delete on every WriteFileAsync call.
@@ -39,8 +43,12 @@ namespace Locus.FileSystem
 
         // --- Optimization 4: Known-directory cache ---
         // Avoid Directory.Exists() stat on every write for already-created shard directories.
-        // Directories are permanent once created, so this cache never expires.
+        // Cache is bounded to keep long-running memory usage predictable.
         private readonly ConcurrentDictionary<string, byte> _knownDirectories;
+        private int _knownDirectoryTrimInProgress;
+
+        private const int DefaultWriteBufferSize = 128 * 1024;
+        private const int DefaultKnownDirectoryCacheMaxEntries = 50_000;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="LocalFileSystemVolume"/> class.
@@ -55,13 +63,19 @@ namespace Locus.FileSystem
         /// Eliminates the file-write+delete health probe and DriveInfo syscall on every write.
         /// Default: 30 seconds. Pass <see cref="TimeSpan.Zero"/> to disable caching (original behavior).
         /// </param>
+        /// <param name="writeBufferSize">Write stream buffer size in bytes. Default 128 KB.</param>
+        /// <param name="knownDirectoryCacheMaxEntries">
+        /// Maximum number of cached directory entries before trimming. Default 50,000.
+        /// </param>
         public LocalFileSystemVolume(
             IFileSystem fileSystem,
             ILogger<LocalFileSystemVolume> logger,
             string volumeId,
             string mountPath,
             int shardingDepth = 2,
-            TimeSpan healthCheckCacheDuration = default)
+            TimeSpan healthCheckCacheDuration = default,
+            int writeBufferSize = DefaultWriteBufferSize,
+            int knownDirectoryCacheMaxEntries = DefaultKnownDirectoryCacheMaxEntries)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -75,9 +89,21 @@ namespace Locus.FileSystem
             if (shardingDepth < 0 || shardingDepth > 3)
                 throw new ArgumentException("Sharding depth must be between 0 and 3", nameof(shardingDepth));
 
+            if (writeBufferSize <= 0)
+                throw new ArgumentException("Write buffer size must be greater than zero", nameof(writeBufferSize));
+
+            if (knownDirectoryCacheMaxEntries <= 0)
+                throw new ArgumentException("Known directory cache size must be greater than zero", nameof(knownDirectoryCacheMaxEntries));
+
             _volumeId = volumeId;
             _mountPath = _fileSystem.Path.GetFullPath(mountPath);
+            _mountPathWithTrailingSeparator = _mountPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
             _shardingDepth = shardingDepth;
+            _pathComparison = Path.DirectorySeparatorChar == '/'
+                ? StringComparison.Ordinal
+                : StringComparison.OrdinalIgnoreCase;
+            _writeBufferSize = writeBufferSize;
+            _knownDirectoryCacheMaxEntries = knownDirectoryCacheMaxEntries;
 
             // Default TTL: 30 seconds
             var cacheDuration = healthCheckCacheDuration == default
@@ -321,8 +347,7 @@ namespace Locus.FileSystem
             if (string.IsNullOrWhiteSpace(path))
                 throw new ArgumentException("Path cannot be empty", nameof(path));
 
-            if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
-                throw new InvalidOperationException($"Path is outside volume mount path: {path}");
+            ValidatePathWithinMountPath(path);
 
             if (!_fileSystem.File.Exists(path))
                 throw new FileNotFoundException($"File not found: {path}");
@@ -349,8 +374,7 @@ namespace Locus.FileSystem
             if (content == null)
                 throw new ArgumentNullException(nameof(content));
 
-            if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
-                throw new InvalidOperationException($"Path is outside volume mount path: {path}");
+            ValidatePathWithinMountPath(path);
 
             try
             {
@@ -362,12 +386,13 @@ namespace Locus.FileSystem
                     if (!_fileSystem.Directory.Exists(directory))
                         _fileSystem.Directory.CreateDirectory(directory!);
 
-                    _knownDirectories.TryAdd(directory!, 0);
+                    TrackKnownDirectory(directory!);
                 }
 
-                using (var fileStream = _fileSystem.File.Create(path))
+                using (var fileStream = CreateWriteStream(path))
                 {
-                    await content.CopyToAsync(fileStream, 81920, ct); // 80 KB buffer
+                    await content.CopyToAsync(fileStream, _writeBufferSize, ct).ConfigureAwait(false);
+                    await fileStream.FlushAsync(ct).ConfigureAwait(false);
                 }
 
                 // content.Length throws NotSupportedException on non-seekable streams (e.g. NetworkStream).
@@ -387,8 +412,7 @@ namespace Locus.FileSystem
             if (string.IsNullOrWhiteSpace(path))
                 throw new ArgumentException("Path cannot be empty", nameof(path));
 
-            if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
-                throw new InvalidOperationException($"Path is outside volume mount path: {path}");
+            ValidatePathWithinMountPath(path);
 
             if (!_fileSystem.File.Exists(path))
             {
@@ -531,6 +555,74 @@ namespace Locus.FileSystem
                    $"Available={availableMB}MB, " +
                    $"Total={totalMB}MB, " +
                    $"Healthy={_cachedIsHealthy})";
+        }
+
+        private void ValidatePathWithinMountPath(string path)
+        {
+            if (IsKnownSafeInternalPath(path))
+                return;
+
+            if (!FileSystemPathSanitizer.IsPathWithinBase(_mountPath, path))
+                throw new InvalidOperationException($"Path is outside volume mount path: {path}");
+        }
+
+        private bool IsKnownSafeInternalPath(string path)
+        {
+            if (!_fileSystem.Path.IsPathRooted(path))
+                return false;
+
+            if (path.IndexOf('\0') >= 0 || path.IndexOf("..", StringComparison.Ordinal) >= 0)
+                return false;
+
+            return path.Equals(_mountPath, _pathComparison)
+                || path.StartsWith(_mountPathWithTrailingSeparator, _pathComparison);
+        }
+
+        private void TrackKnownDirectory(string directory)
+        {
+            _knownDirectories.TryAdd(directory, 0);
+
+            if (_knownDirectories.Count <= _knownDirectoryCacheMaxEntries)
+                return;
+
+            if (Interlocked.CompareExchange(ref _knownDirectoryTrimInProgress, 1, 0) != 0)
+                return;
+
+            try
+            {
+                var targetSize = Math.Max(1, _knownDirectoryCacheMaxEntries / 2);
+                foreach (var cachedDirectory in _knownDirectories.Keys)
+                {
+                    if (_knownDirectories.Count <= targetSize)
+                        break;
+
+                    if (string.Equals(cachedDirectory, _mountPath, _pathComparison))
+                        continue;
+
+                    _knownDirectories.TryRemove(cachedDirectory, out _);
+                }
+
+                _knownDirectories.TryAdd(_mountPath, 0);
+            }
+            finally
+            {
+                Volatile.Write(ref _knownDirectoryTrimInProgress, 0);
+            }
+        }
+
+        private Stream CreateWriteStream(string path)
+        {
+            // MockFileSystem does not map to OS file handles; keep using abstraction in tests.
+            if (_fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0)
+                return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
+
+            return new FileStream(
+                path,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                _writeBufferSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
         }
     }
 }

@@ -8,11 +8,11 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Locus.Benchmarks
 {
     /// <summary>
-    /// Benchmarks isolating the per-call cost of LocalFileSystemVolume health/space properties.
+    /// Benchmarks isolating the cached fast-path cost of LocalFileSystemVolume health/space properties.
     ///
-    /// Key finding: IsHealthy creates + writes + deletes a temp file on EVERY call.
-    ///              AvailableSpace calls DriveInfo.GetDrives() on EVERY call.
-    ///              Both are called on every WriteFileAsync via SelectVolumeForWrite().
+    /// Current implementation uses a 30-second TTL cache:
+    /// - IsHealthy serves cached result in the hot path, refreshing probe asynchronously on expiry.
+    /// - AvailableSpace/TotalCapacity serve cached drive metrics, refreshing on expiry.
     ///
     /// Run in Release mode:
     ///   dotnet run -c Release -- --filter "VolumeHealthCheck*"
@@ -41,24 +41,21 @@ namespace Locus.Benchmarks
         }
 
         /// <summary>
-        /// Current behavior: creates a unique temp file, writes "health check" text,
-        /// then deletes it — full disk I/O on every call.
-        /// This is invoked on every WriteFileAsync via SelectVolumeForWrite().
+        /// Fast path: returns cached health status while TTL is valid.
         /// </summary>
-        [Benchmark(Baseline = true, Description = "IsHealthy — file write+delete per call (current behavior)")]
+        [Benchmark(Baseline = true, Description = "IsHealthy — TTL cached fast path")]
         public bool IsHealthy_PerCall() => _volume.IsHealthy;
 
         /// <summary>
-        /// Current behavior: calls DriveInfo.GetDrives() on every call — system call.
-        /// Called twice per WriteFileAsync (once in IsHealthy, once in OrderByDescending).
+        /// Fast path: returns cached available space while TTL is valid.
         /// </summary>
-        [Benchmark(Description = "AvailableSpace — DriveInfo.GetDrives() per call (current behavior)")]
+        [Benchmark(Description = "AvailableSpace — TTL cached fast path")]
         public long AvailableSpace_PerCall() => _volume.AvailableSpace;
 
         /// <summary>
-        /// For comparison: TotalCapacity also calls DriveInfo.GetDrives().
+        /// Fast path: returns cached total capacity while TTL is valid.
         /// </summary>
-        [Benchmark(Description = "TotalCapacity — DriveInfo.GetDrives() per call")]
+        [Benchmark(Description = "TotalCapacity — TTL cached fast path")]
         public long TotalCapacity_PerCall() => _volume.TotalCapacity;
 
         [GlobalCleanup]

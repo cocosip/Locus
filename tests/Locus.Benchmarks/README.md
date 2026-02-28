@@ -80,7 +80,8 @@ dotnet run -c Release --filter "*AddOrUpdateAsync_Single*"
 ### 4. ConcurrentOperationsBenchmarks
 测试通过 `StoragePool` 的并发端到端场景:
 - **10/50/100 concurrent writes**: 10/50/100个并发写入操作
-- **10 concurrent reads**: 10个并发读取操作
+- **10 concurrent reads (pure read)**: 仅并发读取预置文件（不含预写成本）
+- **10 concurrent reads (write+read)**: 每次基准先写入再并发读取（端到端准备+读取）
 - **Mixed read/write operations**: 混合读写操作 (10写+10读)
 
 ### 5. VolumeHealthCheckBenchmarks
@@ -138,11 +139,13 @@ BenchmarkDotNet 会输出以下关键指标:
 
 | Method | threadCount | Mean | StdDev | Allocated |
 |--------|-------------|------|--------|-----------|
-| 10 concurrent reads | — | 14.413 ms | 4.913 ms | 1520.69 KB |
+| 10 concurrent reads (write+read) | — | 14.413 ms | 4.913 ms | 1520.69 KB |
 | Mixed read/write (20 ops) | — | 8.312 ms | 0.469 ms | 1157.40 KB |
 | Concurrent writes | 10 | 3.076 ms | 0.174 ms | 380.72 KB |
 | Concurrent writes | 50 | 14.249 ms | 1.270 ms | 1644.43 KB |
 | Concurrent writes | 100 | 25.319 ms | 1.970 ms | 2781.31 KB |
+
+> `ConcurrentReads_PureRead` 已新增，用于单独测量纯读取延迟；请运行最新基准获取独立数值。
 
 ### 目录配额操作（Lock-Free CAS）
 

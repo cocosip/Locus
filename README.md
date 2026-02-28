@@ -315,11 +315,13 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 
 | Operation | threadCount | Mean Time | Allocated | Notes |
 |-----------|-------------|-----------|-----------|-------|
-| 10 concurrent reads | — | 14.413 ms | 1520 KB | Parallel file reads |
+| 10 concurrent reads (write+read) | — | 14.413 ms | 1520 KB | Includes pre-write setup + parallel reads |
 | Mixed read/write (20 ops) | — | 8.312 ms | 1157 KB | 10 writes + 10 reads concurrent |
 | Concurrent writes | 10 | 3.076 ms | 380 KB | 10 simultaneous writes |
 | Concurrent writes | 50 | 14.249 ms | 1644 KB | 50 simultaneous writes |
 | Concurrent writes | 100 | 25.319 ms | 2781 KB | 100 simultaneous writes |
+
+`ConcurrentReads_PureRead` benchmark is now included to report read-only throughput separately from setup cost.
 
 **Key Findings**:
 - ⚡ **Directory quota CAS**: 94.80 ns per increment — lock-free atomic operations (vs. ~200 μs with SemaphoreSlim)

@@ -508,5 +508,37 @@ namespace Locus.Storage.Tests
             Assert.EndsWith(".docx", docxLocation.PhysicalPath);
             Assert.EndsWith(".jpg", jpgLocation.PhysicalPath);
         }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_ConcurrentDuplicateCalls_DecrementsQuotaOnce()
+        {
+            // Arrange
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("to complete"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(async (string key, CancellationToken token) =>
+                {
+                    var metadata = await _metadataRepository.GetByFileKeyAsync(key, token);
+                    if (metadata != null)
+                        await _metadataRepository.RemoveAsync(metadata.TenantId, key, token);
+                });
+
+            var tasks = Enumerable.Range(0, 20)
+                .Select(_ => _storagePool.MarkAsCompletedAsync(fileKey, CancellationToken.None))
+                .ToArray();
+
+            // Act
+            await Task.WhenAll(tasks);
+
+            // Assert
+            _tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+
+            var metadataAfterCompletion = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.Null(metadataAfterCompletion);
+        }
     }
 }

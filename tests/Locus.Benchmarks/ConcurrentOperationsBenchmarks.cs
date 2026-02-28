@@ -31,6 +31,7 @@ namespace Locus.Benchmarks
         private StoragePool _storagePool;
         private IStorageVolume _volume;
         private ITenantContext _tenant;
+        private List<string> _readBenchmarkFileKeys = new List<string>();
         private string _testDirectory;
         private string _volumePath;
 
@@ -75,6 +76,15 @@ namespace Locus.Benchmarks
             await _storagePool.AddVolumeAsync(_volume, initialDelayMs: 0, healthCheckDelayMs: 0);
 
             _tenant = tenantContext.Object;
+
+            // Pre-populate stable read corpus for pure-read benchmark (no write cost mixed in).
+            _readBenchmarkFileKeys = new List<string>(capacity: 10);
+            for (int i = 0; i < 10; i++)
+            {
+                var content = new MemoryStream(Encoding.UTF8.GetBytes($"Read seed {i}"));
+                var key = await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
+                _readBenchmarkFileKeys.Add(key);
+            }
         }
 
         [GlobalCleanup]
@@ -121,11 +131,24 @@ namespace Locus.Benchmarks
             await ConcurrentWrites(threadCount);
         }
 
-        [Benchmark(Description = "10 concurrent reads")]
-        public async Task ConcurrentReads()
+        [Benchmark(Description = "10 concurrent reads (pure read)")]
+        public async Task ConcurrentReads_PureRead()
         {
-            // Pre-populate files
-            var fileKeys = new List<string>();
+            var tasks = _readBenchmarkFileKeys.Select(key => Task.Run(async () =>
+            {
+                using var stream = await _storagePool.ReadFileAsync(_tenant, key, CancellationToken.None);
+                using var reader = new StreamReader(stream);
+                await reader.ReadToEndAsync();
+            }));
+
+            await Task.WhenAll(tasks);
+        }
+
+        [Benchmark(Description = "10 concurrent reads (write+read)")]
+        public async Task ConcurrentReads_WriteThenRead()
+        {
+            // Keep this benchmark to show end-to-end "prepare + read" cost separately from pure reads.
+            var fileKeys = new List<string>(capacity: 10);
             for (int i = 0; i < 10; i++)
             {
                 var content = new MemoryStream(Encoding.UTF8.GetBytes($"Read content {i}"));
@@ -133,7 +156,6 @@ namespace Locus.Benchmarks
                 fileKeys.Add(key);
             }
 
-            // Benchmark concurrent reads
             var tasks = fileKeys.Select(key => Task.Run(async () =>
             {
                 using var stream = await _storagePool.ReadFileAsync(_tenant, key, CancellationToken.None);

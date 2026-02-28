@@ -28,12 +28,16 @@ namespace Locus.Storage
         private readonly ILogger<StoragePool> _logger;
         private readonly IFileScheduler _fileScheduler;
 
-        // --- Optimization 2: Volume selection cache ---
-        // SelectVolumeForWrite() previously iterated all volumes and called IsHealthy+AvailableSpace
-        // on every write. Cache the selected volume for a short window.
-        private volatile IStorageVolume? _cachedSelectedVolume;
-        private long _lastVolumeSelectionTicks;
-        private static readonly long VolumeSelectionCacheTicks = 3L * Stopwatch.Frequency; // 3 seconds
+        // Cache a writable-volume snapshot and refresh periodically.
+        // Selection then uses power-of-two choices to avoid pinning traffic to one volume.
+        private volatile IStorageVolume[] _cachedWritableVolumes = Array.Empty<IStorageVolume>();
+        private long _lastVolumeSnapshotTicks;
+        private int _volumeSelectionCounter;
+        private static readonly long VolumeSnapshotRefreshTicks = Stopwatch.Frequency; // 1 second
+
+        // Serialize completion for the same file key to keep quota decrement idempotent.
+        private readonly SemaphoreSlim[] _completionGuards;
+        private const int CompletionGuardStripeCount = 64;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StoragePool"/> class.
@@ -51,6 +55,9 @@ namespace Locus.Storage
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
+            _completionGuards = Enumerable.Range(0, CompletionGuardStripeCount)
+                .Select(_ => new SemaphoreSlim(1, 1))
+                .ToArray();
         }
 
         /// <summary>
@@ -129,8 +136,8 @@ namespace Locus.Storage
                 throw new InvalidOperationException($"Volume {volume.VolumeId} is already mounted");
             }
 
-            _cachedSelectedVolume = null;
-            Interlocked.Exchange(ref _lastVolumeSelectionTicks, 0);
+            _cachedWritableVolumes = Array.Empty<IStorageVolume>();
+            Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
 
             _logger.LogInformation("Mounted volume {VolumeId} at {MountPath} (healthy checks: {HealthyAttempts}/{MaxAttempts})",
                 volume.VolumeId, volume.MountPath, healthyAttempts, maxHealthCheckAttempts);
@@ -234,8 +241,8 @@ namespace Locus.Storage
                 // (itself cached at 30 s) and pick the best available volume.
                 if (!fileWritten && volume != null)
                 {
-                    _cachedSelectedVolume = null;
-                    Interlocked.Exchange(ref _lastVolumeSelectionTicks, 0);
+                    _cachedWritableVolumes = Array.Empty<IStorageVolume>();
+                    Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
                     _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
                 }
                 else if (fileWritten && physicalPath != null && volume != null)
@@ -427,19 +434,28 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
 
-            // Read tenant before delegating — the scheduler removes the record and we
-            // need the tenant ID to decrement quota. Cross-tenant O(tenants) lookup is
-            // fast; completion is not a hot-path so the extra scan is acceptable.
-            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
+            // Concurrent duplicate completion calls for the same key must be idempotent.
+            // Without this guard, two callers can both read metadata before scheduler removal
+            // and both decrement quota.
+            var completionGuard = GetCompletionGuard(fileKey);
+            await completionGuard.WaitAsync(ct);
+            try
+            {
+                // Read tenant before delegating — scheduler removes metadata record.
+                var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
+                if (metadata == null)
+                    return; // Already completed by another caller.
 
-            // Delegate physical deletion + metadata removal to file scheduler.
-            await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
+                // Delegate physical deletion + metadata removal to file scheduler.
+                await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
 
-            // Decrement tenant quota to mirror the increment in WriteFileAsync.
-            // Use CancellationToken.None: a cancelled ct must not leave the quota inflated
-            // after the file has already been deleted from disk.
-            if (metadata != null)
+                // Cancellation here would leave quota inflated after deletion, so use None.
                 await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+            }
+            finally
+            {
+                completionGuard.Release();
+            }
         }
 
         /// <inheritdoc/>
@@ -499,42 +515,63 @@ namespace Locus.Storage
         }
 
         /// <summary>
-        /// Selects the best storage volume for writing a file.
-        /// Prioritizes volumes with the most available space.
-        /// Result is cached for 3 seconds to avoid calling IsHealthy (which probes disk) on every write.
-        /// Cache is invalidated when volumes are added or when a write to the cached volume fails.
+        /// Selects a storage volume for writing.
+        /// Uses a periodically refreshed healthy-volume snapshot + "power of two choices"
+        /// to balance load while still favoring volumes with more free space.
         /// </summary>
         private IStorageVolume SelectVolumeForWrite()
         {
-            // Fast path: return cached volume if still within TTL and still healthy.
-            // IsHealthy is now itself cached (30 s TTL), so this check is very cheap.
             var now = Stopwatch.GetTimestamp();
-            var last = Interlocked.Read(ref _lastVolumeSelectionTicks);
-            var cached = _cachedSelectedVolume;
+            var writableVolumes = GetWritableVolumeSnapshot(now);
 
-            if (cached != null && last != 0 && (now - last) < VolumeSelectionCacheTicks && cached.IsHealthy)
+            if (writableVolumes.Length == 0)
+            {
+                var healthyCount = _volumes.Values.Count(v => v.IsHealthy);
+                if (healthyCount == 0)
+                    throw new InsufficientStorageException("No healthy storage volumes available");
+
+                throw new InsufficientStorageException("All storage volumes are full");
+            }
+
+            if (writableVolumes.Length == 1)
+                return writableVolumes[0];
+
+            // Pick two pseudo-random distinct candidates and choose the one with more free space.
+            var ticket = (uint)Interlocked.Increment(ref _volumeSelectionCounter);
+            var firstIndex = (int)(ticket % (uint)writableVolumes.Length);
+            var secondTicket = ticket * 1103515245u + 12345u;
+            var secondIndex = (int)(secondTicket % (uint)writableVolumes.Length);
+
+            if (secondIndex == firstIndex)
+                secondIndex = (secondIndex + 1) % writableVolumes.Length;
+
+            var first = writableVolumes[firstIndex];
+            var second = writableVolumes[secondIndex];
+
+            return first.AvailableSpace >= second.AvailableSpace ? first : second;
+        }
+
+        private IStorageVolume[] GetWritableVolumeSnapshot(long nowTicks)
+        {
+            var cached = _cachedWritableVolumes;
+            var lastRefresh = Interlocked.Read(ref _lastVolumeSnapshotTicks);
+
+            if (lastRefresh != 0 && (nowTicks - lastRefresh) < VolumeSnapshotRefreshTicks)
                 return cached;
 
-            // Slow path: re-evaluate all volumes.
-            // AvailableSpace is cached per-volume (30 s TTL), so this is still cheap.
-            var healthyVolumes = _volumes.Values
-                .Where(v => v.IsHealthy)
-                .OrderByDescending(v => v.AvailableSpace)
-                .ToList();
+            var refreshed = _volumes.Values
+                .Where(v => v.IsHealthy && v.AvailableSpace > 0)
+                .ToArray();
 
-            if (healthyVolumes.Count == 0)
-                throw new InsufficientStorageException("No healthy storage volumes available");
+            _cachedWritableVolumes = refreshed;
+            Interlocked.Exchange(ref _lastVolumeSnapshotTicks, nowTicks);
+            return refreshed;
+        }
 
-            var selectedVolume = healthyVolumes.First();
-
-            if (selectedVolume.AvailableSpace <= 0)
-                throw new InsufficientStorageException("All storage volumes are full");
-
-            // Update cache (not CAS — last-writer-wins is fine here)
-            _cachedSelectedVolume = selectedVolume;
-            Interlocked.Exchange(ref _lastVolumeSelectionTicks, now);
-
-            return selectedVolume;
+        private SemaphoreSlim GetCompletionGuard(string fileKey)
+        {
+            var hash = StringComparer.Ordinal.GetHashCode(fileKey) & int.MaxValue;
+            return _completionGuards[hash % _completionGuards.Length];
         }
 
         /// <summary>
