@@ -154,14 +154,27 @@ namespace Locus.FileSystem
                 if (last != 0 && (now - last) < _healthCacheDurationTicks)
                     return _cachedIsHealthy;
 
-                // Singleflight: only the CAS winner performs the real check.
+                // Singleflight: only the CAS winner triggers the background refresh.
                 // Losers return the (slightly stale) cached value — acceptable.
                 if (Interlocked.CompareExchange(ref _lastHealthCheckTicks, now, last) != last)
                     return _cachedIsHealthy;
 
-                var result = PerformHealthCheckInternal();
-                _cachedIsHealthy = result; // volatile write — visible to all threads
-                return result;
+                // Dispatch the real probe on the thread pool so the caller is never blocked
+                // by disk/network I/O (critical when volumes are NFS/SMB mounts).
+                // The cached value returned here is at most one TTL window stale.
+                //
+                // ContinueWith logs any unexpected exception that escapes PerformHealthCheckInternal
+                // (it has a catch-all, but defensive programming).
+                // The lambda captures `this`; it is released as soon as the task finishes
+                // (typically within milliseconds), so there is no memory leak.
+                Task.Run(() =>
+                {
+                    var result = PerformHealthCheckInternal();
+                    _cachedIsHealthy = result; // volatile write — visible to all threads
+                }).ContinueWith(
+                    t => _logger.LogError(t.Exception, "Unexpected error in background health check for volume {VolumeId}", _volumeId),
+                    TaskContinuationOptions.OnlyOnFaulted);
+                return _cachedIsHealthy;
             }
         }
 
@@ -466,15 +479,19 @@ namespace Locus.FileSystem
         }
 
         /// <summary>
-        /// Returns a string representation of the volume.
+        /// Returns a string representation of the volume using only cached fields.
+        /// Reads directly from the atomic cache variables to avoid triggering disk I/O,
+        /// which would be unacceptable in hot logging paths (e.g. structured log formatters).
         /// </summary>
         public override string ToString()
         {
+            var availableMB = Interlocked.Read(ref _cachedAvailableSpace) / 1024 / 1024;
+            var totalMB = Interlocked.Read(ref _cachedTotalCapacity) / 1024 / 1024;
             return $"LocalFileSystemVolume(Id={_volumeId}, Path={_mountPath}, " +
                    $"ShardingDepth={_shardingDepth}, " +
-                   $"Available={AvailableSpace / 1024 / 1024}MB, " +
-                   $"Total={TotalCapacity / 1024 / 1024}MB, " +
-                   $"Healthy={IsHealthy})";
+                   $"Available={availableMB}MB, " +
+                   $"Total={totalMB}MB, " +
+                   $"Healthy={_cachedIsHealthy})";
         }
     }
 }

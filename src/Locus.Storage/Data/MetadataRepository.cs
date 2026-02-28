@@ -384,6 +384,13 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Returns the IDs of all tenants that currently have an active in-memory cache.
+        /// Used by maintenance operations to iterate tenants one at a time instead of
+        /// loading all files across all tenants into a single collection.
+        /// </summary>
+        public IEnumerable<string> GetActiveTenantIds() => _activeFiles.Keys;
+
+        /// <summary>
         /// Gets all file metadata for a specific tenant.
         /// </summary>
         public Task<IEnumerable<FileMetadata>> GetByTenantAsync(string tenantId, CancellationToken ct)
@@ -566,7 +573,8 @@ namespace Locus.Storage.Data
                 var tenantId = kvp.Key;
                 var cache = kvp.Value;
 
-                foreach (var file in cache.Values.ToList())
+                // ConcurrentDictionary.Values enumeration is thread-safe without snapshotting.
+                foreach (var file in cache.Values)
                 {
                     if (file.Status != FileProcessingStatus.Processing
                         || !file.ProcessingStartTime.HasValue
@@ -770,8 +778,10 @@ namespace Locus.Storage.Data
         private const int MaxPersistenceQueueSize = 100_000;
 
         // Compact pending queues every N drain cycles to reclaim memory from stale entries.
-        // At ~one drain-cycle per 5 s, 200 cycles ≈ every ~17 minutes.
-        private const int CompactionIntervalCycles = 200;
+        // At ~one drain-cycle per 5 s, 20 cycles ≈ every ~100 seconds.
+        // A shorter interval limits queue bloat when files are retried frequently,
+        // reducing the window in which a retried file is delayed from being re-allocated.
+        private const int CompactionIntervalCycles = 20;
 
         // Enqueues an operation and wakes the background persistence loop.
         // If the queue is full (LiteDB has been unavailable for a long time), the operation
@@ -945,10 +955,14 @@ namespace Locus.Storage.Data
                     .OrderBy(m => m.CreatedAt)
                     .Select(m => m.FileKey);
 
-                // Atomically replace the queue. Future GetNextPendingFileAsync calls will use
-                // the new, compact queue. In-flight calls that already hold the old reference
-                // will drain it harmlessly — validated entries are still correct.
-                _pendingKeys[tenantId] = new ConcurrentQueue<string>(pendingKeys);
+                // TryUpdate atomically replaces the queue only if _pendingKeys[tenantId] still
+                // points to the same instance we observed earlier (i.e., `queue`).  This narrows
+                // the race window: if a concurrent AddOrUpdateAsync already swapped in a newer
+                // queue, we leave it untouched rather than silently discarding newly enqueued keys.
+                // Any in-flight GetNextPendingFileAsync holding the old reference drains it
+                // harmlessly — every dequeued key is validated against the authoritative cache.
+                var newQueue = new ConcurrentQueue<string>(pendingKeys);
+                _pendingKeys.TryUpdate(tenantId, newQueue, queue);
             }
         }
 

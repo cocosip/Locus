@@ -91,7 +91,7 @@ namespace Locus.Storage
 
             if (metadata == null)
             {
-                throw new FileAlreadyProcessingException($"File not found: {fileKey}");
+                throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
             }
 
             if (metadata.Status == FileProcessingStatus.Processing)
@@ -269,20 +269,28 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct)
         {
-            var allMetadata = await _repository.GetAllAsync(ct);
             var removedCount = 0;
 
-            foreach (var metadata in allMetadata)
+            // Process one tenant at a time to avoid allocating a single list of all files
+            // across every tenant (O(total_files) memory spike → O(max_tenant_files) peak).
+            foreach (var tenantId in _repository.GetActiveTenantIds())
             {
-                // Check if physical file exists
-                if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath) &&
-                    !_fileSystem.File.Exists(metadata.PhysicalPath))
-                {
-                    _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
-                        metadata.FileKey, metadata.PhysicalPath);
+                ct.ThrowIfCancellationRequested();
 
-                    await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    removedCount++;
+                var tenantMetadata = await _repository.GetByTenantAsync(tenantId, ct);
+
+                foreach (var metadata in tenantMetadata)
+                {
+                    // Check if physical file exists
+                    if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath) &&
+                        !_fileSystem.File.Exists(metadata.PhysicalPath))
+                    {
+                        _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
+                            metadata.FileKey, metadata.PhysicalPath);
+
+                        await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                        removedCount++;
+                    }
                 }
             }
 
