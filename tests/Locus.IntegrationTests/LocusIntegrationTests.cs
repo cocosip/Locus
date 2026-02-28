@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -6,13 +7,14 @@ using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
 
 namespace Locus.IntegrationTests
 {
-    public class LocusIntegrationTests : IDisposable
+    public class LocusIntegrationTests : IDisposable, IAsyncLifetime
     {
         private readonly ServiceProvider _serviceProvider;
         private readonly string _testDirectory;
@@ -29,8 +31,8 @@ namespace Locus.IntegrationTests
 
             // Configure Locus with builder API
             services.AddLocus(builder => builder
-                .AddLocalVolume("vol-001", Path.Combine(_testDirectory, "volume1"))
-                .AddLocalVolume("vol-002", Path.Combine(_testDirectory, "volume2"))
+                .AddLocalVolume("vol-001", Path.Combine(_testDirectory, "volume1"), initialDelayMs: 0)
+                .AddLocalVolume("vol-002", Path.Combine(_testDirectory, "volume2"), initialDelayMs: 0)
                 .WithMetadataDirectory(Path.Combine(_testDirectory, "metadata"))
                 .WithQuotaDirectory(Path.Combine(_testDirectory, "quota"))
                 .WithRetryPolicy(policy =>
@@ -51,11 +53,31 @@ namespace Locus.IntegrationTests
             _serviceProvider = services.BuildServiceProvider();
         }
 
+        // IAsyncLifetime: start all IHostedServices so that StorageVolumeInitializationService
+        // mounts volumes before any test runs.
+        public async Task InitializeAsync()
+        {
+            var hostedServices = _serviceProvider.GetServices<IHostedService>();
+            foreach (var service in hostedServices)
+                await service.StartAsync(CancellationToken.None);
+        }
+
+        // IAsyncLifetime: stop hosted services gracefully.
+        public async Task DisposeAsync()
+        {
+            var hostedServices = _serviceProvider.GetServices<IHostedService>();
+            foreach (var service in hostedServices)
+            {
+                try { await service.StopAsync(CancellationToken.None); }
+                catch { /* ignore shutdown errors in tests */ }
+            }
+
+            _serviceProvider?.Dispose();
+        }
+
         public void Dispose()
         {
-            _serviceProvider?.Dispose();
-
-            // Cleanup test directory
+            // Cleanup test directory (called after DisposeAsync by xUnit)
             if (Directory.Exists(_testDirectory))
             {
                 try

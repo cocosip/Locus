@@ -178,7 +178,6 @@ namespace Locus.Storage
                     metadata.LastFailedAt.HasValue &&
                     metadata.LastFailedAt.Value < cutoffTime)
                 {
-                    // Delete physical file
                     if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
                     {
                         try
@@ -195,10 +194,7 @@ namespace Locus.Storage
                         }
                     }
 
-                    // Remove metadata
                     await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-
-                    // Decrement quota
                     await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
 
                     removedCount++;
@@ -295,6 +291,91 @@ namespace Locus.Storage
 
             _statistics.TimedOutFilesReset += resetCount;
             _logger.LogInformation("Reset {Count} timed-out processing files to Pending", resetCount);
+        }
+
+        /// <inheritdoc/>
+        public async Task CleanupFilesByStatusAsync(
+            TimeSpan? processingTimeout,
+            TimeSpan? failedRetentionPeriod,
+            TimeSpan? completedRetentionPeriod,
+            CancellationToken ct)
+        {
+            // Skip the GetAllAsync call entirely when nothing needs doing.
+            if (processingTimeout == null && failedRetentionPeriod == null && completedRetentionPeriod == null)
+                return;
+
+            _logger.LogInformation(
+                "Starting combined file status cleanup (timeout={Timeout}, failedRetention={Failed}, completedRetention={Completed})",
+                processingTimeout, failedRetentionPeriod, completedRetentionPeriod);
+
+            var allMetadata = await _metadataRepository.GetAllAsync(ct);
+            var now = DateTime.UtcNow;
+
+            var timeoutCutoff   = processingTimeout.HasValue        ? now - processingTimeout.Value        : (DateTime?)null;
+            var failedCutoff    = failedRetentionPeriod.HasValue    ? now - failedRetentionPeriod.Value    : (DateTime?)null;
+            var completedCutoff = completedRetentionPeriod.HasValue ? now - completedRetentionPeriod.Value : (DateTime?)null;
+
+            int resetCount = 0, removedFailed = 0, removedCompleted = 0;
+            long spaceFreed = 0;
+
+            foreach (var metadata in allMetadata)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (metadata.Status == FileProcessingStatus.Processing
+                    && timeoutCutoff.HasValue
+                    && metadata.ProcessingStartTime.HasValue
+                    && metadata.ProcessingStartTime.Value < timeoutCutoff.Value)
+                {
+                    metadata.Status = FileProcessingStatus.Pending;
+                    metadata.ProcessingStartTime = null;
+                    metadata.AvailableForProcessingAt = now;
+                    await _metadataRepository.AddOrUpdateAsync(metadata, ct);
+                    resetCount++;
+                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
+                }
+                else if (metadata.Status == FileProcessingStatus.PermanentlyFailed
+                    && failedCutoff.HasValue
+                    && metadata.LastFailedAt.HasValue
+                    && metadata.LastFailedAt.Value < failedCutoff.Value)
+                {
+                    if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                    {
+                        try
+                        {
+                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                            {
+                                spaceFreed += metadata.FileSize;
+                                await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
+                        }
+                    }
+                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                    await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
+                    removedFailed++;
+                }
+                else if (metadata.Status == FileProcessingStatus.Completed
+                    && completedCutoff.HasValue
+                    && metadata.CreatedAt < completedCutoff.Value)
+                {
+                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                    removedCompleted++;
+                }
+            }
+
+            _statistics.TimedOutFilesReset += resetCount;
+            _statistics.PermanentlyFailedFilesRemoved += removedFailed;
+            _statistics.CompletedRecordsRemoved += removedCompleted;
+            _statistics.SpaceFreed += spaceFreed;
+
+            _logger.LogInformation(
+                "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed removed, " +
+                "{Completed} completed records removed, {SpaceFreed} bytes freed",
+                resetCount, removedFailed, removedCompleted, spaceFreed);
         }
 
         /// <inheritdoc/>

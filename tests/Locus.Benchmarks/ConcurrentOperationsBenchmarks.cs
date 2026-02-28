@@ -35,7 +35,7 @@ namespace Locus.Benchmarks
         private string _volumePath;
 
         [GlobalSetup]
-        public void Setup()
+        public async Task Setup()
         {
             _fileSystem = new System.IO.Abstractions.FileSystem();
             var testId = Guid.NewGuid().ToString("N").Substring(0, 8);
@@ -69,10 +69,10 @@ namespace Locus.Benchmarks
             var poolLogger = NullLogger<StoragePool>.Instance;
             _storagePool = new StoragePool(_metadataRepository, tenantQuotaManager.Object, tenantManager.Object, fileScheduler.Object, poolLogger);
 
-            // Setup volume
+            // Local filesystem — skip startup delays (no K8s PVC synchronization needed).
             var volumeLogger = NullLogger<LocalFileSystemVolume>.Instance;
             _volume = new LocalFileSystemVolume(_fileSystem, volumeLogger, "vol-001", _volumePath);
-            _storagePool.AddVolume(_volume);
+            await _storagePool.AddVolumeAsync(_volume, initialDelayMs: 0, healthCheckDelayMs: 0);
 
             _tenant = tenantContext.Object;
         }

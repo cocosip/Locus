@@ -147,6 +147,20 @@ namespace Locus
         public int ShardingDepth { get; set; } = 2;
 
         /// <summary>
+        /// Gets or sets the initial delay in milliseconds before health checks begin.
+        /// Allows time for network-attached volumes (e.g., K8s PVCs) to become ready.
+        /// Set to 0 for local volumes or in test environments.
+        /// Default: 2000ms.
+        /// </summary>
+        public int InitialDelayMs { get; set; } = 2000;
+
+        /// <summary>
+        /// Gets or sets the delay in milliseconds between health check attempts.
+        /// Default: 500ms.
+        /// </summary>
+        public int HealthCheckDelayMs { get; set; } = 500;
+
+        /// <summary>
         /// Validates the volume configuration.
         /// </summary>
         public void Validate()

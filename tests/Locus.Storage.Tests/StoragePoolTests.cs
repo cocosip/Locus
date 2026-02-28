@@ -17,7 +17,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
-    public class StoragePoolTests : IDisposable
+    public class StoragePoolTests : IDisposable, IAsyncLifetime
     {
         private readonly IFileSystem _fileSystem;
         private readonly MetadataRepository _metadataRepository;
@@ -171,15 +171,23 @@ namespace Locus.Storage.Tests
                     return Task.CompletedTask;
                 });
 
-            // Mount volumes (now using public method)
-            _storagePool.AddVolume(_volume1.Object);
-            _storagePool.AddVolume(_volume2.Object);
+            // Volumes are mounted in InitializeAsync to use AddVolumeAsync without blocking.
 
             // Setup tenant
             _tenant = new Mock<ITenantContext>();
             _tenant.Setup(t => t.TenantId).Returns("tenant-001");
             _tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
         }
+
+        // IAsyncLifetime — mount volumes once without blocking the constructor.
+        // Pass zero delays so mock volumes are mounted instantly (no Thread.Sleep).
+        public async Task InitializeAsync()
+        {
+            await _storagePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+            await _storagePool.AddVolumeAsync(_volume2.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+        }
+
+        public Task DisposeAsync() => Task.CompletedTask;
 
         public void Dispose()
         {

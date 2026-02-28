@@ -52,27 +52,35 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            // Atomically check and increment in a single operation
-            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
+            // Resolve effective limit: per-tenant limit takes precedence over global limit.
+            var effectiveLimit = await GetEffectiveLimitAsync(tenantId, ct);
 
-            // Get effective limit without re-reading the quota
-            var effectiveLimit = quota.MaxCount > 0
-                ? quota.MaxCount
-                : await GetGlobalLimitAsync(ct);
-
-            // 0 means unlimited
-            if (effectiveLimit > 0 && quota.CurrentCount >= effectiveLimit)
+            // If there is a limit and the per-tenant atomic state has not yet been synced
+            // with the effective limit (e.g. only a global quota is configured), propagate
+            // it now so that TryIncrementAsync can enforce it via lock-free CAS.
+            if (effectiveLimit > 0)
             {
-                throw new TenantQuotaExceededException(tenantId, quota.CurrentCount, effectiveLimit);
+                var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
+                if (quota.MaxCount != effectiveLimit)
+                {
+                    quota.MaxCount = effectiveLimit;
+                    quota.Enabled = true;
+                    // UpdateAsync syncs MaxCount/Enabled to the atomic state immediately.
+                    await _repository.UpdateAsync(tenantId, quota, ct);
+                }
             }
 
-            // Increment count
-            quota.CurrentCount++;
-            quota.LastUpdated = DateTime.UtcNow;
-            await _repository.UpdateAsync(tenantId, quota, ct);
+            // Use the lock-free atomic CAS increment path — symmetric with DecrementAsync.
+            // This ensures _atomicCounters.Count is always accurate in the current session.
+            var success = await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+            if (!success)
+            {
+                var currentCount = await GetFileCountAsync(tenantId, ct);
+                throw new TenantQuotaExceededException(tenantId, currentCount, effectiveLimit);
+            }
 
-            _logger.LogDebug("Incremented file count for tenant {TenantId}: {CurrentCount}/{EffectiveLimit}",
-                tenantId, quota.CurrentCount, effectiveLimit);
+            _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: {EffectiveLimit})",
+                tenantId, effectiveLimit == 0 ? "unlimited" : effectiveLimit.ToString());
         }
 
         /// <inheritdoc/>

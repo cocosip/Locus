@@ -27,6 +27,9 @@ namespace Locus.Storage
         // Track imported files to avoid duplicates: filepath -> fileKey
         private readonly ConcurrentDictionary<string, string> _importedFiles;
 
+        // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
+        private const int MaxImportedFilesCacheSize = 10_000;
+
         // Locks for configuration operations
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _watcherLocks;
 
@@ -81,12 +84,22 @@ namespace Locus.Storage
 
                     if (history != null)
                     {
+                        int loaded = 0;
                         foreach (var kvp in history)
                         {
-                            _importedFiles.TryAdd(kvp.Key, kvp.Value);
+                            // Skip entries whose source file no longer exists.
+                            // This discards stale Delete/Move records that survived a crash
+                            // (the file was deleted/moved but the history save happened before TryRemove).
+                            if (_fileSystem.File.Exists(kvp.Key))
+                            {
+                                _importedFiles.TryAdd(kvp.Key, kvp.Value);
+                                loaded++;
+                            }
                         }
 
-                        _logger.LogInformation("Loaded {Count} imported file records from history", history.Count);
+                        _logger.LogInformation(
+                            "Loaded {Loaded}/{Total} imported file records from history ({Skipped} stale entries discarded)",
+                            loaded, history.Count, history.Count - loaded);
                     }
                 }
             }
@@ -94,6 +107,28 @@ namespace Locus.Storage
             {
                 _logger.LogWarning(ex, "Failed to load imported files history, will start fresh");
             }
+        }
+
+        /// <summary>
+        /// Removes entries from the in-memory cache whose source files no longer exist.
+        /// Called when the cache exceeds MaxImportedFilesCacheSize to prevent unbounded growth in Keep mode.
+        /// </summary>
+        private void PruneStaleImportedEntries()
+        {
+            int pruned = 0;
+            foreach (var key in _importedFiles.Keys.ToList())
+            {
+                if (!_fileSystem.File.Exists(key))
+                {
+                    _importedFiles.TryRemove(key, out _);
+                    pruned++;
+                }
+            }
+
+            if (pruned > 0)
+                _logger.LogInformation(
+                    "Pruned {Count} stale imported file entries (source files no longer exist at watch path)",
+                    pruned);
         }
 
         /// <summary>
@@ -524,6 +559,10 @@ namespace Locus.Storage
                 // Import file
                 using (var stream = _fileSystem.File.OpenRead(filePath))
                 {
+                    // Guard against unbounded growth in Keep mode: prune stale entries before adding a new one.
+                    if (_importedFiles.Count >= MaxImportedFilesCacheSize)
+                        PruneStaleImportedEntries();
+
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
                     _importedFiles[filePath] = fileKey;

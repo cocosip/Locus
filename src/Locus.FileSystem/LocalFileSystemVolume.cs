@@ -312,12 +312,12 @@ namespace Locus.FileSystem
                 // Optimization 4: skip Directory.Exists() for directories we already know exist.
                 // Shard directories are created once and never deleted during normal operation.
                 var directory = _fileSystem.Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory))
+                if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory!))
                 {
                     if (!_fileSystem.Directory.Exists(directory))
                         _fileSystem.Directory.CreateDirectory(directory!);
 
-                    _knownDirectories.TryAdd(directory, 0);
+                    _knownDirectories.TryAdd(directory!, 0);
                 }
 
                 using (var fileStream = _fileSystem.File.Create(path))
@@ -325,7 +325,9 @@ namespace Locus.FileSystem
                     await content.CopyToAsync(fileStream, 81920, ct); // 80 KB buffer
                 }
 
-                _logger.LogDebug("Wrote file: {Path}, Size: {Size} bytes", path, content.Length);
+                // content.Length throws NotSupportedException on non-seekable streams (e.g. NetworkStream).
+                _logger.LogDebug("Wrote file: {Path}, Size: {Size} bytes", path,
+                    content.CanSeek ? content.Length : -1L);
             }
             catch (Exception ex)
             {

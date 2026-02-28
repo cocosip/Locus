@@ -48,26 +48,13 @@ namespace Locus.Storage
                     // Note: This no longer deletes empty directories, only the junk files within them.
                     await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
-                    // 2. Cleanup timed-out processing files (if enabled)
-                    if (_options.CleanupTimedOutFiles && _options.ProcessingTimeout.HasValue)
-                    {
-                        await _cleanupService.CleanupTimedOutProcessingFilesAsync(
-                            _options.ProcessingTimeout.Value, stoppingToken);
-                    }
-
-                    // 3. Cleanup permanently failed files (if enabled)
-                    if (_options.CleanupPermanentlyFailedFiles && _options.FailedFileRetentionPeriod.HasValue)
-                    {
-                        await _cleanupService.CleanupPermanentlyFailedFilesAsync(
-                            _options.FailedFileRetentionPeriod.Value, stoppingToken);
-                    }
-
-                    // 4. Cleanup completed file records (if enabled)
-                    if (_options.CleanupCompletedRecords && _options.CompletedRecordRetentionPeriod.HasValue)
-                    {
-                        await _cleanupService.CleanupCompletedFileRecordsAsync(
-                            _options.CompletedRecordRetentionPeriod.Value, stoppingToken);
-                    }
+                    // 2-4. Combined single-pass cleanup: timed-out, permanently failed, and completed records.
+                    // Uses a single GetAllAsync call instead of one per status category.
+                    await _cleanupService.CleanupFilesByStatusAsync(
+                        _options.CleanupTimedOutFiles           ? _options.ProcessingTimeout            : null,
+                        _options.CleanupPermanentlyFailedFiles  ? _options.FailedFileRetentionPeriod    : null,
+                        _options.CleanupCompletedRecords        ? _options.CompletedRecordRetentionPeriod : null,
+                        stoppingToken);
 
                     // 5. Optimize databases (if enabled and due)
                     if (_options.OptimizeDatabases && ShouldOptimizeDatabases())

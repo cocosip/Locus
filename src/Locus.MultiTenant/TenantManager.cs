@@ -75,50 +75,59 @@ namespace Locus.MultiTenant
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("Tenant ID cannot be null or whitespace.", nameof(tenantId));
 
-            // Check cache first
-            if (_cache.TryGetValue(tenantId, out var cached))
+            // Fast path: cache hit (no lock required).
+            if (_cache.TryGetValue(tenantId, out var cached) && DateTime.UtcNow < cached.ExpiresAt)
             {
-                if (DateTime.UtcNow < cached.ExpiresAt)
+                _logger.LogDebug("Tenant {TenantId} found in cache", tenantId);
+                return cached.Context;
+            }
+
+            // Slow path: cache miss or expiry.
+            // Acquire per-tenant lock so only one thread reads the file — all other concurrent
+            // callers for the same tenantId wait here and then get the freshly cached value.
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct);
+            try
+            {
+                // Double-check: another thread may have populated the cache while we waited.
+                if (_cache.TryGetValue(tenantId, out cached) && DateTime.UtcNow < cached.ExpiresAt)
                 {
-                    _logger.LogDebug("Tenant {TenantId} found in cache", tenantId);
+                    _logger.LogDebug("Tenant {TenantId} found in cache after lock (double-check)", tenantId);
                     return cached.Context;
                 }
 
-                // Cache expired, remove it
+                // Remove any stale entry before loading from disk.
                 _cache.TryRemove(tenantId, out _);
-            }
 
-            // Load from file
-            var metadata = await LoadTenantMetadataAsync(tenantId, ct);
-            if (metadata == null)
-            {
-                // Tenant doesn't exist
-                if (_autoCreateTenants)
+                // Load from file (only one thread does this per cache-expiry cycle).
+                var metadata = await LoadTenantMetadataAsync(tenantId, ct);
+                if (metadata == null)
                 {
-                    // Auto-create the tenant
-                    _logger.LogInformation("Auto-creating tenant: {TenantId}", tenantId);
-                    await CreateTenantAsync(tenantId, ct);
-
-                    // Load the newly created tenant
-                    metadata = await LoadTenantMetadataAsync(tenantId, ct);
-                    if (metadata == null)
+                    if (_autoCreateTenants)
                     {
-                        throw new InvalidOperationException($"Failed to create tenant '{tenantId}'");
+                        _logger.LogInformation("Auto-creating tenant: {TenantId}", tenantId);
+                        await CreateTenantInternalAsync(tenantId, ct);
+
+                        metadata = await LoadTenantMetadataAsync(tenantId, ct);
+                        if (metadata == null)
+                            throw new InvalidOperationException($"Failed to create tenant '{tenantId}'");
+                    }
+                    else
+                    {
+                        throw new TenantNotFoundException(tenantId);
                     }
                 }
-                else
-                {
-                    throw new TenantNotFoundException(tenantId);
-                }
+
+                var context = new TenantContext(metadata.TenantId, metadata.Status);
+                _cache[tenantId] = (context, DateTime.UtcNow.Add(_cacheExpiration));
+
+                _logger.LogDebug("Tenant {TenantId} loaded from file system", tenantId);
+                return context;
             }
-
-            var context = new TenantContext(metadata.TenantId, metadata.Status);
-
-            // Update cache
-            _cache[tenantId] = (context, DateTime.UtcNow.Add(_cacheExpiration));
-
-            _logger.LogDebug("Tenant {TenantId} loaded from file system", tenantId);
-            return context;
+            finally
+            {
+                tenantLock.Release();
+            }
         }
 
         /// <inheritdoc/>
@@ -157,43 +166,44 @@ namespace Locus.MultiTenant
 
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             await tenantLock.WaitAsync(ct);
-
             try
             {
-                var metadataPath = GetTenantMetadataPath(tenantId);
-
-                if (_fileSystem.File.Exists(metadataPath))
-                {
-                    throw new InvalidOperationException($"Tenant '{tenantId}' already exists.");
-                }
-
-                var metadata = new TenantMetadata
-                {
-                    TenantId = tenantId,
-                    Status = TenantStatus.Enabled,
-                    CreatedAt = DateTime.UtcNow,
-                    UpdatedAt = DateTime.UtcNow,
-                    StoragePath = Path.Combine("storage", tenantId)
-                };
-
-                await SaveTenantMetadataAsync(metadata, ct);
-
-                // Create tenant storage directory
-                var storagePath = metadata.StoragePath;
-                if (!_fileSystem.Directory.Exists(storagePath))
-                {
-                    _fileSystem.Directory.CreateDirectory(storagePath);
-                }
-
-                // Invalidate cache
-                _cache.TryRemove(tenantId, out _);
-
-                _logger.LogInformation("Tenant {TenantId} created successfully", tenantId);
+                await CreateTenantInternalAsync(tenantId, ct);
             }
             finally
             {
                 tenantLock.Release();
             }
+        }
+
+        /// <summary>
+        /// Core tenant creation logic. Caller MUST hold the per-tenant SemaphoreSlim lock.
+        /// </summary>
+        private async Task CreateTenantInternalAsync(string tenantId, CancellationToken ct)
+        {
+            var metadataPath = GetTenantMetadataPath(tenantId);
+
+            if (_fileSystem.File.Exists(metadataPath))
+                throw new InvalidOperationException($"Tenant '{tenantId}' already exists.");
+
+            var metadata = new TenantMetadata
+            {
+                TenantId = tenantId,
+                Status = TenantStatus.Enabled,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+                StoragePath = Path.Combine("storage", tenantId)
+            };
+
+            await SaveTenantMetadataAsync(metadata, ct);
+
+            var storagePath = metadata.StoragePath;
+            if (!_fileSystem.Directory.Exists(storagePath))
+                _fileSystem.Directory.CreateDirectory(storagePath);
+
+            _cache.TryRemove(tenantId, out _);
+
+            _logger.LogInformation("Tenant {TenantId} created successfully", tenantId);
         }
 
         /// <inheritdoc/>

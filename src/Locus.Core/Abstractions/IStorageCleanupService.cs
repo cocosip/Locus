@@ -59,6 +59,21 @@ namespace Locus.Core.Abstractions
         Task CleanupTimedOutProcessingFilesAsync(TimeSpan timeout, CancellationToken ct);
 
         /// <summary>
+        /// Performs timed-out, permanently-failed, and completed-records cleanup in a single
+        /// pass over the metadata store, avoiding redundant per-status GetAllAsync calls.
+        /// Pass null for any parameter to skip that cleanup category.
+        /// </summary>
+        /// <param name="processingTimeout">Reset Processing files older than this to Pending. Null to skip.</param>
+        /// <param name="failedRetentionPeriod">Delete PermanentlyFailed files older than this. Null to skip.</param>
+        /// <param name="completedRetentionPeriod">Remove Completed records older than this. Null to skip.</param>
+        /// <param name="ct">Cancellation token.</param>
+        Task CleanupFilesByStatusAsync(
+            TimeSpan? processingTimeout,
+            TimeSpan? failedRetentionPeriod,
+            TimeSpan? completedRetentionPeriod,
+            CancellationToken ct);
+
+        /// <summary>
         /// Gets statistics about cleanup operations.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>

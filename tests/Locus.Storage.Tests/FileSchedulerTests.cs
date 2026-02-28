@@ -459,7 +459,9 @@ namespace Locus.Storage.Tests
         public async Task GetFileStatusAsync_ThrowsWhenFileNotFound()
         {
             // Act & Assert
-            await Assert.ThrowsAsync<FileAlreadyProcessingException>(() =>
+            // Fix 2: GetFileStatusAsync now throws FileNotFoundException (not FileAlreadyProcessingException)
+            // when the file key does not exist in any tenant's metadata.
+            await Assert.ThrowsAsync<FileNotFoundException>(() =>
                 _scheduler.GetFileStatusAsync("nonexistent", CancellationToken.None));
         }
 

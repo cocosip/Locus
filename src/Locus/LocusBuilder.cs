@@ -28,8 +28,19 @@ namespace Locus
         /// <param name="volumeId">The unique volume identifier.</param>
         /// <param name="mountPath">The mount path for the volume.</param>
         /// <param name="shardingDepth">The sharding depth (0-3). Default: 2.</param>
+        /// <param name="initialDelayMs">
+        /// Initial delay in ms before health checks begin.
+        /// Set to 0 for local volumes or in test environments.
+        /// Default: 2000ms (allows time for network volumes like K8s PVCs to become ready).
+        /// </param>
+        /// <param name="healthCheckDelayMs">Delay in ms between health check attempts. Default: 500ms.</param>
         /// <returns>The builder for chaining.</returns>
-        public LocusBuilder AddLocalVolume(string volumeId, string mountPath, int shardingDepth = 2)
+        public LocusBuilder AddLocalVolume(
+            string volumeId,
+            string mountPath,
+            int shardingDepth = 2,
+            int initialDelayMs = 2000,
+            int healthCheckDelayMs = 500)
         {
             if (string.IsNullOrWhiteSpace(volumeId))
                 throw new ArgumentException("Volume ID cannot be empty", nameof(volumeId));
@@ -45,7 +56,9 @@ namespace Locus
                 VolumeId = volumeId,
                 MountPath = mountPath,
                 VolumeType = "LocalFileSystem",
-                ShardingDepth = shardingDepth
+                ShardingDepth = shardingDepth,
+                InitialDelayMs = initialDelayMs,
+                HealthCheckDelayMs = healthCheckDelayMs
             });
 
             return this;

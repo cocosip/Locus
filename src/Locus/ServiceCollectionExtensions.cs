@@ -129,8 +129,9 @@ namespace Locus
                 return new FileScheduler(repository, fileSystem, logger, options.RetryPolicy);
             });
 
-            // Register storage pool
-            services.AddSingleton<IStoragePool>(sp =>
+            // Register StoragePool as its concrete type so StorageVolumeInitializationService
+            // can call AddVolumeAsync directly. IStoragePool forwards to the same instance.
+            services.AddSingleton<StoragePool>(sp =>
             {
                 var metadataRepo = sp.GetRequiredService<MetadataRepository>();
                 var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
@@ -138,49 +139,40 @@ namespace Locus
                 var fileScheduler = sp.GetRequiredService<IFileScheduler>();
                 var logger = sp.GetRequiredService<ILogger<StoragePool>>();
 
-                var pool = new StoragePool(
-                    metadataRepo,
-                    tenantQuotaManager,
-                    tenantManager,
-                    fileScheduler,
-                    logger);
-
-                // Mount configured volumes
-                var fileSystem = sp.GetRequiredService<IFileSystem>();
-                foreach (var volumeConfig in options.Volumes)
-                {
-                    var volume = CreateVolume(volumeConfig, fileSystem, sp);
-                    pool.AddVolume(volume);
-                }
-
-                return pool;
+                // Volumes are NOT mounted here. StorageVolumeInitializationService mounts
+                // them asynchronously in StartAsync, before requests are accepted.
+                return new StoragePool(metadataRepo, tenantQuotaManager, tenantManager, fileScheduler, logger);
             });
+            services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 
-            // Register cleanup service
-            services.AddSingleton<IStorageCleanupService>(sp =>
+            // Register StorageCleanupService as its concrete type so volumes can be registered
+            // by StorageVolumeInitializationService. IStorageCleanupService forwards to the same instance.
+            services.AddSingleton<StorageCleanupService>(sp =>
             {
                 var metadataRepo = sp.GetRequiredService<MetadataRepository>();
                 var quotaRepo = sp.GetRequiredService<DirectoryQuotaRepository>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
 
-                var cleanupService = new StorageCleanupService(
+                // Volumes are registered by StorageVolumeInitializationService after async mount.
+                return new StorageCleanupService(
                     metadataRepo,
                     quotaRepo,
                     fileSystem,
                     logger,
                     options.MetadataDirectory,
                     options.QuotaDirectory);
-
-                // Register volumes with cleanup service
-                foreach (var volumeConfig in options.Volumes)
-                {
-                    var volume = CreateVolume(volumeConfig, fileSystem, sp);
-                    cleanupService.RegisterVolume(volume);
-                }
-
-                return cleanupService;
             });
+            services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
+
+            // Mount volumes asynchronously at startup to avoid blocking Thread.Sleep calls.
+            services.AddHostedService(sp => new StorageVolumeInitializationService(
+                sp.GetRequiredService<StoragePool>(),
+                sp.GetRequiredService<StorageCleanupService>(),
+                sp.GetRequiredService<IFileSystem>(),
+                sp.GetRequiredService<ILogger<StorageVolumeInitializationService>>(),
+                options.Volumes,
+                sp));
 
             // Register database recovery service
             services.AddSingleton<IDatabaseRecoveryService, Locus.Storage.Data.DatabaseRecoveryService>(sp =>

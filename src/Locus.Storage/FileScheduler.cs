@@ -259,7 +259,7 @@ namespace Locus.Storage
 
             if (metadata == null)
             {
-                throw new FileAlreadyProcessingException($"File not found: {fileKey}");
+                throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
             }
 
             return metadata.Status;

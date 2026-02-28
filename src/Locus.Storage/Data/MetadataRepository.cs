@@ -445,6 +445,8 @@ namespace Locus.Storage.Data
                     }
                     if (candidate.AvailableForProcessingAt.HasValue && candidate.AvailableForProcessingAt.Value > now)
                         continue;
+                    // Among eligible files, select the oldest (FIFO ordering by CreatedAt).
+                    // Scanning all n_pending keys is still faster than scanning all n_active cache entries.
                     if (file == null || candidate.CreatedAt < file.CreatedAt)
                         file = candidate;
                 }
@@ -524,9 +526,10 @@ namespace Locus.Storage.Data
                 if (candidates.Count == 0)
                     return [];
 
-                // Sort pending candidates by CreatedAt to honour FIFO order, then take batchSize.
-                // Sorting n_pending (typically small) is much cheaper than sorting n_active.
-                candidates.Sort((a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
+                // Only sort when we have more candidates than needed — if batchSize covers all
+                // eligible files, ordering doesn't matter and we can skip the O(n log n) sort.
+                if (candidates.Count > batchSize)
+                    candidates.Sort((a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
 
                 var results = new List<FileMetadata>();
                 foreach (var file in candidates)

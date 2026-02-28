@@ -54,64 +54,73 @@ namespace Locus.Storage
         }
 
         /// <summary>
-        /// Adds a storage volume to the pool. Can be called during startup or at runtime.
-        /// Uses multiple health check attempts with delays to handle transient failures
+        /// Adds a storage volume to the pool asynchronously.
+        /// Performs multiple health check attempts with async delays to handle transient failures
         /// (especially important for network storage in Kubernetes/Docker environments).
+        /// This method must be called from an async context (e.g., IHostedService.StartAsync)
+        /// to avoid blocking the thread pool.
         /// </summary>
         /// <param name="volume">The storage volume to add.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <param name="initialDelayMs">
+        /// Delay before the first health check in milliseconds.
+        /// Used to allow K8s PVC mount and file system synchronization.
+        /// Pass 0 to skip the initial delay (e.g., in tests or local file system scenarios).
+        /// Default: 2000.
+        /// </param>
+        /// <param name="healthCheckDelayMs">
+        /// Delay between health check retries in milliseconds.
+        /// Pass 0 to disable inter-check delays.
+        /// Default: 500.
+        /// </param>
         /// <exception cref="ArgumentNullException">Thrown when volume is null.</exception>
         /// <exception cref="StorageVolumeUnavailableException">Thrown when the volume fails health checks after all retries.</exception>
         /// <exception cref="InvalidOperationException">Thrown when the volume is already mounted.</exception>
-        public void AddVolume(IStorageVolume volume)
+        public async Task AddVolumeAsync(
+            IStorageVolume volume,
+            int initialDelayMs = 2000,
+            int healthCheckDelayMs = 500,
+            CancellationToken ct = default)
         {
             if (volume == null)
                 throw new ArgumentNullException(nameof(volume));
 
-            // Perform multiple health checks with delays to handle transient failures
-            // This is critical for network storage (NFS, Ceph, K8s PVC) where newly created
-            // directories might need time to fully synchronize
             const int maxHealthCheckAttempts = 10;
-            const int healthCheckDelayMs = 500;
-            const int initialDelayMs = 2000;
             int healthyAttempts = 0;
 
-            // Initial delay to allow K8s PVC mount and file system synchronization
-            System.Threading.Thread.Sleep(initialDelayMs);
+            if (initialDelayMs > 0)
+                await Task.Delay(initialDelayMs, ct);
 
             for (int attempt = 1; attempt <= maxHealthCheckAttempts; attempt++)
             {
+                ct.ThrowIfCancellationRequested();
+
                 if (volume.IsHealthy)
                 {
                     healthyAttempts++;
                     _logger.LogDebug("Volume {VolumeId} health check passed (attempt {Attempt}/{MaxAttempts})",
                         volume.VolumeId, attempt, maxHealthCheckAttempts);
 
-                    // Require at least 2 consecutive successful checks for confidence
                     if (healthyAttempts >= 2)
-                    {
-                        break; // Volume is stable and healthy
-                    }
+                        break;
                 }
                 else
                 {
-                    healthyAttempts = 0; // Reset counter on failure
+                    healthyAttempts = 0;
                     _logger.LogDebug("Volume {VolumeId} health check failed (attempt {Attempt}/{MaxAttempts})",
                         volume.VolumeId, attempt, maxHealthCheckAttempts);
                 }
 
-                // Wait before next attempt (except after last attempt)
-                if (attempt < maxHealthCheckAttempts)
-                {
-                    System.Threading.Thread.Sleep(healthCheckDelayMs);
-                }
+                if (attempt < maxHealthCheckAttempts && healthCheckDelayMs > 0)
+                    await Task.Delay(healthCheckDelayMs, ct);
             }
 
-            // Final health check evaluation
             if (healthyAttempts < 2)
             {
                 _logger.LogWarning("Volume {VolumeId} is not healthy after {MaxAttempts} attempts, skipping mount",
                     volume.VolumeId, maxHealthCheckAttempts);
-                throw new StorageVolumeUnavailableException($"Volume {volume.VolumeId} is not healthy after {maxHealthCheckAttempts} attempts");
+                throw new StorageVolumeUnavailableException(
+                    $"Volume {volume.VolumeId} is not healthy after {maxHealthCheckAttempts} attempts");
             }
 
             if (!_volumes.TryAdd(volume.VolumeId, volume))
@@ -120,7 +129,6 @@ namespace Locus.Storage
                 throw new InvalidOperationException($"Volume {volume.VolumeId} is already mounted");
             }
 
-            // Invalidate volume selection cache so the new volume is considered immediately
             _cachedSelectedVolume = null;
             Interlocked.Exchange(ref _lastVolumeSelectionTicks, 0);
 

@@ -596,8 +596,10 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Gets a directory quota by path.
         /// Returns a snapshot with the live current count from the atomic state.
+        /// No lock needed: GetDatabase uses LazyThreadSafetyMode.ExecutionAndPublication
+        /// and _quotaCache is a ConcurrentDictionary (lock-free reads).
         /// </summary>
-        public async Task<DirectoryQuota?> GetAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task<DirectoryQuota?> GetAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -605,19 +607,11 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(directoryPath))
                 throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
 
-            var tenantLock = await AcquireTenantLockIfNeededAsync(tenantId, ct);
-            try
-            {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(directoryPath, out var quota))
-                    return null;
+            var cache = GetCache(tenantId);
+            if (!cache.TryGetValue(directoryPath, out var quota))
+                return Task.FromResult<DirectoryQuota?>(null);
 
-                return MergeWithLiveCount(tenantId, quota);
-            }
-            finally
-            {
-                tenantLock?.Release();
-            }
+            return Task.FromResult<DirectoryQuota?>(MergeWithLiveCount(tenantId, quota));
         }
 
         /// <summary>
@@ -762,29 +756,23 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Gets all directory quotas for a tenant.
         /// Each entry's CurrentCount reflects the live atomic value.
+        /// No lock needed: GetDatabase uses LazyThreadSafetyMode.ExecutionAndPublication
+        /// and _quotaCache is a ConcurrentDictionary (lock-free reads).
         /// </summary>
-        public async Task<IEnumerable<DirectoryQuota>> GetAllAsync(string tenantId, CancellationToken ct)
+        public Task<IEnumerable<DirectoryQuota>> GetAllAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var tenantLock = await AcquireTenantLockIfNeededAsync(tenantId, ct);
-            try
-            {
-                var cache = GetCache(tenantId);
-                var result = new List<DirectoryQuota>(cache.Count);
+            var cache = GetCache(tenantId);
+            var result = new List<DirectoryQuota>(cache.Count);
 
-                foreach (var quota in cache.Values)
-                {
-                    result.Add(MergeWithLiveCount(tenantId, quota));
-                }
-
-                return result;
-            }
-            finally
+            foreach (var quota in cache.Values)
             {
-                tenantLock?.Release();
+                result.Add(MergeWithLiveCount(tenantId, quota));
             }
+
+            return Task.FromResult<IEnumerable<DirectoryQuota>>(result);
         }
 
         /// <summary>
