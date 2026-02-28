@@ -26,6 +26,8 @@ namespace Locus.Storage
 
         // Track imported files to avoid duplicates: filepath -> fileKey
         private readonly ConcurrentDictionary<string, string> _importedFiles;
+        private readonly SemaphoreSlim _historySaveLock;
+        private int _importedHistoryDirty;
 
         // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
         private const int MaxImportedFilesCacheSize = 10_000;
@@ -57,6 +59,7 @@ namespace Locus.Storage
 
             _importedFiles = new ConcurrentDictionary<string, string>();
             _watcherLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _historySaveLock = new SemaphoreSlim(1, 1);
 
             // Ensure configuration directory exists
             if (!_fileSystem.Directory.Exists(_configurationRoot))
@@ -126,9 +129,17 @@ namespace Locus.Storage
             }
 
             if (pruned > 0)
+            {
+                MarkImportedFilesHistoryDirty();
                 _logger.LogInformation(
                     "Pruned {Count} stale imported file entries (source files no longer exist at watch path)",
                     pruned);
+            }
+        }
+
+        private void MarkImportedFilesHistoryDirty()
+        {
+            Interlocked.Exchange(ref _importedHistoryDirty, 1);
         }
 
         /// <summary>
@@ -136,8 +147,11 @@ namespace Locus.Storage
         /// </summary>
         private async Task SaveImportedFilesHistoryAsync()
         {
+            var lockTaken = false;
             try
             {
+                await _historySaveLock.WaitAsync();
+                lockTaken = true;
                 var historyPath = _fileSystem.Path.Combine(_configurationRoot, "imported-files.json");
                 var history = _importedFiles.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 
@@ -150,8 +164,22 @@ namespace Locus.Storage
             }
             catch (Exception ex)
             {
+                MarkImportedFilesHistoryDirty();
                 _logger.LogWarning(ex, "Failed to save imported files history");
             }
+            finally
+            {
+                if (lockTaken)
+                    _historySaveLock.Release();
+            }
+        }
+
+        private async Task FlushImportedFilesHistoryIfDirtyAsync()
+        {
+            if (Interlocked.Exchange(ref _importedHistoryDirty, 0) == 0)
+                return;
+
+            await SaveImportedFilesHistoryAsync();
         }
 
         /// <inheritdoc/>
@@ -307,6 +335,9 @@ namespace Locus.Storage
                 try
                 {
                     var fileName = _fileSystem.Path.GetFileNameWithoutExtension(filePath);
+                    if (string.Equals(fileName, "imported-files", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
                     var config = await LoadConfigurationAsync(fileName, ct);
                     if (config != null)
                     {
@@ -456,44 +487,47 @@ namespace Locus.Storage
             // Validate MaxConcurrentImports
             var maxConcurrency = Math.Max(1, configuration.MaxConcurrentImports);
 
-            if (maxConcurrency == 1)
+            try
             {
-                // Sequential processing (no concurrency)
-                foreach (var filePath in files)
+                if (maxConcurrency == 1)
                 {
-                    if (ct.IsCancellationRequested)
-                        break;
-
-                    var fileResult = await ProcessSingleFileAsync(configuration, tenant, filePath, ct);
-                    MergeResult(result, fileResult);
-                }
-            }
-            else
-            {
-                // Concurrent processing with semaphore limiting
-                using (var semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency))
-                {
-                    var tasks = files.Select(async filePath =>
+                    // Sequential processing (no concurrency)
+                    foreach (var filePath in files)
                     {
-                        await semaphore.WaitAsync(ct);
-                        try
-                        {
-                            return await ProcessSingleFileAsync(configuration, tenant, filePath, ct);
-                        }
-                        finally
-                        {
-                            semaphore.Release();
-                        }
-                    });
+                        if (ct.IsCancellationRequested)
+                            break;
 
-                    var results = await Task.WhenAll(tasks);
-
-                    // Merge all results
-                    foreach (var fileResult in results)
-                    {
+                        var fileResult = await ProcessSingleFileAsync(configuration, tenant, filePath, ct);
                         MergeResult(result, fileResult);
                     }
                 }
+                else
+                {
+                    // Concurrent processing with a fixed worker pool.
+                    // This avoids creating one Task per file when scanning very large directories.
+                    var queue = new ConcurrentQueue<string>(files);
+                    var workers = Enumerable.Range(0, maxConcurrency).Select(async _ =>
+                    {
+                        var workerResult = new FileWatcherScanResult();
+                        while (!ct.IsCancellationRequested && queue.TryDequeue(out var filePath))
+                        {
+                            var fileResult = await ProcessSingleFileAsync(configuration, tenant, filePath, ct);
+                            MergeResult(workerResult, fileResult);
+                        }
+                        return workerResult;
+                    }).ToArray();
+
+                    var workerResults = await Task.WhenAll(workers);
+
+                    foreach (var workerResult in workerResults)
+                    {
+                        MergeResult(result, workerResult);
+                    }
+                }
+            }
+            finally
+            {
+                await FlushImportedFilesHistoryIfDirtyAsync();
             }
         }
 
@@ -566,6 +600,7 @@ namespace Locus.Storage
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
                     _importedFiles[filePath] = fileKey;
+                    MarkImportedFilesHistoryDirty();
 
                     fileResult.FilesImported++;
                     fileResult.BytesImported += fileInfo.Length;
@@ -574,9 +609,6 @@ namespace Locus.Storage
                         "Imported file {FilePath} as {FileKey} for tenant {TenantId}",
                         filePath, fileKey, tenant.TenantId);
                 }
-
-                // Save import history to prevent re-importing after restart (especially important for Keep mode)
-                await SaveImportedFilesHistoryAsync();
 
                 // Post-import action
                 await ExecutePostImportActionAsync(configuration, filePath, ct);
@@ -624,7 +656,7 @@ namespace Locus.Storage
             return files.Distinct().ToList();
         }
 
-        private async Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct)
+        private Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct)
         {
             switch (configuration.PostImportAction)
             {
@@ -634,7 +666,7 @@ namespace Locus.Storage
 
                     // Remove from history since file no longer exists
                     _importedFiles.TryRemove(filePath, out _);
-                    await SaveImportedFilesHistoryAsync();
+                    MarkImportedFilesHistoryDirty();
                     break;
 
                 case PostImportAction.Move:
@@ -665,7 +697,7 @@ namespace Locus.Storage
 
                         // Remove from history since file is no longer in watch directory
                         _importedFiles.TryRemove(filePath, out _);
-                        await SaveImportedFilesHistoryAsync();
+                        MarkImportedFilesHistoryDirty();
                     }
                     break;
 
@@ -674,7 +706,7 @@ namespace Locus.Storage
                     break;
             }
 
-            await Task.CompletedTask;
+            return Task.CompletedTask;
         }
 
         private async Task UpdateWatcherStatusAsync(string watcherId, bool enabled, CancellationToken ct)

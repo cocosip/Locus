@@ -530,6 +530,7 @@ namespace Locus.Storage.Data
                     updated.ProcessingStartTime = DateTime.UtcNow;
 
                     cache[updated.FileKey] = updated;
+                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                     EnqueuePersistence(new PersistenceOperation(updated));
 
                     _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", updated.FileKey, tenantId);
@@ -605,6 +606,7 @@ namespace Locus.Storage.Data
                     updated.ProcessingStartTime = DateTime.UtcNow;
 
                     cache[updated.FileKey] = updated;
+                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                     EnqueuePersistence(new PersistenceOperation(updated));
                     results.Add(updated);
                 }
@@ -650,7 +652,10 @@ namespace Locus.Storage.Data
                     updated.AvailableForProcessingAt = null;
 
                     // Atomically replace cache entry then enqueue for LiteDB persistence.
+                    cache.TryGetValue(updated.FileKey, out var previous);
                     cache[updated.FileKey] = updated;
+                    if (previous?.Status != FileProcessingStatus.Pending)
+                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
                     EnqueuePersistence(new PersistenceOperation(updated));
 
                     // Re-enqueue in the pending queue so the allocator can find it immediately.
@@ -773,6 +778,7 @@ namespace Locus.Storage.Data
             _databases.TryRemove(tenantId, out _);
             _activeFiles.TryRemove(tenantId, out _);
             _pendingKeys.TryRemove(tenantId, out _);
+            _pendingFileCounts.TryRemove(tenantId, out _);
 
             var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
             _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -836,6 +842,7 @@ namespace Locus.Storage.Data
                 // Step 3: Clear in-memory cache and pending index
                 _activeFiles.TryRemove(tenantId, out _);
                 _pendingKeys.TryRemove(tenantId, out _);
+                _pendingFileCounts.TryRemove(tenantId, out _);
 
                 // Step 4: Backup corrupted database
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
@@ -1116,6 +1123,7 @@ namespace Locus.Storage.Data
             _databases.Clear();
             _activeFiles.Clear();
             _pendingKeys.Clear();
+            _pendingFileCounts.Clear();
 
             // 4. Dispose all tenant locks
             foreach (var semaphore in _tenantLocks.Values)

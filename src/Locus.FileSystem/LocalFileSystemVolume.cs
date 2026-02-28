@@ -150,6 +150,16 @@ namespace Locus.FileSystem
                 var now = Stopwatch.GetTimestamp();
                 var last = Interlocked.Read(ref _lastHealthCheckTicks);
 
+                // First health check should be synchronous so startup callers don't
+                // observe the optimistic default value before any real probe runs.
+                if (last == 0)
+                {
+                    var result = PerformHealthCheckInternal();
+                    _cachedIsHealthy = result;
+                    Interlocked.CompareExchange(ref _lastHealthCheckTicks, now, 0);
+                    return result;
+                }
+
                 // Within TTL: return cached result immediately (no I/O)
                 if (last != 0 && (now - last) < _healthCacheDurationTicks)
                     return _cachedIsHealthy;
@@ -205,6 +215,15 @@ namespace Locus.FileSystem
             var now = Stopwatch.GetTimestamp();
             var last = Interlocked.Read(ref _lastSpaceCheckTicks);
 
+            // First refresh should be synchronous for correctness. Without this,
+            // startup health probes can observe zero-space before async refresh finishes.
+            if (last == 0)
+            {
+                if (Interlocked.CompareExchange(ref _lastSpaceCheckTicks, now, 0) == 0)
+                    RefreshSpaceFromDrive();
+                return;
+            }
+
             if (last != 0 && (now - last) < _spaceCacheDurationTicks)
                 return; // Still within TTL — cached values are fresh enough
 
@@ -253,8 +272,13 @@ namespace Locus.FileSystem
                 EnsureSpaceCacheRefreshed();
                 if (Interlocked.Read(ref _cachedAvailableSpace) <= 0)
                 {
-                    _logger.LogWarning("No available space on volume {VolumeId}", _volumeId);
-                    return false;
+                    // Retry synchronously once: async refresh may still be in-flight.
+                    RefreshSpaceFromDrive();
+                    if (Interlocked.Read(ref _cachedAvailableSpace) <= 0)
+                    {
+                        _logger.LogWarning("No available space on volume {VolumeId}", _volumeId);
+                        return false;
+                    }
                 }
 
                 // Single probe write — no retries to avoid blocking the thread pool with Thread.Sleep.
