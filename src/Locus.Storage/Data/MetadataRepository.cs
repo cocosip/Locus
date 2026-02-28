@@ -36,7 +36,13 @@ namespace Locus.Storage.Data
         // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
 
-        // Per-tenant locks for concurrent file allocation
+        // Per-tenant locks for concurrent file allocation.
+        // NOTE: Locks are intentionally retained for the lifetime of the repository even if a
+        // tenant is deleted (no RemoveTenantAsync path here). The set of tenants in production
+        // systems is typically small and stable, so the bounded growth (~1 SemaphoreSlim per
+        // tenant, ~72 bytes each) is acceptable. If the system supports frequent tenant churn,
+        // consider sweeping _tenantLocks in a maintenance task after verifying no thread holds
+        // the lock (check SemaphoreSlim.CurrentCount == 1).
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
 
         // Per-tenant FIFO queue of Pending file keys for O(1) allocation.
@@ -44,6 +50,12 @@ namespace Locus.Storage.Data
         // Entries are validated on dequeue (stale entries from status changes are skipped).
         // Queue maintains arrival order so callers get FIFO scheduling without any sorting.
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _pendingKeys;
+
+        // Per-tenant count of actual Pending files (maintained in AddOrUpdateAsync / RemoveAsync).
+        // Allows CompactPendingQueues to decide whether a queue is bloated in O(1) rather than
+        // scanning the entire cache to count Pending entries.
+        // Access via Interlocked only.
+        private readonly ConcurrentDictionary<string, int> _pendingFileCounts;
 
         // --- Write-Behind: async LiteDB persistence (netstandard2.0 compatible) ---
         // Memory is always updated first. LiteDB writes are decoupled via this queue.
@@ -103,6 +115,7 @@ namespace Locus.Storage.Data
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
+            _pendingFileCounts = new ConcurrentDictionary<string, int>();
 
             // Write-behind queue + semaphore (fields initialized here, task started LAST)
             _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
@@ -168,7 +181,11 @@ namespace Locus.Storage.Data
                 }
                 catch (LiteException ex) when (ex.Message.Contains("ReadFull") || ex.Message.Contains("PAGE_SIZE") || ex.Message.Contains("Checkpoint"))
                 {
-                    // Database is corrupted during initialization - attempt automatic recovery
+                    // Database is corrupted during initialization - attempt automatic recovery.
+                    // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here — it acquires _tenantLocks[tid],
+                    // which another thread may already hold while waiting for this Lazy to complete,
+                    // causing a deadlock (Lazy lock ↔ tenant lock cycle).
+                    // Instead call the lock-free internal helper directly.
                     _logger.LogError(ex, "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...", tid);
 
                     try
@@ -177,9 +194,9 @@ namespace Locus.Storage.Data
                         _databases.TryRemove(tid, out _);
                         _activeFiles.TryRemove(tid, out _);
 
-                        // Rebuild database synchronously (we're in Lazy initialization)
-                        var backupPath = BeginDatabaseRebuildAsync(tid, CancellationToken.None).GetAwaiter().GetResult();
-                        FinishDatabaseRebuild(tid);
+                        // Rebuild database without acquiring the tenant lock (we may be called
+                        // from within the Lazy factory which is already locked via ExecutionAndPublication).
+                        var backupPath = RebuildDatabaseFileNoLock(tid);
 
                         _logger.LogWarning("Metadata database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}", tid, backupPath ?? "N/A");
 
@@ -233,11 +250,16 @@ namespace Locus.Storage.Data
                     cache[file.FileKey] = file;
 
                 // Enqueue Pending files in CreatedAt order to restore FIFO scheduling after restart.
+                int pendingCount = 0;
                 foreach (var file in activeFiles.Where(f => f.Status == FileProcessingStatus.Pending)
                                                 .OrderBy(f => f.CreatedAt))
                 {
                     pendingQueue.Enqueue(file.FileKey);
+                    pendingCount++;
                 }
+
+                // Seed the O(1) pending count so CompactPendingQueues can check bloat without scanning.
+                _pendingFileCounts[tenantId] = pendingCount;
 
                 _logger.LogInformation("Loaded {Count} active files for tenant {TenantId} into memory",
                     activeFiles.Count, tenantId);
@@ -276,15 +298,27 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            // 1. Update in-memory cache FIRST — always succeeds, immediately visible to readers
+            // 1. Update in-memory cache FIRST — always succeeds, immediately visible to readers.
+            //    Capture the previous status (if any) to maintain the O(1) pending count accurately.
             var cache = _activeFiles.GetOrAdd(metadata.TenantId,
                 _ => new ConcurrentDictionary<string, FileMetadata>());
+
+            cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
 
-            // 2. Enqueue file key when it becomes Pending so the allocator can find it in O(1).
+            // 2. Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
+            //    This keeps CompactPendingQueues O(1) instead of O(N).
+            bool wasP = previous?.Status == FileProcessingStatus.Pending;
+            bool isP  = metadata.Status == FileProcessingStatus.Pending;
+            if (!wasP && isP)
+                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
+            else if (wasP && !isP)
+                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
+
+            // 3. Enqueue file key when it becomes Pending so the allocator can find it in O(1).
             // Non-Pending transitions are not explicitly removed from the queue; stale entries
             // are validated and skipped when GetNextPendingFileAsync dequeues them.
-            if (metadata.Status == FileProcessingStatus.Pending)
+            if (isP)
             {
                 var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
                 pendingQueue.Enqueue(metadata.FileKey);
@@ -366,10 +400,14 @@ namespace Locus.Storage.Data
 
             // Remove from memory cache
             var cache = GetCache(tenantId);
-            var removed = cache.TryRemove(fileKey, out _);
+            var removed = cache.TryRemove(fileKey, out var removedMetadata);
 
             if (removed)
             {
+                // Maintain _pendingFileCounts: if the removed file was Pending, decrement.
+                if (removedMetadata?.Status == FileProcessingStatus.Pending)
+                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+
                 // No explicit removal from _pendingKeys: ConcurrentQueue does not support
                 // O(1) keyed removal. The stale entry (if any) will be skipped by the
                 // dequeue-and-validate loop in GetNextPendingFileAsync.
@@ -419,9 +457,16 @@ namespace Locus.Storage.Data
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
         }
 
-        // Maximum consecutive re-enqueues of delayed-retry files in a single allocation call.
-        // Prevents busy-looping when all pending files have a future AvailableForProcessingAt.
-        private const int MaxDelayedReEnqueues = 256;
+        // Maximum consecutive re-enqueues of delayed-retry files allowed per single-file allocation.
+        // Kept small (16) to bound the time the tenant lock is held: files are queued in FIFO
+        // order, so a delayed file near the head implies most queued files are also delayed.
+        // Scanning past 16 delayed entries without finding a ready file is not worth the latency
+        // imposed on other concurrent workers waiting for the same lock.
+        private const int MaxDelayedReEnqueues = 16;
+
+        // Larger limit used only in batch allocation, where finding more ready files
+        // within the same lock acquisition justifies a deeper scan.
+        private const int MaxDelayedReEnqueuesBatch = 256;
 
         /// <summary>
         /// Gets the next pending file for processing (atomic, O(1) amortized).
@@ -430,7 +475,8 @@ namespace Locus.Storage.Data
         ///
         /// Uses a FIFO ConcurrentQueue. Stale entries (files no longer Pending in cache)
         /// are validated and discarded on dequeue. Delayed-retry files (AvailableForProcessingAt
-        /// in the future) are re-enqueued to the back of the queue and skipped.
+        /// in the future) are re-enqueued to the back of the queue and skipped — but only up to
+        /// MaxDelayedReEnqueues times to bound lock hold time under high-contention scenarios.
         /// </summary>
         public async Task<FileMetadata?> GetNextPendingFileAsync(string tenantId, CancellationToken ct)
         {
@@ -457,8 +503,9 @@ namespace Locus.Storage.Data
                     if (candidate.AvailableForProcessingAt.HasValue
                         && candidate.AvailableForProcessingAt.Value > now)
                     {
-                        // Delayed retry — not ready yet. Re-enqueue to the back and keep looking,
-                        // but cap iterations to avoid busy-looping when all items are delayed.
+                        // Delayed retry — not ready yet. Re-enqueue to the back and stop scanning
+                        // after MaxDelayedReEnqueues attempts to bound the time this lock is held.
+                        // Files are roughly FIFO-ordered; a delayed head implies most items are delayed.
                         pendingQueue.Enqueue(key);
                         if (++delayedCount >= MaxDelayedReEnqueues)
                             break;
@@ -517,7 +564,7 @@ namespace Locus.Storage.Data
                 int delayedCount = 0;
                 // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
                 // are present. batchSize * 5 tolerates up to 80% stale entries in a typical run.
-                int maxDequeues = batchSize * 5 + MaxDelayedReEnqueues;
+                int maxDequeues = batchSize * 5 + MaxDelayedReEnqueuesBatch;
                 int dequeued = 0;
 
                 while (results.Count < batchSize
@@ -533,8 +580,10 @@ namespace Locus.Storage.Data
                         && candidate.AvailableForProcessingAt.Value > now)
                     {
                         // Not ready yet — re-enqueue and stop scanning to avoid busy-looping.
+                        // Batch allocation tolerates more delayed re-enqueues than single-file
+                        // allocation since filling the batch justifies holding the lock longer.
                         pendingQueue.Enqueue(key);
-                        if (++delayedCount >= MaxDelayedReEnqueues)
+                        if (++delayedCount >= MaxDelayedReEnqueuesBatch)
                             break;
                         continue;
                     }
@@ -681,6 +730,47 @@ namespace Locus.Storage.Data
                 .ToList();
 
             return await Task.FromResult(tenantIds);
+        }
+
+        /// <summary>
+        /// Backs up and deletes the corrupted database file WITHOUT acquiring the tenant lock.
+        /// Must only be called from within the Lazy factory (GetDatabase) where acquiring the
+        /// tenant lock would risk a deadlock with threads that hold the lock while waiting for
+        /// the Lazy to complete.
+        /// </summary>
+        /// <returns>Backup file path, or null if no database file existed.</returns>
+        private string? RebuildDatabaseFileNoLock(string tenantId)
+        {
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+
+            if (!_fileSystem.File.Exists(dbPath))
+            {
+                _logger.LogInformation("No database file to rebuild for tenant {TenantId}", tenantId);
+                return null;
+            }
+
+            // Dispose any existing connection held by a previously created Lazy.
+            if (_databases.TryGetValue(tenantId, out var existingLazy) && existingLazy.IsValueCreated)
+            {
+                try { existingLazy.Value?.Dispose(); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error disposing database connection during lock-free rebuild for tenant {TenantId}", tenantId);
+                }
+            }
+
+            _databases.TryRemove(tenantId, out _);
+            _activeFiles.TryRemove(tenantId, out _);
+            _pendingKeys.TryRemove(tenantId, out _);
+
+            var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+            _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+            _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
+
+            _fileSystem.File.Delete(dbPath);
+            _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
+
+            return backupPath;
         }
 
         /// <summary>
@@ -922,6 +1012,9 @@ namespace Locus.Storage.Data
         // the number of actual Pending files in the cache.  Called periodically by the
         // single background persistence thread — never from a request path.
         //
+        // Bloat check uses _pendingFileCounts (O(1)) maintained by AddOrUpdateAsync/RemoveAsync,
+        // avoiding the previous O(N) cache scan that blocked the persistence thread.
+        //
         // Thread-safety: _pendingKeys[tenantId] is replaced atomically (ConcurrentDictionary
         // write).  Any concurrent GetNextPendingFileAsync call that already holds a reference
         // to the old ConcurrentQueue will continue to dequeue from it safely; all dequeued
@@ -937,8 +1030,8 @@ namespace Locus.Storage.Data
                 if (!_pendingKeys.TryGetValue(tenantId, out var queue))
                     continue;
 
-                // Count actual Pending files in cache (infrequent O(n) scan, acceptable here).
-                var actualPendingCount = cache.Values.Count(m => m.Status == FileProcessingStatus.Pending);
+                // O(1): read from the counter maintained by AddOrUpdateAsync / RemoveAsync.
+                _pendingFileCounts.TryGetValue(tenantId, out var actualPendingCount);
 
                 // Only rebuild when the queue is significantly bloated:
                 // more than 2× actual pending entries + a 100-entry slack buffer.
@@ -950,6 +1043,7 @@ namespace Locus.Storage.Data
                     tenantId, queue.Count, actualPendingCount);
 
                 // Rebuild from cache: Pending files only, ordered by CreatedAt to preserve FIFO.
+                // This O(N) scan only runs when the queue IS bloated — much less frequently than before.
                 var pendingKeys = cache.Values
                     .Where(m => m.Status == FileProcessingStatus.Pending)
                     .OrderBy(m => m.CreatedAt)

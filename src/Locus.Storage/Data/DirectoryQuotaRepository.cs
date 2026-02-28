@@ -529,7 +529,11 @@ namespace Locus.Storage.Data
                             tenantId,
                             _ => new ConcurrentDictionary<string, DirectoryQuota>());
 
-                        var quota = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
+                        // Build a fresh snapshot to persist. Do NOT mutate the cached object
+                        // in-place — it is shared with lock-free readers. Even though MergeWithLiveCount
+                        // reads CurrentCount from atomicState (not from quota.CurrentCount), mutating
+                        // the shared object is an unsafe pattern that could break if readers change.
+                        var existing = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
                         {
                             DirectoryPath = path,
                             CurrentCount = count,
@@ -539,14 +543,23 @@ namespace Locus.Storage.Data
                             LastUpdated = DateTime.UtcNow
                         });
 
-                        // Update the cached entry in-place with the live count.
-                        quota.CurrentCount = count;
-                        quota.LastUpdated = DateTime.UtcNow;
+                        var snapshot = new DirectoryQuota
+                        {
+                            DirectoryPath = existing.DirectoryPath,
+                            CurrentCount  = count,
+                            MaxCount      = atomicState.MaxCount,
+                            Enabled       = atomicState.Enabled,
+                            CreatedAt     = existing.CreatedAt,
+                            LastUpdated   = DateTime.UtcNow
+                        };
+
+                        // Atomically replace the cached entry with the updated snapshot.
+                        cache[directoryPath] = snapshot;
 
                         // Persist to LiteDB.
                         var db = GetDatabase(tenantId);
                         var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                        quotas.Upsert(quota);
+                        quotas.Upsert(snapshot);
 
                         _logger.LogDebug(
                             "Flushed quota counter for {TenantId}/{DirectoryPath}: count={Count}",

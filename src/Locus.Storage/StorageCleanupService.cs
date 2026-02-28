@@ -335,15 +335,17 @@ namespace Locus.Storage
                     metadata.ProcessingStartTime.HasValue &&
                     metadata.ProcessingStartTime.Value < cutoffTime)
                 {
-                    // Reset to Pending status
-                    metadata.Status = FileProcessingStatus.Pending;
-                    metadata.ProcessingStartTime = null;
-                    metadata.AvailableForProcessingAt = DateTime.UtcNow; // Available immediately
+                    // Clone before mutating — GetAllAsync returns shared cache references.
+                    // Mutating in-place exposes a partially-written object to concurrent readers.
+                    var updated = metadata.Clone();
+                    updated.Status = FileProcessingStatus.Pending;
+                    updated.ProcessingStartTime = null;
+                    updated.AvailableForProcessingAt = DateTime.UtcNow; // Available immediately
 
-                    await _metadataRepository.AddOrUpdateAsync(metadata, ct);
+                    await _metadataRepository.AddOrUpdateAsync(updated, ct);
                     resetCount++;
 
-                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
+                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
                 }
             }
 
@@ -383,12 +385,14 @@ namespace Locus.Storage
                     && metadata.ProcessingStartTime.HasValue
                     && metadata.ProcessingStartTime.Value < timeoutCutoff.Value)
                 {
-                    metadata.Status = FileProcessingStatus.Pending;
-                    metadata.ProcessingStartTime = null;
-                    metadata.AvailableForProcessingAt = now;
-                    await _metadataRepository.AddOrUpdateAsync(metadata, ct);
+                    // Clone before mutating — same rationale as CleanupTimedOutProcessingFilesAsync.
+                    var updated = metadata.Clone();
+                    updated.Status = FileProcessingStatus.Pending;
+                    updated.ProcessingStartTime = null;
+                    updated.AvailableForProcessingAt = now;
+                    await _metadataRepository.AddOrUpdateAsync(updated, ct);
                     resetCount++;
-                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
+                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
                 }
                 else if (metadata.Status == FileProcessingStatus.PermanentlyFailed
                     && failedCutoff.HasValue
@@ -589,11 +593,11 @@ namespace Locus.Storage
             }
 
             // Also cleanup LiteDB temporary backup files (*.db-backup-*)
-            var (metadataBackupFiles, metadataBackupSpace) = await CleanupLiteDbBackupFilesAsync(_metadataDirectory, ct);
+            var (metadataBackupFiles, metadataBackupSpace) = CleanupLiteDbBackupFiles(_metadataDirectory, ct);
             filesRemoved += metadataBackupFiles;
             spaceFreed += metadataBackupSpace;
 
-            var (quotaBackupFiles, quotaBackupSpace) = await CleanupLiteDbBackupFilesAsync(_quotaDirectory, ct);
+            var (quotaBackupFiles, quotaBackupSpace) = CleanupLiteDbBackupFiles(_quotaDirectory, ct);
             filesRemoved += quotaBackupFiles;
             spaceFreed += quotaBackupSpace;
 
@@ -630,7 +634,7 @@ namespace Locus.Storage
         /// <summary>
         /// Cleans up LiteDB temporary backup files (*.db-backup-*, *.db.corrupted.*) in a directory.
         /// </summary>
-        private async Task<(int FilesRemoved, long SpaceFreed)> CleanupLiteDbBackupFilesAsync(string directory, CancellationToken ct)
+        private (int FilesRemoved, long SpaceFreed) CleanupLiteDbBackupFiles(string directory, CancellationToken ct)
         {
             var filesRemoved = 0;
             long spaceFreed = 0;
@@ -666,7 +670,7 @@ namespace Locus.Storage
                 }
             }
 
-            return await Task.FromResult((filesRemoved, spaceFreed));
+            return (filesRemoved, spaceFreed);
         }
 
         // Maximum directory nesting depth explored by CleanupJunkFilesRecursiveAsync.

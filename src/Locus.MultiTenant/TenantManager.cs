@@ -76,11 +76,10 @@ namespace Locus.MultiTenant
                 throw new ArgumentException("Tenant ID cannot be null or whitespace.", nameof(tenantId));
 
             // Fast path: cache hit (no lock required).
+            // No debug log here — this is the hot path called on every file operation
+            // and logging on each cache hit generates excessive noise at high throughput.
             if (_cache.TryGetValue(tenantId, out var cached) && DateTime.UtcNow < cached.ExpiresAt)
-            {
-                _logger.LogDebug("Tenant {TenantId} found in cache", tenantId);
                 return cached.Context;
-            }
 
             // Slow path: cache miss or expiry.
             // Acquire per-tenant lock so only one thread reads the file — all other concurrent
@@ -91,10 +90,7 @@ namespace Locus.MultiTenant
             {
                 // Double-check: another thread may have populated the cache while we waited.
                 if (_cache.TryGetValue(tenantId, out cached) && DateTime.UtcNow < cached.ExpiresAt)
-                {
-                    _logger.LogDebug("Tenant {TenantId} found in cache after lock (double-check)", tenantId);
                     return cached.Context;
-                }
 
                 // Remove any stale entry before loading from disk.
                 _cache.TryRemove(tenantId, out _);
