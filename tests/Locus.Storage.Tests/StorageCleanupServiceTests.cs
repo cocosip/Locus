@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -360,6 +361,43 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.True(_fileSystem.File.Exists(validFile)); // File still exists
+        }
+
+        [Fact]
+        public async Task CleanupOrphanedFilesAsync_PathComparisonRespectsPlatformCaseSensitivity()
+        {
+            // Arrange
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            var actualFile = Path.Combine(tenantPath, "CaseFile.dat");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            _fileSystem.File.WriteAllText(actualFile, "case content");
+
+            var mismatchedCasePath = Path.Combine(tenantPath, "casefile.dat");
+            var metadata = new FileMetadata
+            {
+                FileKey = "meta-case",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = mismatchedCasePath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            };
+            await _metadataRepository.AddOrUpdateAsync(metadata, default);
+
+            // Act
+            await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);
+
+            // Assert
+            var rebuilt = await _metadataRepository.GetAsync("tenant-001", "CaseFile", default);
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                Assert.Null(rebuilt);
+            }
+            else
+            {
+                Assert.NotNull(rebuilt);
+            }
         }
 
         [Fact]

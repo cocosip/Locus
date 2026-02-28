@@ -249,6 +249,70 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenDeleteFails_MarksPermanentlyFailedAndThrows()
+        {
+            // Arrange
+            var file = new FileMetadata
+            {
+                FileKey = "file-delete-fail",
+                TenantId = "tenant-001",
+                PhysicalPath = "/test/file-delete-fail.txt",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = DateTime.UtcNow
+            };
+
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var fileMock = new Mock<IFile>();
+            fileMock.Setup(f => f.Delete(It.IsAny<string>())).Throws(new IOException("boom"));
+            var fsMock = new Mock<IFileSystem>();
+            fsMock.SetupGet(fs => fs.File).Returns(fileMock.Object);
+
+            var scheduler = new FileScheduler(_repository, fsMock.Object, _logger.Object);
+
+            // Act & Assert
+            await Assert.ThrowsAsync<IOException>(() =>
+                scheduler.MarkAsCompletedAsync("file-delete-fail", CancellationToken.None));
+
+            var updated = await _repository.GetAsync("tenant-001", "file-delete-fail", CancellationToken.None);
+            Assert.NotNull(updated);
+            Assert.Equal(FileProcessingStatus.PermanentlyFailed, updated.Status);
+            Assert.NotNull(updated.LastFailedAt);
+            Assert.Null(updated.ProcessingStartTime);
+            Assert.NotNull(updated.LastError);
+            Assert.StartsWith("COMPLETE_DELETE_FAILED", updated.LastError);
+        }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_FileNotFound_RemovesMetadata()
+        {
+            // Arrange
+            var file = new FileMetadata
+            {
+                FileKey = "file-delete-missing",
+                TenantId = "tenant-001",
+                PhysicalPath = "/test/file-delete-missing.txt",
+                Status = FileProcessingStatus.Processing
+            };
+
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var fileMock = new Mock<IFile>();
+            fileMock.Setup(f => f.Delete(It.IsAny<string>())).Throws(new FileNotFoundException());
+            var fsMock = new Mock<IFileSystem>();
+            fsMock.SetupGet(fs => fs.File).Returns(fileMock.Object);
+
+            var scheduler = new FileScheduler(_repository, fsMock.Object, _logger.Object);
+
+            // Act
+            await scheduler.MarkAsCompletedAsync("file-delete-missing", CancellationToken.None);
+
+            // Assert
+            var metadata = await _repository.GetAsync("tenant-001", "file-delete-missing", CancellationToken.None);
+            Assert.Null(metadata);
+        }
+
+        [Fact]
         public async Task MarkAsFailedAsync_ReturnsFileToPending()
         {
             // Arrange

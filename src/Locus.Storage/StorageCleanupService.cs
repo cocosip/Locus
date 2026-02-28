@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -29,6 +30,11 @@ namespace Locus.Storage
         private readonly int _statusCleanupBatchSizePerTenant;
         private readonly int _databaseOptimizationTenantBatchSize;
         private readonly TimeSpan _databaseOptimizationPauseBetweenBatches;
+        private readonly int _maxOrphanFilesPerRun;
+        private readonly StringComparer _pathComparer;
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _orphanScanLocks;
+        private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
         
         /// <summary>
         /// System files that should be ignored when checking if a directory is empty.
@@ -59,6 +65,9 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
             _statistics = new CleanupStatistics();
+            _orphanScanQueues = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
+            _orphanScanLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _orphanScanLastRunUtc = new ConcurrentDictionary<string, DateTime>();
 
             if (string.IsNullOrWhiteSpace(metadataDirectory))
                 throw new ArgumentException("Metadata directory cannot be empty", nameof(metadataDirectory));
@@ -78,6 +87,12 @@ namespace Locus.Storage
             _databaseOptimizationPauseBetweenBatches = options.DatabaseOptimizationPauseBetweenBatches >= TimeSpan.Zero
                 ? options.DatabaseOptimizationPauseBetweenBatches
                 : TimeSpan.Zero;
+            _maxOrphanFilesPerRun = options.MaxOrphanFilesPerRun > 0
+                ? options.MaxOrphanFilesPerRun
+                : int.MaxValue;
+            _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
         }
 
         /// <summary>
@@ -190,11 +205,15 @@ namespace Locus.Storage
 
             var rebuiltCount = 0;
 
-            // Build a HashSet of known physical paths for this tenant once.
+            // Build a HashSet of known physical paths for this tenant once (normalized).
             var allMetadata = await _metadataRepository.GetByTenantAsync(tenant.TenantId, ct);
-            var knownPaths = new HashSet<string>(
-                allMetadata.Select(m => m.PhysicalPath).Where(p => !string.IsNullOrEmpty(p)),
-                StringComparer.Ordinal);
+            var knownPaths = new HashSet<string>(_pathComparer);
+            foreach (var metadata in allMetadata)
+            {
+                var normalized = NormalizePath(metadata.PhysicalPath);
+                if (normalized != null && normalized.Length > 0)
+                    knownPaths.Add(normalized);
+            }
 
             foreach (var volume in _volumes.Values)
             {
@@ -202,54 +221,193 @@ namespace Locus.Storage
                 if (!_fileSystem.Directory.Exists(tenantPath))
                     continue;
 
-                // Get all physical files for this tenant
-                var physicalFiles = _fileSystem.Directory.GetFiles(tenantPath, "*", SearchOption.AllDirectories);
+                var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
+                var lastRunUtc = _orphanScanLastRunUtc.TryGetValue(scanKey, out var lastRun)
+                    ? lastRun
+                    : DateTime.MinValue;
+                var hotDirectories = GetHotDirectories(allMetadata, volume.VolumeId, lastRunUtc);
+                var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
 
-                foreach (var physicalPath in physicalFiles)
+                await scanLock.WaitAsync(ct);
+                try
                 {
-                    ct.ThrowIfCancellationRequested();
+                    var scanQueue = GetOrphanScanQueue(scanKey, tenantPath);
+                    scanQueue = PrependDirectories(scanKey, scanQueue, hotDirectories);
+                    var scannedThisRun = 0;
+                    var budgetReached = false;
 
-                    // O(1) HashSet lookup instead of O(N) linear scan per file
-                    if (knownPaths.Contains(physicalPath))
-                        continue;
-
-                    // Orphaned physical file 鈥?reconstruct metadata and re-queue for processing.
-                    // DO NOT delete the file: it contains real data that was uploaded but whose
-                    // LiteDB record was lost (e.g. process crash during write-behind flush, or
-                    // persistence queue overflow).  Rebuilding brings it back into the Pending
-                    // queue so that normal consumers can process it on the next scheduling cycle.
-                    try
+                    while (scannedThisRun < _maxOrphanFilesPerRun && scanQueue.TryDequeue(out var directory))
                     {
-                        var metadata = RebuildMetadataFromPath(physicalPath, volume, tenant.TenantId);
+                        ct.ThrowIfCancellationRequested();
 
-                        if (metadata == null)
-                        {
-                            _logger.LogWarning(
-                                "Skipping orphaned file whose path does not match the expected storage layout: {PhysicalPath}",
-                                physicalPath);
+                        if (!_fileSystem.Directory.Exists(directory))
                             continue;
+
+                        try
+                        {
+                            foreach (var physicalPath in _fileSystem.Directory.EnumerateFiles(directory))
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                scannedThisRun++;
+
+                                var normalizedPhysical = NormalizePath(physicalPath);
+                                if (normalizedPhysical != null && knownPaths.Contains(normalizedPhysical))
+                                {
+                                    if (scannedThisRun >= _maxOrphanFilesPerRun)
+                                    {
+                                        scanQueue.Enqueue(directory);
+                                        budgetReached = true;
+                                        break;
+                                    }
+
+                                    continue;
+                                }
+
+                                // Orphaned physical file 鈥?reconstruct metadata and re-queue for processing.
+                                // DO NOT delete the file: it contains real data that was uploaded but whose
+                                // LiteDB record was lost (e.g. process crash during write-behind flush, or
+                                // persistence queue overflow).  Rebuilding brings it back into the Pending
+                                // queue so that normal consumers can process it on the next scheduling cycle.
+                                try
+                                {
+                                    var metadata = RebuildMetadataFromPath(physicalPath, volume, tenant.TenantId);
+
+                                    if (metadata == null)
+                                    {
+                                        _logger.LogWarning(
+                                            "Skipping orphaned file whose path does not match the expected storage layout: {PhysicalPath}",
+                                            physicalPath);
+                                        continue;
+                                    }
+
+                                    // AddOrUpdateDirectAsync writes immediately to LiteDB (not write-behind)
+                                    // so the record survives even if the process crashes right after this call.
+                                    await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+
+                                    rebuiltCount++;
+                                    _logger.LogInformation(
+                                        "Rebuilt metadata for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
+                                        metadata.FileKey, metadata.TenantId, physicalPath);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to rebuild metadata for orphaned file {PhysicalPath}", physicalPath);
+                                }
+
+                                if (scannedThisRun >= _maxOrphanFilesPerRun)
+                                {
+                                    scanQueue.Enqueue(directory);
+                                    budgetReached = true;
+                                    break;
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to enumerate files in directory {DirectoryPath}", directory);
                         }
 
-                        // AddOrUpdateDirectAsync writes immediately to LiteDB (not write-behind)
-                        // so the record survives even if the process crashes right after this call.
-                        await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+                        if (budgetReached)
+                            break;
 
-                        rebuiltCount++;
-                        _logger.LogInformation(
-                            "Rebuilt metadata for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
-                            metadata.FileKey, metadata.TenantId, physicalPath);
+                        try
+                        {
+                            foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(directory))
+                                scanQueue.Enqueue(subdirectory);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to enumerate subdirectories in directory {DirectoryPath}", directory);
+                        }
                     }
-                    catch (Exception ex)
+
+                    if (budgetReached)
                     {
-                        _logger.LogWarning(ex, "Failed to rebuild metadata for orphaned file {PhysicalPath}", physicalPath);
+                        _logger.LogInformation(
+                            "Orphaned file scan budget reached for tenant {TenantId} on volume {VolumeId}; remaining directories will be scanned next run",
+                            tenant.TenantId, volume.VolumeId);
                     }
                 }
+                finally
+                {
+                    scanLock.Release();
+                }
+
+                _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
             }
 
             _statistics.OrphanedFilesRemoved += rebuiltCount;
             _logger.LogInformation(
                 "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
                 tenant.TenantId, rebuiltCount);
+        }
+
+        private string GetOrphanScanKey(string tenantId, string volumeId)
+        {
+            return $"{tenantId}\u001F{volumeId}";
+        }
+
+        private ConcurrentQueue<string> GetOrphanScanQueue(string scanKey, string tenantPath)
+        {
+            var queue = _orphanScanQueues.GetOrAdd(scanKey, _ => new ConcurrentQueue<string>());
+            if (queue.IsEmpty)
+                queue.Enqueue(tenantPath);
+            return queue;
+        }
+
+        private ConcurrentQueue<string> PrependDirectories(
+            string scanKey,
+            ConcurrentQueue<string> scanQueue,
+            IReadOnlyCollection<string> hotDirectories)
+        {
+            if (hotDirectories.Count == 0)
+                return scanQueue;
+
+            var newQueue = new ConcurrentQueue<string>(hotDirectories);
+            while (scanQueue.TryDequeue(out var existing))
+                newQueue.Enqueue(existing);
+
+            _orphanScanQueues[scanKey] = newQueue;
+            return newQueue;
+        }
+
+        private IReadOnlyCollection<string> GetHotDirectories(
+            IEnumerable<FileMetadata> allMetadata,
+            string volumeId,
+            DateTime sinceUtc)
+        {
+            var hotDirectories = new HashSet<string>(_pathComparer);
+
+            foreach (var metadata in allMetadata)
+            {
+                if (!string.Equals(metadata.VolumeId, volumeId, StringComparison.Ordinal))
+                    continue;
+
+                if (metadata.CreatedAt < sinceUtc)
+                    continue;
+
+                var directoryPath = _fileSystem.Path.GetDirectoryName(metadata.PhysicalPath);
+                var normalized = NormalizePath(directoryPath);
+                if (normalized != null && normalized.Length > 0)
+                    hotDirectories.Add(normalized);
+            }
+
+            return hotDirectories;
+        }
+
+        private string? NormalizePath(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return null;
+
+            try
+            {
+                return _fileSystem.Path.GetFullPath(path!);
+            }
+            catch
+            {
+                return path;
+            }
         }
 
         /// <summary>

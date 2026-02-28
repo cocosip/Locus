@@ -54,6 +54,12 @@ namespace Locus.Storage.Data
         // Queue maintains arrival order so callers get FIFO scheduling without any sorting.
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _pendingKeys;
 
+        // Per-tenant delayed queue for Pending files that are not yet available for processing.
+        // Ordered by AvailableForProcessingAt (min-heap) to promote ready items efficiently.
+        private readonly ConcurrentDictionary<string, DelayedQueue> _delayedQueues;
+        private readonly ConcurrentDictionary<string, object> _delayedQueueLocks;
+        private long _delayedSequence;
+
         // Per-tenant count of actual Pending files (maintained in AddOrUpdateAsync / RemoveAsync).
         // Allows CompactPendingQueues to decide whether a queue is bloated in O(1) rather than
         // scanning the entire cache to count Pending entries.
@@ -102,6 +108,118 @@ namespace Locus.Storage.Data
             }
         }
 
+        private sealed class DelayedQueue
+        {
+            private readonly List<DelayedEntry> _heap = new List<DelayedEntry>();
+
+            public int Count => _heap.Count;
+
+            public void Enqueue(string fileKey, DateTime availableAtUtc, long sequence)
+            {
+                _heap.Add(new DelayedEntry(availableAtUtc, sequence, fileKey));
+                HeapifyUp(_heap.Count - 1);
+            }
+
+            public bool TryDequeueReady(DateTime nowUtc, out string fileKey)
+            {
+                if (_heap.Count == 0)
+                {
+                    fileKey = string.Empty;
+                    return false;
+                }
+
+                var entry = _heap[0];
+                if (entry.AvailableAtUtc > nowUtc)
+                {
+                    fileKey = string.Empty;
+                    return false;
+                }
+
+                fileKey = entry.FileKey;
+                RemoveRoot();
+                return true;
+            }
+
+            private void RemoveRoot()
+            {
+                var lastIndex = _heap.Count - 1;
+                if (lastIndex == 0)
+                {
+                    _heap.Clear();
+                    return;
+                }
+
+                _heap[0] = _heap[lastIndex];
+                _heap.RemoveAt(lastIndex);
+                HeapifyDown(0);
+            }
+
+            private void HeapifyUp(int index)
+            {
+                while (index > 0)
+                {
+                    var parent = (index - 1) / 2;
+                    if (IsHigherPriority(_heap[parent], _heap[index]))
+                        break;
+
+                    Swap(parent, index);
+                    index = parent;
+                }
+            }
+
+            private void HeapifyDown(int index)
+            {
+                var lastIndex = _heap.Count - 1;
+                while (true)
+                {
+                    var left = index * 2 + 1;
+                    var right = left + 1;
+                    if (left > lastIndex)
+                        return;
+
+                    var smallest = left;
+                    if (right <= lastIndex && IsHigherPriority(_heap[right], _heap[left]))
+                        smallest = right;
+
+                    if (IsHigherPriority(_heap[index], _heap[smallest]))
+                        return;
+
+                    Swap(index, smallest);
+                    index = smallest;
+                }
+            }
+
+            private void Swap(int a, int b)
+            {
+                var temp = _heap[a];
+                _heap[a] = _heap[b];
+                _heap[b] = temp;
+            }
+
+            private static bool IsHigherPriority(DelayedEntry left, DelayedEntry right)
+            {
+                if (left.AvailableAtUtc < right.AvailableAtUtc)
+                    return true;
+                if (left.AvailableAtUtc > right.AvailableAtUtc)
+                    return false;
+                return left.Sequence <= right.Sequence;
+            }
+        }
+
+        private readonly struct DelayedEntry
+        {
+            public readonly DateTime AvailableAtUtc;
+            public readonly long Sequence;
+            public readonly string FileKey;
+
+            public DelayedEntry(DateTime availableAtUtc, long sequence, string fileKey)
+            {
+                AvailableAtUtc = availableAtUtc;
+                Sequence = sequence;
+                FileKey = fileKey;
+            }
+        }
+
         /// <summary>
         /// Initializes a new instance of the <see cref="MetadataRepository"/> class.
         /// </summary>
@@ -139,6 +257,8 @@ namespace Locus.Storage.Data
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
             _pendingFileCounts = new ConcurrentDictionary<string, int>();
+            _delayedQueues = new ConcurrentDictionary<string, DelayedQueue>();
+            _delayedQueueLocks = new ConcurrentDictionary<string, object>();
 
             // Write-behind queue + semaphore (fields initialized here, task started LAST)
             _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
@@ -359,8 +479,16 @@ namespace Locus.Storage.Data
             // are validated and skipped when GetNextPendingFileAsync dequeues them.
             if (isP)
             {
-                var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
-                pendingQueue.Enqueue(metadata.FileKey);
+                var now = DateTime.UtcNow;
+                if (metadata.AvailableForProcessingAt.HasValue && metadata.AvailableForProcessingAt.Value > now)
+                {
+                    EnqueueDelayed(metadata.TenantId, metadata.FileKey, metadata.AvailableForProcessingAt.Value);
+                }
+                else
+                {
+                    var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
+                    pendingQueue.Enqueue(metadata.FileKey);
+                }
             }
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
@@ -408,8 +536,16 @@ namespace Locus.Storage.Data
             // Enqueue when Pending — stale entries skipped on dequeue (same as AddOrUpdateAsync).
             if (isP)
             {
-                var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
-                pendingQueue.Enqueue(metadata.FileKey);
+                var now = DateTime.UtcNow;
+                if (metadata.AvailableForProcessingAt.HasValue && metadata.AvailableForProcessingAt.Value > now)
+                {
+                    EnqueueDelayed(metadata.TenantId, metadata.FileKey, metadata.AvailableForProcessingAt.Value);
+                }
+                else
+                {
+                    var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
+                    pendingQueue.Enqueue(metadata.FileKey);
+                }
             }
 
             // Write directly to LiteDB (synchronous — required for rebuild correctness)
@@ -570,16 +706,44 @@ namespace Locus.Storage.Data
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
         }
 
-        // Maximum consecutive re-enqueues of delayed-retry files allowed per single-file allocation.
-        // Kept small (16) to bound the time the tenant lock is held: files are queued in FIFO
-        // order, so a delayed file near the head implies most queued files are also delayed.
-        // Scanning past 16 delayed entries without finding a ready file is not worth the latency
-        // imposed on other concurrent workers waiting for the same lock.
-        private const int MaxDelayedReEnqueues = 16;
+        // Maximum number of delayed items promoted to ready per allocation call.
+        // Caps lock hold time when many delayed entries are due simultaneously.
+        private const int MaxDelayedPromotions = 64;
+        private const int MaxDelayedPromotionsBatch = 256;
 
-        // Larger limit used only in batch allocation, where finding more ready files
-        // within the same lock acquisition justifies a deeper scan.
-        private const int MaxDelayedReEnqueuesBatch = 256;
+        private void EnqueueDelayed(string tenantId, string fileKey, DateTime availableAtUtc)
+        {
+            var delayedQueue = _delayedQueues.GetOrAdd(tenantId, _ => new DelayedQueue());
+            var delayedLock = _delayedQueueLocks.GetOrAdd(tenantId, _ => new object());
+            var sequence = Interlocked.Increment(ref _delayedSequence);
+
+            lock (delayedLock)
+            {
+                delayedQueue.Enqueue(fileKey, availableAtUtc, sequence);
+            }
+        }
+
+        private void PromoteDelayedReady(
+            string tenantId,
+            DateTime nowUtc,
+            ConcurrentQueue<string> readyQueue,
+            int maxPromotions)
+        {
+            if (!_delayedQueues.TryGetValue(tenantId, out var delayedQueue))
+                return;
+
+            var delayedLock = _delayedQueueLocks.GetOrAdd(tenantId, _ => new object());
+            var promoted = 0;
+
+            lock (delayedLock)
+            {
+                while (promoted < maxPromotions && delayedQueue.TryDequeueReady(nowUtc, out var fileKey))
+                {
+                    readyQueue.Enqueue(fileKey);
+                    promoted++;
+                }
+            }
+        }
 
         /// <summary>
         /// Gets the next pending file for processing (atomic, O(1) amortized).
@@ -587,14 +751,17 @@ namespace Locus.Storage.Data
         /// Thread-safe: Uses per-tenant lock for atomic dequeue-and-mark.
         ///
         /// Uses a FIFO ConcurrentQueue. Stale entries (files no longer Pending in cache)
-        /// are validated and discarded on dequeue. Delayed-retry files (AvailableForProcessingAt
-        /// in the future) are re-enqueued to the back of the queue and skipped — but only up to
-        /// MaxDelayedReEnqueues times to bound lock hold time under high-contention scenarios.
+        /// are validated and discarded on dequeue. Delayed-retry files are held in a separate
+        /// delayed queue and promoted to ready when they become due.
         /// </summary>
         public async Task<FileMetadata?> GetNextPendingFileAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            // Fast-path: if no pending files, skip taking the tenant lock.
+            if (_pendingFileCounts.TryGetValue(tenantId, out var pendingCount) && pendingCount <= 0)
+                return null;
 
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             await tenantLock.WaitAsync(ct);
@@ -603,7 +770,7 @@ namespace Locus.Storage.Data
                 var cache = GetCache(tenantId);
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>());
                 var now = DateTime.UtcNow;
-                int delayedCount = 0;
+                PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotions);
 
                 while (pendingQueue.TryDequeue(out var key))
                 {
@@ -616,12 +783,8 @@ namespace Locus.Storage.Data
                     if (candidate.AvailableForProcessingAt.HasValue
                         && candidate.AvailableForProcessingAt.Value > now)
                     {
-                        // Delayed retry — not ready yet. Re-enqueue to the back and stop scanning
-                        // after MaxDelayedReEnqueues attempts to bound the time this lock is held.
-                        // Files are roughly FIFO-ordered; a delayed head implies most items are delayed.
-                        pendingQueue.Enqueue(key);
-                        if (++delayedCount >= MaxDelayedReEnqueues)
-                            break;
+                        // Not ready yet — move to delayed queue.
+                        EnqueueDelayed(tenantId, candidate.FileKey, candidate.AvailableForProcessingAt.Value);
                         continue;
                     }
 
@@ -629,7 +792,7 @@ namespace Locus.Storage.Data
                     // a fully-consistent object (Pending snapshot or Processing snapshot).
                     var updated = candidate.Clone();
                     updated.Status = FileProcessingStatus.Processing;
-                    updated.ProcessingStartTime = DateTime.UtcNow;
+                    updated.ProcessingStartTime = now;
 
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
@@ -663,6 +826,10 @@ namespace Locus.Storage.Data
             if (batchSize <= 0)
                 throw new ArgumentException("Batch size must be greater than zero", nameof(batchSize));
 
+            // Fast-path: if no pending files, skip taking the tenant lock.
+            if (_pendingFileCounts.TryGetValue(tenantId, out var pendingCount) && pendingCount <= 0)
+                return Enumerable.Empty<FileMetadata>();
+
             // Get or create tenant-specific lock (shared with GetNextPendingFileAsync)
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
@@ -673,12 +840,13 @@ namespace Locus.Storage.Data
                 var cache = GetCache(tenantId);
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>());
                 var now = DateTime.UtcNow;
+                PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotionsBatch);
 
                 var results = new List<FileMetadata>(batchSize);
-                int delayedCount = 0;
                 // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
-                // are present. batchSize * 5 tolerates up to 80% stale entries in a typical run.
-                int maxDequeues = batchSize * 5 + MaxDelayedReEnqueuesBatch;
+                // are present. Tie the cap to pendingCount and batchSize to bound lock hold time.
+                pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
+                int maxDequeues = Math.Min(pendingCount + 64, batchSize * 2 + 64);
                 int dequeued = 0;
 
                 while (results.Count < batchSize
@@ -693,19 +861,15 @@ namespace Locus.Storage.Data
                     if (candidate.AvailableForProcessingAt.HasValue
                         && candidate.AvailableForProcessingAt.Value > now)
                     {
-                        // Not ready yet — re-enqueue and stop scanning to avoid busy-looping.
-                        // Batch allocation tolerates more delayed re-enqueues than single-file
-                        // allocation since filling the batch justifies holding the lock longer.
-                        pendingQueue.Enqueue(key);
-                        if (++delayedCount >= MaxDelayedReEnqueuesBatch)
-                            break;
+                        // Not ready yet — move to delayed queue.
+                        EnqueueDelayed(tenantId, candidate.FileKey, candidate.AvailableForProcessingAt.Value);
                         continue;
                     }
 
                     // Clone before mutating — same rationale as GetNextPendingFileAsync.
                     var updated = candidate.Clone();
                     updated.Status = FileProcessingStatus.Processing;
-                    updated.ProcessingStartTime = DateTime.UtcNow;
+                    updated.ProcessingStartTime = now;
 
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
@@ -1251,7 +1415,7 @@ namespace Locus.Storage.Data
             }
         }
 
-        // Rebuilds _pendingKeys for any tenant whose queue is significantly larger than
+        // Rebuilds _pendingKeys / _delayedQueues for any tenant whose queues are significantly larger than
         // the number of actual Pending files in the cache.  Called periodically by the
         // single background persistence thread — never from a request path.
         //
@@ -1275,22 +1439,37 @@ namespace Locus.Storage.Data
 
                 // O(1): read from the counter maintained by AddOrUpdateAsync / RemoveAsync.
                 _pendingFileCounts.TryGetValue(tenantId, out var actualPendingCount);
+                var delayedQueueCount = _delayedQueues.TryGetValue(tenantId, out var delayedQueue)
+                    ? delayedQueue.Count
+                    : 0;
 
                 // Only rebuild when the queue is significantly bloated:
                 // more than 2× actual pending entries + a 100-entry slack buffer.
-                if (queue.Count <= actualPendingCount * 2 + 100)
+                if (queue.Count <= actualPendingCount * 2 + 100
+                    && delayedQueueCount <= actualPendingCount * 2 + 100)
                     continue;
 
                 _logger.LogDebug(
-                    "Compacting pending queue for tenant {TenantId}: {QueueCount} queue entries → {PendingCount} actual pending",
-                    tenantId, queue.Count, actualPendingCount);
+                    "Compacting queues for tenant {TenantId}: Ready={ReadyCount}, Delayed={DelayedCount} → Pending={PendingCount}",
+                    tenantId, queue.Count, delayedQueueCount, actualPendingCount);
 
-                // Rebuild from cache: Pending files only, ordered by CreatedAt to preserve FIFO.
-                // This O(N) scan only runs when the queue IS bloated — much less frequently than before.
-                var pendingKeys = cache.Values
+                var now = DateTime.UtcNow;
+                var pendingItems = cache.Values
                     .Where(m => m.Status == FileProcessingStatus.Pending)
+                    .ToList();
+
+                // Ready queue: Pending files available now, ordered by CreatedAt to preserve FIFO.
+                var readyKeys = pendingItems
+                    .Where(m => !m.AvailableForProcessingAt.HasValue || m.AvailableForProcessingAt.Value <= now)
                     .OrderBy(m => m.CreatedAt)
                     .Select(m => m.FileKey);
+
+                // Delayed queue: Pending files scheduled for the future.
+                var delayedItems = pendingItems
+                    .Where(m => m.AvailableForProcessingAt.HasValue && m.AvailableForProcessingAt.Value > now)
+                    .OrderBy(m => m.AvailableForProcessingAt)
+                    .ThenBy(m => m.CreatedAt)
+                    .ToList();
 
                 // TryUpdate atomically replaces the queue only if _pendingKeys[tenantId] still
                 // points to the same instance we observed earlier (i.e., `queue`).  This narrows
@@ -1298,8 +1477,28 @@ namespace Locus.Storage.Data
                 // queue, we leave it untouched rather than silently discarding newly enqueued keys.
                 // Any in-flight GetNextPendingFileAsync holding the old reference drains it
                 // harmlessly — every dequeued key is validated against the authoritative cache.
-                var newQueue = new ConcurrentQueue<string>(pendingKeys);
+                var newQueue = new ConcurrentQueue<string>(readyKeys);
                 _pendingKeys.TryUpdate(tenantId, newQueue, queue);
+
+                if (delayedItems.Count == 0)
+                {
+                    if (delayedQueue != null)
+                        _delayedQueues.TryRemove(tenantId, out _);
+                    continue;
+                }
+
+                var newDelayed = new DelayedQueue();
+                var endSequence = Interlocked.Add(ref _delayedSequence, delayedItems.Count);
+                var sequence = endSequence - delayedItems.Count;
+                foreach (var item in delayedItems)
+                {
+                    newDelayed.Enqueue(item.FileKey, item.AvailableForProcessingAt!.Value, ++sequence);
+                }
+
+                if (delayedQueue != null)
+                    _delayedQueues.TryUpdate(tenantId, newDelayed, delayedQueue);
+                else
+                    _delayedQueues.TryAdd(tenantId, newDelayed);
             }
         }
 
@@ -1353,6 +1552,8 @@ namespace Locus.Storage.Data
             _fileKeyTenantIndex.Clear();
             _pendingKeys.Clear();
             _pendingFileCounts.Clear();
+            _delayedQueues.Clear();
+            _delayedQueueLocks.Clear();
             _coalescedPersistenceOps.Clear();
 
             // 4. Dispose all tenant locks

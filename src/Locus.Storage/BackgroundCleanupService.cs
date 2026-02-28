@@ -192,6 +192,13 @@ namespace Locus.Storage
         public int CleanupBatchSizePerTenant { get; set; } = 500;
 
         /// <summary>
+        /// Gets or sets the maximum number of physical files to scan per orphan-rebuild run
+        /// (per tenant per volume). Set to a non-positive value for unlimited scanning.
+        /// Default: 5000.
+        /// </summary>
+        public int MaxOrphanFilesPerRun { get; set; } = 5000;
+
+        /// <summary>
         /// Gets or sets the number of tenant databases to optimize before pausing briefly.
         /// Default: 10.
         /// </summary>

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Threading;
@@ -18,6 +19,7 @@ namespace Locus.Storage
     /// </summary>
     public class FileScheduler : IFileScheduler
     {
+        private const string CompleteDeleteFailedPrefix = "COMPLETE_DELETE_FAILED";
         private readonly MetadataRepository _repository;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<FileScheduler> _logger;
@@ -125,7 +127,10 @@ namespace Locus.Storage
                 return;
             }
 
-            // Delete physical file if it exists
+            // Delete physical file if it exists. If deletion fails for reasons other than
+            // not-found, keep metadata and mark the file PermanentlyFailed so maintenance
+            // cleanup can handle it and quota is not decremented.
+            Exception? deleteException = null;
             if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath))
             {
                 try
@@ -140,8 +145,27 @@ namespace Locus.Storage
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to delete physical file: {PhysicalPath}", metadata.PhysicalPath);
-                    // Continue to remove metadata even if physical deletion fails
+                    deleteException = ex;
                 }
+            }
+
+            if (deleteException != null)
+            {
+                // Clone before mutating so readers never see partial state.
+                var updated = metadata.Clone();
+                updated.Status = FileProcessingStatus.PermanentlyFailed;
+                updated.LastFailedAt = DateTime.UtcNow;
+                updated.ProcessingStartTime = null;
+                updated.AvailableForProcessingAt = null;
+                updated.LastError = $"{CompleteDeleteFailedPrefix}: {deleteException.GetType().Name}: {deleteException.Message}";
+
+                await _repository.AddOrUpdateAsync(updated, ct);
+
+                _logger.LogWarning(
+                    "Marked file as PermanentlyFailed because physical delete failed: {FileKey}, Path: {PhysicalPath}",
+                    fileKey, metadata.PhysicalPath);
+
+                throw new IOException($"Failed to delete physical file for completion: {fileKey}", deleteException);
             }
 
             // Remove metadata (Write-Behind: memory removed immediately, LiteDB delete queued)

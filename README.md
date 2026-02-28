@@ -313,13 +313,18 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 
 #### End-to-End Concurrent Operations
 
+Last updated: 2026-02-28 (BenchmarkDotNet v0.15.8, .NET 10.0.0, IterationCount=10, WarmupCount=3)
+
 | Operation | threadCount | Mean Time | Allocated | Notes |
 |-----------|-------------|-----------|-----------|-------|
-| 10 concurrent reads (write+read) | — | 14.413 ms | 1520 KB | Includes pre-write setup + parallel reads |
-| Mixed read/write (20 ops) | — | 8.312 ms | 1157 KB | 10 writes + 10 reads concurrent |
-| Concurrent writes | 10 | 3.076 ms | 380 KB | 10 simultaneous writes |
-| Concurrent writes | 50 | 14.249 ms | 1644 KB | 50 simultaneous writes |
-| Concurrent writes | 100 | 25.319 ms | 2781 KB | 100 simultaneous writes |
+| Core path: 100 concurrent writes (no Task.Run) | — | 77.599 ms | 26243.21 KB | Core path, no Task.Run |
+| 10 concurrent reads (pure read) | — | 0.653 ms | 104.10 KB | Read-only, no setup |
+| Core path: 10 concurrent reads (no Task.Run) | — | 2.128 ms | 104.43 KB | Core path, no Task.Run |
+| 10 concurrent reads (write+read) | — | 8.802 ms | 3132.49 KB | Includes pre-write setup + parallel reads |
+| Mixed read/write (20 ops) | — | 7.840 ms | 4417.77 KB | 10 writes + 10 reads concurrent |
+| Concurrent writes | 10 | 3.149 ms | 2158.13 KB | 10 simultaneous writes |
+| Concurrent writes | 50 | 13.551 ms | 10720.19 KB | 50 simultaneous writes |
+| Concurrent writes | 100 | 26.945 ms | 22256.45 KB | 100 simultaneous writes |
 
 `ConcurrentReads_PureRead` benchmark is now included to report read-only throughput separately from setup cost.
 
