@@ -68,6 +68,9 @@ namespace Locus
                 tenant.Validate();
             }
 
+            if (options.PersistenceDrainBatchSize <= 0)
+                throw new InvalidOperationException("PersistenceDrainBatchSize must be greater than zero");
+
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
 
@@ -76,7 +79,13 @@ namespace Locus
             {
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<MetadataRepository>>();
-                return new MetadataRepository(fileSystem, logger, options.MetadataDirectory, options.LiteDB);
+                return new MetadataRepository(
+                    fileSystem,
+                    logger,
+                    options.MetadataDirectory,
+                    options.LiteDB,
+                    enableBackgroundPersistence: true,
+                    maxDrainBatchSize: options.PersistenceDrainBatchSize);
             });
 
             services.AddSingleton(sp =>
@@ -161,7 +170,8 @@ namespace Locus
                     fileSystem,
                     logger,
                     options.MetadataDirectory,
-                    options.QuotaDirectory);
+                    options.QuotaDirectory,
+                    options.CleanupOptions);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 
@@ -253,7 +263,10 @@ namespace Locus
                         logger,
                         config.VolumeId,
                         config.MountPath,
-                        config.ShardingDepth);
+                        config.ShardingDepth,
+                        writeBufferSize: config.WriteBufferSize,
+                        copyBufferSize: config.CopyBufferSize,
+                        forceFlushAfterWrite: config.ForceFlushAfterWrite);
 
                 default:
                     throw new NotSupportedException($"Volume type '{config.VolumeType}' is not supported");

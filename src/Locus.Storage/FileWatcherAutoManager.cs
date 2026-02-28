@@ -208,7 +208,11 @@ namespace Locus.Storage
                 PollingInterval = rootConfig.PollingInterval,
                 MaxFileSizeBytes = rootConfig.MaxFileSizeBytes,
                 MinFileAge = rootConfig.MinFileAge,
-                MaxConcurrentImports = rootConfig.MaxConcurrentImports
+                MaxConcurrentImports = rootConfig.MaxConcurrentImports,
+                EnableImportedFilesPruneThrottle = rootConfig.EnableImportedFilesPruneThrottle,
+                ImportedFilesPruneInterval = rootConfig.ImportedFilesPruneInterval,
+                EnableImportedFilesHistoryFlushDebounce = rootConfig.EnableImportedFilesHistoryFlushDebounce,
+                ImportedFilesHistoryFlushInterval = rootConfig.ImportedFilesHistoryFlushInterval
             };
 
             // Check if watcher already exists
@@ -261,7 +265,11 @@ namespace Locus.Storage
                 PollingInterval = rootConfig.PollingInterval,
                 MaxFileSizeBytes = rootConfig.MaxFileSizeBytes,
                 MinFileAge = rootConfig.MinFileAge,
-                MaxConcurrentImports = rootConfig.MaxConcurrentImports
+                MaxConcurrentImports = rootConfig.MaxConcurrentImports,
+                EnableImportedFilesPruneThrottle = rootConfig.EnableImportedFilesPruneThrottle,
+                ImportedFilesPruneInterval = rootConfig.ImportedFilesPruneInterval,
+                EnableImportedFilesHistoryFlushDebounce = rootConfig.EnableImportedFilesHistoryFlushDebounce,
+                ImportedFilesHistoryFlushInterval = rootConfig.ImportedFilesHistoryFlushInterval
             };
 
             // Check if watcher already exists

@@ -26,6 +26,9 @@ namespace Locus.Storage
         private readonly CleanupStatistics _statistics;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
+        private readonly int _statusCleanupBatchSizePerTenant;
+        private readonly int _databaseOptimizationTenantBatchSize;
+        private readonly TimeSpan _databaseOptimizationPauseBetweenBatches;
         
         /// <summary>
         /// System files that should be ignored when checking if a directory is empty.
@@ -47,7 +50,8 @@ namespace Locus.Storage
             IFileSystem fileSystem,
             ILogger<StorageCleanupService> logger,
             string metadataDirectory,
-            string quotaDirectory)
+            string quotaDirectory,
+            CleanupOptions? cleanupOptions = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
@@ -63,6 +67,17 @@ namespace Locus.Storage
 
             _metadataDirectory = metadataDirectory;
             _quotaDirectory = quotaDirectory;
+
+            var options = cleanupOptions ?? new CleanupOptions();
+            _statusCleanupBatchSizePerTenant = options.CleanupBatchSizePerTenant > 0
+                ? options.CleanupBatchSizePerTenant
+                : 500;
+            _databaseOptimizationTenantBatchSize = options.DatabaseOptimizationTenantBatchSize > 0
+                ? options.DatabaseOptimizationTenantBatchSize
+                : 10;
+            _databaseOptimizationPauseBetweenBatches = options.DatabaseOptimizationPauseBetweenBatches >= TimeSpan.Zero
+                ? options.DatabaseOptimizationPauseBetweenBatches
+                : TimeSpan.Zero;
         }
 
         /// <summary>
@@ -154,36 +169,9 @@ namespace Locus.Storage
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
-                var tenantMetadata = await _metadataRepository.GetByTenantAsync(tenantId, ct);
-
-                foreach (var metadata in tenantMetadata)
-                {
-                    if (metadata.Status == FileProcessingStatus.PermanentlyFailed &&
-                        metadata.LastFailedAt.HasValue &&
-                        metadata.LastFailedAt.Value < cutoffTime)
-                    {
-                        if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
-                        {
-                            try
-                            {
-                                if (_fileSystem.File.Exists(metadata.PhysicalPath))
-                                {
-                                    spaceFreed += metadata.FileSize;
-                                    await volume.DeleteAsync(metadata.PhysicalPath, ct);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
-                            }
-                        }
-
-                        await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                        await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
-
-                        removedCount++;
-                    }
-                }
+                var tenantResult = await CleanupPermanentlyFailedForTenantAsync(tenantId, cutoffTime, ct);
+                removedCount += tenantResult.RemovedCount;
+                spaceFreed += tenantResult.SpaceFreed;
             }
 
             _statistics.PermanentlyFailedFilesRemoved += removedCount;
@@ -337,25 +325,7 @@ namespace Locus.Storage
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
-                var tenantMetadata = await _metadataRepository.GetByTenantAsync(tenantId, ct);
-
-                foreach (var metadata in tenantMetadata)
-                {
-                    if (metadata.Status == FileProcessingStatus.Processing &&
-                        metadata.ProcessingStartTime.HasValue &&
-                        metadata.ProcessingStartTime.Value < cutoffTime)
-                    {
-                        var updated = metadata.Clone();
-                        updated.Status = FileProcessingStatus.Pending;
-                        updated.ProcessingStartTime = null;
-                        updated.AvailableForProcessingAt = DateTime.UtcNow;
-
-                        await _metadataRepository.AddOrUpdateAsync(updated, ct);
-                        resetCount++;
-
-                        _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
-                    }
-                }
+                resetCount += await ResetTimedOutForTenantAsync(tenantId, cutoffTime, DateTime.UtcNow, ct);
             }
 
             _statistics.TimedOutFilesReset += resetCount;
@@ -386,48 +356,14 @@ namespace Locus.Storage
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
-                var tenantMetadata = await _metadataRepository.GetByTenantAsync(tenantId, ct);
+                if (timeoutCutoff.HasValue)
+                    resetCount += await ResetTimedOutForTenantAsync(tenantId, timeoutCutoff.Value, now, ct);
 
-                foreach (var metadata in tenantMetadata)
+                if (failedCutoff.HasValue)
                 {
-                    if (metadata.Status == FileProcessingStatus.Processing
-                        && timeoutCutoff.HasValue
-                        && metadata.ProcessingStartTime.HasValue
-                        && metadata.ProcessingStartTime.Value < timeoutCutoff.Value)
-                    {
-                        var updated = metadata.Clone();
-                        updated.Status = FileProcessingStatus.Pending;
-                        updated.ProcessingStartTime = null;
-                        updated.AvailableForProcessingAt = now;
-                        await _metadataRepository.AddOrUpdateAsync(updated, ct);
-                        resetCount++;
-                        _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
-                    }
-                    else if (metadata.Status == FileProcessingStatus.PermanentlyFailed
-                        && failedCutoff.HasValue
-                        && metadata.LastFailedAt.HasValue
-                        && metadata.LastFailedAt.Value < failedCutoff.Value)
-                    {
-                        if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
-                        {
-                            try
-                            {
-                                if (_fileSystem.File.Exists(metadata.PhysicalPath))
-                                {
-                                    spaceFreed += metadata.FileSize;
-                                    await volume.DeleteAsync(metadata.PhysicalPath, ct);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
-                            }
-                        }
-
-                        await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                        await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
-                        removedFailed++;
-                    }
+                    var tenantResult = await CleanupPermanentlyFailedForTenantAsync(tenantId, failedCutoff.Value, ct);
+                    removedFailed += tenantResult.RemovedCount;
+                    spaceFreed += tenantResult.SpaceFreed;
                 }
             }
 
@@ -438,6 +374,91 @@ namespace Locus.Storage
             _logger.LogInformation(
                 "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed removed, {SpaceFreed} bytes freed",
                 resetCount, removedFailed, spaceFreed);
+        }
+
+        private async Task<int> ResetTimedOutForTenantAsync(
+            string tenantId,
+            DateTime timeoutCutoffUtc,
+            DateTime nowUtc,
+            CancellationToken ct)
+        {
+            int resetCount = 0;
+
+            while (true)
+            {
+                var batch = await _metadataRepository.GetProcessingTimedOutAsync(
+                    tenantId,
+                    timeoutCutoffUtc,
+                    _statusCleanupBatchSizePerTenant,
+                    ct);
+                if (batch.Count == 0)
+                    break;
+
+                foreach (var metadata in batch)
+                {
+                    var updated = metadata.Clone();
+                    updated.Status = FileProcessingStatus.Pending;
+                    updated.ProcessingStartTime = null;
+                    updated.AvailableForProcessingAt = nowUtc;
+                    await _metadataRepository.AddOrUpdateAsync(updated, ct);
+                    resetCount++;
+
+                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
+                }
+
+                if (batch.Count < _statusCleanupBatchSizePerTenant)
+                    break;
+            }
+
+            return resetCount;
+        }
+
+        private async Task<(int RemovedCount, long SpaceFreed)> CleanupPermanentlyFailedForTenantAsync(
+            string tenantId,
+            DateTime failedCutoffUtc,
+            CancellationToken ct)
+        {
+            int removedCount = 0;
+            long spaceFreed = 0;
+
+            while (true)
+            {
+                var batch = await _metadataRepository.GetPermanentlyFailedOlderThanAsync(
+                    tenantId,
+                    failedCutoffUtc,
+                    _statusCleanupBatchSizePerTenant,
+                    ct);
+                if (batch.Count == 0)
+                    break;
+
+                foreach (var metadata in batch)
+                {
+                    if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                    {
+                        try
+                        {
+                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                            {
+                                spaceFreed += metadata.FileSize;
+                                await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
+                        }
+                    }
+
+                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                    await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
+                    removedCount++;
+                }
+
+                if (batch.Count < _statusCleanupBatchSizePerTenant)
+                    break;
+            }
+
+            return (removedCount, spaceFreed);
         }
 
         /// <inheritdoc/>
@@ -473,6 +494,7 @@ namespace Locus.Storage
             var metadataTenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
 
             // Optimize metadata databases (per-tenant, thread-safe)
+            var metadataProcessed = 0;
             foreach (var tenantId in metadataTenantIds)
             {
                 ct.ThrowIfCancellationRequested();
@@ -493,12 +515,20 @@ namespace Locus.Storage
                 {
                     _logger.LogError(ex, "Failed to optimize metadata database for tenant {TenantId}", tenantId);
                 }
+
+                metadataProcessed++;
+                if (_databaseOptimizationPauseBetweenBatches > TimeSpan.Zero
+                    && metadataProcessed % _databaseOptimizationTenantBatchSize == 0)
+                {
+                    await Task.Delay(_databaseOptimizationPauseBetweenBatches, ct);
+                }
             }
 
             // Get all tenant IDs from quota databases
             var quotaTenantIds = await _quotaRepository.GetAllTenantIdsAsync(ct);
 
             // Optimize quota databases (per-tenant, thread-safe)
+            var quotaProcessed = 0;
             foreach (var tenantId in quotaTenantIds)
             {
                 ct.ThrowIfCancellationRequested();
@@ -518,6 +548,13 @@ namespace Locus.Storage
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to optimize quota database for tenant {TenantId}", tenantId);
+                }
+
+                quotaProcessed++;
+                if (_databaseOptimizationPauseBetweenBatches > TimeSpan.Zero
+                    && quotaProcessed % _databaseOptimizationTenantBatchSize == 0)
+                {
+                    await Task.Delay(_databaseOptimizationPauseBetweenBatches, ct);
                 }
             }
 

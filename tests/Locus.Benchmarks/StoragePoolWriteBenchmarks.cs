@@ -204,7 +204,7 @@ namespace Locus.Benchmarks
                 _fileContent[i] = (byte)(i & 0xFF);
         }
 
-        private async Task WriteConcurrently(int concurrency)
+        private async Task WriteConcurrentlyE2E(int concurrency)
         {
             var tasks = Enumerable.Range(0, concurrency).Select(_ => Task.Run(async () =>
             {
@@ -214,18 +214,38 @@ namespace Locus.Benchmarks
             await Task.WhenAll(tasks);
         }
 
+        private async Task WriteConcurrentlyCorePath(int concurrency)
+        {
+            var tasks = new Task[concurrency];
+            for (int i = 0; i < concurrency; i++)
+            {
+                tasks[i] = WriteCoreAsync();
+            }
+
+            await Task.WhenAll(tasks);
+        }
+
+        private async Task WriteCoreAsync()
+        {
+            using var stream = new MemoryStream(_fileContent, writable: false);
+            await _storagePool.WriteFileAsync(_tenant, stream, "dicom-file.dcm", CancellationToken.None);
+        }
+
         /// <summary>Baseline: 1 writer — same as sequential but measured under the concurrency harness.</summary>
         [Benchmark(Baseline = true, Description = "1 writer (baseline)")]
-        public async Task WriteFile_Concurrent1() => await WriteConcurrently(1);
+        public async Task WriteFile_Concurrent1() => await WriteConcurrentlyE2E(1);
 
         [Benchmark(Description = "10 concurrent writers")]
-        public async Task WriteFile_Concurrent10() => await WriteConcurrently(10);
+        public async Task WriteFile_Concurrent10() => await WriteConcurrentlyE2E(10);
 
         [Benchmark(Description = "50 concurrent writers")]
-        public async Task WriteFile_Concurrent50() => await WriteConcurrently(50);
+        public async Task WriteFile_Concurrent50() => await WriteConcurrentlyE2E(50);
 
         [Benchmark(Description = "100 concurrent writers")]
-        public async Task WriteFile_Concurrent100() => await WriteConcurrently(100);
+        public async Task WriteFile_Concurrent100() => await WriteConcurrentlyE2E(100);
+
+        [Benchmark(Description = "Core path: 100 concurrent writers (no Task.Run)")]
+        public async Task WriteFile_Concurrent100_CorePath() => await WriteConcurrentlyCorePath(100);
 
         [GlobalCleanup]
         public void Cleanup()

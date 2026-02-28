@@ -29,6 +29,9 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, string> _importedFiles;
         private readonly SemaphoreSlim _historySaveLock;
         private int _importedHistoryDirty;
+        private long _lastImportedHistoryFlushUtcTicks;
+        private long _lastImportedFilesPruneUtcTicks;
+        private int _pruneInProgress;
         private readonly SemaphoreSlim _watcherCacheLock;
         private volatile IReadOnlyList<FileWatcherConfiguration>? _cachedWatchers;
         private long _watchersCacheExpiresAtTicks;
@@ -37,6 +40,8 @@ namespace Locus.Storage
         private const int MaxImportedFilesCacheSize = 10_000;
         private const string InFlightImportMarker = "__LOCUS_IN_FLIGHT__";
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
+        private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan DefaultImportedHistoryFlushInterval = TimeSpan.FromSeconds(2);
 
         // Locks for configuration operations
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _watcherLocks;
@@ -152,21 +157,30 @@ namespace Locus.Storage
         /// <summary>
         /// Saves the imported files history to persistent storage.
         /// </summary>
-        private async Task SaveImportedFilesHistoryAsync()
+        private async Task SaveImportedFilesHistoryAsync(CancellationToken ct)
         {
             var lockTaken = false;
             try
             {
-                await _historySaveLock.WaitAsync();
+                await _historySaveLock.WaitAsync(ct).ConfigureAwait(false);
                 lockTaken = true;
+
+                if (Volatile.Read(ref _importedHistoryDirty) == 0)
+                    return;
+
+                // Claim the current dirty set before snapshotting so concurrent updates can
+                // re-mark dirty and trigger a follow-up flush with newer state.
+                Interlocked.Exchange(ref _importedHistoryDirty, 0);
+
                 var historyPath = _fileSystem.Path.Combine(_configurationRoot, "imported-files.json");
                 var history = _importedFiles.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 
                 using (var stream = _fileSystem.File.Create(historyPath))
                 {
-                    await JsonSerializer.SerializeAsync(stream, history, JsonOptions);
+                    await JsonSerializer.SerializeAsync(stream, history, JsonOptions, ct).ConfigureAwait(false);
                 }
 
+                Interlocked.Exchange(ref _lastImportedHistoryFlushUtcTicks, DateTime.UtcNow.Ticks);
                 _logger.LogDebug("Saved imported files history: {Count} records", history.Count);
             }
             catch (Exception ex)
@@ -181,12 +195,67 @@ namespace Locus.Storage
             }
         }
 
-        private async Task FlushImportedFilesHistoryIfDirtyAsync()
+        private async Task FlushImportedFilesHistoryIfDirtyAsync(
+            FileWatcherConfiguration configuration,
+            bool force,
+            CancellationToken ct)
         {
-            if (Interlocked.Exchange(ref _importedHistoryDirty, 0) == 0)
+            if (Volatile.Read(ref _importedHistoryDirty) == 0)
                 return;
 
-            await SaveImportedFilesHistoryAsync();
+            if (!force && configuration.EnableImportedFilesHistoryFlushDebounce)
+            {
+                var flushInterval = NormalizeInterval(
+                    configuration.ImportedFilesHistoryFlushInterval,
+                    DefaultImportedHistoryFlushInterval);
+                var lastFlushTicks = Interlocked.Read(ref _lastImportedHistoryFlushUtcTicks);
+                if (lastFlushTicks > 0)
+                {
+                    var elapsedSinceFlush = DateTime.UtcNow - new DateTime(lastFlushTicks, DateTimeKind.Utc);
+                    if (elapsedSinceFlush < flushInterval)
+                        return;
+                }
+            }
+
+            await SaveImportedFilesHistoryAsync(ct).ConfigureAwait(false);
+        }
+
+        private static TimeSpan NormalizeInterval(TimeSpan configured, TimeSpan fallback)
+        {
+            return configured <= TimeSpan.Zero ? fallback : configured;
+        }
+
+        private void TryPruneStaleImportedEntries(FileWatcherConfiguration configuration)
+        {
+            if (_importedFiles.Count < MaxImportedFilesCacheSize)
+                return;
+
+            if (configuration.EnableImportedFilesPruneThrottle)
+            {
+                var pruneInterval = NormalizeInterval(
+                    configuration.ImportedFilesPruneInterval,
+                    DefaultImportedHistoryPruneInterval);
+                var lastPruneTicks = Interlocked.Read(ref _lastImportedFilesPruneUtcTicks);
+                if (lastPruneTicks > 0)
+                {
+                    var elapsedSincePrune = DateTime.UtcNow - new DateTime(lastPruneTicks, DateTimeKind.Utc);
+                    if (elapsedSincePrune < pruneInterval)
+                        return;
+                }
+            }
+
+            if (Interlocked.CompareExchange(ref _pruneInProgress, 1, 0) != 0)
+                return;
+
+            try
+            {
+                Interlocked.Exchange(ref _lastImportedFilesPruneUtcTicks, DateTime.UtcNow.Ticks);
+                PruneStaleImportedEntries();
+            }
+            finally
+            {
+                Volatile.Write(ref _pruneInProgress, 0);
+            }
         }
 
         private void InvalidateWatchersCache()
@@ -559,7 +628,7 @@ namespace Locus.Storage
             }
             finally
             {
-                await FlushImportedFilesHistoryIfDirtyAsync();
+                await FlushImportedFilesHistoryIfDirtyAsync(configuration, force: false, ct).ConfigureAwait(false);
             }
         }
 
@@ -628,9 +697,8 @@ namespace Locus.Storage
                 // Import file
                 using (var stream = _fileSystem.File.OpenRead(filePath))
                 {
-                    // Guard against unbounded growth in Keep mode: prune stale entries before adding a new one.
-                    if (_importedFiles.Count >= MaxImportedFilesCacheSize)
-                        PruneStaleImportedEntries();
+                    // Guard against unbounded growth in Keep mode with interval-based pruning.
+                    TryPruneStaleImportedEntries(configuration);
 
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);

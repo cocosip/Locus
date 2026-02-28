@@ -34,6 +34,7 @@ namespace Locus.Benchmarks
         private List<string> _readBenchmarkFileKeys = new List<string>();
         private string _testDirectory;
         private string _volumePath;
+        private byte[][] _writePayloads = Array.Empty<byte[]>();
 
         [GlobalSetup]
         public async Task Setup()
@@ -77,6 +78,10 @@ namespace Locus.Benchmarks
 
             _tenant = tenantContext.Object;
 
+            _writePayloads = Enumerable.Range(0, 256)
+                .Select(i => Encoding.UTF8.GetBytes($"Payload-{i:D4}"))
+                .ToArray();
+
             // Pre-populate stable read corpus for pure-read benchmark (no write cost mixed in).
             _readBenchmarkFileKeys = new List<string>(capacity: 10);
             for (int i = 0; i < 10; i++)
@@ -108,12 +113,20 @@ namespace Locus.Benchmarks
             for (int i = 0; i < threadCount; i++)
             {
                 int index = i;
-                tasks.Add(Task.Run(async () =>
-                {
-                    var content = new MemoryStream(Encoding.UTF8.GetBytes($"Content {index}"));
-                    await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
-                }));
+                tasks.Add(Task.Run(() => WritePayloadAsync(_writePayloads[index % _writePayloads.Length])));
             }
+            await Task.WhenAll(tasks);
+        }
+
+        [Benchmark(Description = "Core path: 100 concurrent writes (no Task.Run)")]
+        public async Task ConcurrentWrites_100_CorePath()
+        {
+            var tasks = new Task[100];
+            for (int i = 0; i < tasks.Length; i++)
+            {
+                tasks[i] = WritePayloadAsync(_writePayloads[i % _writePayloads.Length]);
+            }
+
             await Task.WhenAll(tasks);
         }
 
@@ -144,6 +157,13 @@ namespace Locus.Benchmarks
             await Task.WhenAll(tasks);
         }
 
+        [Benchmark(Description = "Core path: 10 concurrent reads (no Task.Run)")]
+        public async Task ConcurrentReads_PureRead_CorePath()
+        {
+            var tasks = _readBenchmarkFileKeys.Select(ReadAsyncNoTaskRun);
+            await Task.WhenAll(tasks);
+        }
+
         [Benchmark(Description = "10 concurrent reads (write+read)")]
         public async Task ConcurrentReads_WriteThenRead()
         {
@@ -164,6 +184,19 @@ namespace Locus.Benchmarks
             }));
 
             await Task.WhenAll(tasks);
+        }
+
+        private async Task WritePayloadAsync(byte[] payload)
+        {
+            using var content = new MemoryStream(payload, writable: false);
+            await _storagePool.WriteFileAsync(_tenant, content, null, CancellationToken.None);
+        }
+
+        private async Task ReadAsyncNoTaskRun(string key)
+        {
+            using var stream = await _storagePool.ReadFileAsync(_tenant, key, CancellationToken.None);
+            using var reader = new StreamReader(stream);
+            await reader.ReadToEndAsync();
         }
 
         [Benchmark(Description = "Mixed read/write operations (20 ops)")]

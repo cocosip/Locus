@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -25,6 +26,8 @@ namespace Locus.FileSystem
         private readonly int _shardingDepth;
         private readonly StringComparison _pathComparison;
         private readonly int _writeBufferSize;
+        private readonly int _copyBufferSize;
+        private readonly bool _forceFlushAfterWrite;
         private readonly int _knownDirectoryCacheMaxEntries;
 
         // --- Optimization 1: IsHealthy TTL cache ---
@@ -48,6 +51,7 @@ namespace Locus.FileSystem
         private int _knownDirectoryTrimInProgress;
 
         private const int DefaultWriteBufferSize = 128 * 1024;
+        private const int DefaultCopyBufferSize = 80 * 1024;
         private const int DefaultKnownDirectoryCacheMaxEntries = 50_000;
 
         /// <summary>
@@ -64,6 +68,11 @@ namespace Locus.FileSystem
         /// Default: 30 seconds. Pass <see cref="TimeSpan.Zero"/> to disable caching (original behavior).
         /// </param>
         /// <param name="writeBufferSize">Write stream buffer size in bytes. Default 128 KB.</param>
+        /// <param name="copyBufferSize">Pooled copy buffer size in bytes. Default 80 KB.</param>
+        /// <param name="forceFlushAfterWrite">
+        /// Whether to force <see cref="Stream.FlushAsync(CancellationToken)"/> after each write.
+        /// Default: false.
+        /// </param>
         /// <param name="knownDirectoryCacheMaxEntries">
         /// Maximum number of cached directory entries before trimming. Default 50,000.
         /// </param>
@@ -75,6 +84,8 @@ namespace Locus.FileSystem
             int shardingDepth = 2,
             TimeSpan healthCheckCacheDuration = default,
             int writeBufferSize = DefaultWriteBufferSize,
+            int copyBufferSize = DefaultCopyBufferSize,
+            bool forceFlushAfterWrite = false,
             int knownDirectoryCacheMaxEntries = DefaultKnownDirectoryCacheMaxEntries)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -92,6 +103,9 @@ namespace Locus.FileSystem
             if (writeBufferSize <= 0)
                 throw new ArgumentException("Write buffer size must be greater than zero", nameof(writeBufferSize));
 
+            if (copyBufferSize <= 0)
+                throw new ArgumentException("Copy buffer size must be greater than zero", nameof(copyBufferSize));
+
             if (knownDirectoryCacheMaxEntries <= 0)
                 throw new ArgumentException("Known directory cache size must be greater than zero", nameof(knownDirectoryCacheMaxEntries));
 
@@ -103,6 +117,8 @@ namespace Locus.FileSystem
                 ? StringComparison.Ordinal
                 : StringComparison.OrdinalIgnoreCase;
             _writeBufferSize = writeBufferSize;
+            _copyBufferSize = copyBufferSize;
+            _forceFlushAfterWrite = forceFlushAfterWrite;
             _knownDirectoryCacheMaxEntries = knownDirectoryCacheMaxEntries;
 
             // Default TTL: 30 seconds
@@ -391,8 +407,9 @@ namespace Locus.FileSystem
 
                 using (var fileStream = CreateWriteStream(path))
                 {
-                    await content.CopyToAsync(fileStream, _writeBufferSize, ct).ConfigureAwait(false);
-                    await fileStream.FlushAsync(ct).ConfigureAwait(false);
+                    await CopyStreamAsync(content, fileStream, ct).ConfigureAwait(false);
+                    if (_forceFlushAfterWrite)
+                        await fileStream.FlushAsync(ct).ConfigureAwait(false);
                 }
 
                 // content.Length throws NotSupportedException on non-seekable streams (e.g. NetworkStream).
@@ -623,6 +640,26 @@ namespace Locus.FileSystem
                 FileShare.None,
                 _writeBufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
+        }
+
+        private async Task CopyStreamAsync(Stream source, Stream destination, CancellationToken ct)
+        {
+            var rented = ArrayPool<byte>.Shared.Rent(_copyBufferSize);
+            try
+            {
+                while (true)
+                {
+                    var bytesRead = await source.ReadAsync(rented, 0, _copyBufferSize, ct).ConfigureAwait(false);
+                    if (bytesRead <= 0)
+                        break;
+
+                    await destination.WriteAsync(rented, 0, bytesRead, ct).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
         }
     }
 }

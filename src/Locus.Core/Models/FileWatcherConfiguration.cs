@@ -110,6 +110,30 @@ namespace Locus.Core.Models
         public TimeSpan SkipStabilityCheckAfterAge { get; set; } = TimeSpan.FromMinutes(1);
 
         /// <summary>
+        /// Gets or sets whether stale imported history pruning should be throttled.
+        /// Default is true.
+        /// </summary>
+        public bool EnableImportedFilesPruneThrottle { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the minimum interval between stale imported history prune runs.
+        /// Default is 5 minutes.
+        /// </summary>
+        public TimeSpan ImportedFilesPruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+        /// <summary>
+        /// Gets or sets whether imported history persistence should use debounce.
+        /// Default is true.
+        /// </summary>
+        public bool EnableImportedFilesHistoryFlushDebounce { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the minimum interval between imported history persistence writes.
+        /// Default is 2 seconds.
+        /// </summary>
+        public TimeSpan ImportedFilesHistoryFlushInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+        /// <summary>
         /// Gets or sets the timestamp when this configuration was created.
         /// </summary>
         public DateTime CreatedAt { get; set; }

@@ -184,5 +184,23 @@ namespace Locus.Storage
         /// Default: 1 day.
         /// </summary>
         public TimeSpan? DatabaseOptimizationInterval { get; set; } = TimeSpan.FromDays(1);
+
+        /// <summary>
+        /// Gets or sets the per-tenant batch size for status-based cleanup.
+        /// Default: 500.
+        /// </summary>
+        public int CleanupBatchSizePerTenant { get; set; } = 500;
+
+        /// <summary>
+        /// Gets or sets the number of tenant databases to optimize before pausing briefly.
+        /// Default: 10.
+        /// </summary>
+        public int DatabaseOptimizationTenantBatchSize { get; set; } = 10;
+
+        /// <summary>
+        /// Gets or sets the pause duration between optimization batches.
+        /// Default: 200 milliseconds.
+        /// </summary>
+        public TimeSpan DatabaseOptimizationPauseBetweenBatches { get; set; } = TimeSpan.FromMilliseconds(200);
     }
 }

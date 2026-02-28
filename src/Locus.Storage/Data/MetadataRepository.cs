@@ -70,6 +70,10 @@ namespace Locus.Storage.Data
         private readonly Task _persistenceTask;
         private readonly CancellationTokenSource _persistenceCts;
         private readonly bool _enableBackgroundPersistence;
+        private readonly int _maxDrainBatchSize;
+        private readonly int _persistenceQueueSoftMergeThreshold;
+        private readonly ConcurrentDictionary<string, PersistenceOperation> _coalescedPersistenceOps;
+        private int _coalescedLogCounter;
 
         private bool _disposed;
 
@@ -106,7 +110,9 @@ namespace Locus.Storage.Data
             ILogger<MetadataRepository> logger,
             string metadataDirectory,
             LiteDBOptions? liteDbOptions = null,
-            bool enableBackgroundPersistence = true)
+            bool enableBackgroundPersistence = true,
+            int maxDrainBatchSize = DefaultDrainBatchSize,
+            int persistenceQueueSoftMergeThresholdPercent = DefaultPersistenceQueueSoftMergeThresholdPercent)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -114,9 +120,19 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(metadataDirectory))
                 throw new ArgumentException("Metadata directory cannot be empty", nameof(metadataDirectory));
 
+            if (maxDrainBatchSize <= 0)
+                throw new ArgumentException("Drain batch size must be greater than zero", nameof(maxDrainBatchSize));
+
+            if (persistenceQueueSoftMergeThresholdPercent <= 0 || persistenceQueueSoftMergeThresholdPercent > 100)
+                throw new ArgumentException(
+                    "Soft merge threshold percent must be between 1 and 100",
+                    nameof(persistenceQueueSoftMergeThresholdPercent));
+
             _metadataDirectory = metadataDirectory;
             _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
             _enableBackgroundPersistence = enableBackgroundPersistence;
+            _maxDrainBatchSize = Math.Min(maxDrainBatchSize, MaxPersistenceQueueSize);
+            _persistenceQueueSoftMergeThreshold = (int)(MaxPersistenceQueueSize * (persistenceQueueSoftMergeThresholdPercent / 100.0));
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _fileKeyTenantIndex = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
@@ -128,6 +144,7 @@ namespace Locus.Storage.Data
             _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
             _persistenceSignal = new SemaphoreSlim(0, int.MaxValue);
             _persistenceCts = new CancellationTokenSource();
+            _coalescedPersistenceOps = new ConcurrentDictionary<string, PersistenceOperation>(StringComparer.Ordinal);
 
             // Ensure metadata directory exists before starting the background task,
             // so that if CreateDirectory throws, the task is never started and cannot be orphaned.
@@ -137,11 +154,13 @@ namespace Locus.Storage.Data
             }
 
             _logger.LogInformation(
-                "MetadataRepository initialized at {Directory} with LiteDB write-behind: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s",
+                "MetadataRepository initialized at {Directory} with LiteDB write-behind: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s, DrainBatch={DrainBatch}, SoftMergeThreshold={SoftMergeThreshold}",
                 _metadataDirectory,
                 _liteDbOptions.EnableJournal,
                 _liteDbOptions.CheckpointInterval,
-                _liteDbOptions.TimeoutSeconds);
+                _liteDbOptions.TimeoutSeconds,
+                _maxDrainBatchSize,
+                _persistenceQueueSoftMergeThreshold);
 
             if (_enableBackgroundPersistence)
             {
@@ -473,6 +492,66 @@ namespace Locus.Storage.Data
             var cache = GetCache(tenantId);
             var results = cache.Values.ToList();
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
+        }
+
+        /// <summary>
+        /// Gets a bounded batch of files in Processing status that timed out before the cutoff.
+        /// </summary>
+        public Task<IReadOnlyList<FileMetadata>> GetProcessingTimedOutAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (limit <= 0)
+                return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
+
+            ct.ThrowIfCancellationRequested();
+            var cache = GetCache(tenantId);
+            var results = cache.Values
+                .Where(m =>
+                    m.Status == FileProcessingStatus.Processing
+                    && m.ProcessingStartTime.HasValue
+                    && m.ProcessingStartTime.Value < cutoffUtc)
+                .OrderBy(m => m.ProcessingStartTime)
+                .ThenBy(m => m.CreatedAt)
+                .Take(limit)
+                .ToList();
+
+            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
+        }
+
+        /// <summary>
+        /// Gets a bounded batch of files in PermanentlyFailed status whose last failure is older than the cutoff.
+        /// </summary>
+        public Task<IReadOnlyList<FileMetadata>> GetPermanentlyFailedOlderThanAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (limit <= 0)
+                return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
+
+            ct.ThrowIfCancellationRequested();
+            var cache = GetCache(tenantId);
+            var results = cache.Values
+                .Where(m =>
+                    m.Status == FileProcessingStatus.PermanentlyFailed
+                    && m.LastFailedAt.HasValue
+                    && m.LastFailedAt.Value < cutoffUtc)
+                .OrderBy(m => m.LastFailedAt)
+                .ThenBy(m => m.CreatedAt)
+                .Take(limit)
+                .ToList();
+
+            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
         }
 
         /// <summary>
@@ -964,10 +1043,11 @@ namespace Locus.Storage.Data
         }
 
         // Maximum number of operations allowed in the persistence queue.
-        // If LiteDB is unavailable for an extended period, the queue will fill up. When full,
-        // new operations are dropped with a warning log. The physical file is already safe on
-        // disk and will be recovered by the cleanup service on next restart.
+        // If LiteDB is unavailable for an extended period, the queue may fill up. When near or
+        // at capacity, operations are coalesced by file key so only the latest state is retained.
         private const int MaxPersistenceQueueSize = 100_000;
+        private const int DefaultDrainBatchSize = 2_000;
+        private const int DefaultPersistenceQueueSoftMergeThresholdPercent = 90;
 
         // Compact pending queues every N drain cycles to reclaim memory from stale entries.
         // At ~one drain-cycle per 5 s, 20 cycles ≈ every ~100 seconds.
@@ -991,24 +1071,41 @@ namespace Locus.Storage.Data
 
             // ConcurrentQueue.Count is O(1). Small TOCTOU race is acceptable: we only
             // need to prevent unbounded growth, not enforce an exact hard limit.
-            if (_persistenceQueue.Count >= MaxPersistenceQueueSize)
+            var queueDepth = _persistenceQueue.Count;
+            if (queueDepth >= MaxPersistenceQueueSize)
             {
-                if (op.IsDelete)
-                    _logger.LogWarning(
-                        "Persistence queue is full ({Max} items). Dropping LiteDB delete for {FileKey} (tenant {TenantId}). " +
-                        "Stale metadata record will be removed by cleanup service.",
-                        MaxPersistenceQueueSize, op.FileKey, op.TenantId);
-                else
-                    _logger.LogError(
-                        "Persistence queue is full ({Max} items). Dropping LiteDB upsert for {FileKey} (tenant {TenantId}). " +
-                        "File is safe on disk. On restart, StorageCleanupService will detect the orphan and REBUILD its metadata " +
-                        "so it re-enters the Pending queue for processing. Investigate why LiteDB is unavailable.",
-                        MaxPersistenceQueueSize, op.FileKey, op.TenantId);
+                CoalescePersistenceOperation(op, queueDepth, "queue_full");
+                return;
+            }
+
+            if (queueDepth >= _persistenceQueueSoftMergeThreshold)
+            {
+                CoalescePersistenceOperation(op, queueDepth, "near_capacity");
                 return;
             }
 
             _persistenceQueue.Enqueue(op);
             _persistenceSignal.Release(); // wake the background loop
+        }
+
+        private void CoalescePersistenceOperation(PersistenceOperation op, int queueDepth, string reason)
+        {
+            var compositeKey = $"{op.TenantId}\u001F{op.FileKey}";
+            var added = _coalescedPersistenceOps.TryAdd(compositeKey, op);
+            if (!added)
+                _coalescedPersistenceOps[compositeKey] = op;
+
+            // Wake the loop only when a new coalesced key is introduced. Repeated updates to
+            // the same key should not inflate semaphore permits and cause wake-up churn.
+            if (added)
+                _persistenceSignal.Release();
+
+            if (Interlocked.Increment(ref _coalescedLogCounter) % 256 == 1)
+            {
+                _logger.LogWarning(
+                    "Persistence queue {Reason} at {QueueDepth}/{QueueLimit}; coalescing latest state. CoalescedCount={CoalescedCount}",
+                    reason, queueDepth, MaxPersistenceQueueSize, _coalescedPersistenceOps.Count);
+            }
         }
 
         // Background loop: waits for a signal, then drains the entire queue in one pass,
@@ -1047,37 +1144,73 @@ namespace Locus.Storage.Data
             DrainPersistenceQueue();
         }
 
-        // Drains all currently queued persistence operations in one pass.
+        // Drains queued and coalesced operations in bounded batches.
         // Operations are grouped by tenantId and flushed in a single LiteDB transaction
-        // per tenant, minimising fsync overhead under high write throughput.
+        // per tenant, minimising fsync overhead and memory spikes.
         private void DrainPersistenceQueue()
         {
-            // Collect all available items without blocking.
-            var batch = new List<PersistenceOperation>();
-            while (_persistenceQueue.TryDequeue(out var op))
+            while (DrainPersistenceBatch())
             {
-                batch.Add(op);
-                // Consume the matching semaphore permit to stay in sync.
-                _persistenceSignal.Wait(0);
+                // Keep draining until both queues are empty.
             }
+        }
 
-            if (batch.Count == 0)
-                return;
-
-            // Group by tenantId for per-tenant transaction batching.
+        private bool DrainPersistenceBatch()
+        {
             var byTenant = new Dictionary<string, List<PersistenceOperation>>(StringComparer.Ordinal);
-            foreach (var op in batch)
+            int drainedCount = 0;
+            var hasCoalesced = _coalescedPersistenceOps.Count > 0;
+            var maxQueuedThisBatch = hasCoalesced && _maxDrainBatchSize > 1
+                ? _maxDrainBatchSize - 1
+                : _maxDrainBatchSize;
+
+            while (drainedCount < maxQueuedThisBatch && _persistenceQueue.TryDequeue(out var queuedOp))
             {
-                if (!byTenant.TryGetValue(op.TenantId, out var list))
-                {
-                    list = new List<PersistenceOperation>();
-                    byTenant[op.TenantId] = list;
-                }
-                list.Add(op);
+                drainedCount++;
+                _persistenceSignal.Wait(0); // consume matching permit
+                AddOperationToTenantBucket(byTenant, queuedOp);
             }
+
+            if (drainedCount < _maxDrainBatchSize && _coalescedPersistenceOps.Count > 0)
+            {
+                foreach (var coalesced in _coalescedPersistenceOps)
+                {
+                    if (drainedCount >= _maxDrainBatchSize)
+                        break;
+
+                    if (!_coalescedPersistenceOps.TryRemove(coalesced.Key, out var coalescedOp))
+                        continue;
+
+                    drainedCount++;
+                    _persistenceSignal.Wait(0);
+                    AddOperationToTenantBucket(byTenant, coalescedOp);
+                }
+            }
+
+            if (drainedCount == 0)
+                return false;
 
             foreach (var kvp in byTenant)
                 ExecuteBatch(kvp.Key, kvp.Value);
+
+            _logger.LogDebug(
+                "Flushed persistence batch: {Drained} operations, {TenantBuckets} tenant bucket(s), RemainingQueue={QueueDepth}, RemainingCoalesced={CoalescedDepth}",
+                drainedCount, byTenant.Count, _persistenceQueue.Count, _coalescedPersistenceOps.Count);
+
+            return true;
+        }
+
+        private static void AddOperationToTenantBucket(
+            Dictionary<string, List<PersistenceOperation>> byTenant,
+            PersistenceOperation op)
+        {
+            if (!byTenant.TryGetValue(op.TenantId, out var bucket))
+            {
+                bucket = new List<PersistenceOperation>();
+                byTenant[op.TenantId] = bucket;
+            }
+
+            bucket.Add(op);
         }
 
         // Writes a batch of operations for a single tenant inside one LiteDB transaction.
@@ -1220,6 +1353,7 @@ namespace Locus.Storage.Data
             _fileKeyTenantIndex.Clear();
             _pendingKeys.Clear();
             _pendingFileCounts.Clear();
+            _coalescedPersistenceOps.Clear();
 
             // 4. Dispose all tenant locks
             foreach (var semaphore in _tenantLocks.Values)

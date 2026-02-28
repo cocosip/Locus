@@ -111,6 +111,12 @@ namespace Locus
         /// for Kubernetes + network storage (NFS/Ceph) environments.
         /// </summary>
         public LiteDBOptions LiteDB { get; set; } = new LiteDBOptions();
+
+        /// <summary>
+        /// Gets or sets the max number of metadata persistence operations drained per background batch.
+        /// Default: 2000.
+        /// </summary>
+        public int PersistenceDrainBatchSize { get; set; } = 2000;
     }
 
     /// <summary>
@@ -161,6 +167,24 @@ namespace Locus
         public int HealthCheckDelayMs { get; set; } = 500;
 
         /// <summary>
+        /// Gets or sets the internal FileStream buffer size for write operations (bytes).
+        /// Default: 128 KB.
+        /// </summary>
+        public int WriteBufferSize { get; set; } = 128 * 1024;
+
+        /// <summary>
+        /// Gets or sets the pooled copy buffer size used while streaming content (bytes).
+        /// Default: 80 KB.
+        /// </summary>
+        public int CopyBufferSize { get; set; } = 80 * 1024;
+
+        /// <summary>
+        /// Gets or sets whether each write should force a flush to disk.
+        /// Default: false.
+        /// </summary>
+        public bool ForceFlushAfterWrite { get; set; } = false;
+
+        /// <summary>
         /// Validates the volume configuration.
         /// </summary>
         public void Validate()
@@ -173,6 +197,12 @@ namespace Locus
 
             if (ShardingDepth < 0 || ShardingDepth > 3)
                 throw new InvalidOperationException("ShardingDepth must be between 0 and 3");
+
+            if (WriteBufferSize <= 0)
+                throw new InvalidOperationException("WriteBufferSize must be greater than zero");
+
+            if (CopyBufferSize <= 0)
+                throw new InvalidOperationException("CopyBufferSize must be greater than zero");
         }
     }
 

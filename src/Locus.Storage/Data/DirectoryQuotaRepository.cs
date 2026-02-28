@@ -524,6 +524,10 @@ namespace Locus.Storage.Data
             {
                 var tenantId = tenantPair.Key;
                 var tenantCounters = tenantPair.Value;
+                var cache = _quotaCache.GetOrAdd(
+                    tenantId,
+                    _ => new ConcurrentDictionary<string, DirectoryQuota>());
+                var dirtySnapshots = new List<(string DirectoryPath, AtomicQuotaState State, DirectoryQuota Snapshot)>();
 
                 foreach (var dirPair in tenantCounters)
                 {
@@ -533,65 +537,76 @@ namespace Locus.Storage.Data
                     if (!atomicState.Dirty)
                         continue;
 
+                    // Clear dirty BEFORE reading count so any concurrent increments that
+                    // happen during the LiteDB write will mark Dirty=true again and be
+                    // captured in the next flush cycle.
+                    atomicState.Dirty = false;
+                    var count = Volatile.Read(ref atomicState.Count);
+
+                    // Get or create the cache entry; if it doesn't exist yet (first-ever
+                    // increment for this directory before GetOrCreateAsync was called),
+                    // create a minimal entry so we can persist it.
+                    var existing = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
+                    {
+                        DirectoryPath = path,
+                        CurrentCount = count,
+                        MaxCount = atomicState.MaxCount,
+                        Enabled = atomicState.Enabled,
+                        CreatedAt = DateTime.UtcNow,
+                        LastUpdated = DateTime.UtcNow
+                    });
+
+                    var snapshot = new DirectoryQuota
+                    {
+                        DirectoryPath = existing.DirectoryPath,
+                        CurrentCount = count,
+                        MaxCount = atomicState.MaxCount,
+                        Enabled = atomicState.Enabled,
+                        CreatedAt = existing.CreatedAt,
+                        LastUpdated = DateTime.UtcNow
+                    };
+
+                    // Atomically replace the cached entry with the updated snapshot.
+                    cache[directoryPath] = snapshot;
+                    dirtySnapshots.Add((directoryPath, atomicState, snapshot));
+                }
+
+                if (dirtySnapshots.Count == 0)
+                    continue;
+
+                try
+                {
+                    var db = GetDatabase(tenantId);
+                    var quotas = db.GetCollection<DirectoryQuota>("quotas");
+
+                    db.BeginTrans();
                     try
                     {
-                        // Clear dirty BEFORE reading count so any concurrent increments that
-                        // happen during the LiteDB write will mark Dirty=true again and be
-                        // captured in the next flush cycle.
-                        atomicState.Dirty = false;
-                        var count = Volatile.Read(ref atomicState.Count);
+                        foreach (var item in dirtySnapshots)
+                            quotas.Upsert(item.Snapshot);
 
-                        // Get or create the cache entry; if it doesn't exist yet (first-ever
-                        // increment for this directory before GetOrCreateAsync was called),
-                        // create a minimal entry so we can persist it.
-                        var cache = _quotaCache.GetOrAdd(
-                            tenantId,
-                            _ => new ConcurrentDictionary<string, DirectoryQuota>());
-
-                        // Build a fresh snapshot to persist. Do NOT mutate the cached object
-                        // in-place — it is shared with lock-free readers. Even though MergeWithLiveCount
-                        // reads CurrentCount from atomicState (not from quota.CurrentCount), mutating
-                        // the shared object is an unsafe pattern that could break if readers change.
-                        var existing = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
-                        {
-                            DirectoryPath = path,
-                            CurrentCount = count,
-                            MaxCount = atomicState.MaxCount,
-                            Enabled = atomicState.Enabled,
-                            CreatedAt = DateTime.UtcNow,
-                            LastUpdated = DateTime.UtcNow
-                        });
-
-                        var snapshot = new DirectoryQuota
-                        {
-                            DirectoryPath = existing.DirectoryPath,
-                            CurrentCount  = count,
-                            MaxCount      = atomicState.MaxCount,
-                            Enabled       = atomicState.Enabled,
-                            CreatedAt     = existing.CreatedAt,
-                            LastUpdated   = DateTime.UtcNow
-                        };
-
-                        // Atomically replace the cached entry with the updated snapshot.
-                        cache[directoryPath] = snapshot;
-
-                        // Persist to LiteDB.
-                        var db = GetDatabase(tenantId);
-                        var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                        quotas.Upsert(snapshot);
-
-                        _logger.LogDebug(
-                            "Flushed quota counter for {TenantId}/{DirectoryPath}: count={Count}",
-                            tenantId, directoryPath, count);
+                        db.Commit();
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        _logger.LogError(ex,
-                            "Failed to flush quota counter for {TenantId}/{DirectoryPath}; will retry on next flush",
-                            tenantId, directoryPath);
+                        db.Rollback();
+                        throw;
+                    }
 
+                    _logger.LogDebug(
+                        "Flushed {Count} dirty quota counters for tenant {TenantId} in a single transaction",
+                        dirtySnapshots.Count, tenantId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Failed to flush dirty quota counters for tenant {TenantId}; will retry on next flush (Count={Count})",
+                        tenantId, dirtySnapshots.Count);
+
+                    foreach (var item in dirtySnapshots)
+                    {
                         // Re-mark dirty so the next flush retries.
-                        atomicState.Dirty = true;
+                        item.State.Dirty = true;
                     }
                 }
             }
