@@ -349,13 +349,24 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            // Update in-memory cache
+            // Update in-memory cache.
+            // Maintain _pendingFileCounts for the same reason as AddOrUpdateAsync, so that
+            // CompactPendingQueues has an accurate O(1) bloat estimate even for files added
+            // via this direct path (e.g., orphan recovery in StorageCleanupService).
             var cache = _activeFiles.GetOrAdd(metadata.TenantId,
                 _ => new ConcurrentDictionary<string, FileMetadata>());
+            cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
 
+            bool wasP = previous?.Status == FileProcessingStatus.Pending;
+            bool isP  = metadata.Status == FileProcessingStatus.Pending;
+            if (!wasP && isP)
+                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
+            else if (wasP && !isP)
+                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
+
             // Enqueue when Pending — stale entries skipped on dequeue (same as AddOrUpdateAsync).
-            if (metadata.Status == FileProcessingStatus.Pending)
+            if (isP)
             {
                 var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
                 pendingQueue.Enqueue(metadata.FileKey);

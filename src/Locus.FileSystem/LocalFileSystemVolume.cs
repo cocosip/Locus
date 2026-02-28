@@ -184,7 +184,15 @@ namespace Locus.FileSystem
 
         /// <summary>
         /// Refreshes cached AvailableSpace/TotalCapacity if the TTL has expired.
-        /// Uses singleflight: only one thread calls DriveInfo.GetDrives() per window.
+        /// Uses singleflight (CAS): only one thread calls DriveInfo.GetDrives() per window.
+        ///
+        /// The CAS winner dispatches the actual drive enumeration onto the thread pool
+        /// (same pattern as IsHealthy) so the calling thread — which may be inside
+        /// WriteAsync — is never blocked by a potentially slow GetDrives() syscall on
+        /// network volumes.  All other callers return the (slightly stale) cached values.
+        ///
+        /// Exception: when _spaceCacheDurationTicks == 0 (caching disabled) the call
+        /// is always synchronous for correctness, mirroring the original implementation.
         /// </summary>
         private void EnsureSpaceCacheRefreshed()
         {
@@ -198,12 +206,19 @@ namespace Locus.FileSystem
             var last = Interlocked.Read(ref _lastSpaceCheckTicks);
 
             if (last != 0 && (now - last) < _spaceCacheDurationTicks)
-                return; // Still within TTL
+                return; // Still within TTL — cached values are fresh enough
 
+            // Singleflight: only the CAS winner triggers the refresh.
+            // Losers return immediately with the stale (but acceptable) cached values.
             if (Interlocked.CompareExchange(ref _lastSpaceCheckTicks, now, last) != last)
-                return; // Another thread is refreshing — use stale values for now
+                return;
 
-            RefreshSpaceFromDrive();
+            // Dispatch onto the thread pool so the caller is never blocked by
+            // DriveInfo.GetDrives() — a syscall that can take seconds on NFS/SMB mounts.
+            Task.Run(RefreshSpaceFromDrive)
+                .ContinueWith(
+                    t => _logger.LogWarning(t.Exception, "Background space refresh failed for volume {VolumeId}", _volumeId),
+                    TaskContinuationOptions.OnlyOnFaulted);
         }
 
         private void RefreshSpaceFromDrive()

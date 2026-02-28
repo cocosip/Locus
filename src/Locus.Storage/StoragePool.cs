@@ -177,12 +177,15 @@ namespace Locus.Storage
                 // are tracked per actual shard directory rather than a single root "/".
                 var directoryPath = Path.GetDirectoryName(physicalPath) ?? "/";
 
-                // 7. Write file to volume
+                // 7. Capture the bytes that will be written: from current position to end.
+                // Must be read BEFORE WriteAsync because CopyToAsync advances Position to the end.
+                // Using content.Length alone is wrong for streams not at position 0 — it would
+                // report the total stream size rather than the bytes actually written.
+                var fileSize = content.CanSeek ? content.Length - content.Position : 0;
+
+                // 8. Write file to volume
                 await volume.WriteAsync(physicalPath, content, ct);
                 fileWritten = true; // Mark that physical file was written
-
-                // 8. Get file size
-                var fileSize = content.CanSeek ? content.Length : 0;
 
                 // 9. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
                 // AddOrUpdateAsync never throws from the caller's perspective. If LiteDB is unavailable,
@@ -215,8 +218,15 @@ namespace Locus.Storage
             }
             catch
             {
-                // Rollback: decrement quota if file write failed
-                await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, ct);
+                // Only roll back the quota when the physical write never reached disk.
+                // If fileWritten==true the file exists on disk; the cleanup service will
+                // recover it as a Pending orphan on restart — its quota slot is still needed.
+                // Guard with !fileWritten so that a future exception after the write
+                // (e.g. in AddOrUpdateAsync) does not incorrectly decrement the quota.
+                if (!fileWritten)
+                {
+                    await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, CancellationToken.None);
+                }
 
                 // If the write to the selected volume failed, invalidate the volume-selection cache
                 // so the next caller re-evaluates all volumes instead of reusing a stale (unhealthy)
@@ -417,8 +427,19 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
 
-            // Delegate to file scheduler
+            // Read tenant before delegating — the scheduler removes the record and we
+            // need the tenant ID to decrement quota. Cross-tenant O(tenants) lookup is
+            // fast; completion is not a hot-path so the extra scan is acceptable.
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
+
+            // Delegate physical deletion + metadata removal to file scheduler.
             await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
+
+            // Decrement tenant quota to mirror the increment in WriteFileAsync.
+            // Use CancellationToken.None: a cancelled ct must not leave the quota inflated
+            // after the file has already been deleted from disk.
+            if (metadata != null)
+                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
         }
 
         /// <inheritdoc/>
