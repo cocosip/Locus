@@ -77,6 +77,33 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, GetPendingCount(_repository, _tenantId));
         }
 
+        [Fact]
+        public async Task GetAllTenantIdsAsync_IncludesInMemoryTenantWithoutDbFile()
+        {
+            const string inMemoryTenant = "tenant-memory-only";
+            var activeFiles = GetActiveFiles(_repository);
+            activeFiles.TryAdd(inMemoryTenant, new ConcurrentDictionary<string, FileMetadata>());
+
+            var tenantIds = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
+
+            Assert.Contains(inMemoryTenant, tenantIds);
+        }
+
+        [Fact]
+        public async Task GetAllTenantIdsAsync_IgnoresLiteDbLogSidecarFiles()
+        {
+            const string tenantId = "tenant-log-filter";
+            var mainDbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var logDbPath = Path.Combine(_metadataDir, $"{tenantId}-log.db");
+            _fileSystem.File.WriteAllText(mainDbPath, "main");
+            _fileSystem.File.WriteAllText(logDbPath, "log");
+
+            var tenantIds = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
+
+            Assert.Contains(tenantId, tenantIds);
+            Assert.DoesNotContain($"{tenantId}-log", tenantIds);
+        }
+
         public void Dispose()
         {
             _repository.Dispose();
@@ -114,6 +141,14 @@ namespace Locus.Storage.Tests
 
             var counters = (ConcurrentDictionary<string, int>)field!.GetValue(repository)!;
             return counters.TryGetValue(tenantId, out var count) ? count : 0;
+        }
+
+        private static ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> GetActiveFiles(MetadataRepository repository)
+        {
+            var field = typeof(MetadataRepository).GetField("_activeFiles", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+
+            return (ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>)field!.GetValue(repository)!;
         }
     }
 }

@@ -57,7 +57,8 @@ namespace Locus.Storage.Data
         }
 
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>> _atomicCounters;
-        private readonly Timer _flushTimer;
+        private readonly Timer? _flushTimer;
+        private readonly bool _enableBackgroundFlush;
         private const int FlushIntervalMs = 5_000; // 5 seconds
 
         // ---
@@ -71,7 +72,8 @@ namespace Locus.Storage.Data
             IFileSystem fileSystem,
             ILogger<DirectoryQuotaRepository> logger,
             string quotaDirectory,
-            LiteDBOptions? liteDbOptions = null)
+            LiteDBOptions? liteDbOptions = null,
+            bool enableBackgroundFlush = true)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -81,6 +83,7 @@ namespace Locus.Storage.Data
 
             _quotaDirectory = quotaDirectory;
             _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
+            _enableBackgroundFlush = enableBackgroundFlush;
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
@@ -99,8 +102,15 @@ namespace Locus.Storage.Data
                 _liteDbOptions.CheckpointInterval,
                 _liteDbOptions.TimeoutSeconds);
 
-            // Start the Write-Behind flush timer (non-reentrant: fires once then reschedules)
-            _flushTimer = new Timer(FlushDirtyCounters, null, FlushIntervalMs, Timeout.Infinite);
+            if (_enableBackgroundFlush)
+            {
+                // Start the Write-Behind flush timer (non-reentrant: fires once then reschedules)
+                _flushTimer = new Timer(FlushDirtyCounters, null, FlushIntervalMs, Timeout.Infinite);
+            }
+            else
+            {
+                _logger.LogInformation("DirectoryQuotaRepository background flush timer is disabled.");
+            }
         }
 
         /// <summary>
@@ -491,7 +501,16 @@ namespace Locus.Storage.Data
             finally
             {
                 if (!_disposed)
-                    _flushTimer.Change(FlushIntervalMs, Timeout.Infinite);
+                {
+                    try
+                    {
+                        _flushTimer?.Change(FlushIntervalMs, Timeout.Infinite);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Dispose can race with the timer callback during test/application shutdown.
+                    }
+                }
             }
         }
 
@@ -666,6 +685,79 @@ namespace Locus.Storage.Data
             {
                 tenantLock?.Release();
             }
+        }
+
+        /// <summary>
+        /// Sets the current file count for a directory and synchronizes atomic state immediately.
+        /// Intended for maintenance workflows (e.g. database rebuild) where a deterministic count
+        /// must take effect before returning.
+        /// </summary>
+        public async Task SetCurrentCountAsync(string tenantId, string directoryPath, int count, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(directoryPath))
+                throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
+
+            if (count < 0)
+                throw new ArgumentException("Count cannot be negative", nameof(count));
+
+            var tenantLock = await AcquireTenantLockIfNeededAsync(tenantId, ct);
+            try
+            {
+                SetCurrentCountNoLock(tenantId, directoryPath, count);
+            }
+            finally
+            {
+                tenantLock?.Release();
+            }
+        }
+
+        /// <summary>
+        /// Sets the current count without acquiring tenant lock.
+        /// Callers must already hold the tenant lock for this tenant.
+        /// </summary>
+        internal Task SetCurrentCountForRebuildAsync(string tenantId, string directoryPath, int count, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(directoryPath))
+                throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
+
+            if (count < 0)
+                throw new ArgumentException("Count cannot be negative", nameof(count));
+
+            ct.ThrowIfCancellationRequested();
+            SetCurrentCountNoLock(tenantId, directoryPath, count);
+            return Task.CompletedTask;
+        }
+
+        private void SetCurrentCountNoLock(string tenantId, string directoryPath, int count)
+        {
+            var existing = GetOrCreateNoLock(tenantId, directoryPath);
+            var snapshot = new DirectoryQuota
+            {
+                DirectoryPath = existing.DirectoryPath,
+                CurrentCount = count,
+                MaxCount = existing.MaxCount,
+                Enabled = existing.Enabled,
+                CreatedAt = existing.CreatedAt,
+                LastUpdated = DateTime.UtcNow
+            };
+
+            PersistQuotaWithRecoveryNoLock(tenantId, snapshot, useUpsert: true);
+
+            var state = GetOrCreateAtomicState(tenantId, directoryPath);
+            Interlocked.Exchange(ref state.Count, count);
+            state.MaxCount = snapshot.MaxCount;
+            state.Enabled = snapshot.Enabled;
+            state.Dirty = false;
+
+            _logger.LogDebug(
+                "Set current count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
+                directoryPath, tenantId, count, state.MaxCount);
         }
 
         /// <summary>
@@ -932,8 +1024,25 @@ namespace Locus.Storage.Data
 
             _disposed = true;
 
-            // Stop the timer to prevent new callbacks from being scheduled.
-            _flushTimer.Dispose();
+            // Stop the timer and wait briefly for an in-flight callback to complete.
+            // Without this, a callback may race with Dispose and throw ObjectDisposedException
+            // from _flushTimer.Change(...), which can terminate the test host process.
+            if (_flushTimer != null)
+            {
+                using (var timerDisposed = new ManualResetEvent(false))
+                {
+                    try
+                    {
+                        _flushTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                        _flushTimer.Dispose(timerDisposed);
+                        timerDisposed.WaitOne(TimeSpan.FromSeconds(2));
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Already disposed by a concurrent shutdown path.
+                    }
+                }
+            }
 
             // Final flush: persist any remaining dirty counters before closing databases.
             try

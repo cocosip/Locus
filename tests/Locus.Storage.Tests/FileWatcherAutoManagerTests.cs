@@ -68,6 +68,37 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ApplyRootConfigurationAsync_GeneratesStableHashStyleWatcherId()
+        {
+            // Arrange
+            var rootPath = "/watch-root";
+            _fileSystem.Directory.CreateDirectory(rootPath);
+
+            var rootConfig = new FileWatcherRootConfiguration
+            {
+                RootPath = rootPath,
+                MultiTenantMode = true,
+                Enabled = true
+            };
+
+            string capturedWatcherId = string.Empty;
+            _fileWatcher.Setup(x => x.GetWatcherAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((FileWatcherConfiguration)null!);
+            _fileWatcher.Setup(x => x.RegisterWatcherAsync(It.IsAny<FileWatcherConfiguration>(), It.IsAny<CancellationToken>()))
+                .Callback<FileWatcherConfiguration, CancellationToken>((cfg, _) => capturedWatcherId = cfg.WatcherId)
+                .Returns(Task.CompletedTask);
+
+            // Act
+            await _autoManager.ApplyRootConfigurationAsync(rootConfig, CancellationToken.None);
+
+            // Assert
+            Assert.StartsWith("auto-multi-tenant-", capturedWatcherId);
+            var hash = capturedWatcherId.Substring("auto-multi-tenant-".Length);
+            Assert.Equal(16, hash.Length);
+            Assert.Matches("^[0-9a-f]+$", hash);
+        }
+
+        [Fact]
         public async Task ApplyRootConfigurationAsync_SingleTenantMode_CreatesWatcherWithDefaultTenant()
         {
             // Arrange

@@ -5,6 +5,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -28,9 +29,14 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, string> _importedFiles;
         private readonly SemaphoreSlim _historySaveLock;
         private int _importedHistoryDirty;
+        private readonly SemaphoreSlim _watcherCacheLock;
+        private volatile IReadOnlyList<FileWatcherConfiguration>? _cachedWatchers;
+        private long _watchersCacheExpiresAtTicks;
 
         // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
         private const int MaxImportedFilesCacheSize = 10_000;
+        private const string InFlightImportMarker = "__LOCUS_IN_FLIGHT__";
+        private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
 
         // Locks for configuration operations
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _watcherLocks;
@@ -60,6 +66,7 @@ namespace Locus.Storage
             _importedFiles = new ConcurrentDictionary<string, string>();
             _watcherLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _historySaveLock = new SemaphoreSlim(1, 1);
+            _watcherCacheLock = new SemaphoreSlim(1, 1);
 
             // Ensure configuration directory exists
             if (!_fileSystem.Directory.Exists(_configurationRoot))
@@ -182,6 +189,12 @@ namespace Locus.Storage
             await SaveImportedFilesHistoryAsync();
         }
 
+        private void InvalidateWatchersCache()
+        {
+            _cachedWatchers = null;
+            Interlocked.Exchange(ref _watchersCacheExpiresAtTicks, 0);
+        }
+
         /// <inheritdoc/>
         public async Task RegisterWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct)
         {
@@ -272,6 +285,7 @@ namespace Locus.Storage
                 if (_fileSystem.File.Exists(configPath))
                 {
                     _fileSystem.File.Delete(configPath);
+                    InvalidateWatchersCache();
                     _logger.LogInformation("Removed file watcher {WatcherId}", watcherId);
                 }
             }
@@ -327,30 +341,48 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task<IEnumerable<FileWatcherConfiguration>> GetAllWatchersAsync(CancellationToken ct)
         {
-            var configFiles = _fileSystem.Directory.GetFiles(_configurationRoot, "*.json");
-            var configurations = new List<FileWatcherConfiguration>();
+            var nowTicks = DateTime.UtcNow.Ticks;
+            var cached = _cachedWatchers;
+            if (cached != null && nowTicks < Interlocked.Read(ref _watchersCacheExpiresAtTicks))
+                return cached;
 
-            foreach (var filePath in configFiles)
+            await _watcherCacheLock.WaitAsync(ct);
+            try
             {
-                try
-                {
-                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(filePath);
-                    if (string.Equals(fileName, "imported-files", StringComparison.OrdinalIgnoreCase))
-                        continue;
+                cached = _cachedWatchers;
+                if (cached != null && DateTime.UtcNow.Ticks < Interlocked.Read(ref _watchersCacheExpiresAtTicks))
+                    return cached;
 
-                    var config = await LoadConfigurationAsync(fileName, ct);
-                    if (config != null)
+                var configFiles = _fileSystem.Directory.GetFiles(_configurationRoot, "*.json");
+                var configurations = new List<FileWatcherConfiguration>();
+
+                foreach (var filePath in configFiles)
+                {
+                    try
                     {
-                        configurations.Add(config);
+                        var fileName = _fileSystem.Path.GetFileNameWithoutExtension(filePath);
+                        if (string.Equals(fileName, "imported-files", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        var config = await LoadConfigurationAsync(fileName, ct);
+                        if (config != null)
+                            configurations.Add(config);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to load watcher configuration from {FilePath}", filePath);
                     }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to load watcher configuration from {FilePath}", filePath);
-                }
-            }
 
-            return configurations;
+                var snapshot = configurations.ToArray();
+                _cachedWatchers = snapshot;
+                Interlocked.Exchange(ref _watchersCacheExpiresAtTicks, DateTime.UtcNow.AddTicks(WatchersCacheTtlTicks).Ticks);
+                return snapshot;
+            }
+            finally
+            {
+                _watcherCacheLock.Release();
+            }
         }
 
         private async Task<FileWatcherScanResult> ScanDirectoryAsync(FileWatcherConfiguration configuration, CancellationToken ct)
@@ -538,18 +570,20 @@ namespace Locus.Storage
             CancellationToken ct)
         {
             var fileResult = new FileWatcherScanResult();
+            var importSlotTaken = false;
 
             try
             {
                 if (ct.IsCancellationRequested)
                     return fileResult;
 
-                // Skip if already imported
-                if (_importedFiles.ContainsKey(filePath))
+                // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
+                if (!_importedFiles.TryAdd(filePath, InFlightImportMarker))
                 {
                     fileResult.FilesSkipped++;
                     return fileResult;
                 }
+                importSlotTaken = true;
 
                 // Get file info for validation
                 var fileInfo = _fileSystem.FileInfo.New(filePath);
@@ -564,16 +598,17 @@ namespace Locus.Storage
 
                 // Check file age (prevent importing files still being written)
                 var lastWriteTime = _fileSystem.File.GetLastWriteTimeUtc(filePath);
-                if (DateTime.UtcNow - lastWriteTime < configuration.MinFileAge)
+                var fileAge = DateTime.UtcNow - lastWriteTime;
+                if (fileAge < configuration.MinFileAge)
                 {
                     _logger.LogDebug("Skipping file {FilePath} - too recent (age: {Age})",
-                        filePath, DateTime.UtcNow - lastWriteTime);
+                        filePath, fileAge);
                     fileResult.FilesSkipped++;
                     return fileResult;
                 }
 
                 // Check if file is still being written (multiple methods)
-                if (!await IsFileReadyForImportAsync(filePath, ct))
+                if (!await IsFileReadyForImportAsync(filePath, fileAge, configuration, ct))
                 {
                     _logger.LogDebug("Skipping file {FilePath} - still being written", filePath);
                     fileResult.FilesSkipped++;
@@ -600,6 +635,7 @@ namespace Locus.Storage
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
                     _importedFiles[filePath] = fileKey;
+                    importSlotTaken = false;
                     MarkImportedFilesHistoryDirty();
 
                     fileResult.FilesImported++;
@@ -618,6 +654,15 @@ namespace Locus.Storage
                 fileResult.FilesFailed++;
                 fileResult.Errors.Add($"{filePath}: {ex.Message}");
                 _logger.LogError(ex, "Failed to import file {FilePath}", filePath);
+            }
+            finally
+            {
+                if (importSlotTaken
+                    && _importedFiles.TryGetValue(filePath, out var currentValue)
+                    && string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal))
+                {
+                    _importedFiles.TryRemove(filePath, out _);
+                }
             }
 
             return fileResult;
@@ -638,14 +683,28 @@ namespace Locus.Storage
 
             try
             {
-                foreach (var pattern in patterns)
-                {
-                    var matchingFiles = _fileSystem.Directory.GetFiles(
-                        path,
-                        pattern,
-                        includeSubdirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly);
+                var normalizedPatterns = (patterns ?? new List<string> { "*" })
+                    .Where(p => !string.IsNullOrWhiteSpace(p))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
-                    files.AddRange(matchingFiles);
+                if (normalizedPatterns.Count == 0)
+                    normalizedPatterns.Add("*");
+
+                var searchOption = includeSubdirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+
+                if (normalizedPatterns.Count == 1 && normalizedPatterns[0] == "*")
+                    return _fileSystem.Directory.GetFiles(path, "*", searchOption).ToList();
+
+                var matchers = normalizedPatterns
+                    .Select(CreateWildcardMatcher)
+                    .ToArray();
+
+                foreach (var file in _fileSystem.Directory.EnumerateFiles(path, "*", searchOption))
+                {
+                    var fileName = _fileSystem.Path.GetFileName(file);
+                    if (matchers.Any(m => m.IsMatch(fileName)))
+                        files.Add(file);
                 }
             }
             catch (Exception ex)
@@ -653,7 +712,17 @@ namespace Locus.Storage
                 _logger.LogError(ex, "Error scanning directory {Path}", path);
             }
 
-            return files.Distinct().ToList();
+            return files;
+        }
+
+        private static Regex CreateWildcardMatcher(string pattern)
+        {
+            var normalized = string.IsNullOrWhiteSpace(pattern) ? "*" : pattern.Trim();
+            var regexPattern = "^" + Regex.Escape(normalized)
+                .Replace("\\*", ".*")
+                .Replace("\\?", ".") + "$";
+
+            return new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
         }
 
         private Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct)
@@ -768,6 +837,8 @@ namespace Locus.Storage
             {
                 await JsonSerializer.SerializeAsync(stream, configuration, JsonOptions, ct);
             }
+
+            InvalidateWatchersCache();
         }
 
         private string GetConfigurationPath(string watcherId)
@@ -778,7 +849,11 @@ namespace Locus.Storage
         /// <summary>
         /// Check if file is ready for import by using multiple detection methods.
         /// </summary>
-        private async Task<bool> IsFileReadyForImportAsync(string filePath, CancellationToken ct)
+        private async Task<bool> IsFileReadyForImportAsync(
+            string filePath,
+            TimeSpan fileAge,
+            FileWatcherConfiguration configuration,
+            CancellationToken ct)
         {
             try
             {
@@ -789,13 +864,20 @@ namespace Locus.Storage
                     return false;
                 }
 
+                // Old files are unlikely to still be mutating; skip the delay probe to improve throughput.
+                if (fileAge >= configuration.SkipStabilityCheckAfterAge)
+                    return true;
+
+                var stabilityDelay = configuration.FileStabilityCheckDelay;
+                if (stabilityDelay <= TimeSpan.Zero)
+                    return true;
+
                 // Method 2: Check if file size is stable
                 // Wait a short time and verify size hasn't changed
                 var initialSize = _fileSystem.FileInfo.New(filePath).Length;
                 var initialWriteTime = _fileSystem.File.GetLastWriteTimeUtc(filePath);
 
-                // Wait 100ms
-                await Task.Delay(100, ct);
+                await Task.Delay(stabilityDelay, ct);
 
                 var finalSize = _fileSystem.FileInfo.New(filePath).Length;
                 var finalWriteTime = _fileSystem.File.GetLastWriteTimeUtc(filePath);

@@ -96,6 +96,20 @@ namespace Locus.Core.Models
         public int MaxConcurrentImports { get; set; } = 4;
 
         /// <summary>
+        /// Gets or sets the delay used for file stability checks.
+        /// A value less than or equal to zero disables the delayed second probe.
+        /// Default is 100 milliseconds.
+        /// </summary>
+        public TimeSpan FileStabilityCheckDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
+        /// <summary>
+        /// Gets or sets the file age threshold after which the stability delay is skipped.
+        /// Older files only use accessibility checks to improve import throughput.
+        /// Default is 1 minute.
+        /// </summary>
+        public TimeSpan SkipStabilityCheckAfterAge { get; set; } = TimeSpan.FromMinutes(1);
+
+        /// <summary>
         /// Gets or sets the timestamp when this configuration was created.
         /// </summary>
         public DateTime CreatedAt { get; set; }

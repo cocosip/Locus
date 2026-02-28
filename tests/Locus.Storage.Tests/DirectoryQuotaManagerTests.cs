@@ -313,6 +313,25 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task SetCurrentCountAsync_SynchronizesAtomicCounter()
+        {
+            // Arrange
+            var directoryPath = "/test/sync";
+            await _repository.SetCurrentCountAsync(TenantId, directoryPath, 3, CancellationToken.None);
+
+            var quota = await _repository.GetOrCreateAsync(TenantId, directoryPath, CancellationToken.None);
+            quota.MaxCount = 3;
+            quota.Enabled = true;
+            await _repository.UpdateAsync(TenantId, quota, CancellationToken.None);
+
+            // Act
+            var incremented = await _repository.TryIncrementAsync(TenantId, directoryPath, CancellationToken.None);
+
+            // Assert
+            Assert.False(incremented);
+        }
+
+        [Fact]
         public async Task MultipleDirectories_IndependentQuotas()
         {
             // Arrange

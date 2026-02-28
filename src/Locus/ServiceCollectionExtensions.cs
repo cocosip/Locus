@@ -188,7 +188,8 @@ namespace Locus
                     fileSystem,
                     logger,
                     options.MetadataDirectory,
-                    options.QuotaDirectory);
+                    options.QuotaDirectory,
+                    options.Volumes.ToDictionary(v => v.MountPath, v => v.VolumeId, StringComparer.OrdinalIgnoreCase));
             });
 
             // Register background cleanup service if enabled

@@ -41,10 +41,18 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(_volumePath);
 
             var metadataRepoLogger = new Mock<ILogger<MetadataRepository>>();
-            _metadataRepository = new MetadataRepository(_fileSystem, metadataRepoLogger.Object, _metadataDir);
+            _metadataRepository = new MetadataRepository(
+                _fileSystem,
+                metadataRepoLogger.Object,
+                _metadataDir,
+                enableBackgroundPersistence: false);
 
             var quotaRepoLogger = new Mock<ILogger<DirectoryQuotaRepository>>();
-            _quotaRepository = new DirectoryQuotaRepository(_fileSystem, quotaRepoLogger.Object, _quotaDir);
+            _quotaRepository = new DirectoryQuotaRepository(
+                _fileSystem,
+                quotaRepoLogger.Object,
+                _quotaDir,
+                enableBackgroundFlush: false);
 
             _logger = new Mock<ILogger<DatabaseHealthCheckService>>();
             _recoveryLogger = new Mock<ILogger<DatabaseRecoveryService>>();
@@ -74,7 +82,7 @@ namespace Locus.Storage.Tests
             var tenant1 = $"tenant-healthy-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
 
             // Create database using temporary repository, then dispose it
-            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
                 {
@@ -91,20 +99,9 @@ namespace Locus.Storage.Tests
             // Wait for file system to release locks
             await Task.Delay(100);
 
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(recoveryService, new[] { _volumePath });
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -118,6 +115,8 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.AtLeastOnce);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
@@ -128,7 +127,7 @@ namespace Locus.Storage.Tests
             var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
 
             // Create a valid database first
-            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
                 {
@@ -153,20 +152,9 @@ namespace Locus.Storage.Tests
                 stream.Write(garbage, 0, garbage.Length);
             }
 
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(recoveryService, new[] { _volumePath });
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -180,6 +168,8 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.AtLeastOnce);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
@@ -191,20 +181,9 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(tenantPath);
             _fileSystem.File.WriteAllText(Path.Combine(tenantPath, "orphaned.txt"), "content");
 
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(recoveryService, new[] { _volumePath });
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -218,26 +197,17 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.Once);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
         public async Task StartAsync_LogsNormalForFirstStartup()
         {
             // Arrange - No databases, no files
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(recoveryService, new[] { _volumePath });
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -251,26 +221,17 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.Once);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
         public async Task StartAsync_HandlesNoVolumesConfigured()
         {
             // Arrange - Empty volume paths
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                Array.Empty<string>());
+            var healthCheckService = CreateHealthCheckService(recoveryService, Array.Empty<string>());
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -284,6 +245,8 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.Once);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
@@ -295,12 +258,7 @@ namespace Locus.Storage.Tests
                 .Setup(x => x.CheckAllDatabasesAsync(It.IsAny<CancellationToken>()))
                 .ThrowsAsync(new Exception("Test exception"));
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                mockRecoveryService.Object,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(mockRecoveryService.Object, new[] { _volumePath });
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -314,26 +272,16 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.Once);
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
         public async Task StopAsync_CompletesSuccessfully()
         {
             // Arrange
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(recoveryService, new[] { _volumePath });
 
             // Act & Assert - Should not throw
             await healthCheckService.StopAsync(default);
@@ -355,20 +303,9 @@ namespace Locus.Storage.Tests
             _fileSystem.File.WriteAllText(Path.Combine(tenant1Path, "file1.txt"), "content");
             _fileSystem.File.WriteAllText(Path.Combine(tenant2Path, "file2.txt"), "content");
 
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
-                recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
-                new[] { _volumePath });
+            var healthCheckService = CreateHealthCheckService(recoveryService, new[] { _volumePath });
 
             // Act
             await healthCheckService.StartAsync(default);
@@ -384,6 +321,8 @@ namespace Locus.Storage.Tests
                     It.IsAny<Exception?>(),
                     It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
                 Times.Once);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
@@ -394,7 +333,7 @@ namespace Locus.Storage.Tests
             var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
 
             // Create a valid quota database first
-            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir))
+            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
             {
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
@@ -409,19 +348,10 @@ namespace Locus.Storage.Tests
                 stream.Write(garbage, 0, garbage.Length);
             }
 
-            var recoveryService = new DatabaseRecoveryService(
-                _metadataRepository,
-                _quotaRepository,
-                _fileSystem,
-                _recoveryLogger.Object,
-                _metadataDir,
-                _quotaDir);
+            var recoveryService = CreateRecoveryService();
 
-            var healthCheckService = new DatabaseHealthCheckService(
+            var healthCheckService = CreateHealthCheckService(
                 recoveryService,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
                 new[] { _volumePath },
                 autoRecoverCorruptedDatabases: true,
                 failFastOnRecoveryFailure: false);
@@ -432,6 +362,8 @@ namespace Locus.Storage.Tests
             // Assert
             var report = await recoveryService.CheckAllDatabasesAsync(default);
             Assert.Empty(report.CorruptedDatabases);
+
+            await healthCheckService.StopAsync(default);
         }
 
         [Fact]
@@ -470,17 +402,43 @@ namespace Locus.Storage.Tests
                     Errors = new List<string> { "Rebuild failed" }
                 });
 
-            var healthCheckService = new DatabaseHealthCheckService(
+            var healthCheckService = CreateHealthCheckService(
                 mockRecoveryService.Object,
-                _fileSystem,
-                _logger.Object,
-                _metadataDir,
                 new[] { _volumePath },
                 autoRecoverCorruptedDatabases: true,
                 failFastOnRecoveryFailure: true);
 
             // Act & Assert
             await Assert.ThrowsAnyAsync<Exception>(() => healthCheckService.StartAsync(default));
+            await healthCheckService.StopAsync(default);
         }
+        private DatabaseRecoveryService CreateRecoveryService()
+        {
+            return new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _recoveryLogger.Object,
+                _metadataDir,
+                _quotaDir);
+        }
+
+        private DatabaseHealthCheckService CreateHealthCheckService(
+            IDatabaseRecoveryService recoveryService,
+            IEnumerable<string> volumePaths,
+            bool autoRecoverCorruptedDatabases = true,
+            bool failFastOnRecoveryFailure = false)
+        {
+            return new DatabaseHealthCheckService(
+                recoveryService,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                volumePaths,
+                autoRecoverCorruptedDatabases,
+                failFastOnRecoveryFailure,
+                startupDelay: TimeSpan.Zero);
+        }
+
     }
 }

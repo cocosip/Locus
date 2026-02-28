@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -131,7 +131,7 @@ namespace Locus.Storage
                     var subdirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
                     foreach (var subdirectory in subdirectories)
                     {
-                        // Each subdirectory is a tenant root — protect it from deletion.
+                        // Each subdirectory is a tenant root 鈥?protect it from deletion.
                         removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true);
                     }
                 }
@@ -146,37 +146,43 @@ namespace Locus.Storage
         {
             _logger.LogInformation("Starting cleanup of permanently failed files older than {TimeSpan}", olderThan);
 
-            var allMetadata = await _metadataRepository.GetAllAsync(ct);
             var cutoffTime = DateTime.UtcNow - olderThan;
             var removedCount = 0;
             long spaceFreed = 0;
 
-            foreach (var metadata in allMetadata)
+            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            foreach (var tenantId in tenantIds)
             {
-                if (metadata.Status == FileProcessingStatus.PermanentlyFailed &&
-                    metadata.LastFailedAt.HasValue &&
-                    metadata.LastFailedAt.Value < cutoffTime)
+                ct.ThrowIfCancellationRequested();
+                var tenantMetadata = await _metadataRepository.GetByTenantAsync(tenantId, ct);
+
+                foreach (var metadata in tenantMetadata)
                 {
-                    if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                    if (metadata.Status == FileProcessingStatus.PermanentlyFailed &&
+                        metadata.LastFailedAt.HasValue &&
+                        metadata.LastFailedAt.Value < cutoffTime)
                     {
-                        try
+                        if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
                         {
-                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                            try
                             {
-                                spaceFreed += metadata.FileSize;
-                                await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                                {
+                                    spaceFreed += metadata.FileSize;
+                                    await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
                             }
                         }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
-                        }
+
+                        await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                        await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
+
+                        removedCount++;
                     }
-
-                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
-
-                    removedCount++;
                 }
             }
 
@@ -196,9 +202,8 @@ namespace Locus.Storage
 
             var rebuiltCount = 0;
 
-            // Build a HashSet of known physical paths once — O(N) — so each file lookup is O(1)
-            // instead of calling GetAllAsync inside the per-file loop (which would be O(P × N)).
-            var allMetadata = await _metadataRepository.GetAllAsync(ct);
+            // Build a HashSet of known physical paths for this tenant once.
+            var allMetadata = await _metadataRepository.GetByTenantAsync(tenant.TenantId, ct);
             var knownPaths = new HashSet<string>(
                 allMetadata.Select(m => m.PhysicalPath).Where(p => !string.IsNullOrEmpty(p)),
                 StringComparer.Ordinal);
@@ -220,7 +225,7 @@ namespace Locus.Storage
                     if (knownPaths.Contains(physicalPath))
                         continue;
 
-                    // Orphaned physical file — reconstruct metadata and re-queue for processing.
+                    // Orphaned physical file 鈥?reconstruct metadata and re-queue for processing.
                     // DO NOT delete the file: it contains real data that was uploaded but whose
                     // LiteDB record was lost (e.g. process crash during write-behind flush, or
                     // persistence queue overflow).  Rebuilding brings it back into the Pending
@@ -325,27 +330,31 @@ namespace Locus.Storage
         {
             _logger.LogInformation("Starting cleanup of timed-out processing files (timeout: {Timeout})", timeout);
 
-            var allMetadata = await _metadataRepository.GetAllAsync(ct);
             var cutoffTime = DateTime.UtcNow - timeout;
             var resetCount = 0;
+            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
 
-            foreach (var metadata in allMetadata)
+            foreach (var tenantId in tenantIds)
             {
-                if (metadata.Status == FileProcessingStatus.Processing &&
-                    metadata.ProcessingStartTime.HasValue &&
-                    metadata.ProcessingStartTime.Value < cutoffTime)
+                ct.ThrowIfCancellationRequested();
+                var tenantMetadata = await _metadataRepository.GetByTenantAsync(tenantId, ct);
+
+                foreach (var metadata in tenantMetadata)
                 {
-                    // Clone before mutating — GetAllAsync returns shared cache references.
-                    // Mutating in-place exposes a partially-written object to concurrent readers.
-                    var updated = metadata.Clone();
-                    updated.Status = FileProcessingStatus.Pending;
-                    updated.ProcessingStartTime = null;
-                    updated.AvailableForProcessingAt = DateTime.UtcNow; // Available immediately
+                    if (metadata.Status == FileProcessingStatus.Processing &&
+                        metadata.ProcessingStartTime.HasValue &&
+                        metadata.ProcessingStartTime.Value < cutoffTime)
+                    {
+                        var updated = metadata.Clone();
+                        updated.Status = FileProcessingStatus.Pending;
+                        updated.ProcessingStartTime = null;
+                        updated.AvailableForProcessingAt = DateTime.UtcNow;
 
-                    await _metadataRepository.AddOrUpdateAsync(updated, ct);
-                    resetCount++;
+                        await _metadataRepository.AddOrUpdateAsync(updated, ct);
+                        resetCount++;
 
-                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
+                        _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
+                    }
                 }
             }
 
@@ -359,7 +368,6 @@ namespace Locus.Storage
             TimeSpan? failedRetentionPeriod,
             CancellationToken ct)
         {
-            // Skip the GetAllAsync call entirely when nothing needs doing.
             if (processingTimeout == null && failedRetentionPeriod == null)
                 return;
 
@@ -367,56 +375,59 @@ namespace Locus.Storage
                 "Starting combined file status cleanup (timeout={Timeout}, failedRetention={Failed})",
                 processingTimeout, failedRetentionPeriod);
 
-            var allMetadata = await _metadataRepository.GetAllAsync(ct);
             var now = DateTime.UtcNow;
-
-            var timeoutCutoff = processingTimeout.HasValue     ? now - processingTimeout.Value     : (DateTime?)null;
-            var failedCutoff  = failedRetentionPeriod.HasValue ? now - failedRetentionPeriod.Value : (DateTime?)null;
+            var timeoutCutoff = processingTimeout.HasValue ? now - processingTimeout.Value : (DateTime?)null;
+            var failedCutoff = failedRetentionPeriod.HasValue ? now - failedRetentionPeriod.Value : (DateTime?)null;
 
             int resetCount = 0, removedFailed = 0;
             long spaceFreed = 0;
 
-            foreach (var metadata in allMetadata)
+            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
+                var tenantMetadata = await _metadataRepository.GetByTenantAsync(tenantId, ct);
 
-                if (metadata.Status == FileProcessingStatus.Processing
-                    && timeoutCutoff.HasValue
-                    && metadata.ProcessingStartTime.HasValue
-                    && metadata.ProcessingStartTime.Value < timeoutCutoff.Value)
+                foreach (var metadata in tenantMetadata)
                 {
-                    // Clone before mutating — same rationale as CleanupTimedOutProcessingFilesAsync.
-                    var updated = metadata.Clone();
-                    updated.Status = FileProcessingStatus.Pending;
-                    updated.ProcessingStartTime = null;
-                    updated.AvailableForProcessingAt = now;
-                    await _metadataRepository.AddOrUpdateAsync(updated, ct);
-                    resetCount++;
-                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
-                }
-                else if (metadata.Status == FileProcessingStatus.PermanentlyFailed
-                    && failedCutoff.HasValue
-                    && metadata.LastFailedAt.HasValue
-                    && metadata.LastFailedAt.Value < failedCutoff.Value)
-                {
-                    if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                    if (metadata.Status == FileProcessingStatus.Processing
+                        && timeoutCutoff.HasValue
+                        && metadata.ProcessingStartTime.HasValue
+                        && metadata.ProcessingStartTime.Value < timeoutCutoff.Value)
                     {
-                        try
+                        var updated = metadata.Clone();
+                        updated.Status = FileProcessingStatus.Pending;
+                        updated.ProcessingStartTime = null;
+                        updated.AvailableForProcessingAt = now;
+                        await _metadataRepository.AddOrUpdateAsync(updated, ct);
+                        resetCount++;
+                        _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
+                    }
+                    else if (metadata.Status == FileProcessingStatus.PermanentlyFailed
+                        && failedCutoff.HasValue
+                        && metadata.LastFailedAt.HasValue
+                        && metadata.LastFailedAt.Value < failedCutoff.Value)
+                    {
+                        if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
                         {
-                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                            try
                             {
-                                spaceFreed += metadata.FileSize;
-                                await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                                {
+                                    spaceFreed += metadata.FileSize;
+                                    await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
                             }
                         }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
-                        }
+
+                        await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                        await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
+                        removedFailed++;
                     }
-                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
-                    removedFailed++;
                 }
             }
 
@@ -683,7 +694,7 @@ namespace Locus.Storage
         /// A directory is considered empty when it contains no files (other than junk files that are
         /// deleted) and no subdirectories survive after recursive processing.
         /// The <paramref name="isProtectedRoot"/> flag prevents the top-level tenant or volume directory
-        /// from being deleted even when it is empty — only its children are cleaned up.
+        /// from being deleted even when it is empty 鈥?only its children are cleaned up.
         /// </summary>
         /// <returns>Number of directories deleted.</returns>
         private async Task<int> CleanupJunkFilesRecursiveAsync(
@@ -732,7 +743,7 @@ namespace Locus.Storage
                 }
             }
 
-            // 3. Delete the directory itself if it is now empty — but never delete protected roots
+            // 3. Delete the directory itself if it is now empty 鈥?but never delete protected roots
             //    (volume mount paths, tenant root directories) to avoid recreating them on next write.
             if (!isProtectedRoot && IsDirectoryEmpty(directoryPath))
             {
@@ -767,3 +778,5 @@ namespace Locus.Storage
         }
     }
 }
+
+

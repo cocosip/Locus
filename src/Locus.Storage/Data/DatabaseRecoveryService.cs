@@ -23,6 +23,7 @@ namespace Locus.Storage.Data
         private readonly ILogger<DatabaseRecoveryService> _logger;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
+        private readonly IReadOnlyDictionary<string, string> _volumeIdByPath;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DatabaseRecoveryService"/> class.
@@ -33,7 +34,8 @@ namespace Locus.Storage.Data
             IFileSystem fileSystem,
             ILogger<DatabaseRecoveryService> logger,
             string metadataDirectory,
-            string quotaDirectory)
+            string quotaDirectory,
+            IReadOnlyDictionary<string, string>? volumeIdByPath = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
@@ -41,6 +43,7 @@ namespace Locus.Storage.Data
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _metadataDirectory = metadataDirectory ?? throw new ArgumentNullException(nameof(metadataDirectory));
             _quotaDirectory = quotaDirectory ?? throw new ArgumentNullException(nameof(quotaDirectory));
+            _volumeIdByPath = NormalizeVolumePathMap(volumeIdByPath);
         }
 
         /// <summary>
@@ -160,12 +163,18 @@ namespace Locus.Storage.Data
                         try
                         {
                             var fileInfo = _fileSystem.FileInfo.New(filePath);
-                            var volumeId = _fileSystem.Path.GetFileName(volumePath);
+                            var volumeId = ResolveVolumeId(volumePath);
                             var relativePath = filePath.Substring(tenantPath.Length + 1);
                             var directoryPath = _fileSystem.Path.GetDirectoryName(relativePath) ?? "/";
 
-                            // Generate a file key from the physical path
-                            var fileKey = Guid.NewGuid().ToString("N");
+                            // Use the physical file name as key so rebuild is deterministic.
+                            var fileName = _fileSystem.Path.GetFileName(filePath);
+                            var fileKey = _fileSystem.Path.GetFileNameWithoutExtension(fileName);
+                            if (string.IsNullOrWhiteSpace(fileKey))
+                            {
+                                result.Errors.Add($"Failed to rebuild metadata for {filePath}: invalid file name");
+                                continue;
+                            }
 
                             var metadata = new FileMetadata
                             {
@@ -178,7 +187,9 @@ namespace Locus.Storage.Data
                                 Status = FileProcessingStatus.Pending, // Unknown status, mark as pending
                                 CreatedAt = fileInfo.CreationTimeUtc,
                                 RetryCount = 0,
-                                AvailableForProcessingAt = DateTime.UtcNow
+                                AvailableForProcessingAt = DateTime.UtcNow,
+                                OriginalFileName = fileName,
+                                FileExtension = _fileSystem.Path.GetExtension(filePath)
                             };
 
                             // Use direct write — rebuild must be persisted synchronously so the
@@ -258,11 +269,6 @@ namespace Locus.Storage.Data
                     return result;
                 }
 
-                // Lock is only needed for backup/delete stage.
-                // Rebuilding records uses normal repository APIs (which take tenant locks internally).
-                _quotaRepository.FinishDatabaseRebuild(tenantId);
-                rebuildLockHeld = false;
-
                 // Step 2: Scan directories and rebuild quotas
                 var directoryCounts = new Dictionary<string, int>();
 
@@ -283,13 +289,9 @@ namespace Locus.Storage.Data
 
                     try
                     {
-                        var quota = await _quotaRepository.GetOrCreateAsync(tenantId, kvp.Key, ct);
-                        quota.CurrentCount = kvp.Value;
-                        quota.LastUpdated = DateTime.UtcNow;
-                        quota.Enabled = true;
-                        quota.MaxCount = 0; // No limit by default, needs manual configuration
-
-                        await _quotaRepository.UpdateAsync(tenantId, quota, ct);
+                        // BeginDatabaseRebuildAsync already holds the tenant lock until FinishDatabaseRebuild.
+                        // Use the rebuild-specific path to avoid re-acquiring the same lock and deadlocking.
+                        await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, kvp.Key, kvp.Value, ct);
                         rebuiltQuotas++;
 
                         _logger.LogDebug("Rebuilt quota for directory: {DirectoryPath}, Count: {Count}",
@@ -371,6 +373,12 @@ namespace Locus.Storage.Data
             if (_fileSystem.Directory.Exists(_metadataDirectory))
             {
                 var metadataFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
+                var metadataFileNames = new HashSet<string>(
+                    metadataFiles
+                        .Select(p => _fileSystem.Path.GetFileNameWithoutExtension(p))
+                        .Where(n => !string.IsNullOrWhiteSpace(n)),
+                    StringComparer.OrdinalIgnoreCase);
+
                 foreach (var dbPath in metadataFiles)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -380,6 +388,10 @@ namespace Locus.Storage.Data
                     // Skip backup files created by LiteDB Rebuild() or corruption recovery
                     // Examples: "tenant-001.db-backup-1", "tenant-001.db.corrupted.20240122120000"
                     if (IsBackupFile(tenantId))
+                        continue;
+
+                    // Skip LiteDB sidecar log files like "{tenantId}-log.db"
+                    if (IsMetadataLogSidecar(tenantId, metadataFileNames))
                         continue;
 
                     var isCorrupted = IsDatabaseCorrupted(dbPath);
@@ -442,6 +454,41 @@ namespace Locus.Storage.Data
             return await Task.FromResult(report);
         }
 
+        private static IReadOnlyDictionary<string, string> NormalizeVolumePathMap(
+            IReadOnlyDictionary<string, string>? volumeIdByPath)
+        {
+            if (volumeIdByPath == null || volumeIdByPath.Count == 0)
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in volumeIdByPath)
+            {
+                if (string.IsNullOrWhiteSpace(kvp.Key) || string.IsNullOrWhiteSpace(kvp.Value))
+                    continue;
+
+                var normalizedPath = Path.GetFullPath(kvp.Key)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                normalized[normalizedPath] = kvp.Value;
+            }
+
+            return normalized;
+        }
+
+        private string ResolveVolumeId(string volumePath)
+        {
+            var normalizedPath = Path.GetFullPath(volumePath)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            if (_volumeIdByPath.TryGetValue(normalizedPath, out var configuredVolumeId))
+                return configuredVolumeId;
+
+            var fallback = _fileSystem.Path.GetFileName(volumePath);
+            _logger.LogWarning(
+                "Volume path {VolumePath} is not in the configured map, falling back to directory name {FallbackVolumeId}",
+                volumePath, fallback);
+            return fallback;
+        }
+
         /// <summary>
         /// Checks if a tenant ID represents a backup file rather than a real tenant.
         /// LiteDB Rebuild() creates temporary backup files like "tenant-001.db-backup-1".
@@ -467,6 +514,15 @@ namespace Locus.Storage.Data
                 return true;
 
             return false;
+        }
+
+        private static bool IsMetadataLogSidecar(string tenantId, HashSet<string> metadataFileNames)
+        {
+            if (!tenantId.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var baseTenantId = tenantId.Substring(0, tenantId.Length - 4);
+            return metadataFileNames.Contains(baseTenantId);
         }
     }
 }

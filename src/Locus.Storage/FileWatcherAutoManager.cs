@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -283,7 +285,9 @@ namespace Locus.Storage
         {
             // Create deterministic ID based on mode and path
             var normalizedPath = rootPath.Replace("\\", "/").TrimEnd('/');
-            var hash = normalizedPath.GetHashCode().ToString("X8");
+            using var sha256 = SHA256.Create();
+            var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes($"{mode}:{normalizedPath}"));
+            var hash = BitConverter.ToString(hashBytes, 0, 8).Replace("-", "").ToLowerInvariant();
             return $"auto-{mode}-{hash}";
         }
 

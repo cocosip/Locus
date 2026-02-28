@@ -23,6 +23,7 @@ namespace Locus.Storage
         private readonly IEnumerable<string> _volumePaths;
         private readonly bool _autoRecoverCorruptedDatabases;
         private readonly bool _failFastOnRecoveryFailure;
+        private readonly TimeSpan _startupDelay;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DatabaseHealthCheckService"/> class.
@@ -34,7 +35,8 @@ namespace Locus.Storage
             string metadataDirectory,
             IEnumerable<string> volumePaths,
             bool autoRecoverCorruptedDatabases = true,
-            bool failFastOnRecoveryFailure = false)
+            bool failFastOnRecoveryFailure = false,
+            TimeSpan? startupDelay = null)
         {
             _recoveryService = recoveryService ?? throw new ArgumentNullException(nameof(recoveryService));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -43,6 +45,7 @@ namespace Locus.Storage
             _volumePaths = volumePaths ?? throw new ArgumentNullException(nameof(volumePaths));
             _autoRecoverCorruptedDatabases = autoRecoverCorruptedDatabases;
             _failFastOnRecoveryFailure = failFastOnRecoveryFailure;
+            _startupDelay = startupDelay ?? TimeSpan.FromSeconds(2);
         }
 
         /// <inheritdoc/>
@@ -52,8 +55,11 @@ namespace Locus.Storage
 
             // Add delay to avoid startup timing conflicts
             // Other services (MetadataRepository, etc.) need time to initialize
-            _logger.LogDebug("Waiting 2 seconds for other services to initialize...");
-            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+            if (_startupDelay > TimeSpan.Zero)
+            {
+                _logger.LogDebug("Waiting {StartupDelay} for other services to initialize...", _startupDelay);
+                await Task.Delay(_startupDelay, cancellationToken);
+            }
 
             try
             {
@@ -267,6 +273,12 @@ namespace Locus.Storage
             if (_fileSystem.Directory.Exists(_metadataDirectory))
             {
                 var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
+                var dbFileNames = new HashSet<string>(
+                    dbFiles
+                        .Select(path => _fileSystem.Path.GetFileNameWithoutExtension(path))
+                        .Where(name => !string.IsNullOrWhiteSpace(name)),
+                    StringComparer.OrdinalIgnoreCase);
+
                 foreach (var dbFile in dbFiles)
                 {
                     var tenantId = _fileSystem.Path.GetFileNameWithoutExtension(dbFile);
@@ -274,6 +286,10 @@ namespace Locus.Storage
                     // Skip backup files created by LiteDB Rebuild() or corruption recovery
                     // Examples: "tenant-001.db-backup-1", "tenant-001.db.corrupted.20240122120000"
                     if (IsBackupFile(tenantId))
+                        continue;
+
+                    // Skip LiteDB sidecar log files like "{tenantId}-log.db"
+                    if (IsMetadataLogSidecar(tenantId, dbFileNames))
                         continue;
 
                     existingTenantIds.Add(tenantId);
@@ -386,6 +402,15 @@ namespace Locus.Storage
                 return true;
 
             return false;
+        }
+
+        private static bool IsMetadataLogSidecar(string tenantId, HashSet<string> dbFileNames)
+        {
+            if (!tenantId.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var baseTenantId = tenantId.Substring(0, tenantId.Length - 4);
+            return dbFileNames.Contains(baseTenantId);
         }
 
         /// <inheritdoc/>

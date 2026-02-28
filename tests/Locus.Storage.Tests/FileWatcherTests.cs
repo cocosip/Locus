@@ -179,6 +179,59 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_ConcurrentScans_DoNotImportDuplicateFile()
+        {
+            // Arrange
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var filePath = Path.Combine(watchPath, "duplicate.txt");
+            _fileSystem.File.WriteAllText(filePath, "content");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(),
+                    It.IsAny<Stream>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    await Task.Delay(50);
+                    return "generated-key";
+                });
+
+            var config = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+
+            // Act
+            await Task.WhenAll(
+                _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None),
+                _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None));
+
+            // Assert
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task ScanNowAsync_MultiTenantMode_ImportsFilesPerTenant()
         {
             // Arrange

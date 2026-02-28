@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.Exceptions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -47,9 +48,18 @@ namespace Locus
                 {
                     try
                     {
-                        // Create tenant if it doesn't exist
-                        var existingTenant = await _tenantManager.GetTenantAsync(tenantConfig.TenantId, cancellationToken);
-                        if (existingTenant == null)
+                        // Create tenant if it doesn't exist. GetTenantAsync throws when not found.
+                        var tenantExists = true;
+                        try
+                        {
+                            await _tenantManager.GetTenantAsync(tenantConfig.TenantId, cancellationToken);
+                        }
+                        catch (TenantNotFoundException)
+                        {
+                            tenantExists = false;
+                        }
+
+                        if (!tenantExists)
                         {
                             await _tenantManager.CreateTenantAsync(tenantConfig.TenantId, cancellationToken);
                             _logger.LogInformation("Created tenant: {TenantId}", tenantConfig.TenantId);

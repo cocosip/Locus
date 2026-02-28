@@ -66,6 +66,7 @@ namespace Locus.Storage.Data
         private readonly SemaphoreSlim _persistenceSignal; // one permit per enqueued item
         private readonly Task _persistenceTask;
         private readonly CancellationTokenSource _persistenceCts;
+        private readonly bool _enableBackgroundPersistence;
 
         private bool _disposed;
 
@@ -101,7 +102,8 @@ namespace Locus.Storage.Data
             IFileSystem fileSystem,
             ILogger<MetadataRepository> logger,
             string metadataDirectory,
-            LiteDBOptions? liteDbOptions = null)
+            LiteDBOptions? liteDbOptions = null,
+            bool enableBackgroundPersistence = true)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -111,6 +113,7 @@ namespace Locus.Storage.Data
 
             _metadataDirectory = metadataDirectory;
             _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
+            _enableBackgroundPersistence = enableBackgroundPersistence;
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
@@ -136,11 +139,19 @@ namespace Locus.Storage.Data
                 _liteDbOptions.CheckpointInterval,
                 _liteDbOptions.TimeoutSeconds);
 
-            // Start background persistence loop LAST — all fields are fully initialized at this point.
-            // The task immediately blocks on _persistenceSignal.WaitAsync() and consumes no CPU
-            // until EnqueuePersistence() is called. Dispose() cancels _persistenceCts and waits
-            // for the task to drain remaining items before closing databases.
-            _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
+            if (_enableBackgroundPersistence)
+            {
+                // Start background persistence loop LAST — all fields are fully initialized at this point.
+                // The task immediately blocks on _persistenceSignal.WaitAsync() and consumes no CPU
+                // until EnqueuePersistence() is called. Dispose() cancels _persistenceCts and waits
+                // for the task to drain remaining items before closing databases.
+                _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
+            }
+            else
+            {
+                _persistenceTask = Task.CompletedTask;
+                _logger.LogInformation("MetadataRepository write-behind background loop is disabled; persistence is synchronous.");
+            }
         }
 
         /// <summary>
@@ -732,20 +743,62 @@ namespace Locus.Storage.Data
         /// </summary>
         public async Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
         {
-            if (!_fileSystem.Directory.Exists(_metadataDirectory))
-                return [];
+            // Include in-memory tenants first so cleanup can process recent writes that have not
+            // been flushed to disk yet by the write-behind persistence loop.
+            var tenantIds = new HashSet<string>(_activeFiles.Keys, StringComparer.Ordinal);
 
-            // Use the file system directly to get the database files
-            var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
-            var tenantIds = dbFiles
-                .Select(f => _fileSystem.Path.GetFileNameWithoutExtension(f))
-                .Where(name => !string.IsNullOrWhiteSpace(name)
-                    && !name.Contains("-backup", StringComparison.OrdinalIgnoreCase)    // Filter LiteDB backup files: "tenant-001.db-backup-1"
-                    && !name.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase) // Filter corruption backups
-                    && !name.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))   // Filter LiteDB journal files
-                .ToList();
+            if (_fileSystem.Directory.Exists(_metadataDirectory))
+            {
+                // Use the file system directly to get the database files
+                var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
+                var diskNames = dbFiles
+                    .Select(f => _fileSystem.Path.GetFileNameWithoutExtension(f))
+                    .Where(n => !string.IsNullOrWhiteSpace(n))
+                    .ToList();
+                var diskNameSet = new HashSet<string>(diskNames, StringComparer.OrdinalIgnoreCase);
 
-            return await Task.FromResult(tenantIds);
+                foreach (var fileName in diskNames)
+                {
+                    if (IsMetadataLogSidecar(fileName, diskNameSet))
+                        continue;
+
+                    if (!IsValidTenantDatabaseName(fileName))
+                        continue;
+
+                    tenantIds.Add(fileName);
+                }
+            }
+
+            return await Task.FromResult<IEnumerable<string>>(tenantIds);
+        }
+
+        private static bool IsValidTenantDatabaseName(string? fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+                return false;
+
+            var tenantDatabaseName = fileName!;
+
+            // Filter LiteDB maintenance sidecar files and backups.
+            if (tenantDatabaseName.Contains("-backup", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (tenantDatabaseName.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (tenantDatabaseName.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            return true;
+        }
+
+        private static bool IsMetadataLogSidecar(string fileName, HashSet<string> diskNameSet)
+        {
+            if (!fileName.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var baseName = fileName.Substring(0, fileName.Length - 4);
+            return diskNameSet.Contains(baseName);
         }
 
         /// <summary>
@@ -897,6 +950,14 @@ namespace Locus.Storage.Data
         // within this process lifetime. On restart, the cleanup service reconciles disk vs metadata.
         private void EnqueuePersistence(PersistenceOperation op)
         {
+            // Used by unit tests to avoid orphaned background workers.
+            // When disabled, persist inline and skip queueing/task signaling.
+            if (!_enableBackgroundPersistence)
+            {
+                ExecuteBatch(op.TenantId, new List<PersistenceOperation> { op });
+                return;
+            }
+
             // ConcurrentQueue.Count is O(1). Small TOCTOU race is acceptable: we only
             // need to prevent unbounded growth, not enforce an exact hard limit.
             if (_persistenceQueue.Count >= MaxPersistenceQueueSize)
@@ -1090,20 +1151,23 @@ namespace Locus.Storage.Data
 
             _disposed = true;
 
-            // 1. Signal the background persistence loop to stop accepting new signals
-            _persistenceCts.Cancel();
+            if (_enableBackgroundPersistence)
+            {
+                // 1. Signal the background persistence loop to stop accepting new signals
+                _persistenceCts.Cancel();
 
-            // 2. Wait for the background task to drain remaining queued items (up to 5 seconds).
-            // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach LiteDB.
-            // If LiteDB is unavailable or the queue is too large to drain in time, remaining items
-            // are discarded — physical files are safe on disk and recovered by cleanup service on restart.
-            try
-            {
-                _persistenceTask.Wait(TimeSpan.FromSeconds(5));
-            }
-            catch (AggregateException)
-            {
-                // OperationCanceledException wrapped in AggregateException — expected on cancellation
+                // 2. Wait for the background task to drain remaining queued items (up to 5 seconds).
+                // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach LiteDB.
+                // If LiteDB is unavailable or the queue is too large to drain in time, remaining items
+                // are discarded — physical files are safe on disk and recovered by cleanup service on restart.
+                try
+                {
+                    _persistenceTask.Wait(TimeSpan.FromSeconds(5));
+                }
+                catch (AggregateException)
+                {
+                    // OperationCanceledException wrapped in AggregateException — expected on cancellation
+                }
             }
 
             // 3. Close all databases AFTER the drain is complete

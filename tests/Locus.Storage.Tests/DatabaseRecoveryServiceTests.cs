@@ -38,10 +38,18 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(_volumePath);
 
             var metadataRepoLogger = new Mock<ILogger<MetadataRepository>>();
-            _metadataRepository = new MetadataRepository(_fileSystem, metadataRepoLogger.Object, _metadataDir);
+            _metadataRepository = new MetadataRepository(
+                _fileSystem,
+                metadataRepoLogger.Object,
+                _metadataDir,
+                enableBackgroundPersistence: false);
 
             var quotaRepoLogger = new Mock<ILogger<DirectoryQuotaRepository>>();
-            _quotaRepository = new DirectoryQuotaRepository(_fileSystem, quotaRepoLogger.Object, _quotaDir);
+            _quotaRepository = new DirectoryQuotaRepository(
+                _fileSystem,
+                quotaRepoLogger.Object,
+                _quotaDir,
+                enableBackgroundFlush: false);
 
             _logger = new Mock<ILogger<DatabaseRecoveryService>>();
             _recoveryService = new DatabaseRecoveryService(
@@ -91,7 +99,7 @@ namespace Locus.Storage.Tests
             var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
 
             // Create a temporary repository to create the database, then dispose it
-            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 var metadata = new FileMetadata
                 {
@@ -124,7 +132,7 @@ namespace Locus.Storage.Tests
             var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
 
             // First create a valid LiteDB database
-            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
                 {
@@ -173,7 +181,7 @@ namespace Locus.Storage.Tests
 
             // Create a valid database first, then corrupt it
             var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
-            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
                 {
@@ -211,6 +219,68 @@ namespace Locus.Storage.Tests
 
             // Verify new database file exists
             Assert.True(_fileSystem.File.Exists(dbPath));
+        }
+
+        [Fact]
+        public async Task RebuildMetadataDatabaseAsync_UsesStableFileKeyAndConfiguredVolumeId()
+        {
+            // Arrange
+            var tenantId = $"tenant-stable-key-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var tenantPath = Path.Combine(_volumePath, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+
+            var physicalFile = Path.Combine(tenantPath, "invoice-001.pdf");
+            _fileSystem.File.WriteAllText(physicalFile, "content");
+
+            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
+            {
+                await tempRepo.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = "temp",
+                    TenantId = tenantId,
+                    VolumeId = "vol",
+                    PhysicalPath = "/temp",
+                    DirectoryPath = "/",
+                    Status = FileProcessingStatus.Pending,
+                    CreatedAt = DateTime.UtcNow
+                }, default);
+            }
+
+            await Task.Delay(100);
+
+            var garbage = new byte[512];
+            new Random().NextBytes(garbage);
+            using (var stream = _fileSystem.File.Open(dbPath, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write(garbage, 0, garbage.Length);
+            }
+
+            var recoveryWithVolumeMap = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [_volumePath] = "vol-configured"
+                });
+
+            // Act
+            var result = await recoveryWithVolumeMap.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            // Assert
+            Assert.True(result.Success);
+            var metadata = (await _metadataRepository.GetByTenantAsync(tenantId, default)).Single();
+            Assert.Equal("invoice-001", metadata.FileKey);
+            Assert.Equal("vol-configured", metadata.VolumeId);
+            Assert.Equal(".pdf", metadata.FileExtension);
+            Assert.Equal("invoice-001.pdf", metadata.OriginalFileName);
         }
 
         [Fact]
@@ -252,7 +322,7 @@ namespace Locus.Storage.Tests
 
             // Create a valid database first, then corrupt it
             var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
-            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir))
+            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
             {
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
@@ -283,6 +353,47 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildQuotaDatabaseAsync_SynchronizesAtomicCounterState()
+        {
+            // Arrange
+            var tenantId = $"tenant-rebuild-counter-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var tenantPath = Path.Combine(_volumePath, tenantId);
+            var docsPath = Path.Combine(tenantPath, "documents");
+            _fileSystem.Directory.CreateDirectory(docsPath);
+            _fileSystem.File.WriteAllText(Path.Combine(docsPath, "a.txt"), "a");
+            _fileSystem.File.WriteAllText(Path.Combine(docsPath, "b.txt"), "b");
+
+            var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
+            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
+            {
+                await tempRepo.GetOrCreateAsync(tenantId, "/", default);
+            }
+
+            await Task.Delay(100);
+
+            var garbage = new byte[512];
+            new Random().NextBytes(garbage);
+            using (var stream = _fileSystem.File.Open(dbPath, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write(garbage, 0, garbage.Length);
+            }
+
+            await _recoveryService.RebuildQuotaDatabaseAsync(tenantId, new[] { _volumePath }, default);
+
+            // Set limit equal to rebuilt count; a further increment must be rejected.
+            var quota = await _quotaRepository.GetOrCreateAsync(tenantId, "/documents", default);
+            quota.MaxCount = 2;
+            quota.Enabled = true;
+            await _quotaRepository.UpdateAsync(tenantId, quota, default);
+
+            // Act
+            var incremented = await _quotaRepository.TryIncrementAsync(tenantId, "/documents", default);
+
+            // Assert
+            Assert.False(incremented);
+        }
+
+        [Fact]
         public async Task CheckAllDatabasesAsync_ReturnsHealthyForAllHealthyDatabases()
         {
             // Arrange - use unique tenant IDs and temporary repositories
@@ -290,7 +401,7 @@ namespace Locus.Storage.Tests
             var tenant2 = $"tenant-check-2-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
 
             // Create databases using temporary repositories, then dispose them
-            using (var tempMetaRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempMetaRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempMetaRepo.AddOrUpdateAsync(new FileMetadata
                 {
@@ -304,7 +415,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            using (var tempQuotaRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir))
+            using (var tempQuotaRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
             {
                 await tempQuotaRepo.GetOrCreateAsync(tenant2, "/", default);
             }
@@ -329,7 +440,7 @@ namespace Locus.Storage.Tests
             var tenant2 = $"tenant-corrupt-2-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
 
             // Create valid databases first, then corrupt them
-            using (var tempMetaRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir))
+            using (var tempMetaRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempMetaRepo.AddOrUpdateAsync(new FileMetadata
                 {
@@ -343,7 +454,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            using (var tempQuotaRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir))
+            using (var tempQuotaRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
             {
                 await tempQuotaRepo.GetOrCreateAsync(tenant2, "/", default);
             }
