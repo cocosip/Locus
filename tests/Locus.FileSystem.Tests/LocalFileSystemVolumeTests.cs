@@ -273,7 +273,7 @@ namespace Locus.FileSystem.Tests
         }
 
         [Fact]
-        public void BuildPhysicalPath_WithUpperCaseFileKey_ConvertsToLowerCase()
+        public void BuildPhysicalPath_WithUpperCaseFileKey_UsesOriginalCaseForShards()
         {
             // Arrange
             var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath, shardingDepth: 2);
@@ -281,8 +281,8 @@ namespace Locus.FileSystem.Tests
             // Act
             var path = volume.BuildPhysicalPath("tenant-001", "FF00AA55BB");
 
-            // Assert - Should convert to lowercase: ff/00/FF00AA55BB
-            var expected = Path.Combine(_mountPath, "tenant-001", "ff", "00", "FF00AA55BB");
+            // Assert - Shard dirs use the original case from fileKey (GUIDs are always lowercase, so this is academic).
+            var expected = Path.Combine(_mountPath, "tenant-001", "FF", "00", "FF00AA55BB");
             Assert.Equal(Path.GetFullPath(expected), path);
         }
 
@@ -355,9 +355,9 @@ namespace Locus.FileSystem.Tests
             var expected3 = Path.Combine(_mountPath, "tenant-003", "ff", "ff", "ffffffff");
             Assert.Equal(Path.GetFullPath(expected3), path3);
 
-            // Test case 4: Mixed case
+            // Test case 4: Mixed case — shard dirs preserve original case (GUID fileKeys are always lowercase)
             var path4 = volume.BuildPhysicalPath("tenant-004", "AaBbCcDd");
-            var expected4 = Path.Combine(_mountPath, "tenant-004", "aa", "bb", "AaBbCcDd");
+            var expected4 = Path.Combine(_mountPath, "tenant-004", "Aa", "Bb", "AaBbCcDd");
             Assert.Equal(Path.GetFullPath(expected4), path4);
         }
     }

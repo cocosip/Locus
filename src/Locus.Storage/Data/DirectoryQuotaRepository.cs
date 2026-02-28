@@ -688,7 +688,10 @@ namespace Locus.Storage.Data
 
                 if (cur >= state.MaxCount)
                 {
-                    _logger.LogWarning(
+                    // Log at Debug rather than Warning: quota rejection is normal business behaviour.
+                    // The caller (DirectoryQuotaManager) will throw DirectoryQuotaExceededException,
+                    // which is the correct place to surface the rejection at a higher log level.
+                    _logger.LogDebug(
                         "Cannot increment directory {DirectoryPath} for tenant {TenantId}: limit {MaxCount} reached",
                         directoryPath, tenantId, state.MaxCount);
                     return Task.FromResult(false);

@@ -48,12 +48,12 @@ namespace Locus.Storage
                     // Note: This no longer deletes empty directories, only the junk files within them.
                     await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
-                    // 2-4. Combined single-pass cleanup: timed-out, permanently failed, and completed records.
+                    // 2-3. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.
+                    // Note: Completed files are deleted immediately on MarkAsCompletedAsync and never accumulate.
                     await _cleanupService.CleanupFilesByStatusAsync(
-                        _options.CleanupTimedOutFiles           ? _options.ProcessingTimeout            : null,
-                        _options.CleanupPermanentlyFailedFiles  ? _options.FailedFileRetentionPeriod    : null,
-                        _options.CleanupCompletedRecords        ? _options.CompletedRecordRetentionPeriod : null,
+                        _options.CleanupTimedOutFiles          ? _options.ProcessingTimeout         : null,
+                        _options.CleanupPermanentlyFailedFiles ? _options.FailedFileRetentionPeriod : null,
                         stoppingToken);
 
                     // 5. Optimize databases (if enabled and due)
@@ -168,18 +168,6 @@ namespace Locus.Storage
         /// Default: 7 days.
         /// </summary>
         public TimeSpan? FailedFileRetentionPeriod { get; set; } = TimeSpan.FromDays(7);
-
-        /// <summary>
-        /// Gets or sets whether to cleanup completed file records.
-        /// Default: false (keep records indefinitely).
-        /// </summary>
-        public bool CleanupCompletedRecords { get; set; } = false;
-
-        /// <summary>
-        /// Gets or sets the retention period for completed file records.
-        /// Default: 30 days.
-        /// </summary>
-        public TimeSpan? CompletedRecordRetentionPeriod { get; set; } = TimeSpan.FromDays(30);
 
         /// <summary>
         /// Gets or sets whether to optimize (shrink) LiteDB databases periodically.

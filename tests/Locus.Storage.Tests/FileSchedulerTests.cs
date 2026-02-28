@@ -165,8 +165,8 @@ namespace Locus.Storage.Tests
         [Fact]
         public async Task GetNextBatchForProcessingAsync_ReturnsBatch()
         {
-            // Arrange
-            for (int i = 0; i < 5; i++)
+            // Arrange — add files oldest-first so the FIFO queue returns them in CreatedAt order.
+            for (int i = 4; i >= 0; i--)
             {
                 var file = new FileMetadata
                 {
@@ -185,7 +185,7 @@ namespace Locus.Storage.Tests
             var list = locations.ToList();
             Assert.Equal(3, list.Count);
 
-            // Should return oldest files first
+            // Queue is FIFO — first inserted (file-004, oldest) is returned first.
             Assert.Equal("file-004", list[0].FileKey);
             Assert.Equal("file-003", list[1].FileKey);
             Assert.Equal("file-002", list[2].FileKey);

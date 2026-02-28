@@ -170,28 +170,21 @@ namespace Locus.Storage
                     fileExtension = Path.GetExtension(originalFileName);
                 }
 
-                // 6. Build physical file path with automatic sharding
-                // Use volume's BuildPhysicalPath if available (LocalFileSystemVolume)
-                if (volume is FileSystem.LocalFileSystemVolume localVolume)
-                {
-                    physicalPath = localVolume.BuildPhysicalPath(tenant.TenantId, fileKey, fileExtension);
-                }
-                else
-                {
-                    // Fallback for other volume types
-                    var fileNameWithExtension = fileKey + fileExtension;
-                    var relativePath = Path.Combine(tenant.TenantId, fileNameWithExtension);
-                    physicalPath = Path.Combine(volume.MountPath, relativePath);
-                }
+                // 6. Build physical file path using the volume's layout strategy
+                physicalPath = volume.BuildPhysicalPath(tenant.TenantId, fileKey, fileExtension);
 
-                // 6. Write file to volume
+                // Derive the shard directory from the physical path so directory-level quotas
+                // are tracked per actual shard directory rather than a single root "/".
+                var directoryPath = Path.GetDirectoryName(physicalPath) ?? "/";
+
+                // 7. Write file to volume
                 await volume.WriteAsync(physicalPath, content, ct);
                 fileWritten = true; // Mark that physical file was written
 
-                // 7. Get file size
+                // 8. Get file size
                 var fileSize = content.CanSeek ? content.Length : 0;
 
-                // 8. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
+                // 9. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
                 // AddOrUpdateAsync never throws from the caller's perspective. If LiteDB is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
@@ -200,7 +193,7 @@ namespace Locus.Storage
                     TenantId = tenant.TenantId,
                     VolumeId = volume.VolumeId,
                     PhysicalPath = physicalPath,
-                    DirectoryPath = "/",
+                    DirectoryPath = directoryPath,
                     FileSize = fileSize,
                     CreatedAt = DateTime.UtcNow,
                     Status = FileProcessingStatus.Pending,

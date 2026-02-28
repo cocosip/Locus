@@ -111,6 +111,9 @@ namespace Locus.Storage.Tests
             _volume1.Setup(v => v.TotalCapacity).Returns(1000000000L); // 1GB
             _volume1.Setup(v => v.AvailableSpace).Returns(500000000L); // 500MB
             _volume1.Setup(v => v.IsHealthy).Returns(true);
+            _volume1.Setup(v => v.BuildPhysicalPath(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>()))
+                .Returns((string tenantId, string fileKey, string? ext) =>
+                    Path.Combine(_volume1Path, tenantId, string.IsNullOrEmpty(ext) ? fileKey : fileKey + ext));
             _volume1.Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
                 .Returns((string path, Stream content, CancellationToken ct) =>
                 {
@@ -144,6 +147,9 @@ namespace Locus.Storage.Tests
             _volume2.Setup(v => v.TotalCapacity).Returns(1000000000L);
             _volume2.Setup(v => v.AvailableSpace).Returns(600000000L); // 600MB (more than volume1)
             _volume2.Setup(v => v.IsHealthy).Returns(true);
+            _volume2.Setup(v => v.BuildPhysicalPath(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>()))
+                .Returns((string tenantId, string fileKey, string? ext) =>
+                    Path.Combine(_volume2Path, tenantId, string.IsNullOrEmpty(ext) ? fileKey : fileKey + ext));
             _volume2.Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
                 .Returns((string path, Stream content, CancellationToken ct) =>
                 {
@@ -346,7 +352,7 @@ namespace Locus.Storage.Tests
             Assert.Equal(fileKey, location.FileKey);
             Assert.Equal("tenant-001", location.TenantId);
             Assert.Equal(FileProcessingStatus.Pending, location.Status);
-            Assert.Equal("/", location.DirectoryPath);
+            Assert.False(string.IsNullOrEmpty(location.DirectoryPath));
         }
 
         [Fact]

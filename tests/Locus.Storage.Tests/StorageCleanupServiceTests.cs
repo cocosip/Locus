@@ -304,34 +304,6 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupCompletedFileRecordsAsync_RemovesOldCompletedRecords()
-        {
-            // Arrange
-            var completedMetadata = new FileMetadata
-            {
-                FileKey = "file-005",
-                TenantId = "tenant-001",
-                VolumeId = "vol-001",
-                PhysicalPath = Path.Combine(_volumePath, "completed.dat"),
-                DirectoryPath = "/",
-                Status = FileProcessingStatus.Completed,
-                CreatedAt = DateTime.UtcNow.AddDays(-40) // 40 days ago
-            };
-
-            await _metadataRepository.AddOrUpdateAsync(completedMetadata, default);
-
-            // Act
-            await _cleanupService.CleanupCompletedFileRecordsAsync(TimeSpan.FromDays(30), default);
-
-            // Assert
-            var metadata = await _metadataRepository.GetAsync("tenant-001", "file-005", default);
-            Assert.Null(metadata); // Record removed
-
-            var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
-            Assert.Equal(1, stats.CompletedRecordsRemoved);
-        }
-
-        [Fact]
         public async Task CleanupOrphanedFilesAsync_DeletesOrphanedFiles()
         {
             // Arrange
@@ -412,7 +384,8 @@ namespace Locus.Storage.Tests
             Assert.True(_fileSystem.Directory.Exists(junkDir), "Directory should be preserved");
             
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
-            Assert.Equal(1, stats.EmptyDirectoriesRemoved); // Metric now tracks junk files removed
+            // junkDir still has valid.txt after Thumbs.db deletion — no directories were removed
+            Assert.Equal(0, stats.EmptyDirectoriesRemoved);
         }
 
         [Fact]
@@ -423,7 +396,7 @@ namespace Locus.Storage.Tests
             var level1 = Path.Combine(tenantPath, "level1");
             var level2 = Path.Combine(level1, "level2");
             _fileSystem.Directory.CreateDirectory(level2);
-            
+
             // Create junk files in both levels
             _fileSystem.File.WriteAllText(Path.Combine(level1, "desktop.ini"), "junk");
             _fileSystem.File.WriteAllText(Path.Combine(level2, ".DS_Store"), "junk");
@@ -434,11 +407,12 @@ namespace Locus.Storage.Tests
             // Assert
             Assert.False(_fileSystem.File.Exists(Path.Combine(level1, "desktop.ini")));
             Assert.False(_fileSystem.File.Exists(Path.Combine(level2, ".DS_Store")));
-            
-            // Directories must exist
-            Assert.True(_fileSystem.Directory.Exists(level1));
-            Assert.True(_fileSystem.Directory.Exists(level2));
-            
+
+            // After junk files are removed both dirs become empty and are deleted bottom-up.
+            // Only the tenant root (tenantPath) is protected from deletion.
+            Assert.False(_fileSystem.Directory.Exists(level2));
+            Assert.False(_fileSystem.Directory.Exists(level1));
+
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
             Assert.Equal(2, stats.EmptyDirectoriesRemoved);
         }

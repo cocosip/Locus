@@ -92,5 +92,33 @@ namespace Locus.Storage.Data
         /// Gets or sets additional metadata as key-value pairs.
         /// </summary>
         public System.Collections.Generic.Dictionary<string, string>? Metadata { get; set; }
+
+        /// <summary>
+        /// Creates a shallow clone of this instance.
+        /// Used before mutating state so that concurrent lock-free readers always observe
+        /// a fully-consistent object rather than a partially-written intermediate state.
+        /// </summary>
+        public FileMetadata Clone()
+        {
+            return new FileMetadata
+            {
+                FileKey = FileKey,
+                TenantId = TenantId,
+                VolumeId = VolumeId,
+                PhysicalPath = PhysicalPath,
+                DirectoryPath = DirectoryPath,
+                FileSize = FileSize,
+                CreatedAt = CreatedAt,
+                Status = Status,
+                RetryCount = RetryCount,
+                LastFailedAt = LastFailedAt,
+                LastError = LastError,
+                ProcessingStartTime = ProcessingStartTime,
+                AvailableForProcessingAt = AvailableForProcessingAt,
+                OriginalFileName = OriginalFileName,
+                FileExtension = FileExtension,
+                Metadata = Metadata
+            };
+        }
     }
 }

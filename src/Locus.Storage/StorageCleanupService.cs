@@ -106,7 +106,8 @@ namespace Locus.Storage
                 var tenantPath = Path.Combine(volume.MountPath, tenantId);
                 if (_fileSystem.Directory.Exists(tenantPath))
                 {
-                    removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct);
+                    // isProtectedRoot=true: never delete the tenant root directory itself.
+                    removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct, isProtectedRoot: true);
                 }
             }
 
@@ -130,36 +131,14 @@ namespace Locus.Storage
                     var subdirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
                     foreach (var subdirectory in subdirectories)
                     {
-                        removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct);
+                        // Each subdirectory is a tenant root — protect it from deletion.
+                        removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true);
                     }
                 }
             }
 
             _statistics.EmptyDirectoriesRemoved += removedCount;
             _logger.LogInformation("Cleaned up {Count} junk files across all tenants", removedCount);
-        }
-
-        /// <inheritdoc/>
-        public async Task CleanupCompletedFileRecordsAsync(TimeSpan olderThan, CancellationToken ct)
-        {
-            _logger.LogInformation("Starting cleanup of completed file records older than {TimeSpan}", olderThan);
-
-            var allMetadata = await _metadataRepository.GetAllAsync(ct);
-            var cutoffTime = DateTime.UtcNow - olderThan;
-            var removedCount = 0;
-
-            foreach (var metadata in allMetadata)
-            {
-                if (metadata.Status == FileProcessingStatus.Completed &&
-                    metadata.CreatedAt < cutoffTime)
-                {
-                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    removedCount++;
-                }
-            }
-
-            _statistics.CompletedRecordsRemoved += removedCount;
-            _logger.LogInformation("Cleaned up {Count} completed file records", removedCount);
         }
 
         /// <inheritdoc/>
@@ -297,25 +276,23 @@ namespace Locus.Storage
         public async Task CleanupFilesByStatusAsync(
             TimeSpan? processingTimeout,
             TimeSpan? failedRetentionPeriod,
-            TimeSpan? completedRetentionPeriod,
             CancellationToken ct)
         {
             // Skip the GetAllAsync call entirely when nothing needs doing.
-            if (processingTimeout == null && failedRetentionPeriod == null && completedRetentionPeriod == null)
+            if (processingTimeout == null && failedRetentionPeriod == null)
                 return;
 
             _logger.LogInformation(
-                "Starting combined file status cleanup (timeout={Timeout}, failedRetention={Failed}, completedRetention={Completed})",
-                processingTimeout, failedRetentionPeriod, completedRetentionPeriod);
+                "Starting combined file status cleanup (timeout={Timeout}, failedRetention={Failed})",
+                processingTimeout, failedRetentionPeriod);
 
             var allMetadata = await _metadataRepository.GetAllAsync(ct);
             var now = DateTime.UtcNow;
 
-            var timeoutCutoff   = processingTimeout.HasValue        ? now - processingTimeout.Value        : (DateTime?)null;
-            var failedCutoff    = failedRetentionPeriod.HasValue    ? now - failedRetentionPeriod.Value    : (DateTime?)null;
-            var completedCutoff = completedRetentionPeriod.HasValue ? now - completedRetentionPeriod.Value : (DateTime?)null;
+            var timeoutCutoff = processingTimeout.HasValue     ? now - processingTimeout.Value     : (DateTime?)null;
+            var failedCutoff  = failedRetentionPeriod.HasValue ? now - failedRetentionPeriod.Value : (DateTime?)null;
 
-            int resetCount = 0, removedFailed = 0, removedCompleted = 0;
+            int resetCount = 0, removedFailed = 0;
             long spaceFreed = 0;
 
             foreach (var metadata in allMetadata)
@@ -358,24 +335,15 @@ namespace Locus.Storage
                     await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
                     removedFailed++;
                 }
-                else if (metadata.Status == FileProcessingStatus.Completed
-                    && completedCutoff.HasValue
-                    && metadata.CreatedAt < completedCutoff.Value)
-                {
-                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    removedCompleted++;
-                }
             }
 
             _statistics.TimedOutFilesReset += resetCount;
             _statistics.PermanentlyFailedFilesRemoved += removedFailed;
-            _statistics.CompletedRecordsRemoved += removedCompleted;
             _statistics.SpaceFreed += spaceFreed;
 
             _logger.LogInformation(
-                "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed removed, " +
-                "{Completed} completed records removed, {SpaceFreed} bytes freed",
-                resetCount, removedFailed, removedCompleted, spaceFreed);
+                "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed removed, {SpaceFreed} bytes freed",
+                resetCount, removedFailed, spaceFreed);
         }
 
         /// <inheritdoc/>
@@ -623,35 +591,41 @@ namespace Locus.Storage
         }
 
         /// <summary>
-        /// Recursively cleans up junk files in directories but preserves the directory structure.
+        /// Recursively removes junk files and empty directories, bottom-up.
+        /// A directory is considered empty when it contains no files (other than junk files that are
+        /// deleted) and no subdirectories survive after recursive processing.
+        /// The <paramref name="isProtectedRoot"/> flag prevents the top-level tenant or volume directory
+        /// from being deleted even when it is empty — only its children are cleaned up.
         /// </summary>
-        private async Task<int> CleanupJunkFilesRecursiveAsync(string directoryPath, CancellationToken ct)
+        /// <returns>Number of directories deleted.</returns>
+        private async Task<int> CleanupJunkFilesRecursiveAsync(
+            string directoryPath,
+            CancellationToken ct,
+            bool isProtectedRoot = false)
         {
             if (!_fileSystem.Directory.Exists(directoryPath))
                 return 0;
 
             var removedCount = 0;
 
-            // 1. Recursively process subdirectories
+            // 1. Process subdirectories first (bottom-up so parents can be emptied).
             var subdirectories = _fileSystem.Directory.GetDirectories(directoryPath);
             foreach (var subdirectory in subdirectories)
             {
-                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct);
+                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false);
             }
 
-            // 2. Process files in current directory
+            // 2. Delete junk files in the current directory.
             var files = _fileSystem.Directory.GetFiles(directoryPath);
             foreach (var file in files)
             {
+                ct.ThrowIfCancellationRequested();
                 var fileName = _fileSystem.Path.GetFileName(file);
-                
-                // Only delete files if they are in the ignored list (junk files)
                 if (_ignoredFilenames.Contains(fileName))
                 {
                     try
                     {
                         _fileSystem.File.Delete(file);
-                        removedCount++;
                         _logger.LogDebug("Deleted junk file: {FilePath}", file);
                     }
                     catch (Exception ex)
@@ -661,7 +635,38 @@ namespace Locus.Storage
                 }
             }
 
+            // 3. Delete the directory itself if it is now empty — but never delete protected roots
+            //    (volume mount paths, tenant root directories) to avoid recreating them on next write.
+            if (!isProtectedRoot && IsDirectoryEmpty(directoryPath))
+            {
+                try
+                {
+                    _fileSystem.Directory.Delete(directoryPath);
+                    removedCount++;
+                    _logger.LogDebug("Deleted empty directory: {DirectoryPath}", directoryPath);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete empty directory {DirectoryPath}", directoryPath);
+                }
+            }
+
             return removedCount;
+        }
+
+        /// <summary>
+        /// Returns true when a directory contains no files and no subdirectories.
+        /// </summary>
+        private bool IsDirectoryEmpty(string directoryPath)
+        {
+            try
+            {
+                return !_fileSystem.Directory.GetFileSystemEntries(directoryPath).Any();
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 }

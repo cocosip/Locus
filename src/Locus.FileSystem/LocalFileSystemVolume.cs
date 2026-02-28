@@ -229,35 +229,21 @@ namespace Locus.FileSystem
                     return false;
                 }
 
+                // Single probe write — no retries to avoid blocking the thread pool with Thread.Sleep.
+                // A transient failure here simply marks the volume unhealthy for the 30-second TTL
+                // window, after which the next IsHealthy access will re-probe.
                 var testFilePath = _fileSystem.Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
-                const int maxRetries = 3;
-                const int retryDelayMs = 100;
-
-                for (int attempt = 1; attempt <= maxRetries; attempt++)
+                try
                 {
-                    try
-                    {
-                        _fileSystem.File.WriteAllText(testFilePath, "health check");
-                        _fileSystem.File.Delete(testFilePath);
-                        return true;
-                    }
-                    catch (Exception ex) when (attempt < maxRetries)
-                    {
-                        _logger.LogDebug(ex,
-                            "Health check write/delete test failed for volume {VolumeId} (attempt {Attempt}/{MaxRetries}), retrying...",
-                            _volumeId, attempt, maxRetries);
-                        System.Threading.Thread.Sleep(retryDelayMs);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex,
-                            "Health check write/delete test failed for volume {VolumeId} after {MaxRetries} attempts",
-                            _volumeId, maxRetries);
-                        return false;
-                    }
+                    _fileSystem.File.WriteAllText(testFilePath, "health check");
+                    _fileSystem.File.Delete(testFilePath);
+                    return true;
                 }
-
-                return false;
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Health check probe failed for volume {VolumeId}", _volumeId);
+                    return false;
+                }
             }
             catch (Exception ex)
             {
@@ -271,7 +257,7 @@ namespace Locus.FileSystem
         // ---------------------------------------------------------------------------
 
         /// <inheritdoc/>
-        public async Task<Stream> ReadAsync(string path, CancellationToken ct)
+        public Task<Stream> ReadAsync(string path, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(path))
                 throw new ArgumentException("Path cannot be empty", nameof(path));
@@ -284,9 +270,9 @@ namespace Locus.FileSystem
 
             try
             {
-                var stream = _fileSystem.File.OpenRead(path);
+                Stream stream = _fileSystem.File.OpenRead(path);
                 _logger.LogDebug("Opened file for reading: {Path}", path);
-                return await Task.FromResult(stream);
+                return Task.FromResult(stream);
             }
             catch (Exception ex)
             {
@@ -337,7 +323,7 @@ namespace Locus.FileSystem
         }
 
         /// <inheritdoc/>
-        public async Task DeleteAsync(string path, CancellationToken ct)
+        public Task DeleteAsync(string path, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(path))
                 throw new ArgumentException("Path cannot be empty", nameof(path));
@@ -348,14 +334,14 @@ namespace Locus.FileSystem
             if (!_fileSystem.File.Exists(path))
             {
                 _logger.LogWarning("Attempted to delete non-existent file: {Path}", path);
-                return;
+                return Task.CompletedTask;
             }
 
             try
             {
                 _fileSystem.File.Delete(path);
                 _logger.LogDebug("Deleted file: {Path}", path);
-                await Task.CompletedTask;
+                return Task.CompletedTask;
             }
             catch (Exception ex)
             {
@@ -423,30 +409,53 @@ namespace Locus.FileSystem
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            var pathParts = new List<string> { _mountPath, tenantId };
+            // fileKey is always produced by Guid.NewGuid().ToString("N") which is lowercase hex,
+            // so ToLowerInvariant() is redundant and avoided here to reduce hot-path allocations.
+            // Path.Combine with fixed argument counts avoids the List<string> + ToArray overhead.
+            var fileName = string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension;
 
-            for (int i = 0; i < _shardingDepth; i++)
+            switch (_shardingDepth)
             {
-                int startIndex = i * 2;
+                case 0:
+                    return _fileSystem.Path.Combine(_mountPath, tenantId, fileName);
 
-                if (startIndex + 1 < fileKey.Length)
+                case 1:
                 {
-                    pathParts.Add(fileKey.Substring(startIndex, 2).ToLowerInvariant());
+                    var shard0 = fileKey.Length >= 2 ? fileKey.Substring(0, 2)
+                               : fileKey.Length == 1 ? fileKey[0] + "0"
+                               : "00";
+                    return _fileSystem.Path.Combine(_mountPath, tenantId, shard0, fileName);
                 }
-                else if (startIndex < fileKey.Length)
+
+                case 2:
                 {
-                    pathParts.Add((fileKey[startIndex].ToString() + "0").ToLowerInvariant());
+                    var shard0 = fileKey.Length >= 2 ? fileKey.Substring(0, 2)
+                               : fileKey.Length == 1 ? fileKey[0] + "0"
+                               : "00";
+                    var shard1 = fileKey.Length >= 4 ? fileKey.Substring(2, 2)
+                               : fileKey.Length == 3 ? fileKey[2] + "0"
+                               : "00";
+                    return _fileSystem.Path.Combine(_mountPath, tenantId, shard0, shard1, fileName);
                 }
-                else
+
+                default:
                 {
-                    break;
+                    // Depth >= 3: fall back to the general loop (rare configuration).
+                    var pathParts = new List<string> { _mountPath, tenantId };
+                    for (int i = 0; i < _shardingDepth; i++)
+                    {
+                        int startIndex = i * 2;
+                        if (startIndex + 1 < fileKey.Length)
+                            pathParts.Add(fileKey.Substring(startIndex, 2));
+                        else if (startIndex < fileKey.Length)
+                            pathParts.Add(fileKey[startIndex] + "0");
+                        else
+                            break;
+                    }
+                    pathParts.Add(fileName);
+                    return _fileSystem.Path.Combine(pathParts.ToArray());
                 }
             }
-
-            var fileNameWithExtension = string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension;
-            pathParts.Add(fileNameWithExtension);
-
-            return _fileSystem.Path.Combine(pathParts.ToArray());
         }
 
         /// <summary>

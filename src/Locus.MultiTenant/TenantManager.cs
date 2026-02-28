@@ -210,15 +210,29 @@ namespace Locus.MultiTenant
         public async Task<IEnumerable<ITenantContext>> GetAllTenantsAsync(CancellationToken ct)
         {
             var metadataFiles = _fileSystem.Directory.GetFiles(_metadataRoot, "*.json");
-            var tenants = new List<ITenantContext>();
+            var tenants = new List<ITenantContext>(metadataFiles.Length);
 
             foreach (var filePath in metadataFiles)
             {
+                ct.ThrowIfCancellationRequested();
                 try
                 {
-                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(filePath);
-                    var tenant = await GetTenantAsync(fileName, ct);
-                    tenants.Add(tenant);
+                    // Read the JSON file directly — bypasses GetTenantAsync's per-tenant lock
+                    // and avoids N sequential lock acquisitions for large tenant counts.
+                    TenantMetadata? metadata;
+                    using (var stream = _fileSystem.File.OpenRead(filePath))
+                    {
+                        metadata = await JsonSerializer.DeserializeAsync<TenantMetadata>(stream, JsonOptions, ct);
+                    }
+
+                    if (metadata == null)
+                        continue;
+
+                    var context = new TenantContext(metadata.TenantId, metadata.Status);
+                    tenants.Add(context);
+
+                    // Populate cache so subsequent GetTenantAsync calls are served from memory.
+                    _cache[metadata.TenantId] = (context, DateTime.UtcNow.Add(_cacheExpiration));
                 }
                 catch (Exception ex)
                 {

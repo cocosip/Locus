@@ -56,5 +56,15 @@ namespace Locus.Core.Abstractions
         /// <param name="path">The relative path of the file to delete.</param>
         /// <param name="ct">Cancellation token.</param>
         Task DeleteAsync(string path, CancellationToken ct);
+
+        /// <summary>
+        /// Builds the full physical path for a file, applying any volume-specific layout
+        /// strategy (e.g. directory sharding).
+        /// </summary>
+        /// <param name="tenantId">The tenant identifier.</param>
+        /// <param name="fileKey">The unique file key (hex string).</param>
+        /// <param name="fileExtension">Optional file extension including the leading dot (e.g. ".pdf").</param>
+        /// <returns>The full physical path where the file should be stored.</returns>
+        string BuildPhysicalPath(string tenantId, string fileKey, string? fileExtension);
     }
 }
