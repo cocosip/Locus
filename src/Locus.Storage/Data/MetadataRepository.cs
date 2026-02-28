@@ -769,6 +769,10 @@ namespace Locus.Storage.Data
         // disk and will be recovered by the cleanup service on next restart.
         private const int MaxPersistenceQueueSize = 100_000;
 
+        // Compact pending queues every N drain cycles to reclaim memory from stale entries.
+        // At ~one drain-cycle per 5 s, 200 cycles ≈ every ~17 minutes.
+        private const int CompactionIntervalCycles = 200;
+
         // Enqueues an operation and wakes the background persistence loop.
         // If the queue is full (LiteDB has been unavailable for a long time), the operation
         // is dropped with a warning — memory state is already correct, so data is not lost
@@ -785,9 +789,10 @@ namespace Locus.Storage.Data
                         "Stale metadata record will be removed by cleanup service.",
                         MaxPersistenceQueueSize, op.FileKey, op.TenantId);
                 else
-                    _logger.LogWarning(
+                    _logger.LogError(
                         "Persistence queue is full ({Max} items). Dropping LiteDB upsert for {FileKey} (tenant {TenantId}). " +
-                        "File is safe on disk; metadata will be lost if process restarts before LiteDB recovers.",
+                        "File is safe on disk. On restart, StorageCleanupService will detect the orphan and REBUILD its metadata " +
+                        "so it re-enters the Pending queue for processing. Investigate why LiteDB is unavailable.",
                         MaxPersistenceQueueSize, op.FileKey, op.TenantId);
                 return;
             }
@@ -802,12 +807,16 @@ namespace Locus.Storage.Data
         // under burst writes (e.g. 1000 concurrent file writes → 1 transaction per tenant).
         private async Task RunPersistenceLoopAsync(CancellationToken ct)
         {
+            int drainCycles = 0;
             while (true)
             {
                 try
                 {
-                    // Block until at least one item is enqueued.
-                    await _persistenceSignal.WaitAsync(ct);
+                    // Wait for a signal OR up to 5 seconds (whichever comes first).
+                    // The periodic timeout guarantees that any items enqueued during low-activity
+                    // periods are flushed within ~5 s, reducing data-loss exposure on unexpected
+                    // process termination even when the queue never fills.
+                    await _persistenceSignal.WaitAsync(TimeSpan.FromSeconds(5), ct);
                 }
                 catch (OperationCanceledException)
                 {
@@ -817,6 +826,11 @@ namespace Locus.Storage.Data
                 // Drain all queued items in a single batch, regardless of how many signals
                 // accumulated. Consuming extra semaphore permits avoids spurious wake-ups.
                 DrainPersistenceQueue();
+
+                // Periodically compact pending queues to reclaim memory occupied by stale
+                // entries left over from completed/failed files that were never explicitly removed.
+                if (++drainCycles % CompactionIntervalCycles == 0)
+                    CompactPendingQueues();
             }
 
             // Drain any items enqueued before cancellation was observed.
@@ -891,6 +905,50 @@ namespace Locus.Storage.Data
                     "LiteDB batch write failed for tenant {TenantId} ({Count} operations). " +
                     "Physical files are safe on disk; metadata may be lost if process restarts before LiteDB recovers.",
                     tenantId, ops.Count);
+            }
+        }
+
+        // Rebuilds _pendingKeys for any tenant whose queue is significantly larger than
+        // the number of actual Pending files in the cache.  Called periodically by the
+        // single background persistence thread — never from a request path.
+        //
+        // Thread-safety: _pendingKeys[tenantId] is replaced atomically (ConcurrentDictionary
+        // write).  Any concurrent GetNextPendingFileAsync call that already holds a reference
+        // to the old ConcurrentQueue will continue to dequeue from it safely; all dequeued
+        // keys are validated against the authoritative cache before being promoted, so no
+        // duplicates or phantom entries can slip through.
+        private void CompactPendingQueues()
+        {
+            foreach (var kvp in _activeFiles)
+            {
+                var tenantId = kvp.Key;
+                var cache = kvp.Value;
+
+                if (!_pendingKeys.TryGetValue(tenantId, out var queue))
+                    continue;
+
+                // Count actual Pending files in cache (infrequent O(n) scan, acceptable here).
+                var actualPendingCount = cache.Values.Count(m => m.Status == FileProcessingStatus.Pending);
+
+                // Only rebuild when the queue is significantly bloated:
+                // more than 2× actual pending entries + a 100-entry slack buffer.
+                if (queue.Count <= actualPendingCount * 2 + 100)
+                    continue;
+
+                _logger.LogDebug(
+                    "Compacting pending queue for tenant {TenantId}: {QueueCount} queue entries → {PendingCount} actual pending",
+                    tenantId, queue.Count, actualPendingCount);
+
+                // Rebuild from cache: Pending files only, ordered by CreatedAt to preserve FIFO.
+                var pendingKeys = cache.Values
+                    .Where(m => m.Status == FileProcessingStatus.Pending)
+                    .OrderBy(m => m.CreatedAt)
+                    .Select(m => m.FileKey);
+
+                // Atomically replace the queue. Future GetNextPendingFileAsync calls will use
+                // the new, compact queue. In-flight calls that already hold the old reference
+                // will drain it harmlessly — validated entries are still correct.
+                _pendingKeys[tenantId] = new ConcurrentQueue<string>(pendingKeys);
             }
         }
 

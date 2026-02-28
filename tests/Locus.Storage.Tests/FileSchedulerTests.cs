@@ -466,64 +466,66 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task GetNextFileForProcessingAsync_SkipsAndRemovesMissingPhysicalFiles()
+        public async Task GetNextFileForProcessingAsync_ReturnsPendingFileWithoutPhysicalExistenceCheck()
         {
             // Arrange
+            // File.Exists is intentionally removed from the hot allocation path.
+            // Physical-file existence is now validated by CleanupOrphanedMetadataAsync
+            // (maintenance path), not on every GetNext call.
             var file1 = new FileMetadata
             {
                 FileKey = "file-001",
                 TenantId = "tenant-001",
-                PhysicalPath = "/test/missing-file.txt", // File doesn't exist
+                PhysicalPath = "/test/missing-file.txt", // Physical file absent — scheduler no longer checks
                 Status = FileProcessingStatus.Pending,
                 CreatedAt = DateTime.UtcNow.AddMinutes(-10)
             };
 
-            var physicalPath2 = Path.Combine(_metadataDir, "existing-file.txt");
             var file2 = new FileMetadata
             {
                 FileKey = "file-002",
                 TenantId = "tenant-001",
-                PhysicalPath = physicalPath2,
+                PhysicalPath = Path.Combine(_metadataDir, "existing-file.txt"),
                 Status = FileProcessingStatus.Pending,
                 CreatedAt = DateTime.UtcNow.AddMinutes(-5)
             };
 
-            // Create physical file for file2
-            _fileSystem.File.WriteAllText(physicalPath2, "test content");
-
             await _repository.AddOrUpdateAsync(file1, CancellationToken.None);
             await _repository.AddOrUpdateAsync(file2, CancellationToken.None);
 
-            // Act
+            // Act — scheduler returns the oldest Pending file (FIFO), regardless of physical existence
             var location = await _scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
 
-            // Assert - should get file2, and file1 metadata should be removed
+            // Assert — file-001 is returned first (oldest CreatedAt); no file is skipped or removed
             Assert.NotNull(location);
-            Assert.Equal("file-002", location.FileKey);
+            Assert.Equal("file-001", location.FileKey);
 
-            var orphanedMetadata = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
-            Assert.Null(orphanedMetadata); // Should be removed
+            // file-001 metadata still present (not removed by the scheduler)
+            var metadata1 = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
+            Assert.NotNull(metadata1);
+            Assert.Equal(FileProcessingStatus.Processing, metadata1.Status);
         }
 
         [Fact]
-        public async Task GetNextBatchForProcessingAsync_SkipsAndRemovesMissingPhysicalFiles()
+        public async Task GetNextBatchForProcessingAsync_ReturnsAllPendingFilesWithoutPhysicalExistenceCheck()
         {
             // Arrange
+            // File.Exists is intentionally removed from the hot allocation path.
+            // Physical-file existence is now validated by CleanupOrphanedMetadataAsync.
             var file1 = new FileMetadata
             {
                 FileKey = "file-001",
                 TenantId = "tenant-001",
-                PhysicalPath = "/test/missing-file1.txt", // File doesn't exist
+                PhysicalPath = "/test/missing-file1.txt", // Physical file absent — scheduler no longer checks
                 Status = FileProcessingStatus.Pending,
                 CreatedAt = DateTime.UtcNow.AddMinutes(-10)
             };
 
-            var physicalPath2 = Path.Combine(_metadataDir, "existing-file.txt");
             var file2 = new FileMetadata
             {
                 FileKey = "file-002",
                 TenantId = "tenant-001",
-                PhysicalPath = physicalPath2,
+                PhysicalPath = Path.Combine(_metadataDir, "existing-file.txt"),
                 Status = FileProcessingStatus.Pending,
                 CreatedAt = DateTime.UtcNow.AddMinutes(-5)
             };
@@ -532,29 +534,28 @@ namespace Locus.Storage.Tests
             {
                 FileKey = "file-003",
                 TenantId = "tenant-001",
-                PhysicalPath = "/test/missing-file3.txt", // File doesn't exist
+                PhysicalPath = "/test/missing-file3.txt", // Physical file absent — scheduler no longer checks
                 Status = FileProcessingStatus.Pending,
                 CreatedAt = DateTime.UtcNow.AddMinutes(-3)
             };
-
-            // Only create physical file for file2
-            _fileSystem.File.WriteAllText(physicalPath2, "test content");
 
             await _repository.AddOrUpdateAsync(file1, CancellationToken.None);
             await _repository.AddOrUpdateAsync(file2, CancellationToken.None);
             await _repository.AddOrUpdateAsync(file3, CancellationToken.None);
 
-            // Act
+            // Act — all 3 files are returned; no existence check is performed
             var locations = await _scheduler.GetNextBatchForProcessingAsync(_tenant.Object, 3, CancellationToken.None);
 
-            // Assert - should only get file2
+            // Assert — all 3 files allocated as Processing
             var list = locations.ToList();
-            Assert.Single(list);
-            Assert.Equal("file-002", list[0].FileKey);
+            Assert.Equal(3, list.Count);
+            Assert.Contains(list, l => l.FileKey == "file-001");
+            Assert.Contains(list, l => l.FileKey == "file-002");
+            Assert.Contains(list, l => l.FileKey == "file-003");
 
-            // Orphaned metadata should be removed
-            Assert.Null(await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None));
-            Assert.Null(await _repository.GetAsync("tenant-001", "file-003", CancellationToken.None));
+            // All metadata records still present (none removed by the scheduler)
+            Assert.NotNull(await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None));
+            Assert.NotNull(await _repository.GetAsync("tenant-001", "file-003", CancellationToken.None));
         }
 
         [Fact]

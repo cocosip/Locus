@@ -236,13 +236,20 @@ namespace Locus.FileSystem
                 try
                 {
                     _fileSystem.File.WriteAllText(testFilePath, "health check");
-                    _fileSystem.File.Delete(testFilePath);
                     return true;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Health check probe failed for volume {VolumeId}", _volumeId);
                     return false;
+                }
+                finally
+                {
+                    // Always attempt to remove the temp file. Without this, a WriteAllText that
+                    // succeeds but whose Delete subsequently throws (e.g. permission change, race
+                    // with antivirus) would leave .health-check-*.tmp files accumulating on disk.
+                    try { _fileSystem.File.Delete(testFilePath); }
+                    catch { /* best-effort; the file will be cleaned up by the next probe cycle */ }
                 }
             }
             catch (Exception ex)

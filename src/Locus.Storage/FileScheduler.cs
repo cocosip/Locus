@@ -44,29 +44,17 @@ namespace Locus.Storage
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
 
-            while (true)
-            {
-                var metadata = await _repository.GetNextPendingFileAsync(tenant.TenantId, ct);
+            var metadata = await _repository.GetNextPendingFileAsync(tenant.TenantId, ct);
 
-                if (metadata == null)
-                {
-                    // No files available - return null instead of throwing exception
-                    return null;
-                }
+            if (metadata == null)
+                return null;
 
-                // Verify physical file exists (self-healing)
-                if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath) &&
-                    !_fileSystem.File.Exists(metadata.PhysicalPath))
-                {
-                    _logger.LogWarning("Physical file missing for metadata {FileKey}, removing orphaned metadata: {PhysicalPath}",
-                        metadata.FileKey, metadata.PhysicalPath);
-
-                    await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    continue; // Try next file
-                }
-
-                return MapToFileLocation(metadata);
-            }
+            // NOTE: File.Exists is intentionally omitted from this hot path.
+            // The cleanup service (CleanupOrphanedFilesAsync) periodically rebuilds metadata
+            // for any orphaned physical files, so the in-memory cache stays consistent.
+            // Doing a syscall on every allocation would add latency proportional to inode
+            // lookup cost (significant on network volumes) and is not necessary at runtime.
+            return MapToFileLocation(metadata);
         }
 
         /// <inheritdoc/>
@@ -83,28 +71,11 @@ namespace Locus.Storage
 
             var metadataList = await _repository.GetNextPendingBatchAsync(tenant.TenantId, batchSize, ct);
 
-            var locations = new List<FileLocation>();
-            foreach (var metadata in metadataList)
-            {
-                // Verify physical file exists (self-healing)
-                if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath) &&
-                    !_fileSystem.File.Exists(metadata.PhysicalPath))
-                {
-                    _logger.LogWarning("Physical file missing for metadata {FileKey}, removing orphaned metadata: {PhysicalPath}",
-                        metadata.FileKey, metadata.PhysicalPath);
+            // NOTE: File.Exists is intentionally omitted — same rationale as GetNextFileForProcessingAsync.
+            var locations = metadataList.Select(MapToFileLocation).ToList();
 
-                    await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    continue; // Skip this file
-                }
-
-                locations.Add(MapToFileLocation(metadata));
-            }
-
-            // Return empty collection if no files available (instead of throwing exception)
             if (locations.Count == 0)
-            {
                 _logger.LogDebug("No pending files available for tenant: {TenantId}", tenant.TenantId);
-            }
 
             return locations;
         }
@@ -128,10 +99,13 @@ namespace Locus.Storage
                 throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
             }
 
-            metadata.Status = FileProcessingStatus.Processing;
-            metadata.ProcessingStartTime = DateTime.UtcNow;
+            // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
+            // Mutating it in-place would expose a partial (inconsistent) state to concurrent readers.
+            var updated = metadata.Clone();
+            updated.Status = FileProcessingStatus.Processing;
+            updated.ProcessingStartTime = DateTime.UtcNow;
 
-            await _repository.AddOrUpdateAsync(metadata, ct);
+            await _repository.AddOrUpdateAsync(updated, ct);
 
             _logger.LogDebug("Marked file as processing: {FileKey}", fileKey);
         }
@@ -191,34 +165,36 @@ namespace Locus.Storage
                 return;
             }
 
-            metadata.RetryCount++;
-            metadata.LastError = errorMessage;
-            metadata.LastFailedAt = DateTime.UtcNow;
-            metadata.ProcessingStartTime = null;
+            // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
+            var updated = metadata.Clone();
+            updated.RetryCount++;
+            updated.LastError = errorMessage;
+            updated.LastFailedAt = DateTime.UtcNow;
+            updated.ProcessingStartTime = null;
 
-            if (metadata.RetryCount >= _retryPolicy.MaxRetryCount)
+            if (updated.RetryCount >= _retryPolicy.MaxRetryCount)
             {
                 // Exceeded max retries, mark as permanently failed
-                metadata.Status = FileProcessingStatus.PermanentlyFailed;
-                metadata.AvailableForProcessingAt = null;
+                updated.Status = FileProcessingStatus.PermanentlyFailed;
+                updated.AvailableForProcessingAt = null;
 
                 _logger.LogError("File permanently failed after {RetryCount} retries: {FileKey}, Error: {Error}",
-                    metadata.RetryCount, fileKey, errorMessage);
+                    updated.RetryCount, fileKey, errorMessage);
             }
             else
             {
                 // Return to pending status for retry
-                metadata.Status = FileProcessingStatus.Pending;
+                updated.Status = FileProcessingStatus.Pending;
 
                 // Calculate retry delay with exponential backoff
-                var delay = CalculateRetryDelay(metadata.RetryCount);
-                metadata.AvailableForProcessingAt = DateTime.UtcNow.Add(delay);
+                var delay = CalculateRetryDelay(updated.RetryCount);
+                updated.AvailableForProcessingAt = DateTime.UtcNow.Add(delay);
 
                 _logger.LogWarning("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
-                    metadata.RetryCount, _retryPolicy.MaxRetryCount, delay, fileKey, errorMessage);
+                    updated.RetryCount, _retryPolicy.MaxRetryCount, delay, fileKey, errorMessage);
             }
 
-            await _repository.AddOrUpdateAsync(metadata, ct);
+            await _repository.AddOrUpdateAsync(updated, ct);
         }
 
         /// <inheritdoc/>
@@ -236,14 +212,16 @@ namespace Locus.Storage
                 return;
             }
 
-            metadata.Status = FileProcessingStatus.Pending;
-            metadata.ProcessingStartTime = null;
-            metadata.AvailableForProcessingAt = null;
-            metadata.RetryCount = 0;
-            metadata.LastError = null;
-            metadata.LastFailedAt = null;
+            // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
+            var updated = metadata.Clone();
+            updated.Status = FileProcessingStatus.Pending;
+            updated.ProcessingStartTime = null;
+            updated.AvailableForProcessingAt = null;
+            updated.RetryCount = 0;
+            updated.LastError = null;
+            updated.LastFailedAt = null;
 
-            await _repository.AddOrUpdateAsync(metadata, ct);
+            await _repository.AddOrUpdateAsync(updated, ct);
 
             _logger.LogInformation("Reset processing status for file: {FileKey}", fileKey);
         }
@@ -275,16 +253,17 @@ namespace Locus.Storage
                 return _retryPolicy.InitialRetryDelay;
             }
 
-            var delay = TimeSpan.FromMilliseconds(
-                _retryPolicy.InitialRetryDelay.TotalMilliseconds * Math.Pow(2, retryCount - 1));
+            // Cap the exponent before computing to prevent double.PositiveInfinity.
+            // 2^62 ≈ 4.6e18 ms — far above any practical MaxRetryDelay, so the clamp below
+            // catches it. TimeSpan.FromMilliseconds(Infinity) throws OverflowException, which
+            // would escape the caller without this guard.
+            const int maxExponent = 62;
+            var exponent = Math.Max(0, Math.Min(retryCount - 1, maxExponent));
+            var delayMs = _retryPolicy.InitialRetryDelay.TotalMilliseconds * Math.Pow(2, exponent);
 
-            // Cap at maximum delay
-            if (delay > _retryPolicy.MaxRetryDelay)
-            {
-                delay = _retryPolicy.MaxRetryDelay;
-            }
-
-            return delay;
+            // Apply MaxRetryDelay cap using double comparison to stay safe before constructing TimeSpan.
+            var maxMs = _retryPolicy.MaxRetryDelay.TotalMilliseconds;
+            return TimeSpan.FromMilliseconds(Math.Min(delayMs, maxMs));
         }
 
         /// <inheritdoc/>

@@ -304,7 +304,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupOrphanedFilesAsync_DeletesOrphanedFiles()
+        public async Task CleanupOrphanedFilesAsync_RebuildsMetadataForOrphanedFiles()
         {
             // Arrange
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -312,17 +312,25 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(tenantPath);
             _fileSystem.File.WriteAllText(orphanedFile, "orphaned content");
 
-            // No metadata for this file - it's orphaned
+            // No metadata for this file — it is orphaned (physical file present, no LiteDB record)
 
             // Act
             await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);
 
-            // Assert
-            Assert.False(_fileSystem.File.Exists(orphanedFile));
+            // Assert — file is NOT deleted; its metadata has been reconstructed instead
+            Assert.True(_fileSystem.File.Exists(orphanedFile));
+
+            // Metadata was rebuilt: fileKey = filename without extension = "orphaned"
+            var rebuilt = await _metadataRepository.GetAsync("tenant-001", "orphaned", default);
+            Assert.NotNull(rebuilt);
+            Assert.Equal("tenant-001", rebuilt.TenantId);
+            Assert.Equal("vol-001", rebuilt.VolumeId);
+            Assert.Equal(orphanedFile, rebuilt.PhysicalPath);
+            Assert.Equal(FileProcessingStatus.Pending, rebuilt.Status);
+            Assert.Equal(0, rebuilt.RetryCount);
 
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
-            Assert.Equal(1, stats.OrphanedFilesRemoved);
-            Assert.True(stats.SpaceFreed > 0);
+            Assert.Equal(1, stats.OrphanedFilesRemoved); // counter reused for "rebuilt" count
         }
 
         [Fact]

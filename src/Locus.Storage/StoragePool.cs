@@ -33,7 +33,7 @@ namespace Locus.Storage
         // on every write. Cache the selected volume for a short window.
         private volatile IStorageVolume? _cachedSelectedVolume;
         private long _lastVolumeSelectionTicks;
-        private static readonly long VolumeSelectionCacheTicks = 10L * Stopwatch.Frequency; // 10 seconds
+        private static readonly long VolumeSelectionCacheTicks = 3L * Stopwatch.Frequency; // 3 seconds
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StoragePool"/> class.
@@ -218,9 +218,17 @@ namespace Locus.Storage
                 // Rollback: decrement quota if file write failed
                 await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, ct);
 
-                // If physical file was written but we're in catch block, it means something failed after
-                // We've already tried to delete it in the metadata catch block above
-                if (fileWritten && physicalPath != null && volume != null)
+                // If the write to the selected volume failed, invalidate the volume-selection cache
+                // so the next caller re-evaluates all volumes instead of reusing a stale (unhealthy)
+                // cached entry.  This is cheap: the next SelectVolumeForWrite() will re-probe IsHealthy
+                // (itself cached at 30 s) and pick the best available volume.
+                if (!fileWritten && volume != null)
+                {
+                    _cachedSelectedVolume = null;
+                    Interlocked.Exchange(ref _lastVolumeSelectionTicks, 0);
+                    _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
+                }
+                else if (fileWritten && physicalPath != null && volume != null)
                 {
                     _logger.LogWarning("Transaction failed with physical file potentially orphaned at {PhysicalPath}", physicalPath);
                 }
@@ -472,8 +480,8 @@ namespace Locus.Storage
         /// <summary>
         /// Selects the best storage volume for writing a file.
         /// Prioritizes volumes with the most available space.
-        /// Result is cached for 10 seconds to avoid calling IsHealthy (which probes disk) on every write.
-        /// Cache is invalidated when volumes are added.
+        /// Result is cached for 3 seconds to avoid calling IsHealthy (which probes disk) on every write.
+        /// Cache is invalidated when volumes are added or when a write to the cached volume fails.
         /// </summary>
         private IStorageVolume SelectVolumeForWrite()
         {

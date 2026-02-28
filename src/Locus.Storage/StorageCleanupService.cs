@@ -192,10 +192,9 @@ namespace Locus.Storage
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
 
-            _logger.LogInformation("Starting orphaned file cleanup for tenant: {TenantId}", tenant.TenantId);
+            _logger.LogInformation("Starting orphaned file metadata rebuild for tenant: {TenantId}", tenant.TenantId);
 
-            var removedCount = 0;
-            long spaceFreed = 0;
+            var rebuiltCount = 0;
 
             // Build a HashSet of known physical paths once — O(N) — so each file lookup is O(1)
             // instead of calling GetAllAsync inside the per-file loop (which would be O(P × N)).
@@ -215,30 +214,110 @@ namespace Locus.Storage
 
                 foreach (var physicalPath in physicalFiles)
                 {
+                    ct.ThrowIfCancellationRequested();
+
                     // O(1) HashSet lookup instead of O(N) linear scan per file
-                    if (!knownPaths.Contains(physicalPath))
+                    if (knownPaths.Contains(physicalPath))
+                        continue;
+
+                    // Orphaned physical file — reconstruct metadata and re-queue for processing.
+                    // DO NOT delete the file: it contains real data that was uploaded but whose
+                    // LiteDB record was lost (e.g. process crash during write-behind flush, or
+                    // persistence queue overflow).  Rebuilding brings it back into the Pending
+                    // queue so that normal consumers can process it on the next scheduling cycle.
+                    try
                     {
-                        // Orphaned file - delete it
-                        try
+                        var metadata = RebuildMetadataFromPath(physicalPath, volume, tenant.TenantId);
+
+                        if (metadata == null)
                         {
-                            var fileInfo = _fileSystem.FileInfo.New(physicalPath);
-                            spaceFreed += fileInfo.Length;
-                            _fileSystem.File.Delete(physicalPath);
-                            removedCount++;
-                            _logger.LogDebug("Deleted orphaned file: {PhysicalPath}", physicalPath);
+                            _logger.LogWarning(
+                                "Skipping orphaned file whose path does not match the expected storage layout: {PhysicalPath}",
+                                physicalPath);
+                            continue;
                         }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to delete orphaned file {PhysicalPath}", physicalPath);
-                        }
+
+                        // AddOrUpdateDirectAsync writes immediately to LiteDB (not write-behind)
+                        // so the record survives even if the process crashes right after this call.
+                        await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+
+                        rebuiltCount++;
+                        _logger.LogInformation(
+                            "Rebuilt metadata for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
+                            metadata.FileKey, metadata.TenantId, physicalPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to rebuild metadata for orphaned file {PhysicalPath}", physicalPath);
                     }
                 }
             }
 
-            _statistics.OrphanedFilesRemoved += removedCount;
-            _statistics.SpaceFreed += spaceFreed;
-            _logger.LogInformation("Cleaned up {Count} orphaned files for tenant {TenantId}, freed {Size} bytes",
-                removedCount, tenant.TenantId, spaceFreed);
+            _statistics.OrphanedFilesRemoved += rebuiltCount;
+            _logger.LogInformation(
+                "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
+                tenant.TenantId, rebuiltCount);
+        }
+
+        /// <summary>
+        /// Reconstructs <see cref="FileMetadata"/> from the physical path of an orphaned file.
+        /// Returns null if the path does not conform to the expected storage layout:
+        ///   {mountPath}/{tenantId}/[shardDirs.../{fileKey}{extension}
+        /// </summary>
+        private FileMetadata? RebuildMetadataFromPath(string physicalPath, IStorageVolume volume, string expectedTenantId)
+        {
+            var normalizedPhysical = Path.GetFullPath(physicalPath);
+            var normalizedMount   = Path.GetFullPath(volume.MountPath);
+
+            // Ensure the file is actually inside this volume's mount path.
+            var mountPrefix = normalizedMount.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                              + Path.DirectorySeparatorChar;
+            if (!normalizedPhysical.StartsWith(mountPrefix, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            // Relative path segments after the mount: [tenantId, shard?, shard?, ..., filename]
+            var relativePath = normalizedPhysical.Substring(mountPrefix.Length);
+            var segments = relativePath.Split(
+                new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries);
+
+            // Minimum viable path: tenantId/fileKey (2 segments)
+            if (segments.Length < 2)
+                return null;
+
+            var tenantId = segments[0];
+            if (!string.Equals(tenantId, expectedTenantId, StringComparison.Ordinal))
+                return null;
+
+            // Last segment is the file name: {fileKey}{extension}
+            var filename      = segments[segments.Length - 1];
+            var fileExtension = Path.GetExtension(filename);
+            var fileKey       = Path.GetFileNameWithoutExtension(filename);
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                return null;
+
+            var fileInfo      = _fileSystem.FileInfo.New(physicalPath);
+            var directoryPath = Path.GetDirectoryName(physicalPath) ?? string.Empty;
+
+            return new FileMetadata
+            {
+                FileKey       = fileKey,
+                TenantId      = tenantId,
+                VolumeId      = volume.VolumeId,
+                PhysicalPath  = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize      = fileInfo.Length,
+                // Prefer the file's own creation time; fall back to now if unavailable.
+                CreatedAt     = fileInfo.CreationTimeUtc > DateTime.MinValue
+                                    ? fileInfo.CreationTimeUtc
+                                    : DateTime.UtcNow,
+                Status        = FileProcessingStatus.Pending,
+                RetryCount    = 0,
+                FileExtension = string.IsNullOrEmpty(fileExtension) ? null : fileExtension,
+                // Original file name is unknown for orphaned files.
+                OriginalFileName = null,
+            };
         }
 
         /// <inheritdoc/>
@@ -590,6 +669,11 @@ namespace Locus.Storage
             return await Task.FromResult((filesRemoved, spaceFreed));
         }
 
+        // Maximum directory nesting depth explored by CleanupJunkFilesRecursiveAsync.
+        // Prevents stack overflow on pathological directory trees (e.g. symlink cycles or
+        // extremely deep sharding hierarchies).  Normal storage depth is 3-5 levels.
+        private const int MaxCleanupRecursionDepth = 20;
+
         /// <summary>
         /// Recursively removes junk files and empty directories, bottom-up.
         /// A directory is considered empty when it contains no files (other than junk files that are
@@ -601,10 +685,19 @@ namespace Locus.Storage
         private async Task<int> CleanupJunkFilesRecursiveAsync(
             string directoryPath,
             CancellationToken ct,
-            bool isProtectedRoot = false)
+            bool isProtectedRoot = false,
+            int depth = 0)
         {
             if (!_fileSystem.Directory.Exists(directoryPath))
                 return 0;
+
+            if (depth > MaxCleanupRecursionDepth)
+            {
+                _logger.LogWarning(
+                    "Cleanup recursion depth limit ({Limit}) reached at {DirectoryPath}; skipping deeper subdirectories",
+                    MaxCleanupRecursionDepth, directoryPath);
+                return 0;
+            }
 
             var removedCount = 0;
 
@@ -612,7 +705,7 @@ namespace Locus.Storage
             var subdirectories = _fileSystem.Directory.GetDirectories(directoryPath);
             foreach (var subdirectory in subdirectories)
             {
-                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false);
+                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false, depth: depth + 1);
             }
 
             // 2. Delete junk files in the current directory.
