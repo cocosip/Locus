@@ -6,6 +6,7 @@ using Locus.FileSystem;
 using Locus.MultiTenant;
 using Locus.Storage;
 using Locus.Storage.Data;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -39,6 +40,30 @@ namespace Locus
         }
 
         /// <summary>
+        /// Adds Locus file storage services from configuration.
+        /// Binds from section "Locus" by default.
+        /// </summary>
+        /// <param name="services">The service collection.</param>
+        /// <param name="configuration">Application configuration root.</param>
+        /// <param name="sectionName">Configuration section name. Default: "Locus".</param>
+        /// <returns>The service collection for chaining.</returns>
+        public static IServiceCollection AddLocus(
+            this IServiceCollection services,
+            IConfiguration configuration,
+            string sectionName = "Locus")
+        {
+            if (services == null)
+                throw new ArgumentNullException(nameof(services));
+
+            if (configuration == null)
+                throw new ArgumentNullException(nameof(configuration));
+
+            var options = new LocusOptions();
+            configuration.GetSection(sectionName).Bind(options);
+            return services.AddLocus(options);
+        }
+
+        /// <summary>
         /// Adds Locus file storage services to the service collection.
         /// </summary>
         /// <param name="services">The service collection.</param>
@@ -68,8 +93,14 @@ namespace Locus
                 tenant.Validate();
             }
 
-            if (options.PersistenceDrainBatchSize <= 0)
-                throw new InvalidOperationException("PersistenceDrainBatchSize must be greater than zero");
+            if (options.PersistenceDrainBatchSize != MetadataRepositoryOptions.DefaultDrainBatchSize
+                && options.MetadataRepository.DrainBatchSize == MetadataRepositoryOptions.DefaultDrainBatchSize)
+            {
+                options.MetadataRepository.DrainBatchSize = options.PersistenceDrainBatchSize;
+            }
+
+            options.MetadataRepository.Validate();
+            options.StoragePool.Validate();
 
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
@@ -84,8 +115,11 @@ namespace Locus
                     logger,
                     options.MetadataDirectory,
                     options.LiteDB,
-                    enableBackgroundPersistence: true,
-                    maxDrainBatchSize: options.PersistenceDrainBatchSize);
+                    enableBackgroundPersistence: options.MetadataRepository.EnableBackgroundPersistence,
+                    maxDrainBatchSize: options.MetadataRepository.DrainBatchSize,
+                    persistenceQueueSoftMergeThresholdPercent: options.MetadataRepository.SoftMergeThresholdPercent,
+                    maxPersistenceQueueSize: options.MetadataRepository.MaxQueueSize,
+                    startupLoadBatchSize: options.MetadataRepository.StartupLoadBatchSize);
             });
 
             services.AddSingleton(sp =>
@@ -150,7 +184,13 @@ namespace Locus
 
                 // Volumes are NOT mounted here. StorageVolumeInitializationService mounts
                 // them asynchronously in StartAsync, before requests are accepted.
-                return new StoragePool(metadataRepo, tenantQuotaManager, tenantManager, fileScheduler, logger);
+                return new StoragePool(
+                    metadataRepo,
+                    tenantQuotaManager,
+                    tenantManager,
+                    fileScheduler,
+                    logger,
+                    options.StoragePool.CompletionGuardStripeCount);
             });
             services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 

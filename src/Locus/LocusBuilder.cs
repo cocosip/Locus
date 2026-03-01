@@ -138,6 +138,20 @@ namespace Locus
         }
 
         /// <summary>
+        /// Configures storage pool options.
+        /// </summary>
+        /// <param name="configure">Configuration action for storage pool options.</param>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder WithStoragePoolOptions(Action<StoragePoolOptions> configure)
+        {
+            if (configure == null)
+                throw new ArgumentNullException(nameof(configure));
+
+            configure(_options.StoragePool);
+            return this;
+        }
+
+        /// <summary>
         /// Enables the background cleanup service.
         /// </summary>
         /// <returns>The builder for chaining.</returns>

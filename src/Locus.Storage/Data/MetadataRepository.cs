@@ -1,10 +1,13 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using LiteDB;
 using Locus.Core.Models;
@@ -35,6 +38,11 @@ namespace Locus.Storage.Data
 
         // Global fileKey -> tenantId index for O(1) cross-tenant lookup by file key.
         private readonly ConcurrentDictionary<string, string> _fileKeyTenantIndex;
+        private readonly StringComparer _pathComparer;
+
+        // Per-tenant normalized physical path -> file key index for O(1) orphan-rebuild path checks.
+        // This avoids rebuilding large per-run HashSet snapshots in StorageCleanupService.
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> _physicalPathIndex;
 
         // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
@@ -52,7 +60,8 @@ namespace Locus.Storage.Data
         // Enqueued when a file becomes Pending; dequeued-and-validated in GetNextPendingFileAsync.
         // Entries are validated on dequeue (stale entries from status changes are skipped).
         // Queue maintains arrival order so callers get FIFO scheduling without any sorting.
-        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _pendingKeys;
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<PendingQueueEntry>> _pendingKeys;
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, long>> _pendingGenerations;
 
         // Per-tenant delayed queue for Pending files that are not yet available for processing.
         // Ordered by AvailableForProcessingAt (min-heap) to promote ready items efficiently.
@@ -65,21 +74,38 @@ namespace Locus.Storage.Data
         // scanning the entire cache to count Pending entries.
         // Access via Interlocked only.
         private readonly ConcurrentDictionary<string, int> _pendingFileCounts;
+        private long _pendingDequeuedAttempts;
+        private long _pendingDequeuedStaleSkips;
+        private int _pendingStaleCompactionCounter;
+
+        // Per-tenant status indexes for cleanup hot paths.
+        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _processingByStartTime;
+        private readonly ConcurrentDictionary<string, object> _processingByStartTimeLocks;
+        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _permanentlyFailedByLastFailedAt;
+        private readonly ConcurrentDictionary<string, object> _permanentlyFailedByLastFailedAtLocks;
+        private long _statusIndexSequence;
+        private long _statusIndexStaleSkips;
 
         // --- Write-Behind: async LiteDB persistence (netstandard2.0 compatible) ---
         // Memory is always updated first. LiteDB writes are decoupled via this queue.
         // If LiteDB is unavailable, writes buffer in memory and are retried by the background loop.
-        // On crash, in-flight writes are lost — physical files stay on disk as orphans and are
+        // On crash, in-flight writes are lost 鈥?physical files stay on disk as orphans and are
         // recovered by the cleanup service on next startup.
-        private readonly ConcurrentQueue<PersistenceOperation> _persistenceQueue;
-        private readonly SemaphoreSlim _persistenceSignal; // one permit per enqueued item
+        private readonly Channel<PersistenceOperation> _persistenceChannel;
+        private readonly ChannelWriter<PersistenceOperation> _persistenceWriter;
+        private readonly ChannelReader<PersistenceOperation> _persistenceReader;
         private readonly Task _persistenceTask;
         private readonly CancellationTokenSource _persistenceCts;
         private readonly bool _enableBackgroundPersistence;
+        private readonly int _maxPersistenceQueueSize;
         private readonly int _maxDrainBatchSize;
         private readonly int _persistenceQueueSoftMergeThreshold;
+        private readonly int _startupLoadBatchSize;
         private readonly ConcurrentDictionary<string, PersistenceOperation> _coalescedPersistenceOps;
         private int _coalescedLogCounter;
+        private int _persistenceChannelDepth;
+        private int _persistenceChannelPeakDepth;
+        private int _coalescedDepth;
 
         private bool _disposed;
 
@@ -114,28 +140,28 @@ namespace Locus.Storage.Data
 
             public int Count => _heap.Count;
 
-            public void Enqueue(string fileKey, DateTime availableAtUtc, long sequence)
+            public void Enqueue(string fileKey, long generation, DateTime availableAtUtc, long sequence)
             {
-                _heap.Add(new DelayedEntry(availableAtUtc, sequence, fileKey));
+                _heap.Add(new DelayedEntry(availableAtUtc, sequence, fileKey, generation));
                 HeapifyUp(_heap.Count - 1);
             }
 
-            public bool TryDequeueReady(DateTime nowUtc, out string fileKey)
+            public bool TryDequeueReady(DateTime nowUtc, out PendingQueueEntry entry)
             {
                 if (_heap.Count == 0)
                 {
-                    fileKey = string.Empty;
+                    entry = default(PendingQueueEntry);
                     return false;
                 }
 
-                var entry = _heap[0];
-                if (entry.AvailableAtUtc > nowUtc)
+                var top = _heap[0];
+                if (top.AvailableAtUtc > nowUtc)
                 {
-                    fileKey = string.Empty;
+                    entry = default(PendingQueueEntry);
                     return false;
                 }
 
-                fileKey = entry.FileKey;
+                entry = new PendingQueueEntry(top.FileKey, top.Generation);
                 RemoveRoot();
                 return true;
             }
@@ -206,17 +232,152 @@ namespace Locus.Storage.Data
             }
         }
 
+        private readonly struct PendingQueueEntry
+        {
+            public readonly string FileKey;
+            public readonly long Generation;
+
+            public PendingQueueEntry(string fileKey, long generation)
+            {
+                FileKey = fileKey;
+                Generation = generation;
+            }
+        }
+
+        private sealed class StatusTimestampIndex
+        {
+            private readonly List<StatusTimestampEntry> _heap = new List<StatusTimestampEntry>();
+
+            public int Count => _heap.Count;
+
+            public void Enqueue(string fileKey, DateTime timestampUtc, DateTime createdAtUtc, long sequence)
+            {
+                _heap.Add(new StatusTimestampEntry(timestampUtc, createdAtUtc, sequence, fileKey));
+                HeapifyUp(_heap.Count - 1);
+            }
+
+            public bool TryPeek(out StatusTimestampEntry entry)
+            {
+                if (_heap.Count == 0)
+                {
+                    entry = default(StatusTimestampEntry);
+                    return false;
+                }
+
+                entry = _heap[0];
+                return true;
+            }
+
+            public bool TryDequeue(out StatusTimestampEntry entry)
+            {
+                if (!TryPeek(out entry))
+                    return false;
+
+                RemoveRoot();
+                return true;
+            }
+
+            private void RemoveRoot()
+            {
+                var lastIndex = _heap.Count - 1;
+                if (lastIndex == 0)
+                {
+                    _heap.Clear();
+                    return;
+                }
+
+                _heap[0] = _heap[lastIndex];
+                _heap.RemoveAt(lastIndex);
+                HeapifyDown(0);
+            }
+
+            private void HeapifyUp(int index)
+            {
+                while (index > 0)
+                {
+                    var parent = (index - 1) / 2;
+                    if (IsHigherPriority(_heap[parent], _heap[index]))
+                        break;
+
+                    Swap(parent, index);
+                    index = parent;
+                }
+            }
+
+            private void HeapifyDown(int index)
+            {
+                var lastIndex = _heap.Count - 1;
+                while (true)
+                {
+                    var left = index * 2 + 1;
+                    var right = left + 1;
+                    if (left > lastIndex)
+                        return;
+
+                    var smallest = left;
+                    if (right <= lastIndex && IsHigherPriority(_heap[right], _heap[left]))
+                        smallest = right;
+
+                    if (IsHigherPriority(_heap[index], _heap[smallest]))
+                        return;
+
+                    Swap(index, smallest);
+                    index = smallest;
+                }
+            }
+
+            private void Swap(int a, int b)
+            {
+                var temp = _heap[a];
+                _heap[a] = _heap[b];
+                _heap[b] = temp;
+            }
+
+            private static bool IsHigherPriority(StatusTimestampEntry left, StatusTimestampEntry right)
+            {
+                if (left.TimestampUtc < right.TimestampUtc)
+                    return true;
+                if (left.TimestampUtc > right.TimestampUtc)
+                    return false;
+
+                if (left.CreatedAtUtc < right.CreatedAtUtc)
+                    return true;
+                if (left.CreatedAtUtc > right.CreatedAtUtc)
+                    return false;
+
+                return left.Sequence <= right.Sequence;
+            }
+        }
+
+        private readonly struct StatusTimestampEntry
+        {
+            public readonly DateTime TimestampUtc;
+            public readonly DateTime CreatedAtUtc;
+            public readonly long Sequence;
+            public readonly string FileKey;
+
+            public StatusTimestampEntry(DateTime timestampUtc, DateTime createdAtUtc, long sequence, string fileKey)
+            {
+                TimestampUtc = timestampUtc;
+                CreatedAtUtc = createdAtUtc;
+                Sequence = sequence;
+                FileKey = fileKey;
+            }
+        }
+
         private readonly struct DelayedEntry
         {
             public readonly DateTime AvailableAtUtc;
             public readonly long Sequence;
             public readonly string FileKey;
+            public readonly long Generation;
 
-            public DelayedEntry(DateTime availableAtUtc, long sequence, string fileKey)
+            public DelayedEntry(DateTime availableAtUtc, long sequence, string fileKey, long generation)
             {
                 AvailableAtUtc = availableAtUtc;
                 Sequence = sequence;
                 FileKey = fileKey;
+                Generation = generation;
             }
         }
 
@@ -230,7 +391,9 @@ namespace Locus.Storage.Data
             LiteDBOptions? liteDbOptions = null,
             bool enableBackgroundPersistence = true,
             int maxDrainBatchSize = DefaultDrainBatchSize,
-            int persistenceQueueSoftMergeThresholdPercent = DefaultPersistenceQueueSoftMergeThresholdPercent)
+            int persistenceQueueSoftMergeThresholdPercent = DefaultPersistenceQueueSoftMergeThresholdPercent,
+            int maxPersistenceQueueSize = DefaultMaxPersistenceQueueSize,
+            int startupLoadBatchSize = DefaultStartupLoadBatchSize)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -246,23 +409,46 @@ namespace Locus.Storage.Data
                     "Soft merge threshold percent must be between 1 and 100",
                     nameof(persistenceQueueSoftMergeThresholdPercent));
 
+            if (maxPersistenceQueueSize <= 0)
+                throw new ArgumentException("Max persistence queue size must be greater than zero", nameof(maxPersistenceQueueSize));
+            if (startupLoadBatchSize <= 0)
+                throw new ArgumentException("Startup load batch size must be greater than zero", nameof(startupLoadBatchSize));
+
             _metadataDirectory = metadataDirectory;
             _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
             _enableBackgroundPersistence = enableBackgroundPersistence;
-            _maxDrainBatchSize = Math.Min(maxDrainBatchSize, MaxPersistenceQueueSize);
-            _persistenceQueueSoftMergeThreshold = (int)(MaxPersistenceQueueSize * (persistenceQueueSoftMergeThresholdPercent / 100.0));
+            _maxPersistenceQueueSize = maxPersistenceQueueSize;
+            _maxDrainBatchSize = Math.Min(maxDrainBatchSize, _maxPersistenceQueueSize);
+            _persistenceQueueSoftMergeThreshold = (int)(_maxPersistenceQueueSize * (persistenceQueueSoftMergeThresholdPercent / 100.0));
+            _startupLoadBatchSize = startupLoadBatchSize;
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _fileKeyTenantIndex = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+            _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+            _physicalPathIndex = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>();
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
-            _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
+            _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<PendingQueueEntry>>();
+            _pendingGenerations = new ConcurrentDictionary<string, ConcurrentDictionary<string, long>>();
             _pendingFileCounts = new ConcurrentDictionary<string, int>();
+            _processingByStartTime = new ConcurrentDictionary<string, StatusTimestampIndex>();
+            _processingByStartTimeLocks = new ConcurrentDictionary<string, object>();
+            _permanentlyFailedByLastFailedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
+            _permanentlyFailedByLastFailedAtLocks = new ConcurrentDictionary<string, object>();
             _delayedQueues = new ConcurrentDictionary<string, DelayedQueue>();
             _delayedQueueLocks = new ConcurrentDictionary<string, object>();
 
-            // Write-behind queue + semaphore (fields initialized here, task started LAST)
-            _persistenceQueue = new ConcurrentQueue<PersistenceOperation>();
-            _persistenceSignal = new SemaphoreSlim(0, int.MaxValue);
+            // Write-behind channel (fields initialized here, task started LAST)
+            _persistenceChannel = Channel.CreateBounded<PersistenceOperation>(new BoundedChannelOptions(_maxPersistenceQueueSize)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+                AllowSynchronousContinuations = false
+            });
+            _persistenceWriter = _persistenceChannel.Writer;
+            _persistenceReader = _persistenceChannel.Reader;
             _persistenceCts = new CancellationTokenSource();
             _coalescedPersistenceOps = new ConcurrentDictionary<string, PersistenceOperation>(StringComparer.Ordinal);
 
@@ -284,9 +470,9 @@ namespace Locus.Storage.Data
 
             if (_enableBackgroundPersistence)
             {
-                // Start background persistence loop LAST — all fields are fully initialized at this point.
-                // The task immediately blocks on _persistenceSignal.WaitAsync() and consumes no CPU
-                // until EnqueuePersistence() is called. Dispose() cancels _persistenceCts and waits
+                // Start background persistence loop LAST 鈥?all fields are fully initialized at this point.
+                // The task blocks on ChannelReader.WaitToReadAsync until items are available.
+                // Dispose() cancels _persistenceCts and waits
                 // for the task to drain remaining items before closing databases.
                 _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
             }
@@ -336,9 +522,9 @@ namespace Locus.Storage.Data
                 catch (LiteException ex) when (ex.Message.Contains("ReadFull") || ex.Message.Contains("PAGE_SIZE") || ex.Message.Contains("Checkpoint"))
                 {
                     // Database is corrupted during initialization - attempt automatic recovery.
-                    // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here — it acquires _tenantLocks[tid],
+                    // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here 鈥?it acquires _tenantLocks[tid],
                     // which another thread may already hold while waiting for this Lazy to complete,
-                    // causing a deadlock (Lazy lock ↔ tenant lock cycle).
+                    // causing a deadlock (Lazy lock 鈫?tenant lock cycle).
                     // Instead call the lock-free internal helper directly.
                     _logger.LogError(ex, "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...", tid);
 
@@ -348,6 +534,7 @@ namespace Locus.Storage.Data
                         _databases.TryRemove(tid, out _);
                         if (_activeFiles.TryRemove(tid, out var staleTenantCache))
                             RemoveTenantFromGlobalIndex(staleTenantCache);
+                        _physicalPathIndex.TryRemove(tid, out _);
 
                         // Rebuild database without acquiring the tenant lock (we may be called
                         // from within the Lazy factory which is already locked via ExecutionAndPublication).
@@ -386,42 +573,149 @@ namespace Locus.Storage.Data
         /// </summary>
         private void LoadActiveFilesForTenant(string tenantId, ILiteCollection<FileMetadata> collection)
         {
-            var activeStatuses = new[]
-            {
-                FileProcessingStatus.Pending,
+            var cache = _activeFiles.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, FileMetadata>());
+            var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
+
+            var nowUtc = DateTime.UtcNow;
+            var pendingCount = 0;
+            var totalLoaded = 0;
+            var batchCount = 0;
+
+            // Process non-pending statuses first; pending files are loaded in CreatedAt order afterwards
+            // to rebuild FIFO scheduling without materializing all active records into one large list.
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId,
+                collection,
+                cache,
+                pendingQueue,
                 FileProcessingStatus.Processing,
+                orderByCreatedAt: false,
+                nowUtc,
+                ref pendingCount,
+                ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId,
+                collection,
+                cache,
+                pendingQueue,
                 FileProcessingStatus.Failed,
-                FileProcessingStatus.PermanentlyFailed
-            };
+                orderByCreatedAt: false,
+                nowUtc,
+                ref pendingCount,
+                ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId,
+                collection,
+                cache,
+                pendingQueue,
+                FileProcessingStatus.PermanentlyFailed,
+                orderByCreatedAt: false,
+                nowUtc,
+                ref pendingCount,
+                ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId,
+                collection,
+                cache,
+                pendingQueue,
+                FileProcessingStatus.Pending,
+                orderByCreatedAt: true,
+                nowUtc,
+                ref pendingCount,
+                ref batchCount);
 
-            var activeFiles = collection.Find(f => activeStatuses.Contains(f.Status)).ToList();
+            if (totalLoaded == 0)
+                return;
 
-            if (activeFiles.Count > 0)
+            // Seed the O(1) pending count so CompactPendingQueues can check bloat without scanning.
+            _pendingFileCounts[tenantId] = pendingCount;
+
+            _logger.LogInformation(
+                "Loaded {Count} active files for tenant {TenantId} into memory in {BatchCount} startup batch(es) (batchSize={BatchSize})",
+                totalLoaded,
+                tenantId,
+                batchCount,
+                _startupLoadBatchSize);
+        }
+
+        private int LoadActiveFilesByStatusInBatches(
+            string tenantId,
+            ILiteCollection<FileMetadata> collection,
+            ConcurrentDictionary<string, FileMetadata> cache,
+            ConcurrentQueue<PendingQueueEntry> pendingQueue,
+            FileProcessingStatus status,
+            bool orderByCreatedAt,
+            DateTime nowUtc,
+            ref int pendingCount,
+            ref int batchCount)
+        {
+            var query = collection.Query().Where(f => f.Status == status);
+            if (orderByCreatedAt)
+                query = query.OrderBy(f => f.CreatedAt);
+
+            var loaded = 0;
+            var batch = new List<FileMetadata>(_startupLoadBatchSize);
+            foreach (var metadata in query.ToEnumerable())
             {
-                var cache = _activeFiles.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, FileMetadata>());
-                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>());
+                batch.Add(metadata);
+                if (batch.Count < _startupLoadBatchSize)
+                    continue;
 
-                foreach (var file in activeFiles)
-                {
-                    cache[file.FileKey] = file;
-                    _fileKeyTenantIndex[file.FileKey] = tenantId;
-                }
-
-                // Enqueue Pending files in CreatedAt order to restore FIFO scheduling after restart.
-                int pendingCount = 0;
-                foreach (var file in activeFiles.Where(f => f.Status == FileProcessingStatus.Pending)
-                                                .OrderBy(f => f.CreatedAt))
-                {
-                    pendingQueue.Enqueue(file.FileKey);
-                    pendingCount++;
-                }
-
-                // Seed the O(1) pending count so CompactPendingQueues can check bloat without scanning.
-                _pendingFileCounts[tenantId] = pendingCount;
-
-                _logger.LogInformation("Loaded {Count} active files for tenant {TenantId} into memory",
-                    activeFiles.Count, tenantId);
+                loaded += ApplyStartupLoadBatch(
+                    tenantId,
+                    cache,
+                    pendingQueue,
+                    batch,
+                    nowUtc,
+                    ref pendingCount);
+                batch.Clear();
+                batchCount++;
             }
+
+            if (batch.Count > 0)
+            {
+                loaded += ApplyStartupLoadBatch(
+                    tenantId,
+                    cache,
+                    pendingQueue,
+                    batch,
+                    nowUtc,
+                    ref pendingCount);
+                batchCount++;
+            }
+
+            return loaded;
+        }
+
+        private int ApplyStartupLoadBatch(
+            string tenantId,
+            ConcurrentDictionary<string, FileMetadata> cache,
+            ConcurrentQueue<PendingQueueEntry> pendingQueue,
+            List<FileMetadata> batch,
+            DateTime nowUtc,
+            ref int pendingCount)
+        {
+            foreach (var file in batch)
+            {
+                cache[file.FileKey] = file;
+                _fileKeyTenantIndex[file.FileKey] = tenantId;
+                IndexPhysicalPathCandidate(tenantId, file.FileKey, previous: null, file);
+                IndexStatusCandidate(null, file);
+
+                if (file.Status != FileProcessingStatus.Pending)
+                    continue;
+
+                var generation = GetOrCreatePendingGeneration(tenantId, file.FileKey);
+                var entry = new PendingQueueEntry(file.FileKey, generation);
+                if (file.AvailableForProcessingAt.HasValue && file.AvailableForProcessingAt.Value > nowUtc)
+                    EnqueueDelayed(tenantId, entry, file.AvailableForProcessingAt.Value);
+                else
+                    pendingQueue.Enqueue(entry);
+
+                pendingCount++;
+            }
+
+            return batch.Count;
         }
 
         /// <summary>
@@ -456,7 +750,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            // 1. Update in-memory cache FIRST — always succeeds, immediately visible to readers.
+            // 1. Update in-memory cache FIRST 鈥?always succeeds, immediately visible to readers.
             //    Capture the previous status (if any) to maintain the O(1) pending count accurately.
             var cache = _activeFiles.GetOrAdd(metadata.TenantId,
                 _ => new ConcurrentDictionary<string, FileMetadata>());
@@ -464,6 +758,7 @@ namespace Locus.Storage.Data
             cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
             _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
+            IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
 
             // 2. Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
             //    This keeps CompactPendingQueues O(1) instead of O(N).
@@ -474,27 +769,21 @@ namespace Locus.Storage.Data
             else if (wasP && !isP)
                 _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
 
+            if (wasP && !isP)
+                InvalidatePendingGeneration(metadata.TenantId, metadata.FileKey);
+
             // 3. Enqueue file key when it becomes Pending so the allocator can find it in O(1).
             // Non-Pending transitions are not explicitly removed from the queue; stale entries
             // are validated and skipped when GetNextPendingFileAsync dequeues them.
             if (isP)
-            {
-                var now = DateTime.UtcNow;
-                if (metadata.AvailableForProcessingAt.HasValue && metadata.AvailableForProcessingAt.Value > now)
-                {
-                    EnqueueDelayed(metadata.TenantId, metadata.FileKey, metadata.AvailableForProcessingAt.Value);
-                }
-                else
-                {
-                    var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
-                    pendingQueue.Enqueue(metadata.FileKey);
-                }
-            }
+                EnqueuePendingCandidate(metadata);
+
+            IndexStatusCandidate(previous, metadata);
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
 
-            // Queue LiteDB persistence — caller is not blocked; background loop drains the queue.
+            // Queue LiteDB persistence 鈥?caller is not blocked; background loop drains the queue.
             EnqueuePersistence(new PersistenceOperation(metadata));
 
             return Task.CompletedTask;
@@ -502,7 +791,7 @@ namespace Locus.Storage.Data
 
         /// <summary>
         /// Adds or updates file metadata with immediate synchronous LiteDB write.
-        /// Bypasses the Write-Behind queue — use only for maintenance operations such as
+        /// Bypasses the Write-Behind queue 鈥?use only for maintenance operations such as
         /// database rebuild where the caller needs the data persisted before returning.
         /// </summary>
         internal Task AddOrUpdateDirectAsync(FileMetadata metadata, CancellationToken ct)
@@ -525,6 +814,7 @@ namespace Locus.Storage.Data
             cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
             _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
+            IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
 
             bool wasP = previous?.Status == FileProcessingStatus.Pending;
             bool isP  = metadata.Status == FileProcessingStatus.Pending;
@@ -533,22 +823,16 @@ namespace Locus.Storage.Data
             else if (wasP && !isP)
                 _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
 
-            // Enqueue when Pending — stale entries skipped on dequeue (same as AddOrUpdateAsync).
-            if (isP)
-            {
-                var now = DateTime.UtcNow;
-                if (metadata.AvailableForProcessingAt.HasValue && metadata.AvailableForProcessingAt.Value > now)
-                {
-                    EnqueueDelayed(metadata.TenantId, metadata.FileKey, metadata.AvailableForProcessingAt.Value);
-                }
-                else
-                {
-                    var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<string>());
-                    pendingQueue.Enqueue(metadata.FileKey);
-                }
-            }
+            if (wasP && !isP)
+                InvalidatePendingGeneration(metadata.TenantId, metadata.FileKey);
 
-            // Write directly to LiteDB (synchronous — required for rebuild correctness)
+            // Enqueue when Pending 鈥?stale entries skipped on dequeue (same as AddOrUpdateAsync).
+            if (isP)
+                EnqueuePendingCandidate(metadata);
+
+            IndexStatusCandidate(previous, metadata);
+
+            // Write directly to LiteDB (synchronous 鈥?required for rebuild correctness)
             var db = GetDatabase(metadata.TenantId);
             var files = db.GetCollection<FileMetadata>("files");
             files.Upsert(metadata);
@@ -592,16 +876,19 @@ namespace Locus.Storage.Data
             if (removed)
             {
                 _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                RemovePhysicalPathCandidate(tenantId, fileKey, removedMetadata?.PhysicalPath);
 
                 // Maintain _pendingFileCounts: if the removed file was Pending, decrement.
                 if (removedMetadata?.Status == FileProcessingStatus.Pending)
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
 
+                InvalidatePendingGeneration(tenantId, fileKey);
+
                 // No explicit removal from _pendingKeys: ConcurrentQueue does not support
                 // O(1) keyed removal. The stale entry (if any) will be skipped by the
                 // dequeue-and-validate loop in GetNextPendingFileAsync.
 
-                // Queue LiteDB deletion — caller is not blocked by disk I/O
+                // Queue LiteDB deletion 鈥?caller is not blocked by disk I/O
                 EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
 
                 _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
@@ -631,6 +918,61 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Checks whether a metadata record exists for the specified physical path.
+        /// Path comparison follows platform-specific case sensitivity.
+        /// </summary>
+        public Task<bool> ExistsByPhysicalPathAsync(string tenantId, string physicalPath, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(physicalPath))
+                throw new ArgumentException("PhysicalPath cannot be empty", nameof(physicalPath));
+
+            ct.ThrowIfCancellationRequested();
+            var normalizedPath = NormalizePhysicalPath(physicalPath);
+            if (normalizedPath == null)
+                return Task.FromResult(false);
+
+            return ExistsByNormalizedPhysicalPathAsync(tenantId, normalizedPath, ct);
+        }
+
+        internal Task<bool> ExistsByNormalizedPhysicalPathAsync(
+            string tenantId,
+            string normalizedPhysicalPath,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(normalizedPhysicalPath))
+                throw new ArgumentException("Normalized physical path cannot be empty", nameof(normalizedPhysicalPath));
+
+            ct.ThrowIfCancellationRequested();
+
+            var cache = GetCache(tenantId);
+            if (!_physicalPathIndex.TryGetValue(tenantId, out var tenantPathIndex))
+                return Task.FromResult(false);
+
+            if (!tenantPathIndex.TryGetValue(normalizedPhysicalPath, out var fileKey))
+                return Task.FromResult(false);
+
+            if (cache.TryGetValue(fileKey, out var metadata))
+            {
+                if (_pathComparer.Equals(metadata.PhysicalPath, normalizedPhysicalPath))
+                    return Task.FromResult(true);
+
+                var indexedMetadataPath = NormalizePhysicalPath(metadata.PhysicalPath);
+                if (indexedMetadataPath != null && _pathComparer.Equals(indexedMetadataPath, normalizedPhysicalPath))
+                    return Task.FromResult(true);
+            }
+
+            // Stale index entry (e.g., out-of-order concurrent update): self-heal on read.
+            tenantPathIndex.TryRemove(normalizedPhysicalPath, out _);
+            return Task.FromResult(false);
+        }
+
+        /// <summary>
         /// Gets a bounded batch of files in Processing status that timed out before the cutoff.
         /// </summary>
         public Task<IReadOnlyList<FileMetadata>> GetProcessingTimedOutAsync(
@@ -646,18 +988,16 @@ namespace Locus.Storage.Data
                 return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
 
             ct.ThrowIfCancellationRequested();
-            var cache = GetCache(tenantId);
-            var results = cache.Values
-                .Where(m =>
-                    m.Status == FileProcessingStatus.Processing
-                    && m.ProcessingStartTime.HasValue
-                    && m.ProcessingStartTime.Value < cutoffUtc)
-                .OrderBy(m => m.ProcessingStartTime)
-                .ThenBy(m => m.CreatedAt)
-                .Take(limit)
-                .ToList();
+            var results = GetStatusBatchFromIndex(
+                tenantId,
+                cutoffUtc,
+                limit,
+                FileProcessingStatus.Processing,
+                _processingByStartTime,
+                _processingByStartTimeLocks,
+                metadata => metadata.ProcessingStartTime);
 
-            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
+            return Task.FromResult(results);
         }
 
         /// <summary>
@@ -676,18 +1016,16 @@ namespace Locus.Storage.Data
                 return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
 
             ct.ThrowIfCancellationRequested();
-            var cache = GetCache(tenantId);
-            var results = cache.Values
-                .Where(m =>
-                    m.Status == FileProcessingStatus.PermanentlyFailed
-                    && m.LastFailedAt.HasValue
-                    && m.LastFailedAt.Value < cutoffUtc)
-                .OrderBy(m => m.LastFailedAt)
-                .ThenBy(m => m.CreatedAt)
-                .Take(limit)
-                .ToList();
+            var results = GetStatusBatchFromIndex(
+                tenantId,
+                cutoffUtc,
+                limit,
+                FileProcessingStatus.PermanentlyFailed,
+                _permanentlyFailedByLastFailedAt,
+                _permanentlyFailedByLastFailedAtLocks,
+                metadata => metadata.LastFailedAt);
 
-            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
+            return Task.FromResult(results);
         }
 
         /// <summary>
@@ -706,12 +1044,285 @@ namespace Locus.Storage.Data
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
         }
 
+        private void EnqueuePendingCandidate(FileMetadata metadata)
+        {
+            var generation = IncrementPendingGeneration(metadata.TenantId, metadata.FileKey);
+            var entry = new PendingQueueEntry(metadata.FileKey, generation);
+            var now = DateTime.UtcNow;
+            if (metadata.AvailableForProcessingAt.HasValue && metadata.AvailableForProcessingAt.Value > now)
+            {
+                EnqueueDelayed(metadata.TenantId, entry, metadata.AvailableForProcessingAt.Value);
+                return;
+            }
+
+            var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
+            pendingQueue.Enqueue(entry);
+        }
+
+        private long GetOrCreatePendingGeneration(string tenantId, string fileKey)
+        {
+            var generations = _pendingGenerations.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, long>(StringComparer.Ordinal));
+            return generations.GetOrAdd(fileKey, 1);
+        }
+
+        private long IncrementPendingGeneration(string tenantId, string fileKey)
+        {
+            var generations = _pendingGenerations.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, long>(StringComparer.Ordinal));
+            return generations.AddOrUpdate(fileKey, 1, (_, current) => current + 1);
+        }
+
+        private void InvalidatePendingGeneration(string tenantId, string fileKey)
+        {
+            if (_pendingGenerations.TryGetValue(tenantId, out var generations))
+                generations.TryRemove(fileKey, out _);
+        }
+
+        private bool IsGenerationCurrent(string tenantId, PendingQueueEntry entry)
+        {
+            return _pendingGenerations.TryGetValue(tenantId, out var generations)
+                && generations.TryGetValue(entry.FileKey, out var currentGeneration)
+                && currentGeneration == entry.Generation;
+        }
+
+        private void RecordPendingDequeueStats(int attempts, int staleSkips)
+        {
+            if (attempts > 0)
+                Interlocked.Add(ref _pendingDequeuedAttempts, attempts);
+            if (staleSkips > 0)
+                Interlocked.Add(ref _pendingDequeuedStaleSkips, staleSkips);
+        }
+
+        private void MaybeCompactPendingQueueForStaleRatio(
+            string tenantId,
+            ConcurrentDictionary<string, FileMetadata> cache,
+            int staleSkips,
+            int attempts)
+        {
+            if (attempts < StaleCompactionMinSamples || staleSkips <= 0)
+                return;
+
+            var staleRatio = staleSkips / (double)attempts;
+            if (staleRatio < StaleCompactionRatioThreshold)
+                return;
+
+            CompactPendingQueueForTenant(tenantId, cache, force: true);
+
+            if (Interlocked.Increment(ref _pendingStaleCompactionCounter) % 64 == 1)
+            {
+                _logger.LogInformation(
+                    "Opportunistic pending queue compaction triggered for tenant {TenantId}: staleRatio={StaleRatio:P2}, staleSkips={StaleSkips}, attempts={Attempts}",
+                    tenantId,
+                    staleRatio,
+                    staleSkips,
+                    attempts);
+            }
+        }
+
+        private void IndexPhysicalPathCandidate(
+            string tenantId,
+            string fileKey,
+            FileMetadata? previous,
+            FileMetadata current)
+        {
+            var normalizedCurrentPath = NormalizePhysicalPath(current.PhysicalPath);
+            var normalizedPreviousPath = previous == null
+                ? null
+                : NormalizePhysicalPath(previous.PhysicalPath);
+
+            var tenantPathIndex = _physicalPathIndex.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, string>(_pathComparer));
+
+            if (normalizedPreviousPath != null
+                && (normalizedCurrentPath == null || !_pathComparer.Equals(normalizedPreviousPath, normalizedCurrentPath))
+                && tenantPathIndex.TryGetValue(normalizedPreviousPath, out var previousOwner)
+                && string.Equals(previousOwner, fileKey, StringComparison.Ordinal))
+            {
+                tenantPathIndex.TryRemove(normalizedPreviousPath, out _);
+            }
+
+            if (normalizedCurrentPath != null)
+            {
+                tenantPathIndex[normalizedCurrentPath] = fileKey;
+            }
+        }
+
+        private void RemovePhysicalPathCandidate(string tenantId, string fileKey, string? physicalPath)
+        {
+            if (physicalPath == null)
+                return;
+
+            var normalizedPath = NormalizePhysicalPath(physicalPath);
+            if (normalizedPath == null)
+                return;
+
+            if (!_physicalPathIndex.TryGetValue(tenantId, out var tenantPathIndex))
+                return;
+
+            if (tenantPathIndex.TryGetValue(normalizedPath, out var existingFileKey)
+                && string.Equals(existingFileKey, fileKey, StringComparison.Ordinal))
+            {
+                tenantPathIndex.TryRemove(normalizedPath, out _);
+            }
+        }
+
+        private string? NormalizePhysicalPath(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return null;
+
+            try
+            {
+                return _fileSystem.Path.GetFullPath(path!);
+            }
+            catch
+            {
+                return path;
+            }
+        }
+
+        private void IndexStatusCandidate(FileMetadata? previous, FileMetadata current)
+        {
+            var statusChanged = previous == null || previous.Status != current.Status;
+            if (current.Status == FileProcessingStatus.Processing && current.ProcessingStartTime.HasValue)
+            {
+                if (statusChanged || previous?.ProcessingStartTime != current.ProcessingStartTime)
+                {
+                    EnqueueStatusIndex(
+                        _processingByStartTime,
+                        _processingByStartTimeLocks,
+                        current.TenantId,
+                        current.FileKey,
+                        current.ProcessingStartTime.Value,
+                        current.CreatedAt);
+                }
+            }
+
+            if (current.Status == FileProcessingStatus.PermanentlyFailed && current.LastFailedAt.HasValue)
+            {
+                if (statusChanged || previous?.LastFailedAt != current.LastFailedAt)
+                {
+                    EnqueueStatusIndex(
+                        _permanentlyFailedByLastFailedAt,
+                        _permanentlyFailedByLastFailedAtLocks,
+                        current.TenantId,
+                        current.FileKey,
+                        current.LastFailedAt.Value,
+                        current.CreatedAt);
+                }
+            }
+        }
+
+        private void EnqueueStatusIndex(
+            ConcurrentDictionary<string, StatusTimestampIndex> indexMap,
+            ConcurrentDictionary<string, object> lockMap,
+            string tenantId,
+            string fileKey,
+            DateTime timestampUtc,
+            DateTime createdAtUtc)
+        {
+            var index = indexMap.GetOrAdd(tenantId, _ => new StatusTimestampIndex());
+            var indexLock = lockMap.GetOrAdd(tenantId, _ => new object());
+            var sequence = Interlocked.Increment(ref _statusIndexSequence);
+            lock (indexLock)
+            {
+                index.Enqueue(fileKey, timestampUtc, createdAtUtc, sequence);
+            }
+        }
+
+        private IReadOnlyList<FileMetadata> GetStatusBatchFromIndex(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            FileProcessingStatus expectedStatus,
+            ConcurrentDictionary<string, StatusTimestampIndex> indexMap,
+            ConcurrentDictionary<string, object> lockMap,
+            Func<FileMetadata, DateTime?> timestampSelector)
+        {
+            if (!indexMap.TryGetValue(tenantId, out var index) || index.Count == 0)
+                return Array.Empty<FileMetadata>();
+
+            var cache = GetCache(tenantId);
+            var indexLock = lockMap.GetOrAdd(tenantId, _ => new object());
+            var results = new List<FileMetadata>(limit);
+            var restoreEntries = new List<StatusTimestampEntry>(limit);
+            var selectedKeys = new HashSet<string>(StringComparer.Ordinal);
+            var staleSkips = 0;
+
+            lock (indexLock)
+            {
+                while (results.Count < limit && index.TryPeek(out var peek))
+                {
+                    if (peek.TimestampUtc >= cutoffUtc)
+                        break;
+
+                    if (!index.TryDequeue(out var candidate))
+                        break;
+
+                    if (!cache.TryGetValue(candidate.FileKey, out var metadata))
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    if (metadata.Status != expectedStatus)
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    var timestamp = timestampSelector(metadata);
+                    if (!timestamp.HasValue)
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    if (timestamp.Value != candidate.TimestampUtc || timestamp.Value >= cutoffUtc)
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    if (!selectedKeys.Add(candidate.FileKey))
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    results.Add(metadata);
+                    restoreEntries.Add(candidate);
+                }
+
+                foreach (var entry in restoreEntries)
+                {
+                    index.Enqueue(
+                        entry.FileKey,
+                        entry.TimestampUtc,
+                        entry.CreatedAtUtc,
+                        Interlocked.Increment(ref _statusIndexSequence));
+                }
+            }
+
+            if (staleSkips > 0)
+                Interlocked.Add(ref _statusIndexStaleSkips, staleSkips);
+
+            return results;
+        }
+
         // Maximum number of delayed items promoted to ready per allocation call.
         // Caps lock hold time when many delayed entries are due simultaneously.
         private const int MaxDelayedPromotions = 64;
         private const int MaxDelayedPromotionsBatch = 256;
+        private const int MaxSinglePendingDequeues = 512;
+        private const int StaleCompactionMinSamples = 32;
+        private const double StaleCompactionRatioThreshold = 0.5;
 
-        private void EnqueueDelayed(string tenantId, string fileKey, DateTime availableAtUtc)
+        private void EnqueueDelayed(string tenantId, PendingQueueEntry entry, DateTime availableAtUtc)
         {
             var delayedQueue = _delayedQueues.GetOrAdd(tenantId, _ => new DelayedQueue());
             var delayedLock = _delayedQueueLocks.GetOrAdd(tenantId, _ => new object());
@@ -719,14 +1330,14 @@ namespace Locus.Storage.Data
 
             lock (delayedLock)
             {
-                delayedQueue.Enqueue(fileKey, availableAtUtc, sequence);
+                delayedQueue.Enqueue(entry.FileKey, entry.Generation, availableAtUtc, sequence);
             }
         }
 
         private void PromoteDelayedReady(
             string tenantId,
             DateTime nowUtc,
-            ConcurrentQueue<string> readyQueue,
+            ConcurrentQueue<PendingQueueEntry> readyQueue,
             int maxPromotions)
         {
             if (!_delayedQueues.TryGetValue(tenantId, out var delayedQueue))
@@ -737,9 +1348,9 @@ namespace Locus.Storage.Data
 
             lock (delayedLock)
             {
-                while (promoted < maxPromotions && delayedQueue.TryDequeueReady(nowUtc, out var fileKey))
+                while (promoted < maxPromotions && delayedQueue.TryDequeueReady(nowUtc, out var entry))
                 {
-                    readyQueue.Enqueue(fileKey);
+                    readyQueue.Enqueue(entry);
                     promoted++;
                 }
             }
@@ -768,23 +1379,39 @@ namespace Locus.Storage.Data
             try
             {
                 var cache = GetCache(tenantId);
-                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>());
+                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
                 var now = DateTime.UtcNow;
                 PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotions);
+                pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
+                var maxDequeues = Math.Min(Math.Max(pendingCount + 64, 64), MaxSinglePendingDequeues);
+                var dequeuedAttempts = 0;
+                var staleSkips = 0;
 
-                while (pendingQueue.TryDequeue(out var key))
+                while (dequeuedAttempts++ < maxDequeues && pendingQueue.TryDequeue(out var entry))
                 {
-                    // Validate: skip stale entries whose file was removed or status changed.
-                    if (!cache.TryGetValue(key, out var candidate))
-                        continue; // stale — file was removed from cache
+                    if (!IsGenerationCurrent(tenantId, entry))
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    if (!cache.TryGetValue(entry.FileKey, out var candidate))
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
                     if (candidate.Status != FileProcessingStatus.Pending)
-                        continue; // stale — status changed outside this lock
+                    {
+                        staleSkips++;
+                        continue;
+                    }
 
                     if (candidate.AvailableForProcessingAt.HasValue
                         && candidate.AvailableForProcessingAt.Value > now)
                     {
-                        // Not ready yet — move to delayed queue.
-                        EnqueueDelayed(tenantId, candidate.FileKey, candidate.AvailableForProcessingAt.Value);
+                        // Not ready yet - move back to delayed queue.
+                        EnqueueDelayed(tenantId, entry, candidate.AvailableForProcessingAt.Value);
                         continue;
                     }
 
@@ -796,12 +1423,18 @@ namespace Locus.Storage.Data
 
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+                    InvalidatePendingGeneration(tenantId, updated.FileKey);
+                    IndexStatusCandidate(candidate, updated);
                     EnqueuePersistence(new PersistenceOperation(updated));
+                    RecordPendingDequeueStats(dequeuedAttempts, staleSkips);
+                    MaybeCompactPendingQueueForStaleRatio(tenantId, cache, staleSkips, dequeuedAttempts);
 
                     _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", updated.FileKey, tenantId);
                     return updated;
                 }
 
+                RecordPendingDequeueStats(dequeuedAttempts, staleSkips);
+                MaybeCompactPendingQueueForStaleRatio(tenantId, cache, staleSkips, dequeuedAttempts);
                 return null;
             }
             finally
@@ -809,7 +1442,6 @@ namespace Locus.Storage.Data
                 tenantLock.Release();
             }
         }
-
         /// <summary>
         /// Gets a batch of pending files for processing (atomic operation).
         /// Thread-safe: Uses the same per-tenant SemaphoreSlim as GetNextPendingFileAsync
@@ -838,7 +1470,7 @@ namespace Locus.Storage.Data
             try
             {
                 var cache = GetCache(tenantId);
-                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>());
+                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
                 var now = DateTime.UtcNow;
                 PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotionsBatch);
 
@@ -846,37 +1478,55 @@ namespace Locus.Storage.Data
                 // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
                 // are present. Tie the cap to pendingCount and batchSize to bound lock hold time.
                 pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
-                int maxDequeues = Math.Min(pendingCount + 64, batchSize * 2 + 64);
-                int dequeued = 0;
+                var maxDequeues = Math.Min(pendingCount + 64, batchSize * 2 + 64);
+                var dequeued = 0;
+                var staleSkips = 0;
 
                 while (results.Count < batchSize
                        && dequeued++ < maxDequeues
-                       && pendingQueue.TryDequeue(out var key))
+                       && pendingQueue.TryDequeue(out var entry))
                 {
-                    if (!cache.TryGetValue(key, out var candidate))
-                        continue; // stale — removed from cache
+                    if (!IsGenerationCurrent(tenantId, entry))
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
+                    if (!cache.TryGetValue(entry.FileKey, out var candidate))
+                    {
+                        staleSkips++;
+                        continue;
+                    }
+
                     if (candidate.Status != FileProcessingStatus.Pending)
-                        continue; // stale — status changed
+                    {
+                        staleSkips++;
+                        continue;
+                    }
 
                     if (candidate.AvailableForProcessingAt.HasValue
                         && candidate.AvailableForProcessingAt.Value > now)
                     {
-                        // Not ready yet — move to delayed queue.
-                        EnqueueDelayed(tenantId, candidate.FileKey, candidate.AvailableForProcessingAt.Value);
+                        // Not ready yet - move back to delayed queue.
+                        EnqueueDelayed(tenantId, entry, candidate.AvailableForProcessingAt.Value);
                         continue;
                     }
 
-                    // Clone before mutating — same rationale as GetNextPendingFileAsync.
+                    // Clone before mutating - same rationale as GetNextPendingFileAsync.
                     var updated = candidate.Clone();
                     updated.Status = FileProcessingStatus.Processing;
                     updated.ProcessingStartTime = now;
 
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+                    InvalidatePendingGeneration(tenantId, updated.FileKey);
+                    IndexStatusCandidate(candidate, updated);
                     EnqueuePersistence(new PersistenceOperation(updated));
                     results.Add(updated);
                 }
 
+                RecordPendingDequeueStats(dequeued, staleSkips);
+                MaybeCompactPendingQueueForStaleRatio(tenantId, cache, staleSkips, dequeued);
                 _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
                 return results;
             }
@@ -885,7 +1535,6 @@ namespace Locus.Storage.Data
                 tenantLock.Release();
             }
         }
-
         /// <summary>
         /// Resets files that have been in Processing status for longer than the timeout.
         /// Uses Write-Behind (same as AddOrUpdateAsync) for consistency with the rest of the
@@ -911,7 +1560,7 @@ namespace Locus.Storage.Data
 
                     var processingDuration = DateTime.UtcNow - file.ProcessingStartTime.Value;
 
-                    // Clone before mutating — keeps the cache entry consistent for lock-free readers.
+                    // Clone before mutating 鈥?keeps the cache entry consistent for lock-free readers.
                     var updated = file.Clone();
                     updated.Status = FileProcessingStatus.Pending;
                     updated.ProcessingStartTime = null;
@@ -922,10 +1571,11 @@ namespace Locus.Storage.Data
                     cache[updated.FileKey] = updated;
                     if (previous?.Status != FileProcessingStatus.Pending)
                         _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                    IndexStatusCandidate(previous, updated);
                     EnqueuePersistence(new PersistenceOperation(updated));
 
                     // Re-enqueue in the pending queue so the allocator can find it immediately.
-                    _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<string>()).Enqueue(updated.FileKey);
+                    EnqueuePendingCandidate(updated);
 
                     count++;
                     _logger.LogWarning("Reset timed-out file: {FileKey}, Tenant: {TenantId}, was processing for {Duration}",
@@ -1103,8 +1753,14 @@ namespace Locus.Storage.Data
             _databases.TryRemove(tenantId, out _);
             if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                 RemoveTenantFromGlobalIndex(staleTenantCache);
+            _physicalPathIndex.TryRemove(tenantId, out _);
             _pendingKeys.TryRemove(tenantId, out _);
+            _pendingGenerations.TryRemove(tenantId, out _);
             _pendingFileCounts.TryRemove(tenantId, out _);
+            _processingByStartTime.TryRemove(tenantId, out _);
+            _processingByStartTimeLocks.TryRemove(tenantId, out _);
+            _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+            _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
             var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
             _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -1168,8 +1824,14 @@ namespace Locus.Storage.Data
                 // Step 3: Clear in-memory cache and pending index
                 if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                     RemoveTenantFromGlobalIndex(staleTenantCache);
+                _physicalPathIndex.TryRemove(tenantId, out _);
                 _pendingKeys.TryRemove(tenantId, out _);
+                _pendingGenerations.TryRemove(tenantId, out _);
                 _pendingFileCounts.TryRemove(tenantId, out _);
+                _processingByStartTime.TryRemove(tenantId, out _);
+                _processingByStartTimeLocks.TryRemove(tenantId, out _);
+                _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+                _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                 // Step 4: Backup corrupted database
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
@@ -1209,19 +1871,20 @@ namespace Locus.Storage.Data
         // Maximum number of operations allowed in the persistence queue.
         // If LiteDB is unavailable for an extended period, the queue may fill up. When near or
         // at capacity, operations are coalesced by file key so only the latest state is retained.
-        private const int MaxPersistenceQueueSize = 100_000;
+        private const int DefaultMaxPersistenceQueueSize = 100_000;
         private const int DefaultDrainBatchSize = 2_000;
         private const int DefaultPersistenceQueueSoftMergeThresholdPercent = 90;
+        private const int DefaultStartupLoadBatchSize = 2_000;
 
         // Compact pending queues every N drain cycles to reclaim memory from stale entries.
-        // At ~one drain-cycle per 5 s, 20 cycles ≈ every ~100 seconds.
+        // At ~one drain-cycle per 5 s, 20 cycles 鈮?every ~100 seconds.
         // A shorter interval limits queue bloat when files are retried frequently,
         // reducing the window in which a retried file is delayed from being re-allocated.
         private const int CompactionIntervalCycles = 20;
 
-        // Enqueues an operation and wakes the background persistence loop.
+        // Enqueues an operation for background persistence.
         // If the queue is full (LiteDB has been unavailable for a long time), the operation
-        // is dropped with a warning — memory state is already correct, so data is not lost
+        // is dropped with a warning - memory state is already correct, so data is not lost
         // within this process lifetime. On restart, the cleanup service reconciles disk vs metadata.
         private void EnqueuePersistence(PersistenceOperation op)
         {
@@ -1233,23 +1896,43 @@ namespace Locus.Storage.Data
                 return;
             }
 
-            // ConcurrentQueue.Count is O(1). Small TOCTOU race is acceptable: we only
-            // need to prevent unbounded growth, not enforce an exact hard limit.
-            var queueDepth = _persistenceQueue.Count;
-            if (queueDepth >= MaxPersistenceQueueSize)
-            {
-                CoalescePersistenceOperation(op, queueDepth, "queue_full");
+            if (TryWritePersistenceOperation(op))
                 return;
-            }
 
+            var queueDepth = Volatile.Read(ref _persistenceChannelDepth);
             if (queueDepth >= _persistenceQueueSoftMergeThreshold)
             {
                 CoalescePersistenceOperation(op, queueDepth, "near_capacity");
                 return;
             }
 
-            _persistenceQueue.Enqueue(op);
-            _persistenceSignal.Release(); // wake the background loop
+            CoalescePersistenceOperation(op, queueDepth, "queue_full");
+        }
+
+        private bool TryWritePersistenceOperation(PersistenceOperation op)
+        {
+            Interlocked.Increment(ref _persistenceChannelDepth);
+            if (!_persistenceWriter.TryWrite(op))
+            {
+                Interlocked.Decrement(ref _persistenceChannelDepth);
+                return false;
+            }
+
+            UpdatePeakPersistenceDepth(Volatile.Read(ref _persistenceChannelDepth));
+            return true;
+        }
+
+        private void UpdatePeakPersistenceDepth(int currentDepth)
+        {
+            while (true)
+            {
+                var observedPeak = Volatile.Read(ref _persistenceChannelPeakDepth);
+                if (observedPeak >= currentDepth)
+                    return;
+
+                if (Interlocked.CompareExchange(ref _persistenceChannelPeakDepth, currentDepth, observedPeak) == observedPeak)
+                    return;
+            }
         }
 
         private void CoalescePersistenceOperation(PersistenceOperation op, int queueDepth, string reason)
@@ -1259,23 +1942,21 @@ namespace Locus.Storage.Data
             if (!added)
                 _coalescedPersistenceOps[compositeKey] = op;
 
-            // Wake the loop only when a new coalesced key is introduced. Repeated updates to
-            // the same key should not inflate semaphore permits and cause wake-up churn.
             if (added)
-                _persistenceSignal.Release();
+                Interlocked.Increment(ref _coalescedDepth);
 
             if (Interlocked.Increment(ref _coalescedLogCounter) % 256 == 1)
             {
                 _logger.LogWarning(
                     "Persistence queue {Reason} at {QueueDepth}/{QueueLimit}; coalescing latest state. CoalescedCount={CoalescedCount}",
-                    reason, queueDepth, MaxPersistenceQueueSize, _coalescedPersistenceOps.Count);
+                    reason, queueDepth, _maxPersistenceQueueSize, Volatile.Read(ref _coalescedDepth));
             }
         }
 
-        // Background loop: waits for a signal, then drains the entire queue in one pass,
+        // Background loop: waits for channel data or periodic timeout, then drains in one pass,
         // grouping operations by tenant so each tenant gets a single LiteDB transaction
         // instead of one transaction per operation. This dramatically reduces LiteDB overhead
-        // under burst writes (e.g. 1000 concurrent file writes → 1 transaction per tenant).
+        // under burst writes (e.g. 1000 concurrent file writes -> 1 transaction per tenant).
         private async Task RunPersistenceLoopAsync(CancellationToken ct)
         {
             int drainCycles = 0;
@@ -1283,29 +1964,58 @@ namespace Locus.Storage.Data
             {
                 try
                 {
-                    // Wait for a signal OR up to 5 seconds (whichever comes first).
-                    // The periodic timeout guarantees that any items enqueued during low-activity
-                    // periods are flushed within ~5 s, reducing data-loss exposure on unexpected
-                    // process termination even when the queue never fills.
-                    await _persistenceSignal.WaitAsync(TimeSpan.FromSeconds(5), ct);
+                    await WaitForPersistenceWorkAsync(ct);
                 }
                 catch (OperationCanceledException)
                 {
-                    break; // shutdown requested — fall through to drain
+                    break; // shutdown requested - fall through to drain
                 }
 
-                // Drain all queued items in a single batch, regardless of how many signals
-                // accumulated. Consuming extra semaphore permits avoids spurious wake-ups.
                 DrainPersistenceQueue();
 
                 // Periodically compact pending queues to reclaim memory occupied by stale
                 // entries left over from completed/failed files that were never explicitly removed.
                 if (++drainCycles % CompactionIntervalCycles == 0)
                     CompactPendingQueues();
+
+                LogPerformanceSnapshotIfNeeded(drainCycles);
             }
 
             // Drain any items enqueued before cancellation was observed.
             DrainPersistenceQueue();
+        }
+
+        private void LogPerformanceSnapshotIfNeeded(int drainCycles)
+        {
+            if (drainCycles % 128 != 0)
+                return;
+
+            var pendingAttempts = Interlocked.Read(ref _pendingDequeuedAttempts);
+            var pendingStaleSkips = Interlocked.Read(ref _pendingDequeuedStaleSkips);
+            var staleRatio = pendingAttempts > 0
+                ? pendingStaleSkips / (double)pendingAttempts
+                : 0;
+
+            _logger.LogInformation(
+                "MetadataRepository performance counters: QueueDepth={QueueDepth}, QueuePeakDepth={QueuePeakDepth}, CoalescedDepth={CoalescedDepth}, PendingStaleSkipRatio={PendingStaleSkipRatio:P2}, StatusIndexStaleSkips={StatusIndexStaleSkips}",
+                Volatile.Read(ref _persistenceChannelDepth),
+                Volatile.Read(ref _persistenceChannelPeakDepth),
+                Volatile.Read(ref _coalescedDepth),
+                staleRatio,
+                Interlocked.Read(ref _statusIndexStaleSkips));
+        }
+
+        private async Task WaitForPersistenceWorkAsync(CancellationToken ct)
+        {
+            // Periodic timeout keeps coalesced-only writes moving even when no new channel items arrive.
+            var waitToReadTask = _persistenceReader.WaitToReadAsync(ct).AsTask();
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), ct);
+            var completed = await Task.WhenAny(waitToReadTask, timeoutTask);
+            if (ct.IsCancellationRequested)
+                throw new OperationCanceledException(ct);
+
+            if (completed == waitToReadTask && !await waitToReadTask)
+                throw new OperationCanceledException(ct);
         }
 
         // Drains queued and coalesced operations in bounded batches.
@@ -1323,19 +2033,19 @@ namespace Locus.Storage.Data
         {
             var byTenant = new Dictionary<string, List<PersistenceOperation>>(StringComparer.Ordinal);
             int drainedCount = 0;
-            var hasCoalesced = _coalescedPersistenceOps.Count > 0;
+            var hasCoalesced = Volatile.Read(ref _coalescedDepth) > 0;
             var maxQueuedThisBatch = hasCoalesced && _maxDrainBatchSize > 1
                 ? _maxDrainBatchSize - 1
                 : _maxDrainBatchSize;
 
-            while (drainedCount < maxQueuedThisBatch && _persistenceQueue.TryDequeue(out var queuedOp))
+            while (drainedCount < maxQueuedThisBatch && _persistenceReader.TryRead(out var queuedOp))
             {
                 drainedCount++;
-                _persistenceSignal.Wait(0); // consume matching permit
+                Interlocked.Decrement(ref _persistenceChannelDepth);
                 AddOperationToTenantBucket(byTenant, queuedOp);
             }
 
-            if (drainedCount < _maxDrainBatchSize && _coalescedPersistenceOps.Count > 0)
+            if (drainedCount < _maxDrainBatchSize && Volatile.Read(ref _coalescedDepth) > 0)
             {
                 foreach (var coalesced in _coalescedPersistenceOps)
                 {
@@ -1346,7 +2056,7 @@ namespace Locus.Storage.Data
                         continue;
 
                     drainedCount++;
-                    _persistenceSignal.Wait(0);
+                    Interlocked.Decrement(ref _coalescedDepth);
                     AddOperationToTenantBucket(byTenant, coalescedOp);
                 }
             }
@@ -1359,7 +2069,10 @@ namespace Locus.Storage.Data
 
             _logger.LogDebug(
                 "Flushed persistence batch: {Drained} operations, {TenantBuckets} tenant bucket(s), RemainingQueue={QueueDepth}, RemainingCoalesced={CoalescedDepth}",
-                drainedCount, byTenant.Count, _persistenceQueue.Count, _coalescedPersistenceOps.Count);
+                drainedCount,
+                byTenant.Count,
+                Volatile.Read(ref _persistenceChannelDepth),
+                Volatile.Read(ref _coalescedDepth));
 
             return true;
         }
@@ -1378,7 +2091,7 @@ namespace Locus.Storage.Data
         }
 
         // Writes a batch of operations for a single tenant inside one LiteDB transaction.
-        // Errors are logged but never propagated — LiteDB unavailability must never fail writes.
+        // Errors are logged but never propagated 鈥?LiteDB unavailability must never fail writes.
         private void ExecuteBatch(string tenantId, List<PersistenceOperation> ops)
         {
             try
@@ -1417,7 +2130,7 @@ namespace Locus.Storage.Data
 
         // Rebuilds _pendingKeys / _delayedQueues for any tenant whose queues are significantly larger than
         // the number of actual Pending files in the cache.  Called periodically by the
-        // single background persistence thread — never from a request path.
+        // single background persistence thread - never from a request path.
         //
         // Bloat check uses _pendingFileCounts (O(1)) maintained by AddOrUpdateAsync/RemoveAsync,
         // avoiding the previous O(N) cache scan that blocked the persistence thread.
@@ -1433,73 +2146,92 @@ namespace Locus.Storage.Data
             {
                 var tenantId = kvp.Key;
                 var cache = kvp.Value;
+                CompactPendingQueueForTenant(tenantId, cache, force: false);
+            }
+        }
 
-                if (!_pendingKeys.TryGetValue(tenantId, out var queue))
-                    continue;
+        private void CompactPendingQueueForTenant(
+            string tenantId,
+            ConcurrentDictionary<string, FileMetadata> cache,
+            bool force)
+        {
+            if (!_pendingKeys.TryGetValue(tenantId, out var queue))
+                return;
 
-                // O(1): read from the counter maintained by AddOrUpdateAsync / RemoveAsync.
-                _pendingFileCounts.TryGetValue(tenantId, out var actualPendingCount);
-                var delayedQueueCount = _delayedQueues.TryGetValue(tenantId, out var delayedQueue)
-                    ? delayedQueue.Count
-                    : 0;
+            // O(1): read from the counter maintained by AddOrUpdateAsync / RemoveAsync.
+            _pendingFileCounts.TryGetValue(tenantId, out var actualPendingCount);
+            var delayedQueueCount = _delayedQueues.TryGetValue(tenantId, out var delayedQueue)
+                ? delayedQueue.Count
+                : 0;
 
+            if (!force)
+            {
                 // Only rebuild when the queue is significantly bloated:
-                // more than 2× actual pending entries + a 100-entry slack buffer.
+                // more than 2x actual pending entries + a 100-entry slack buffer.
                 if (queue.Count <= actualPendingCount * 2 + 100
                     && delayedQueueCount <= actualPendingCount * 2 + 100)
-                    continue;
-
-                _logger.LogDebug(
-                    "Compacting queues for tenant {TenantId}: Ready={ReadyCount}, Delayed={DelayedCount} → Pending={PendingCount}",
-                    tenantId, queue.Count, delayedQueueCount, actualPendingCount);
-
-                var now = DateTime.UtcNow;
-                var pendingItems = cache.Values
-                    .Where(m => m.Status == FileProcessingStatus.Pending)
-                    .ToList();
-
-                // Ready queue: Pending files available now, ordered by CreatedAt to preserve FIFO.
-                var readyKeys = pendingItems
-                    .Where(m => !m.AvailableForProcessingAt.HasValue || m.AvailableForProcessingAt.Value <= now)
-                    .OrderBy(m => m.CreatedAt)
-                    .Select(m => m.FileKey);
-
-                // Delayed queue: Pending files scheduled for the future.
-                var delayedItems = pendingItems
-                    .Where(m => m.AvailableForProcessingAt.HasValue && m.AvailableForProcessingAt.Value > now)
-                    .OrderBy(m => m.AvailableForProcessingAt)
-                    .ThenBy(m => m.CreatedAt)
-                    .ToList();
-
-                // TryUpdate atomically replaces the queue only if _pendingKeys[tenantId] still
-                // points to the same instance we observed earlier (i.e., `queue`).  This narrows
-                // the race window: if a concurrent AddOrUpdateAsync already swapped in a newer
-                // queue, we leave it untouched rather than silently discarding newly enqueued keys.
-                // Any in-flight GetNextPendingFileAsync holding the old reference drains it
-                // harmlessly — every dequeued key is validated against the authoritative cache.
-                var newQueue = new ConcurrentQueue<string>(readyKeys);
-                _pendingKeys.TryUpdate(tenantId, newQueue, queue);
-
-                if (delayedItems.Count == 0)
-                {
-                    if (delayedQueue != null)
-                        _delayedQueues.TryRemove(tenantId, out _);
-                    continue;
-                }
-
-                var newDelayed = new DelayedQueue();
-                var endSequence = Interlocked.Add(ref _delayedSequence, delayedItems.Count);
-                var sequence = endSequence - delayedItems.Count;
-                foreach (var item in delayedItems)
-                {
-                    newDelayed.Enqueue(item.FileKey, item.AvailableForProcessingAt!.Value, ++sequence);
-                }
-
-                if (delayedQueue != null)
-                    _delayedQueues.TryUpdate(tenantId, newDelayed, delayedQueue);
-                else
-                    _delayedQueues.TryAdd(tenantId, newDelayed);
+                    return;
             }
+
+            _logger.LogDebug(
+                "Compacting queues for tenant {TenantId}: Ready={ReadyCount}, Delayed={DelayedCount} -> Pending={PendingCount}, Force={Force}",
+                tenantId, queue.Count, delayedQueueCount, actualPendingCount, force);
+
+            var now = DateTime.UtcNow;
+            var pendingItems = cache.Values
+                .Where(m => m.Status == FileProcessingStatus.Pending)
+                .OrderBy(m => m.CreatedAt)
+                .ToList();
+
+            var generations = _pendingGenerations.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, long>(StringComparer.Ordinal));
+            generations.Clear();
+
+            var readyEntries = new List<PendingQueueEntry>(pendingItems.Count);
+            var delayedItems = new List<FileMetadata>(pendingItems.Count);
+
+            foreach (var item in pendingItems)
+            {
+                generations[item.FileKey] = 1;
+                var entry = new PendingQueueEntry(item.FileKey, 1);
+                if (item.AvailableForProcessingAt.HasValue && item.AvailableForProcessingAt.Value > now)
+                    delayedItems.Add(item);
+                else
+                    readyEntries.Add(entry);
+            }
+
+            // TryUpdate atomically replaces the queue only if _pendingKeys[tenantId] still
+            // points to the same instance we observed earlier (i.e., `queue`).  This narrows
+            // the race window: if a concurrent AddOrUpdateAsync already swapped in a newer
+            // queue, we leave it untouched rather than silently discarding newly enqueued keys.
+            var newQueue = new ConcurrentQueue<PendingQueueEntry>(readyEntries);
+            _pendingKeys.TryUpdate(tenantId, newQueue, queue);
+
+            if (delayedItems.Count == 0)
+            {
+                if (delayedQueue != null)
+                    _delayedQueues.TryRemove(tenantId, out _);
+                return;
+            }
+
+            delayedItems = delayedItems
+                .OrderBy(m => m.AvailableForProcessingAt)
+                .ThenBy(m => m.CreatedAt)
+                .ToList();
+
+            var newDelayed = new DelayedQueue();
+            var endSequence = Interlocked.Add(ref _delayedSequence, delayedItems.Count);
+            var sequence = endSequence - delayedItems.Count;
+            foreach (var item in delayedItems)
+            {
+                newDelayed.Enqueue(item.FileKey, 1, item.AvailableForProcessingAt!.Value, ++sequence);
+            }
+
+            if (delayedQueue != null)
+                _delayedQueues.TryUpdate(tenantId, newDelayed, delayedQueue);
+            else
+                _delayedQueues.TryAdd(tenantId, newDelayed);
         }
 
         /// <summary>
@@ -1522,14 +2254,14 @@ namespace Locus.Storage.Data
                 // 2. Wait for the background task to drain remaining queued items (up to 5 seconds).
                 // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach LiteDB.
                 // If LiteDB is unavailable or the queue is too large to drain in time, remaining items
-                // are discarded — physical files are safe on disk and recovered by cleanup service on restart.
+                // are discarded 鈥?physical files are safe on disk and recovered by cleanup service on restart.
                 try
                 {
                     _persistenceTask.Wait(TimeSpan.FromSeconds(5));
                 }
                 catch (AggregateException)
                 {
-                    // OperationCanceledException wrapped in AggregateException — expected on cancellation
+                    // OperationCanceledException wrapped in AggregateException 鈥?expected on cancellation
                 }
             }
 
@@ -1550,8 +2282,14 @@ namespace Locus.Storage.Data
             _databases.Clear();
             _activeFiles.Clear();
             _fileKeyTenantIndex.Clear();
+            _physicalPathIndex.Clear();
             _pendingKeys.Clear();
+            _pendingGenerations.Clear();
             _pendingFileCounts.Clear();
+            _processingByStartTime.Clear();
+            _processingByStartTimeLocks.Clear();
+            _permanentlyFailedByLastFailedAt.Clear();
+            _permanentlyFailedByLastFailedAtLocks.Clear();
             _delayedQueues.Clear();
             _delayedQueueLocks.Clear();
             _coalescedPersistenceOps.Clear();
@@ -1571,10 +2309,11 @@ namespace Locus.Storage.Data
             _tenantLocks.Clear();
 
             // 5. Dispose write-behind resources
-            _persistenceSignal.Dispose();
             _persistenceCts.Dispose();
 
             _logger.LogInformation("MetadataRepository disposed");
         }
     }
 }
+
+

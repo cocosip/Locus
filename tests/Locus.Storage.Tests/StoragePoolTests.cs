@@ -540,5 +540,17 @@ namespace Locus.Storage.Tests
             var metadataAfterCompletion = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.Null(metadataAfterCompletion);
         }
+
+        [Fact]
+        public void Constructor_WithNonPositiveCompletionGuardStripeCount_Throws()
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() => new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                completionGuardStripeCount: 0));
+        }
     }
 }

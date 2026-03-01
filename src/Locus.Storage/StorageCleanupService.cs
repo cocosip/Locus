@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
@@ -31,10 +32,13 @@ namespace Locus.Storage
         private readonly int _databaseOptimizationTenantBatchSize;
         private readonly TimeSpan _databaseOptimizationPauseBetweenBatches;
         private readonly int _maxOrphanFilesPerRun;
+        private readonly int _orphanRebuildLookupCacheSize;
         private readonly StringComparer _pathComparer;
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _orphanScanLocks;
         private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
+        private long _statusCleanupIterationCount;
+        private long _statusCleanupIterationStopwatchTicks;
         
         /// <summary>
         /// System files that should be ignored when checking if a directory is empty.
@@ -90,6 +94,9 @@ namespace Locus.Storage
             _maxOrphanFilesPerRun = options.MaxOrphanFilesPerRun > 0
                 ? options.MaxOrphanFilesPerRun
                 : int.MaxValue;
+            _orphanRebuildLookupCacheSize = options.OrphanRebuildLookupCacheSize > 0
+                ? options.OrphanRebuildLookupCacheSize
+                : 0;
             _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
@@ -205,16 +212,6 @@ namespace Locus.Storage
 
             var rebuiltCount = 0;
 
-            // Build a HashSet of known physical paths for this tenant once (normalized).
-            var allMetadata = await _metadataRepository.GetByTenantAsync(tenant.TenantId, ct);
-            var knownPaths = new HashSet<string>(_pathComparer);
-            foreach (var metadata in allMetadata)
-            {
-                var normalized = NormalizePath(metadata.PhysicalPath);
-                if (normalized != null && normalized.Length > 0)
-                    knownPaths.Add(normalized);
-            }
-
             foreach (var volume in _volumes.Values)
             {
                 var tenantPath = Path.Combine(volume.MountPath, tenant.TenantId);
@@ -222,17 +219,15 @@ namespace Locus.Storage
                     continue;
 
                 var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
-                var lastRunUtc = _orphanScanLastRunUtc.TryGetValue(scanKey, out var lastRun)
-                    ? lastRun
-                    : DateTime.MinValue;
-                var hotDirectories = GetHotDirectories(allMetadata, volume.VolumeId, lastRunUtc);
                 var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
+                var existenceCache = _orphanRebuildLookupCacheSize > 0
+                    ? new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer)
+                    : null;
 
                 await scanLock.WaitAsync(ct);
                 try
                 {
                     var scanQueue = GetOrphanScanQueue(scanKey, tenantPath);
-                    scanQueue = PrependDirectories(scanKey, scanQueue, hotDirectories);
                     var scannedThisRun = 0;
                     var budgetReached = false;
 
@@ -251,7 +246,30 @@ namespace Locus.Storage
                                 scannedThisRun++;
 
                                 var normalizedPhysical = NormalizePath(physicalPath);
-                                if (normalizedPhysical != null && knownPaths.Contains(normalizedPhysical))
+                                var metadataExists = false;
+                                if (normalizedPhysical != null)
+                                {
+                                    if (existenceCache != null
+                                        && existenceCache.TryGetValue(normalizedPhysical, out var cachedExists))
+                                    {
+                                        metadataExists = cachedExists;
+                                    }
+                                    else
+                                    {
+                                        metadataExists = await _metadataRepository.ExistsByNormalizedPhysicalPathAsync(
+                                            tenant.TenantId,
+                                            normalizedPhysical,
+                                            ct);
+
+                                        if (existenceCache != null
+                                            && existenceCache.Count < _orphanRebuildLookupCacheSize)
+                                        {
+                                            existenceCache[normalizedPhysical] = metadataExists;
+                                        }
+                                    }
+                                }
+
+                                if (metadataExists)
                                 {
                                     if (scannedThisRun >= _maxOrphanFilesPerRun)
                                     {
@@ -283,6 +301,14 @@ namespace Locus.Storage
                                     // AddOrUpdateDirectAsync writes immediately to LiteDB (not write-behind)
                                     // so the record survives even if the process crashes right after this call.
                                     await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+                                    if (normalizedPhysical != null && existenceCache != null)
+                                    {
+                                        if (existenceCache.Count < _orphanRebuildLookupCacheSize
+                                            || existenceCache.ContainsKey(normalizedPhysical))
+                                        {
+                                            existenceCache[normalizedPhysical] = true;
+                                        }
+                                    }
 
                                     rebuiltCount++;
                                     _logger.LogInformation(
@@ -353,46 +379,6 @@ namespace Locus.Storage
             if (queue.IsEmpty)
                 queue.Enqueue(tenantPath);
             return queue;
-        }
-
-        private ConcurrentQueue<string> PrependDirectories(
-            string scanKey,
-            ConcurrentQueue<string> scanQueue,
-            IReadOnlyCollection<string> hotDirectories)
-        {
-            if (hotDirectories.Count == 0)
-                return scanQueue;
-
-            var newQueue = new ConcurrentQueue<string>(hotDirectories);
-            while (scanQueue.TryDequeue(out var existing))
-                newQueue.Enqueue(existing);
-
-            _orphanScanQueues[scanKey] = newQueue;
-            return newQueue;
-        }
-
-        private IReadOnlyCollection<string> GetHotDirectories(
-            IEnumerable<FileMetadata> allMetadata,
-            string volumeId,
-            DateTime sinceUtc)
-        {
-            var hotDirectories = new HashSet<string>(_pathComparer);
-
-            foreach (var metadata in allMetadata)
-            {
-                if (!string.Equals(metadata.VolumeId, volumeId, StringComparison.Ordinal))
-                    continue;
-
-                if (metadata.CreatedAt < sinceUtc)
-                    continue;
-
-                var directoryPath = _fileSystem.Path.GetDirectoryName(metadata.PhysicalPath);
-                var normalized = NormalizePath(directoryPath);
-                if (normalized != null && normalized.Length > 0)
-                    hotDirectories.Add(normalized);
-            }
-
-            return hotDirectories;
         }
 
         private string? NormalizePath(string? path)
@@ -544,13 +530,17 @@ namespace Locus.Storage
 
             while (true)
             {
+                var iterationStartedAt = Stopwatch.GetTimestamp();
                 var batch = await _metadataRepository.GetProcessingTimedOutAsync(
                     tenantId,
                     timeoutCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
                     ct);
                 if (batch.Count == 0)
+                {
+                    RecordStatusCleanupIteration("timeout_reset", tenantId, 0, iterationStartedAt);
                     break;
+                }
 
                 foreach (var metadata in batch)
                 {
@@ -563,6 +553,8 @@ namespace Locus.Storage
 
                     _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
                 }
+
+                RecordStatusCleanupIteration("timeout_reset", tenantId, batch.Count, iterationStartedAt);
 
                 if (batch.Count < _statusCleanupBatchSizePerTenant)
                     break;
@@ -581,13 +573,17 @@ namespace Locus.Storage
 
             while (true)
             {
+                var iterationStartedAt = Stopwatch.GetTimestamp();
                 var batch = await _metadataRepository.GetPermanentlyFailedOlderThanAsync(
                     tenantId,
                     failedCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
                     ct);
                 if (batch.Count == 0)
+                {
+                    RecordStatusCleanupIteration("failed_cleanup", tenantId, 0, iterationStartedAt);
                     break;
+                }
 
                 foreach (var metadata in batch)
                 {
@@ -612,11 +608,42 @@ namespace Locus.Storage
                     removedCount++;
                 }
 
+                RecordStatusCleanupIteration("failed_cleanup", tenantId, batch.Count, iterationStartedAt);
+
                 if (batch.Count < _statusCleanupBatchSizePerTenant)
                     break;
             }
 
             return (removedCount, spaceFreed);
+        }
+
+        private void RecordStatusCleanupIteration(
+            string operation,
+            string tenantId,
+            int batchSize,
+            long iterationStartedAt)
+        {
+            var elapsedStopwatchTicks = Stopwatch.GetTimestamp() - iterationStartedAt;
+            var iteration = Interlocked.Increment(ref _statusCleanupIterationCount);
+            Interlocked.Add(ref _statusCleanupIterationStopwatchTicks, elapsedStopwatchTicks);
+
+            if (iteration % 128 != 1)
+                return;
+
+            var totalTicks = Interlocked.Read(ref _statusCleanupIterationStopwatchTicks);
+            var avgMs = iteration > 0
+                ? (totalTicks * 1000.0 / Stopwatch.Frequency) / iteration
+                : 0;
+            var elapsedMs = elapsedStopwatchTicks * 1000.0 / Stopwatch.Frequency;
+
+            _logger.LogInformation(
+                "Status cleanup iteration metrics: Operation={Operation}, Tenant={TenantId}, BatchSize={BatchSize}, IterationMs={IterationMs:F3}, AvgIterationMs={AvgIterationMs:F3}, TotalIterations={TotalIterations}",
+                operation,
+                tenantId,
+                batchSize,
+                elapsedMs,
+                avgMs,
+                iteration);
         }
 
         /// <inheritdoc/>

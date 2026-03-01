@@ -40,5 +40,11 @@ namespace Locus.Core.Models
         /// Default is 1 minute.
         /// </summary>
         public TimeSpan DisabledCheckInterval { get; set; } = TimeSpan.FromMinutes(1);
+
+        /// <summary>
+        /// Gets or sets the maximum number of watcher scans executed in parallel in each cycle.
+        /// Default is 4.
+        /// </summary>
+        public int MaxParallelWatcherScans { get; set; } = 4;
     }
 }

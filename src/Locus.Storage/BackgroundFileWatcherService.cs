@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
@@ -18,7 +20,7 @@ namespace Locus.Storage
         private readonly IFileWatcher _fileWatcher;
         private readonly IFileWatcherOptionsManager _optionsManager;
         private readonly ILogger<BackgroundFileWatcherService> _logger;
-        private readonly Dictionary<string, DateTime> _nextScanDueByWatcherId;
+        private readonly ConcurrentDictionary<string, DateTime> _nextScanDueByWatcherId;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BackgroundFileWatcherService"/> class.
@@ -31,7 +33,7 @@ namespace Locus.Storage
             _fileWatcher = fileWatcher ?? throw new ArgumentNullException(nameof(fileWatcher));
             _optionsManager = optionsManager ?? throw new ArgumentNullException(nameof(optionsManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _nextScanDueByWatcherId = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+            _nextScanDueByWatcherId = new ConcurrentDictionary<string, DateTime>(StringComparer.Ordinal);
         }
 
         /// <inheritdoc/>
@@ -96,58 +98,46 @@ namespace Locus.Storage
             _logger.LogInformation("Scanning {DueCount} due watchers (enabled total: {EnabledCount})",
                 dueWatchers.Count, enabledWatchers.Count);
 
-            foreach (var watcher in dueWatchers)
+            var maxParallel = Math.Max(1, options.MaxParallelWatcherScans);
+            if (maxParallel == 1 || dueWatchers.Count == 1)
             {
-                if (ct.IsCancellationRequested)
-                    break;
-
-                try
+                foreach (var watcher in dueWatchers)
                 {
-                    _logger.LogDebug("Scanning watcher {WatcherId} ({Mode} mode) at path {WatchPath}",
-                        watcher.WatcherId,
-                        watcher.MultiTenantMode ? "multi-tenant" : "single-tenant",
-                        watcher.WatchPath);
+                    if (ct.IsCancellationRequested)
+                        break;
+                    await ScanWatcherAsync(watcher, options, ct);
+                }
+            }
+            else
+            {
+                var queue = Channel.CreateBounded<FileWatcherConfiguration>(new BoundedChannelOptions(dueWatchers.Count)
+                {
+                    SingleReader = false,
+                    SingleWriter = true,
+                    FullMode = BoundedChannelFullMode.Wait,
+                    AllowSynchronousContinuations = false
+                });
 
-                    var result = await _fileWatcher.ScanNowAsync(watcher.WatcherId, ct);
+                foreach (var watcher in dueWatchers)
+                {
+                    if (!queue.Writer.TryWrite(watcher))
+                        await queue.Writer.WriteAsync(watcher, ct);
+                }
+                queue.Writer.Complete();
 
-                    if (result.FilesImported > 0 || result.FilesFailed > 0)
+                var workerCount = Math.Min(maxParallel, dueWatchers.Count);
+                var workers = Enumerable.Range(0, workerCount).Select(_ => Task.Run(async () =>
+                {
+                    while (!ct.IsCancellationRequested && await queue.Reader.WaitToReadAsync(ct))
                     {
-                        _logger.LogInformation(
-                            "Watcher {WatcherId} scan completed: {Discovered} discovered, {Imported} imported, {Skipped} skipped, {Failed} failed, {Bytes} bytes",
-                            watcher.WatcherId,
-                            result.FilesDiscovered,
-                            result.FilesImported,
-                            result.FilesSkipped,
-                            result.FilesFailed,
-                            result.BytesImported);
+                        if (!queue.Reader.TryRead(out var watcher))
+                            continue;
 
-                        if (result.Errors.Any())
-                        {
-                            foreach (var error in result.Errors.Take(5)) // Log first 5 errors
-                            {
-                                _logger.LogWarning("Watcher {WatcherId} error: {Error}", watcher.WatcherId, error);
-                            }
+                        await ScanWatcherAsync(watcher, options, ct);
+                    }
+                }, ct)).ToArray();
 
-                            if (result.Errors.Count > 5)
-                            {
-                                _logger.LogWarning("Watcher {WatcherId} had {Count} more errors", watcher.WatcherId, result.Errors.Count - 5);
-                            }
-                        }
-                    }
-                    else if (result.FilesDiscovered > 0)
-                    {
-                        _logger.LogDebug("Watcher {WatcherId} found {Count} files (all skipped)", watcher.WatcherId, result.FilesDiscovered);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error scanning watcher {WatcherId}", watcher.WatcherId);
-                }
-                finally
-                {
-                    var interval = NormalizePollingInterval(watcher, options);
-                    _nextScanDueByWatcherId[watcher.WatcherId] = DateTime.UtcNow.Add(interval);
-                }
+                await Task.WhenAll(workers);
             }
 
             return GetDelayUntilNextDue(enabledWatchers, options, DateTime.UtcNow);
@@ -159,7 +149,7 @@ namespace Locus.Storage
             var staleIds = _nextScanDueByWatcherId.Keys.Where(id => !enabledIds.Contains(id)).ToList();
 
             foreach (var watcherId in staleIds)
-                _nextScanDueByWatcherId.Remove(watcherId);
+                _nextScanDueByWatcherId.TryRemove(watcherId, out _);
         }
 
         private DateTime GetNextDueUtc(FileWatcherConfiguration watcher, FileWatcherOptions options, DateTime now)
@@ -167,12 +157,8 @@ namespace Locus.Storage
             var interval = NormalizePollingInterval(watcher, options);
             var maxAllowedDue = now.Add(interval);
 
-            if (!_nextScanDueByWatcherId.TryGetValue(watcher.WatcherId, out var dueUtc))
-            {
-                dueUtc = now;
-                _nextScanDueByWatcherId[watcher.WatcherId] = dueUtc;
-            }
-            else if (dueUtc > maxAllowedDue)
+            var dueUtc = _nextScanDueByWatcherId.GetOrAdd(watcher.WatcherId, now);
+            if (dueUtc > maxAllowedDue)
             {
                 dueUtc = maxAllowedDue;
                 _nextScanDueByWatcherId[watcher.WatcherId] = dueUtc;
@@ -218,6 +204,60 @@ namespace Locus.Storage
             }
 
             return interval;
+        }
+
+        private async Task ScanWatcherAsync(
+            FileWatcherConfiguration watcher,
+            FileWatcherOptions options,
+            CancellationToken ct)
+        {
+            try
+            {
+                _logger.LogDebug("Scanning watcher {WatcherId} ({Mode} mode) at path {WatchPath}",
+                    watcher.WatcherId,
+                    watcher.MultiTenantMode ? "multi-tenant" : "single-tenant",
+                    watcher.WatchPath);
+
+                var result = await _fileWatcher.ScanNowAsync(watcher.WatcherId, ct);
+
+                if (result.FilesImported > 0 || result.FilesFailed > 0)
+                {
+                    _logger.LogInformation(
+                        "Watcher {WatcherId} scan completed: {Discovered} discovered, {Imported} imported, {Skipped} skipped, {Failed} failed, {Bytes} bytes",
+                        watcher.WatcherId,
+                        result.FilesDiscovered,
+                        result.FilesImported,
+                        result.FilesSkipped,
+                        result.FilesFailed,
+                        result.BytesImported);
+
+                    if (result.Errors.Any())
+                    {
+                        foreach (var error in result.Errors.Take(5))
+                        {
+                            _logger.LogWarning("Watcher {WatcherId} error: {Error}", watcher.WatcherId, error);
+                        }
+
+                        if (result.Errors.Count > 5)
+                        {
+                            _logger.LogWarning("Watcher {WatcherId} had {Count} more errors", watcher.WatcherId, result.Errors.Count - 5);
+                        }
+                    }
+                }
+                else if (result.FilesDiscovered > 0)
+                {
+                    _logger.LogDebug("Watcher {WatcherId} found {Count} files (all skipped)", watcher.WatcherId, result.FilesDiscovered);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error scanning watcher {WatcherId}", watcher.WatcherId);
+            }
+            finally
+            {
+                var interval = NormalizePollingInterval(watcher, options);
+                _nextScanDueByWatcherId[watcher.WatcherId] = DateTime.UtcNow.Add(interval);
+            }
         }
     }
 }

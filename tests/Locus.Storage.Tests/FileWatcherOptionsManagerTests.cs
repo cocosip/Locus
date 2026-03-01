@@ -42,6 +42,7 @@ namespace Locus.Storage.Tests
             Assert.Equal(TimeSpan.FromSeconds(5), options.MinimumPollingInterval);
             Assert.Equal(TimeSpan.FromHours(1), options.MaximumPollingInterval);
             Assert.Equal(TimeSpan.FromMinutes(1), options.DisabledCheckInterval);
+            Assert.Equal(4, options.MaxParallelWatcherScans);
 
             // Verify config file was created
             var configPath = Path.Combine(_configRoot, "file-watcher-options.json");
@@ -58,7 +59,8 @@ namespace Locus.Storage.Tests
                 DefaultPollingInterval = TimeSpan.FromSeconds(10),
                 MinimumPollingInterval = TimeSpan.FromSeconds(5),
                 MaximumPollingInterval = TimeSpan.FromMinutes(10),
-                DisabledCheckInterval = TimeSpan.FromMinutes(2)
+                DisabledCheckInterval = TimeSpan.FromMinutes(2),
+                MaxParallelWatcherScans = 3
             };
 
             // Act
@@ -69,6 +71,7 @@ namespace Locus.Storage.Tests
             Assert.False(loadedOptions.Enabled);
             Assert.Equal(TimeSpan.FromSeconds(10), loadedOptions.DefaultPollingInterval);
             Assert.Equal(TimeSpan.FromMinutes(2), loadedOptions.DisabledCheckInterval);
+            Assert.Equal(3, loadedOptions.MaxParallelWatcherScans);
         }
 
         [Fact]
@@ -97,6 +100,21 @@ namespace Locus.Storage.Tests
             };
 
             // Act & Assert
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _optionsManager.UpdateOptionsAsync(invalidOptions, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task UpdateOptionsAsync_ThrowsWhenMaxParallelWatcherScansIsInvalid()
+        {
+            var invalidOptions = new FileWatcherOptions
+            {
+                DefaultPollingInterval = TimeSpan.FromSeconds(10),
+                MinimumPollingInterval = TimeSpan.FromSeconds(5),
+                MaximumPollingInterval = TimeSpan.FromMinutes(1),
+                MaxParallelWatcherScans = 0
+            };
+
             await Assert.ThrowsAsync<ArgumentException>(() =>
                 _optionsManager.UpdateOptionsAsync(invalidOptions, CancellationToken.None));
         }
@@ -217,7 +235,8 @@ namespace Locus.Storage.Tests
                 ""defaultPollingInterval"": ""00:00:20"",
                 ""minimumPollingInterval"": ""00:00:03"",
                 ""maximumPollingInterval"": ""00:30:00"",
-                ""disabledCheckInterval"": ""00:05:00""
+                ""disabledCheckInterval"": ""00:05:00"",
+                ""maxParallelWatcherScans"": 6
             }");
 
             // Act
@@ -230,6 +249,7 @@ namespace Locus.Storage.Tests
             Assert.Equal(TimeSpan.FromSeconds(3), options.MinimumPollingInterval);
             Assert.Equal(TimeSpan.FromMinutes(30), options.MaximumPollingInterval);
             Assert.Equal(TimeSpan.FromMinutes(5), options.DisabledCheckInterval);
+            Assert.Equal(6, options.MaxParallelWatcherScans);
         }
     }
 }

@@ -113,10 +113,22 @@ namespace Locus
         public LiteDBOptions LiteDB { get; set; } = new LiteDBOptions();
 
         /// <summary>
-        /// Gets or sets the max number of metadata persistence operations drained per background batch.
-        /// Default: 2000.
+        /// Gets or sets MetadataRepository tuning options.
+        /// Supports appsettings binding under "Locus:MetadataRepository".
         /// </summary>
-        public int PersistenceDrainBatchSize { get; set; } = 2000;
+        public MetadataRepositoryOptions MetadataRepository { get; set; } = new MetadataRepositoryOptions();
+
+        /// <summary>
+        /// Gets or sets StoragePool tuning options.
+        /// Supports appsettings binding under "Locus:StoragePool".
+        /// </summary>
+        public StoragePoolOptions StoragePool { get; set; } = new StoragePoolOptions();
+
+        /// <summary>
+        /// Backward-compatible alias for MetadataRepository.DrainBatchSize.
+        /// Prefer using MetadataRepository.DrainBatchSize.
+        /// </summary>
+        public int PersistenceDrainBatchSize { get; set; } = MetadataRepositoryOptions.DefaultDrainBatchSize;
     }
 
     /// <summary>

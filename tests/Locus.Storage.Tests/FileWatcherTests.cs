@@ -749,6 +749,126 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task UpdateWatcherAsync_InvalidatesPatternMatcherCache()
+        {
+            // Arrange
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-cache";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var txtPath = Path.Combine(watchPath, "file-a.txt");
+            var csvPath = Path.Combine(watchPath, "file-b.csv");
+            _fileSystem.File.WriteAllText(txtPath, "txt");
+            _fileSystem.File.WriteAllText(csvPath, "csv");
+            _fileSystem.File.SetLastWriteTimeUtc(txtPath, DateTime.UtcNow.AddMinutes(-5));
+            _fileSystem.File.SetLastWriteTimeUtc(csvPath, DateTime.UtcNow.AddMinutes(-5));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var configuration = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep,
+                FilePatterns = new List<string> { "*.txt" }
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(configuration, CancellationToken.None);
+
+            // Prime matcher cache with txt-only scan.
+            var firstResult = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+            Assert.Equal(1, firstResult.FilesImported);
+
+            // Act: switch to csv pattern and scan again.
+            configuration.FilePatterns = new List<string> { "*.csv" };
+            await _fileWatcher.UpdateWatcherAsync(configuration, CancellationToken.None);
+            var secondResult = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+
+            // Assert
+            Assert.Equal(1, secondResult.FilesImported);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_KeepMode_ReplaysJournalAfterRestart()
+        {
+            // Arrange
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-journal";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var filePath = Path.Combine(watchPath, "keep.txt");
+            _fileSystem.File.WriteAllText(filePath, "payload");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-2));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var configuration = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(configuration, CancellationToken.None);
+            var firstScan = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+            Assert.Equal(1, firstScan.FilesImported);
+
+            var journalPath = Path.Combine(_configRoot, "imported-files.journal.jsonl");
+            Assert.True(_fileSystem.File.Exists(journalPath));
+            Assert.Contains("\"operation\":1", _fileSystem.File.ReadAllText(journalPath));
+
+            var restartedWatcher = new FileWatcher(
+                _fileSystem,
+                _storagePool.Object,
+                _tenantManager.Object,
+                _logger.Object,
+                _configRoot);
+
+            // Act
+            var secondScan = await restartedWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+
+            // Assert
+            Assert.Equal(0, secondScan.FilesImported);
+            Assert.True(secondScan.FilesSkipped >= 1);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task RemoveWatcherAsync_DeletesConfiguration()
         {
             // Arrange

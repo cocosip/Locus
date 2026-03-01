@@ -23,7 +23,8 @@ namespace Locus.Storage.Tests
                 DefaultPollingInterval = TimeSpan.FromMilliseconds(100),
                 MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
                 MaximumPollingInterval = TimeSpan.FromSeconds(5),
-                DisabledCheckInterval = TimeSpan.FromMilliseconds(100)
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 4
             };
 
             var fastWatcher = new FileWatcherConfiguration
@@ -74,7 +75,8 @@ namespace Locus.Storage.Tests
                 DefaultPollingInterval = TimeSpan.FromMilliseconds(100),
                 MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
                 MaximumPollingInterval = TimeSpan.FromSeconds(5),
-                DisabledCheckInterval = TimeSpan.FromMilliseconds(100)
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 4
             };
 
             var fastWatcher = new FileWatcherConfiguration
@@ -116,6 +118,85 @@ namespace Locus.Storage.Tests
             Assert.InRange(slowCount, 2, 4);
         }
 
+        [Fact]
+        public async Task ExecuteAsync_RespectsMaxParallelWatcherScans()
+        {
+            var options = new FileWatcherOptions
+            {
+                Enabled = true,
+                DefaultPollingInterval = TimeSpan.FromMilliseconds(100),
+                MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
+                MaximumPollingInterval = TimeSpan.FromSeconds(5),
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 2
+            };
+
+            var watchers = new[]
+            {
+                new FileWatcherConfiguration { WatcherId = "w1", Enabled = true, PollingInterval = TimeSpan.FromSeconds(5), WatchPath = "/watch/w1" },
+                new FileWatcherConfiguration { WatcherId = "w2", Enabled = true, PollingInterval = TimeSpan.FromSeconds(5), WatchPath = "/watch/w2" },
+                new FileWatcherConfiguration { WatcherId = "w3", Enabled = true, PollingInterval = TimeSpan.FromSeconds(5), WatchPath = "/watch/w3" },
+                new FileWatcherConfiguration { WatcherId = "w4", Enabled = true, PollingInterval = TimeSpan.FromSeconds(5), WatchPath = "/watch/w4" }
+            };
+
+            var fileWatcher = new Mock<IFileWatcher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            var scanCounts = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+            var inFlight = 0;
+            var maxInFlight = 0;
+
+            optionsManager
+                .Setup(m => m.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(options);
+            optionsManager
+                .Setup(m => m.IsServiceEnabledAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            fileWatcher
+                .Setup(m => m.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(watchers);
+
+            fileWatcher
+                .Setup(m => m.ScanNowAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns<string, CancellationToken>(async (watcherId, token) =>
+                {
+                    scanCounts.AddOrUpdate(watcherId, 1, (_, current) => current + 1);
+
+                    var currentInFlight = Interlocked.Increment(ref inFlight);
+                    UpdateMax(ref maxInFlight, currentInFlight);
+
+                    try
+                    {
+                        await Task.Delay(120, token);
+                        return new FileWatcherScanResult();
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref inFlight);
+                    }
+                });
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                NullLogger<BackgroundFileWatcherService>.Instance);
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(
+                    () => watchers.All(w => GetCount(scanCounts, w.WatcherId) >= 1),
+                    TimeSpan.FromSeconds(3),
+                    "Timed out waiting for all watchers to be scanned at least once.");
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            Assert.InRange(maxInFlight, 2, 2);
+        }
+
         private static BackgroundFileWatcherService CreateService(
             FileWatcherOptions options,
             IReadOnlyCollection<FileWatcherConfiguration> watchers,
@@ -155,6 +236,19 @@ namespace Locus.Storage.Tests
         private static int GetCount(ConcurrentDictionary<string, int> counts, string watcherId)
         {
             return counts.TryGetValue(watcherId, out var value) ? value : 0;
+        }
+
+        private static void UpdateMax(ref int target, int candidate)
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref target);
+                if (candidate <= current)
+                    return;
+
+                if (Interlocked.CompareExchange(ref target, candidate, current) == current)
+                    return;
+            }
         }
 
         private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout, string timeoutMessage)

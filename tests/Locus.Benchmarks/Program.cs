@@ -1,13 +1,16 @@
-﻿using BenchmarkDotNet.Running;
+using BenchmarkDotNet.Running;
 
 namespace Locus.Benchmarks
 {
     public class Program
     {
-        public static void Main(string[] args)
+        public static int Main(string[] args)
         {
-            // Run all benchmarks
+            if (OrphanRebuildPeakMemoryCommand.ShouldRun(args))
+                return OrphanRebuildPeakMemoryCommand.RunAsync(args).GetAwaiter().GetResult();
+
             BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
+            return 0;
         }
     }
 }

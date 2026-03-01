@@ -305,6 +305,72 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupFilesByStatusAsync_ResetsTimedOutAndRemovesOldFailed()
+        {
+            var processing1 = new FileMetadata
+            {
+                FileKey = "combo-processing-1",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumePath, "combo-processing-1.dat"),
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = DateTime.UtcNow.AddMinutes(-90),
+                CreatedAt = DateTime.UtcNow.AddMinutes(-90)
+            };
+            var processing2 = new FileMetadata
+            {
+                FileKey = "combo-processing-2",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumePath, "combo-processing-2.dat"),
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = DateTime.UtcNow.AddMinutes(-60),
+                CreatedAt = DateTime.UtcNow.AddMinutes(-60)
+            };
+            var failedPath = Path.Combine(_volumePath, "combo-failed.dat");
+            _fileSystem.File.WriteAllText(failedPath, "failed content");
+            var failed = new FileMetadata
+            {
+                FileKey = "combo-failed",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = failedPath,
+                DirectoryPath = "/failed",
+                FileSize = 14,
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-10),
+                CreatedAt = DateTime.UtcNow.AddDays(-10)
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(processing1, default);
+            await _metadataRepository.AddOrUpdateAsync(processing2, default);
+            await _metadataRepository.AddOrUpdateAsync(failed, default);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
+
+            await _cleanupService.CleanupFilesByStatusAsync(
+                processingTimeout: TimeSpan.FromMinutes(30),
+                failedRetentionPeriod: TimeSpan.FromDays(7),
+                ct: default);
+
+            var updated1 = await _metadataRepository.GetAsync("tenant-001", "combo-processing-1", default);
+            var updated2 = await _metadataRepository.GetAsync("tenant-001", "combo-processing-2", default);
+            var removedFailed = await _metadataRepository.GetAsync("tenant-001", "combo-failed", default);
+
+            Assert.NotNull(updated1);
+            Assert.Equal(FileProcessingStatus.Pending, updated1!.Status);
+            Assert.NotNull(updated2);
+            Assert.Equal(FileProcessingStatus.Pending, updated2!.Status);
+            Assert.Null(removedFailed);
+
+            var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
+            Assert.Equal(2, stats.TimedOutFilesReset);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
+        }
+
+        [Fact]
         public async Task CleanupOrphanedFilesAsync_RebuildsMetadataForOrphanedFiles()
         {
             // Arrange
@@ -375,7 +441,7 @@ namespace Locus.Storage.Tests
             var mismatchedCasePath = Path.Combine(tenantPath, "casefile.dat");
             var metadata = new FileMetadata
             {
-                FileKey = "meta-case",
+                FileKey = "CaseFile",
                 TenantId = "tenant-001",
                 VolumeId = "vol-001",
                 PhysicalPath = mismatchedCasePath,
@@ -389,15 +455,70 @@ namespace Locus.Storage.Tests
             await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);
 
             // Assert
-            var rebuilt = await _metadataRepository.GetAsync("tenant-001", "CaseFile", default);
+            var after = await _metadataRepository.GetAsync("tenant-001", "CaseFile", default);
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                Assert.Null(rebuilt);
+                Assert.NotNull(after);
+                Assert.Equal(mismatchedCasePath, after!.PhysicalPath);
             }
             else
             {
+                Assert.NotNull(after);
+                Assert.Equal(actualFile, after!.PhysicalPath);
+            }
+        }
+
+        [Fact]
+        public async Task CleanupOrphanedFilesAsync_WithSmallLookupCache_RebuildsAllOrphans()
+        {
+            var cleanupWithSmallCache = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new CleanupOptions
+                {
+                    MaxOrphanFilesPerRun = 10_000,
+                    OrphanRebuildLookupCacheSize = 1
+                });
+            cleanupWithSmallCache.RegisterVolume(_volume.Object);
+
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+
+            for (var i = 0; i < 40; i++)
+            {
+                var fileName = $"batch-{i:D3}.dat";
+                var physicalPath = Path.Combine(tenantPath, fileName);
+                _fileSystem.File.WriteAllText(physicalPath, "content");
+
+                if (i % 2 == 0)
+                {
+                    await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+                    {
+                        FileKey = $"batch-{i:D3}",
+                        TenantId = "tenant-001",
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalPath,
+                        DirectoryPath = tenantPath,
+                        Status = FileProcessingStatus.Pending,
+                        CreatedAt = DateTime.UtcNow
+                    }, CancellationToken.None);
+                }
+            }
+
+            await cleanupWithSmallCache.CleanupOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            for (var i = 0; i < 40; i++)
+            {
+                var rebuilt = await _metadataRepository.GetAsync("tenant-001", $"batch-{i:D3}", CancellationToken.None);
                 Assert.NotNull(rebuilt);
             }
+
+            var stats = await cleanupWithSmallCache.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(20, stats.OrphanedFilesRemoved);
         }
 
         [Fact]

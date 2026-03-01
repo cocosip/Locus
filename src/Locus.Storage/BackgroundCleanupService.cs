@@ -199,6 +199,14 @@ namespace Locus.Storage
         public int MaxOrphanFilesPerRun { get; set; } = 5000;
 
         /// <summary>
+        /// Gets or sets the maximum number of physical-path lookup results cached in memory
+        /// during a single orphan-rebuild run (per tenant per volume).
+        /// Set to 0 to disable the cache.
+        /// Default: 8192.
+        /// </summary>
+        public int OrphanRebuildLookupCacheSize { get; set; } = 8192;
+
+        /// <summary>
         /// Gets or sets the number of tenant databases to optimize before pausing briefly.
         /// Default: 10.
         /// </summary>

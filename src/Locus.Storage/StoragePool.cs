@@ -37,7 +37,11 @@ namespace Locus.Storage
 
         // Serialize completion for the same file key to keep quota decrement idempotent.
         private readonly SemaphoreSlim[] _completionGuards;
-        private const int CompletionGuardStripeCount = 64;
+
+        /// <summary>
+        /// Default number of completion-guard stripes used to reduce lock collisions.
+        /// </summary>
+        public const int DefaultCompletionGuardStripeCount = 256;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="StoragePool"/> class.
@@ -48,14 +52,37 @@ namespace Locus.Storage
             ITenantManager tenantManager,
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger)
+            : this(
+                metadataRepository,
+                tenantQuotaManager,
+                tenantManager,
+                fileScheduler,
+                logger,
+                DefaultCompletionGuardStripeCount)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="StoragePool"/> class.
+        /// </summary>
+        public StoragePool(
+            MetadataRepository metadataRepository,
+            ITenantQuotaManager tenantQuotaManager,
+            ITenantManager tenantManager,
+            IFileScheduler fileScheduler,
+            ILogger<StoragePool> logger,
+            int completionGuardStripeCount)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            if (completionGuardStripeCount <= 0)
+                throw new ArgumentOutOfRangeException(nameof(completionGuardStripeCount), "Completion guard stripe count must be greater than zero.");
+
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
-            _completionGuards = Enumerable.Range(0, CompletionGuardStripeCount)
+            _completionGuards = Enumerable.Range(0, completionGuardStripeCount)
                 .Select(_ => new SemaphoreSlim(1, 1))
                 .ToArray();
         }

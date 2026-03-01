@@ -94,6 +94,12 @@ namespace Locus.Storage
                     $"DefaultPollingInterval ({options.DefaultPollingInterval}) cannot be greater than MaximumPollingInterval ({options.MaximumPollingInterval})");
             }
 
+            if (options.MaxParallelWatcherScans <= 0)
+            {
+                throw new ArgumentException(
+                    $"MaxParallelWatcherScans ({options.MaxParallelWatcherScans}) must be greater than zero.");
+            }
+
             await _lock.WaitAsync(ct);
             try
             {

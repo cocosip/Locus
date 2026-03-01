@@ -253,3 +253,49 @@ dotnet run -c Release --exporters markdown --artifacts ./benchmark-results
 
 - [BenchmarkDotNet 文档](https://benchmarkdotnet.org/)
 - [LiteDB 性能文档](https://www.litedb.org/docs/performance/)
+
+## P0-2 Peak Memory Validation (100k+ files)
+
+To validate the **peak managed memory** target for orphan-rebuild (not only BDN `Allocated`), run:
+
+```powershell
+pwsh ./tests/Locus.Benchmarks/measure-orphan-peak-memory.ps1 `
+  -Mode both `
+  -FileCount 120000 `
+  -MetadataRatio 0.90 `
+  -AttachDelaySec 15 `
+  -PostRunDelaySec 5
+```
+
+Or run directly:
+
+```powershell
+dotnet run -c Release --project tests/Locus.Benchmarks -- `
+  --scenario orphan-rebuild-peak `
+  --mode both `
+  --file-count 120000 `
+  --metadata-ratio 0.90 `
+  --attach-delay-sec 15 `
+  --post-run-delay-sec 5
+```
+
+During attach delay, use `dotnet-counters` (if installed) for external EventPipe verification:
+
+```powershell
+dotnet-counters monitor -p <pid> --counters System.Runtime[gc-heap-size]
+```
+
+The scenario prints:
+- `baseline`: legacy full-HashSet style path check
+- `current`: current on-demand orphan rebuild path
+- peak values and `Delta(current-vs-baseline)`
+
+If `dotnet-counters` is unavailable, the command falls back to an in-process heap sampler and still reports a peak-bytes estimate for comparison.
+
+## Phase D Cold-Start Benchmark
+
+Run cold-start active-index loading benchmark:
+
+```powershell
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.MetadataRepositoryColdStartBenchmarks*"
+```

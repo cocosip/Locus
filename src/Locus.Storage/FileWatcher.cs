@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
@@ -27,11 +28,19 @@ namespace Locus.Storage
 
         // Track imported files to avoid duplicates: filepath -> fileKey
         private readonly ConcurrentDictionary<string, string> _importedFiles;
+        private readonly Channel<ImportedHistoryOperation> _pendingImportedHistoryChannel;
+        private readonly ChannelWriter<ImportedHistoryOperation> _pendingImportedHistoryWriter;
+        private readonly ChannelReader<ImportedHistoryOperation> _pendingImportedHistoryReader;
+        private readonly ConcurrentDictionary<string, ImportedHistoryOperation> _coalescedImportedHistoryOperations;
         private readonly SemaphoreSlim _historySaveLock;
         private int _importedHistoryDirty;
+        private int _pendingImportedHistoryDepth;
+        private int _coalescedImportedHistoryDepth;
+        private int _historyJournalOperationCount;
         private long _lastImportedHistoryFlushUtcTicks;
         private long _lastImportedFilesPruneUtcTicks;
         private int _pruneInProgress;
+        private readonly ConcurrentDictionary<string, PatternMatcherCacheEntry> _patternMatcherCache;
         private readonly SemaphoreSlim _watcherCacheLock;
         private volatile IReadOnlyList<FileWatcherConfiguration>? _cachedWatchers;
         private long _watchersCacheExpiresAtTicks;
@@ -39,6 +48,12 @@ namespace Locus.Storage
         // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
         private const int MaxImportedFilesCacheSize = 10_000;
         private const string InFlightImportMarker = "__LOCUS_IN_FLIGHT__";
+        private const string ImportedFilesCheckpointFileName = "imported-files.json";
+        private const string ImportedFilesJournalFileName = "imported-files.journal.jsonl";
+        private const string ImportedFilesCheckpointTempFileName = "imported-files.tmp.json";
+        private const int ImportedHistoryCompactThresholdOperationCount = 4_000;
+        private const long ImportedHistoryCompactThresholdBytes = 4L * 1024 * 1024;
+        private const int MaxImportedHistoryChannelSize = 20_000;
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
         private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan DefaultImportedHistoryFlushInterval = TimeSpan.FromSeconds(2);
@@ -49,6 +64,11 @@ namespace Locus.Storage
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        private static readonly JsonSerializerOptions HistoryJournalJsonOptions = new JsonSerializerOptions
+        {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         };
 
@@ -69,7 +89,18 @@ namespace Locus.Storage
             _configurationRoot = configurationRoot ?? Path.Combine(".locus", "watchers");
 
             _importedFiles = new ConcurrentDictionary<string, string>();
+            _pendingImportedHistoryChannel = Channel.CreateBounded<ImportedHistoryOperation>(new BoundedChannelOptions(MaxImportedHistoryChannelSize)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+                AllowSynchronousContinuations = false
+            });
+            _pendingImportedHistoryWriter = _pendingImportedHistoryChannel.Writer;
+            _pendingImportedHistoryReader = _pendingImportedHistoryChannel.Reader;
+            _coalescedImportedHistoryOperations = new ConcurrentDictionary<string, ImportedHistoryOperation>(StringComparer.Ordinal);
             _watcherLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _patternMatcherCache = new ConcurrentDictionary<string, PatternMatcherCacheEntry>(StringComparer.Ordinal);
             _historySaveLock = new SemaphoreSlim(1, 1);
             _watcherCacheLock = new SemaphoreSlim(1, 1);
 
@@ -91,31 +122,31 @@ namespace Locus.Storage
         {
             try
             {
-                var historyPath = _fileSystem.Path.Combine(_configurationRoot, "imported-files.json");
-                if (_fileSystem.File.Exists(historyPath))
+                var checkpoint = LoadImportedHistoryCheckpoint();
+                var journalResult = ReplayImportedHistoryJournal(checkpoint);
+                var loaded = 0;
+
+                foreach (var kvp in checkpoint)
                 {
-                    var json = _fileSystem.File.ReadAllText(historyPath);
-                    var history = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
-
-                    if (history != null)
+                    // Skip entries whose source file no longer exists.
+                    // This discards stale Delete/Move records that survived a crash
+                    // (the file was deleted/moved but the history save happened before the journal delete op flushed).
+                    if (_fileSystem.File.Exists(kvp.Key))
                     {
-                        int loaded = 0;
-                        foreach (var kvp in history)
-                        {
-                            // Skip entries whose source file no longer exists.
-                            // This discards stale Delete/Move records that survived a crash
-                            // (the file was deleted/moved but the history save happened before TryRemove).
-                            if (_fileSystem.File.Exists(kvp.Key))
-                            {
-                                _importedFiles.TryAdd(kvp.Key, kvp.Value);
-                                loaded++;
-                            }
-                        }
-
-                        _logger.LogInformation(
-                            "Loaded {Loaded}/{Total} imported file records from history ({Skipped} stale entries discarded)",
-                            loaded, history.Count, history.Count - loaded);
+                        _importedFiles.TryAdd(kvp.Key, kvp.Value);
+                        loaded++;
                     }
+                }
+
+                if (checkpoint.Count > 0 || journalResult.AppliedOperations > 0 || journalResult.InvalidLines > 0)
+                {
+                    _logger.LogInformation(
+                        "Loaded {Loaded}/{Total} imported file records from history checkpoint + journal ({Skipped} stale, JournalOps={JournalOps}, InvalidJournalLines={InvalidLines})",
+                        loaded,
+                        checkpoint.Count,
+                        checkpoint.Count - loaded,
+                        journalResult.AppliedOperations,
+                        journalResult.InvalidLines);
                 }
             }
             catch (Exception ex)
@@ -135,14 +166,13 @@ namespace Locus.Storage
             {
                 if (!_fileSystem.File.Exists(key))
                 {
-                    _importedFiles.TryRemove(key, out _);
-                    pruned++;
+                    if (TryRemoveImportedFileRecord(key))
+                        pruned++;
                 }
             }
 
             if (pruned > 0)
             {
-                MarkImportedFilesHistoryDirty();
                 _logger.LogInformation(
                     "Pruned {Count} stale imported file entries (source files no longer exist at watch path)",
                     pruned);
@@ -154,37 +184,81 @@ namespace Locus.Storage
             Interlocked.Exchange(ref _importedHistoryDirty, 1);
         }
 
+        private void EnqueueImportedHistoryOperation(ImportedHistoryOperation operation)
+        {
+            if (!TryWriteImportedHistoryOperation(operation))
+            {
+                var added = _coalescedImportedHistoryOperations.TryAdd(operation.Path, operation);
+                if (!added)
+                    _coalescedImportedHistoryOperations[operation.Path] = operation;
+
+                if (added)
+                    Interlocked.Increment(ref _coalescedImportedHistoryDepth);
+            }
+
+            MarkImportedFilesHistoryDirty();
+        }
+
+        private bool TryWriteImportedHistoryOperation(ImportedHistoryOperation operation)
+        {
+            Interlocked.Increment(ref _pendingImportedHistoryDepth);
+            if (_pendingImportedHistoryWriter.TryWrite(operation))
+                return true;
+
+            Interlocked.Decrement(ref _pendingImportedHistoryDepth);
+            return false;
+        }
+
         /// <summary>
         /// Saves the imported files history to persistent storage.
         /// </summary>
-        private async Task SaveImportedFilesHistoryAsync(CancellationToken ct)
+        private async Task SaveImportedFilesHistoryAsync(bool force, CancellationToken ct)
         {
             var lockTaken = false;
+            List<ImportedHistoryOperation>? pendingOperations = null;
             try
             {
                 await _historySaveLock.WaitAsync(ct).ConfigureAwait(false);
                 lockTaken = true;
 
-                if (Volatile.Read(ref _importedHistoryDirty) == 0)
+                if (Volatile.Read(ref _importedHistoryDirty) == 0
+                    && Volatile.Read(ref _pendingImportedHistoryDepth) == 0
+                    && Volatile.Read(ref _coalescedImportedHistoryDepth) == 0)
                     return;
 
                 // Claim the current dirty set before snapshotting so concurrent updates can
                 // re-mark dirty and trigger a follow-up flush with newer state.
                 Interlocked.Exchange(ref _importedHistoryDirty, 0);
 
-                var historyPath = _fileSystem.Path.Combine(_configurationRoot, "imported-files.json");
-                var history = _importedFiles.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                pendingOperations = DrainImportedHistoryOperations();
+                var appendedOperations = 0;
+                if (pendingOperations.Count > 0)
+                    appendedOperations = await AppendImportedHistoryJournalAsync(pendingOperations, ct).ConfigureAwait(false);
 
-                using (var stream = _fileSystem.File.Create(historyPath))
+                if (ShouldCompactImportedHistory(force))
                 {
-                    await JsonSerializer.SerializeAsync(stream, history, JsonOptions, ct).ConfigureAwait(false);
+                    await CompactImportedHistoryAsync(ct).ConfigureAwait(false);
                 }
 
                 Interlocked.Exchange(ref _lastImportedHistoryFlushUtcTicks, DateTime.UtcNow.Ticks);
-                _logger.LogDebug("Saved imported files history: {Count} records", history.Count);
+
+                if (Volatile.Read(ref _pendingImportedHistoryDepth) > 0
+                    || Volatile.Read(ref _coalescedImportedHistoryDepth) > 0)
+                    MarkImportedFilesHistoryDirty();
+
+                if (appendedOperations > 0)
+                {
+                    _logger.LogDebug(
+                        "Flushed imported files history journal operations: {Count} (pending: {Pending})",
+                        appendedOperations,
+                        Volatile.Read(ref _pendingImportedHistoryDepth));
+                }
             }
             catch (Exception ex)
             {
+                if (pendingOperations != null && pendingOperations.Count > 0)
+                    RequeueImportedHistoryOperations(pendingOperations);
+
                 MarkImportedFilesHistoryDirty();
                 _logger.LogWarning(ex, "Failed to save imported files history");
             }
@@ -217,12 +291,259 @@ namespace Locus.Storage
                 }
             }
 
-            await SaveImportedFilesHistoryAsync(ct).ConfigureAwait(false);
+            await SaveImportedFilesHistoryAsync(force, ct).ConfigureAwait(false);
         }
 
         private static TimeSpan NormalizeInterval(TimeSpan configured, TimeSpan fallback)
         {
             return configured <= TimeSpan.Zero ? fallback : configured;
+        }
+
+        private Dictionary<string, string> LoadImportedHistoryCheckpoint()
+        {
+            var checkpointPath = GetImportedHistoryCheckpointPath();
+            if (!_fileSystem.File.Exists(checkpointPath))
+                return new Dictionary<string, string>();
+
+            var json = _fileSystem.File.ReadAllText(checkpointPath);
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+                ?? new Dictionary<string, string>();
+        }
+
+        private (int AppliedOperations, int InvalidLines) ReplayImportedHistoryJournal(
+            Dictionary<string, string> checkpointState)
+        {
+            var journalPath = GetImportedHistoryJournalPath();
+            if (!_fileSystem.File.Exists(journalPath))
+            {
+                Interlocked.Exchange(ref _historyJournalOperationCount, 0);
+                return (0, 0);
+            }
+
+            var applied = 0;
+            var invalid = 0;
+            using (var stream = _fileSystem.File.OpenRead(journalPath))
+            using (var reader = new StreamReader(stream))
+            {
+                while (!reader.EndOfStream)
+                {
+                    var line = reader.ReadLine();
+                    if (string.IsNullOrWhiteSpace(line))
+                        continue;
+
+                    ImportedHistoryJournalEntry? entry;
+                    try
+                    {
+                        entry = JsonSerializer.Deserialize<ImportedHistoryJournalEntry>(line, HistoryJournalJsonOptions);
+                    }
+                    catch
+                    {
+                        invalid++;
+                        continue;
+                    }
+
+                    if (entry == null || string.IsNullOrWhiteSpace(entry.Path))
+                    {
+                        invalid++;
+                        continue;
+                    }
+
+                    switch (entry.Operation)
+                    {
+                        case ImportedHistoryOperationType.Delete:
+                            checkpointState.Remove(entry.Path);
+                            applied++;
+                            break;
+                        case ImportedHistoryOperationType.Upsert:
+                            if (string.IsNullOrWhiteSpace(entry.FileKey))
+                            {
+                                invalid++;
+                                continue;
+                            }
+
+                            checkpointState[entry.Path] = entry.FileKey!;
+                            applied++;
+                            break;
+                        default:
+                            invalid++;
+                            break;
+                    }
+                }
+            }
+
+            Interlocked.Exchange(ref _historyJournalOperationCount, applied);
+            return (applied, invalid);
+        }
+
+        private void UpsertImportedFileRecord(string path, string fileKey)
+        {
+            _importedFiles[path] = fileKey;
+            EnqueueImportedHistoryOperation(ImportedHistoryOperation.CreateUpsert(path, fileKey));
+        }
+
+        private bool TryRemoveImportedFileRecord(string path)
+        {
+            if (!_importedFiles.TryRemove(path, out var removedFileKey))
+                return false;
+
+            if (string.Equals(removedFileKey, InFlightImportMarker, StringComparison.Ordinal))
+                return true;
+
+            EnqueueImportedHistoryOperation(ImportedHistoryOperation.CreateDelete(path));
+            return true;
+        }
+
+        private List<ImportedHistoryOperation> DrainImportedHistoryOperations()
+        {
+            var operations = new List<ImportedHistoryOperation>();
+            var channelDepthSnapshot = Volatile.Read(ref _pendingImportedHistoryDepth);
+            for (var i = 0; i < channelDepthSnapshot; i++)
+            {
+                if (!_pendingImportedHistoryReader.TryRead(out var operation))
+                    break;
+
+                operations.Add(operation);
+                Interlocked.Decrement(ref _pendingImportedHistoryDepth);
+            }
+
+            if (Volatile.Read(ref _coalescedImportedHistoryDepth) > 0)
+            {
+                foreach (var kvp in _coalescedImportedHistoryOperations)
+                {
+                    if (!_coalescedImportedHistoryOperations.TryRemove(kvp.Key, out var operation))
+                        continue;
+
+                    operations.Add(operation);
+                    Interlocked.Decrement(ref _coalescedImportedHistoryDepth);
+                }
+            }
+
+            return operations;
+        }
+
+        private void RequeueImportedHistoryOperations(List<ImportedHistoryOperation> operations)
+        {
+            foreach (var operation in operations)
+                EnqueueImportedHistoryOperation(operation);
+        }
+
+        private async Task<int> AppendImportedHistoryJournalAsync(
+            List<ImportedHistoryOperation> operations,
+            CancellationToken ct)
+        {
+            if (operations.Count == 0)
+                return 0;
+
+            var journalPath = GetImportedHistoryJournalPath();
+
+            using (var stream = _fileSystem.File.Open(journalPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+            using (var writer = new StreamWriter(stream))
+            {
+                foreach (var operation in operations)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var entry = new ImportedHistoryJournalEntry
+                    {
+                        Operation = operation.Operation,
+                        Path = operation.Path,
+                        FileKey = operation.FileKey
+                    };
+
+                    var line = JsonSerializer.Serialize(entry, HistoryJournalJsonOptions);
+                    await writer.WriteLineAsync(line).ConfigureAwait(false);
+                }
+
+                await writer.FlushAsync().ConfigureAwait(false);
+            }
+
+            Interlocked.Add(ref _historyJournalOperationCount, operations.Count);
+            return operations.Count;
+        }
+
+        private bool ShouldCompactImportedHistory(bool force)
+        {
+            if (force)
+                return true;
+
+            if (Interlocked.CompareExchange(ref _historyJournalOperationCount, 0, 0)
+                >= ImportedHistoryCompactThresholdOperationCount)
+            {
+                return true;
+            }
+
+            var journalPath = GetImportedHistoryJournalPath();
+            if (!_fileSystem.File.Exists(journalPath))
+                return false;
+
+            try
+            {
+                var length = _fileSystem.FileInfo.New(journalPath).Length;
+                return length >= ImportedHistoryCompactThresholdBytes;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private async Task CompactImportedHistoryAsync(CancellationToken ct)
+        {
+            var checkpointPath = GetImportedHistoryCheckpointPath();
+            var tempPath = GetImportedHistoryCheckpointTempPath();
+            var journalPath = GetImportedHistoryJournalPath();
+
+            var snapshot = _importedFiles
+                .Where(kvp => !string.Equals(kvp.Value, InFlightImportMarker, StringComparison.Ordinal))
+                .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+            try
+            {
+                using (var stream = _fileSystem.File.Create(tempPath))
+                {
+                    await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions, ct).ConfigureAwait(false);
+                }
+
+                if (_fileSystem.File.Exists(checkpointPath))
+                    _fileSystem.File.Delete(checkpointPath);
+                _fileSystem.File.Move(tempPath, checkpointPath);
+
+                if (_fileSystem.File.Exists(journalPath))
+                    _fileSystem.File.Delete(journalPath);
+
+                Interlocked.Exchange(ref _historyJournalOperationCount, 0);
+                _logger.LogDebug("Compacted imported files history checkpoint: {Count} records", snapshot.Count);
+            }
+            catch
+            {
+                if (_fileSystem.File.Exists(tempPath))
+                {
+                    try
+                    {
+                        _fileSystem.File.Delete(tempPath);
+                    }
+                    catch
+                    {
+                        // Ignore cleanup failures for temporary checkpoint file.
+                    }
+                }
+
+                throw;
+            }
+        }
+
+        private string GetImportedHistoryCheckpointPath()
+        {
+            return _fileSystem.Path.Combine(_configurationRoot, ImportedFilesCheckpointFileName);
+        }
+
+        private string GetImportedHistoryJournalPath()
+        {
+            return _fileSystem.Path.Combine(_configurationRoot, ImportedFilesJournalFileName);
+        }
+
+        private string GetImportedHistoryCheckpointTempPath()
+        {
+            return _fileSystem.Path.Combine(_configurationRoot, ImportedFilesCheckpointTempFileName);
         }
 
         private void TryPruneStaleImportedEntries(FileWatcherConfiguration configuration)
@@ -262,6 +583,14 @@ namespace Locus.Storage
         {
             _cachedWatchers = null;
             Interlocked.Exchange(ref _watchersCacheExpiresAtTicks, 0);
+        }
+
+        private void InvalidatePatternMatcherCache(string watcherId)
+        {
+            if (string.IsNullOrWhiteSpace(watcherId))
+                return;
+
+            _patternMatcherCache.TryRemove(watcherId, out _);
         }
 
         /// <inheritdoc/>
@@ -355,6 +684,7 @@ namespace Locus.Storage
                 {
                     _fileSystem.File.Delete(configPath);
                     InvalidateWatchersCache();
+                    InvalidatePatternMatcherCache(watcherId);
                     _logger.LogInformation("Removed file watcher {WatcherId}", watcherId);
                 }
             }
@@ -430,7 +760,7 @@ namespace Locus.Storage
                     try
                     {
                         var fileName = _fileSystem.Path.GetFileNameWithoutExtension(filePath);
-                        if (string.Equals(fileName, "imported-files", StringComparison.OrdinalIgnoreCase))
+                        if (fileName.StartsWith("imported-files", StringComparison.OrdinalIgnoreCase))
                             continue;
 
                         var config = await LoadConfigurationAsync(fileName, ct);
@@ -486,6 +816,7 @@ namespace Locus.Storage
 
             // Get all files recursively
             var files = GetFilesRecursive(
+                configuration.WatcherId,
                 configuration.WatchPath,
                 configuration.FilePatterns,
                 configuration.IncludeSubdirectories);
@@ -559,6 +890,7 @@ namespace Locus.Storage
 
                     // Scan tenant directory recursively
                     var files = GetFilesRecursive(
+                        configuration.WatcherId,
                         tenantDirectory,
                         configuration.FilePatterns,
                         configuration.IncludeSubdirectories);
@@ -605,13 +937,30 @@ namespace Locus.Storage
                 else
                 {
                     // Concurrent processing with a fixed worker pool.
-                    // This avoids creating one Task per file when scanning very large directories.
-                    var queue = new ConcurrentQueue<string>(files);
+                    // Bounded channel keeps the queue size explicit and prevents unbounded growth.
+                    var queue = Channel.CreateBounded<string>(new BoundedChannelOptions(files.Count)
+                    {
+                        SingleWriter = true,
+                        SingleReader = false,
+                        FullMode = BoundedChannelFullMode.Wait,
+                        AllowSynchronousContinuations = false
+                    });
+
+                    foreach (var filePath in files)
+                    {
+                        if (!queue.Writer.TryWrite(filePath))
+                            await queue.Writer.WriteAsync(filePath, ct);
+                    }
+                    queue.Writer.Complete();
+
                     var workers = Enumerable.Range(0, maxConcurrency).Select(async _ =>
                     {
                         var workerResult = new FileWatcherScanResult();
-                        while (!ct.IsCancellationRequested && queue.TryDequeue(out var filePath))
+                        while (!ct.IsCancellationRequested && await queue.Reader.WaitToReadAsync(ct))
                         {
+                            if (!queue.Reader.TryRead(out var filePath))
+                                continue;
+
                             var fileResult = await ProcessSingleFileAsync(configuration, tenant, filePath, ct);
                             MergeResult(workerResult, fileResult);
                         }
@@ -702,9 +1051,8 @@ namespace Locus.Storage
 
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
-                    _importedFiles[filePath] = fileKey;
+                    UpsertImportedFileRecord(filePath, fileKey);
                     importSlotTaken = false;
-                    MarkImportedFilesHistoryDirty();
 
                     fileResult.FilesImported++;
                     fileResult.BytesImported += fileInfo.Length;
@@ -745,7 +1093,11 @@ namespace Locus.Storage
             target.Errors.AddRange(source.Errors);
         }
 
-        private List<string> GetFilesRecursive(string path, List<string> patterns, bool includeSubdirectories)
+        private List<string> GetFilesRecursive(
+            string watcherId,
+            string path,
+            List<string> patterns,
+            bool includeSubdirectories)
         {
             var files = new List<string>();
 
@@ -764,14 +1116,12 @@ namespace Locus.Storage
                 if (normalizedPatterns.Count == 1 && normalizedPatterns[0] == "*")
                     return _fileSystem.Directory.GetFiles(path, "*", searchOption).ToList();
 
-                var matchers = normalizedPatterns
-                    .Select(CreateWildcardMatcher)
-                    .ToArray();
+                var matcherCacheEntry = GetOrCreatePatternMatcherCacheEntry(watcherId, normalizedPatterns);
 
                 foreach (var file in _fileSystem.Directory.EnumerateFiles(path, "*", searchOption))
                 {
                     var fileName = _fileSystem.Path.GetFileName(file);
-                    if (matchers.Any(m => m.IsMatch(fileName)))
+                    if (matcherCacheEntry.Matchers.Any(m => m.IsMatch(fileName)))
                         files.Add(file);
                 }
             }
@@ -793,6 +1143,28 @@ namespace Locus.Storage
             return new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
         }
 
+        private PatternMatcherCacheEntry GetOrCreatePatternMatcherCacheEntry(
+            string watcherId,
+            List<string> normalizedPatterns)
+        {
+            var fingerprint = string.Join(
+                "\u001F",
+                normalizedPatterns.Select(p => p.Trim().ToUpperInvariant()));
+
+            if (_patternMatcherCache.TryGetValue(watcherId, out var existing)
+                && string.Equals(existing.PatternFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                return existing;
+            }
+
+            var matchers = normalizedPatterns
+                .Select(CreateWildcardMatcher)
+                .ToArray();
+            var created = new PatternMatcherCacheEntry(fingerprint, matchers);
+            _patternMatcherCache[watcherId] = created;
+            return created;
+        }
+
         private Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct)
         {
             switch (configuration.PostImportAction)
@@ -802,8 +1174,7 @@ namespace Locus.Storage
                     _logger.LogDebug("Deleted file {FilePath} after import", filePath);
 
                     // Remove from history since file no longer exists
-                    _importedFiles.TryRemove(filePath, out _);
-                    MarkImportedFilesHistoryDirty();
+                    TryRemoveImportedFileRecord(filePath);
                     break;
 
                 case PostImportAction.Move:
@@ -833,8 +1204,7 @@ namespace Locus.Storage
                         _logger.LogDebug("Moved file {FilePath} to {TargetPath}", filePath, targetPath);
 
                         // Remove from history since file is no longer in watch directory
-                        _importedFiles.TryRemove(filePath, out _);
-                        MarkImportedFilesHistoryDirty();
+                        TryRemoveImportedFileRecord(filePath);
                     }
                     break;
 
@@ -907,11 +1277,66 @@ namespace Locus.Storage
             }
 
             InvalidateWatchersCache();
+            InvalidatePatternMatcherCache(configuration.WatcherId);
         }
 
         private string GetConfigurationPath(string watcherId)
         {
             return _fileSystem.Path.Combine(_configurationRoot, $"{watcherId}.json");
+        }
+
+        private readonly struct PatternMatcherCacheEntry
+        {
+            public PatternMatcherCacheEntry(string patternFingerprint, Regex[] matchers)
+            {
+                PatternFingerprint = patternFingerprint;
+                Matchers = matchers;
+            }
+
+            public string PatternFingerprint { get; }
+
+            public Regex[] Matchers { get; }
+        }
+
+        private readonly struct ImportedHistoryOperation
+        {
+            public ImportedHistoryOperation(ImportedHistoryOperationType operation, string path, string? fileKey)
+            {
+                Operation = operation;
+                Path = path;
+                FileKey = fileKey;
+            }
+
+            public ImportedHistoryOperationType Operation { get; }
+
+            public string Path { get; }
+
+            public string? FileKey { get; }
+
+            public static ImportedHistoryOperation CreateUpsert(string path, string fileKey)
+            {
+                return new ImportedHistoryOperation(ImportedHistoryOperationType.Upsert, path, fileKey);
+            }
+
+            public static ImportedHistoryOperation CreateDelete(string path)
+            {
+                return new ImportedHistoryOperation(ImportedHistoryOperationType.Delete, path, null);
+            }
+        }
+
+        private sealed class ImportedHistoryJournalEntry
+        {
+            public ImportedHistoryOperationType Operation { get; set; }
+
+            public string Path { get; set; } = string.Empty;
+
+            public string? FileKey { get; set; }
+        }
+
+        private enum ImportedHistoryOperationType
+        {
+            Upsert = 1,
+            Delete = 2
         }
 
         /// <summary>

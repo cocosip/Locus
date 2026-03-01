@@ -128,6 +128,268 @@ namespace Locus.Storage.Tests
             Assert.Null(result);
         }
 
+        [Fact]
+        public async Task ExistsByPhysicalPathAsync_ReturnsTrueForIndexedPath()
+        {
+            var metadata = CreateMetadata("file-path", FileProcessingStatus.Pending);
+            metadata.PhysicalPath = Path.Combine(_metadataDir, "tenant-001", "file-path.dat");
+
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var exists = await _repository.ExistsByPhysicalPathAsync(
+                _tenantId,
+                metadata.PhysicalPath,
+                CancellationToken.None);
+
+            Assert.True(exists);
+        }
+
+        [Fact]
+        public async Task ExistsByPhysicalPathAsync_TracksPathUpdateAndRemove()
+        {
+            var metadata = CreateMetadata("file-move", FileProcessingStatus.Pending);
+            var oldPath = Path.Combine(_metadataDir, "tenant-001", "old", "file-move.dat");
+            var newPath = Path.Combine(_metadataDir, "tenant-001", "new", "file-move.dat");
+
+            metadata.PhysicalPath = oldPath;
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            metadata.PhysicalPath = newPath;
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var oldExists = await _repository.ExistsByPhysicalPathAsync(_tenantId, oldPath, CancellationToken.None);
+            var newExists = await _repository.ExistsByPhysicalPathAsync(_tenantId, newPath, CancellationToken.None);
+            Assert.False(oldExists);
+            Assert.True(newExists);
+
+            await _repository.RemoveAsync(_tenantId, metadata.FileKey, CancellationToken.None);
+            var existsAfterRemove = await _repository.ExistsByPhysicalPathAsync(_tenantId, newPath, CancellationToken.None);
+            Assert.False(existsAfterRemove);
+        }
+
+        [Fact]
+        public async Task GetNextPendingFileAsync_BoundedDequeuesEventuallyAllocatesUnderStaleQueue()
+        {
+            var metadata = CreateMetadata("stale-heavy", FileProcessingStatus.Pending);
+            for (int i = 0; i < 700; i++)
+            {
+                metadata.CreatedAt = DateTime.UtcNow.AddTicks(i);
+                await _repository.AddOrUpdateAsync(metadata.Clone(), CancellationToken.None);
+            }
+
+            FileMetadata? allocated = null;
+            for (int i = 0; i < 20 && allocated == null; i++)
+            {
+                allocated = await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            }
+
+            Assert.NotNull(allocated);
+            Assert.Equal(FileProcessingStatus.Processing, allocated!.Status);
+        }
+
+        [Fact]
+        public async Task GetProcessingTimedOutAsync_DoesNotRepeatAfterStatusTransition()
+        {
+            var oldA = CreateMetadata("proc-a", FileProcessingStatus.Processing);
+            oldA.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-30);
+            var oldB = CreateMetadata("proc-b", FileProcessingStatus.Processing);
+            oldB.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-20);
+            var oldC = CreateMetadata("proc-c", FileProcessingStatus.Processing);
+            oldC.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-10);
+
+            await _repository.AddOrUpdateAsync(oldA, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(oldB, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(oldC, CancellationToken.None);
+
+            var cutoff = DateTime.UtcNow.AddMinutes(-5);
+            var firstBatch = await _repository.GetProcessingTimedOutAsync(_tenantId, cutoff, 2, CancellationToken.None);
+            Assert.Equal(2, firstBatch.Count);
+
+            foreach (var item in firstBatch)
+            {
+                var updated = item.Clone();
+                updated.Status = FileProcessingStatus.Pending;
+                updated.ProcessingStartTime = null;
+                await _repository.AddOrUpdateAsync(updated, CancellationToken.None);
+            }
+
+            var secondBatch = await _repository.GetProcessingTimedOutAsync(_tenantId, cutoff, 2, CancellationToken.None);
+            Assert.Single(secondBatch);
+            Assert.Equal("proc-c", secondBatch[0].FileKey);
+        }
+
+        [Fact]
+        public async Task GetProcessingTimedOutAsync_ReturnsOldestFirst()
+        {
+            var first = CreateMetadata("order-a", FileProcessingStatus.Processing);
+            first.CreatedAt = DateTime.UtcNow.AddMinutes(-40);
+            first.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-30);
+            var second = CreateMetadata("order-b", FileProcessingStatus.Processing);
+            second.CreatedAt = DateTime.UtcNow.AddMinutes(-39);
+            second.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-20);
+            var third = CreateMetadata("order-c", FileProcessingStatus.Processing);
+            third.CreatedAt = DateTime.UtcNow.AddMinutes(-38);
+            third.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-10);
+
+            await _repository.AddOrUpdateAsync(second, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(third, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(first, CancellationToken.None);
+
+            var cutoff = DateTime.UtcNow.AddMinutes(-5);
+            var batch = await _repository.GetProcessingTimedOutAsync(_tenantId, cutoff, 3, CancellationToken.None);
+
+            Assert.Equal(["order-a", "order-b", "order-c"], batch.Select(x => x.FileKey).ToArray());
+        }
+
+        [Fact]
+        public async Task GetProcessingTimedOutAsync_DoesNotDuplicateWithinSingleBatch()
+        {
+            var metadata = CreateMetadata("proc-dup", FileProcessingStatus.Processing);
+            metadata.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-15);
+
+            for (int i = 0; i < 12; i++)
+            {
+                await _repository.AddOrUpdateAsync(metadata.Clone(), CancellationToken.None);
+            }
+
+            var cutoff = DateTime.UtcNow.AddMinutes(-5);
+            var batch = await _repository.GetProcessingTimedOutAsync(_tenantId, cutoff, 10, CancellationToken.None);
+
+            Assert.Single(batch);
+            Assert.Equal("proc-dup", batch[0].FileKey);
+        }
+
+        [Fact]
+        public async Task GetPermanentlyFailedOlderThanAsync_DoesNotRepeatAfterRemove()
+        {
+            var oldA = CreateMetadata("failed-a", FileProcessingStatus.PermanentlyFailed);
+            oldA.LastFailedAt = DateTime.UtcNow.AddDays(-10);
+            var oldB = CreateMetadata("failed-b", FileProcessingStatus.PermanentlyFailed);
+            oldB.LastFailedAt = DateTime.UtcNow.AddDays(-9);
+            var oldC = CreateMetadata("failed-c", FileProcessingStatus.PermanentlyFailed);
+            oldC.LastFailedAt = DateTime.UtcNow.AddDays(-8);
+
+            await _repository.AddOrUpdateAsync(oldA, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(oldB, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(oldC, CancellationToken.None);
+
+            var cutoff = DateTime.UtcNow.AddDays(-7);
+            var firstBatch = await _repository.GetPermanentlyFailedOlderThanAsync(_tenantId, cutoff, 2, CancellationToken.None);
+            Assert.Equal(2, firstBatch.Count);
+
+            foreach (var item in firstBatch)
+            {
+                await _repository.RemoveAsync(_tenantId, item.FileKey, CancellationToken.None);
+            }
+
+            var secondBatch = await _repository.GetPermanentlyFailedOlderThanAsync(_tenantId, cutoff, 2, CancellationToken.None);
+            Assert.Single(secondBatch);
+            Assert.Equal("failed-c", secondBatch[0].FileKey);
+        }
+
+        [Fact]
+        public async Task AddOrUpdateAsync_WhenPersistenceChannelIsSaturated_UsesCoalescingFallback()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var saturatedDir = Path.Combine(_metadataDir, $"saturated-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(saturatedDir);
+            var saturatedRepo = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                saturatedDir,
+                enableBackgroundPersistence: true,
+                maxDrainBatchSize: 1,
+                persistenceQueueSoftMergeThresholdPercent: 100,
+                maxPersistenceQueueSize: 1);
+
+            try
+            {
+                var metadata = CreateMetadata("coalesce-file", FileProcessingStatus.Pending);
+                for (int i = 0; i < 10_000; i++)
+                {
+                    metadata.RetryCount = i;
+                    await saturatedRepo.AddOrUpdateAsync(metadata.Clone(), CancellationToken.None);
+                }
+
+                await Task.Delay(300);
+                var coalesceLogCounter = GetPrivateIntField(saturatedRepo, "_coalescedLogCounter");
+                var coalescedDepth = GetPrivateIntField(saturatedRepo, "_coalescedDepth");
+                Assert.True(coalesceLogCounter > 0 || coalescedDepth > 0);
+            }
+            finally
+            {
+                saturatedRepo.Dispose();
+                if (_fileSystem.Directory.Exists(saturatedDir))
+                    _fileSystem.Directory.Delete(saturatedDir, recursive: true);
+            }
+        }
+
+        [Fact]
+        public async Task StartupLoad_BatchedPendingLoad_PreservesCreatedAtOrder()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var tenantId = "tenant-startup-batch";
+            var startupDir = Path.Combine(_metadataDir, $"startup-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(startupDir);
+
+            var createdTimes = Enumerable.Range(0, 6)
+                .Select(i => DateTime.UtcNow.AddMinutes(-10).AddSeconds(i))
+                .ToArray();
+            var insertionOrder = new[] { 3, 1, 5, 0, 4, 2 };
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                startupDir,
+                enableBackgroundPersistence: false,
+                startupLoadBatchSize: 2))
+            {
+                foreach (var index in insertionOrder)
+                {
+                    var metadata = CreateMetadata($"startup-file-{index:D2}", FileProcessingStatus.Pending, tenantId);
+                    metadata.CreatedAt = createdTimes[index];
+                    await writer.AddOrUpdateAsync(metadata, CancellationToken.None);
+                }
+            }
+
+            using (var reader = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                startupDir,
+                enableBackgroundPersistence: false,
+                startupLoadBatchSize: 2))
+            {
+                var allocated = new System.Collections.Generic.List<string>();
+                for (int i = 0; i < insertionOrder.Length; i++)
+                {
+                    var next = await reader.GetNextPendingFileAsync(tenantId, CancellationToken.None);
+                    Assert.NotNull(next);
+                    allocated.Add(next!.FileKey);
+                }
+
+                var expected = createdTimes
+                    .Select((createdAt, index) => new { createdAt, index })
+                    .OrderBy(x => x.createdAt)
+                    .Select(x => $"startup-file-{x.index:D2}")
+                    .ToArray();
+
+                Assert.Equal(expected, allocated);
+            }
+        }
+
+        [Fact]
+        public void Constructor_ThrowsWhenStartupLoadBatchSizeIsNotPositive()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+
+            Assert.Throws<ArgumentException>(() => new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                _metadataDir,
+                enableBackgroundPersistence: false,
+                startupLoadBatchSize: 0));
+        }
+
         public void Dispose()
         {
             _repository.Dispose();
@@ -173,6 +435,14 @@ namespace Locus.Storage.Tests
             Assert.NotNull(field);
 
             return (ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>)field!.GetValue(repository)!;
+        }
+
+        private static int GetPrivateIntField(MetadataRepository repository, string fieldName)
+        {
+            var field = typeof(MetadataRepository).GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+
+            return (int)field!.GetValue(repository)!;
         }
     }
 }
