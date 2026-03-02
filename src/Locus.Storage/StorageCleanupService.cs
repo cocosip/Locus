@@ -34,6 +34,7 @@ namespace Locus.Storage
         private readonly int _maxOrphanFilesPerRun;
         private readonly int _orphanRebuildLookupCacheSize;
         private readonly StringComparer _pathComparer;
+        private readonly StringComparison _pathComparison;
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _orphanScanLocks;
         private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
@@ -100,6 +101,9 @@ namespace Locus.Storage
             _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
+            _pathComparison = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
         }
 
         /// <summary>
@@ -403,13 +407,13 @@ namespace Locus.Storage
         /// </summary>
         private FileMetadata? RebuildMetadataFromPath(string physicalPath, IStorageVolume volume, string expectedTenantId)
         {
-            var normalizedPhysical = Path.GetFullPath(physicalPath);
-            var normalizedMount   = Path.GetFullPath(volume.MountPath);
+            var normalizedPhysical = _fileSystem.Path.GetFullPath(physicalPath);
+            var normalizedMount   = _fileSystem.Path.GetFullPath(volume.MountPath);
 
             // Ensure the file is actually inside this volume's mount path.
             var mountPrefix = normalizedMount.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
                               + Path.DirectorySeparatorChar;
-            if (!normalizedPhysical.StartsWith(mountPrefix, StringComparison.OrdinalIgnoreCase))
+            if (!normalizedPhysical.StartsWith(mountPrefix, _pathComparison))
                 return null;
 
             // Relative path segments after the mount: [tenantId, shard?, shard?, ..., filename]

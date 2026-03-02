@@ -173,6 +173,7 @@ namespace Locus.Storage
             if (_importedFiles.Count == 0)
                 return;
 
+            var directoryExistsCache = new Dictionary<string, bool>(StringComparer.Ordinal);
             var snapshot = _importedPruneSnapshot;
             if (snapshot == null || snapshot.Length == 0 || _importedPruneCursor >= snapshot.Length)
             {
@@ -199,7 +200,7 @@ namespace Locus.Storage
                 if (!_importedFiles.ContainsKey(key))
                     continue;
 
-                if (!_fileSystem.File.Exists(key))
+                if (IsImportedSourceMissing(key, directoryExistsCache))
                 {
                     if (TryRemoveImportedFileRecord(key))
                         pruned++;
@@ -219,6 +220,33 @@ namespace Locus.Storage
                     pruned,
                     processed,
                     snapshot.Length);
+            }
+        }
+
+        private bool IsImportedSourceMissing(string sourcePath, Dictionary<string, bool> directoryExistsCache)
+        {
+            try
+            {
+                var directoryPath = _fileSystem.Path.GetDirectoryName(sourcePath);
+                if (!string.IsNullOrWhiteSpace(directoryPath))
+                {
+                    var directoryKey = directoryPath!;
+                    if (!directoryExistsCache.TryGetValue(directoryKey, out var directoryExists))
+                    {
+                        directoryExists = _fileSystem.Directory.Exists(directoryPath);
+                        directoryExistsCache[directoryKey] = directoryExists;
+                    }
+
+                    if (!directoryExists)
+                        return true;
+                }
+
+                return !_fileSystem.File.Exists(sourcePath);
+            }
+            catch
+            {
+                // Fail-open: keep the record if the path probe throws transient IO exceptions.
+                return false;
             }
         }
 
@@ -535,15 +563,26 @@ namespace Locus.Storage
             var tempPath = GetImportedHistoryCheckpointTempPath();
             var journalPath = GetImportedHistoryJournalPath();
 
-            var snapshot = _importedFiles
-                .Where(kvp => !string.Equals(kvp.Value, InFlightImportMarker, StringComparison.Ordinal))
-                .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
-
             try
             {
                 using (var stream = _fileSystem.File.Create(tempPath))
                 {
-                    await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions, ct).ConfigureAwait(false);
+                    // Stream checkpoint JSON directly to avoid allocating a large intermediate
+                    // dictionary when imported history contains many entries.
+                    using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = JsonOptions.WriteIndented }))
+                    {
+                        writer.WriteStartObject();
+                        foreach (var kvp in _importedFiles)
+                        {
+                            if (string.Equals(kvp.Value, InFlightImportMarker, StringComparison.Ordinal))
+                                continue;
+
+                            writer.WriteString(kvp.Key, kvp.Value);
+                        }
+
+                        writer.WriteEndObject();
+                        writer.Flush();
+                    }
                 }
 
                 if (_fileSystem.File.Exists(checkpointPath))
@@ -554,7 +593,7 @@ namespace Locus.Storage
                     _fileSystem.File.Delete(journalPath);
 
                 Interlocked.Exchange(ref _historyJournalOperationCount, 0);
-                _logger.LogDebug("Compacted imported files history checkpoint: {Count} records", snapshot.Count);
+                _logger.LogDebug("Compacted imported files history checkpoint");
             }
             catch
             {
@@ -1186,11 +1225,13 @@ namespace Locus.Storage
                 }
                 importSlotTaken = true;
 
-                // Get file info for validation
+                // Get file info for validation (single stat object reused by stability probes).
                 var fileInfo = _fileSystem.FileInfo.New(filePath);
+                var fileSize = fileInfo.Length;
+                var lastWriteTime = fileInfo.LastWriteTimeUtc;
 
                 // Skip empty files (0 bytes)
-                if (fileInfo.Length == 0)
+                if (fileSize == 0)
                 {
                     _logger.LogDebug("Skipping empty file {FilePath} (0 bytes)", filePath);
                     fileResult.FilesSkipped++;
@@ -1198,7 +1239,6 @@ namespace Locus.Storage
                 }
 
                 // Check file age (prevent importing files still being written)
-                var lastWriteTime = _fileSystem.File.GetLastWriteTimeUtc(filePath);
                 var fileAge = DateTime.UtcNow - lastWriteTime;
                 if (fileAge < configuration.MinFileAge)
                 {
@@ -1209,33 +1249,42 @@ namespace Locus.Storage
                 }
 
                 // Check if file is still being written (multiple methods)
-                if (!await IsFileReadyForImportAsync(filePath, fileAge, configuration, ct))
+                if (!await IsFileReadyForImportAsync(filePath, fileInfo, fileAge, configuration, ct))
                 {
                     _logger.LogDebug("Skipping file {FilePath} - still being written", filePath);
                     fileResult.FilesSkipped++;
                     return fileResult;
                 }
 
-                // Check file size limit
-                if (configuration.MaxFileSizeBytes > 0 && fileInfo.Length > configuration.MaxFileSizeBytes)
+                var importStream = TryOpenImportStream(filePath);
+                if (importStream == null)
+                {
+                    _logger.LogDebug("Skipping file {FilePath} - cannot acquire exclusive read access", filePath);
+                    fileResult.FilesSkipped++;
+                    return fileResult;
+                }
+
+                var importSize = importStream.Length;
+                if (configuration.MaxFileSizeBytes > 0 && importSize > configuration.MaxFileSizeBytes)
                 {
                     _logger.LogWarning(
                         "Skipping file {FilePath} - size {FileSize} exceeds limit {MaxSize}",
-                        filePath, fileInfo.Length, configuration.MaxFileSizeBytes);
+                        filePath, importSize, configuration.MaxFileSizeBytes);
+                    importStream.Dispose();
                     fileResult.FilesSkipped++;
                     return fileResult;
                 }
 
                 // Import file
-                using (var stream = _fileSystem.File.OpenRead(filePath))
+                using (importStream)
                 {
                     var fileName = Path.GetFileName(filePath);
-                    var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
+                    var fileKey = await _storagePool.WriteFileAsync(tenant, importStream, fileName, ct);
                     UpsertImportedFileRecord(filePath, fileKey);
                     importSlotTaken = false;
 
                     fileResult.FilesImported++;
-                    fileResult.BytesImported += fileInfo.Length;
+                    fileResult.BytesImported += importSize;
 
                     _logger.LogInformation(
                         "Imported file {FilePath} as {FileKey} for tenant {TenantId}",
@@ -1301,8 +1350,20 @@ namespace Locus.Storage
             if (normalizedPatterns.Count == 1 && normalizedPatterns[0] == "*")
                 return EnumerateFilesSafe(path, searchOption);
 
-            var matcherCacheEntry = GetOrCreatePatternMatcherCacheEntry(watcherId, normalizedPatterns);
+            var matcherCacheEntry = GetOrCreatePatternMatcherCacheEntry(
+                ResolvePatternMatcherCacheKey(watcherId, path),
+                normalizedPatterns);
             return EnumerateMatchingFiles(path, searchOption, matcherCacheEntry.Matchers);
+        }
+
+        private static string ResolvePatternMatcherCacheKey(string watcherId, string path)
+        {
+            if (!string.IsNullOrWhiteSpace(watcherId))
+                return watcherId;
+
+            // ScanNowAsync(configuration) may be called with an ad-hoc configuration that does
+            // not have a persisted WatcherId yet. Use watch path as a stable in-memory cache key.
+            return string.IsNullOrWhiteSpace(path) ? "<anonymous-watcher>" : path;
         }
 
         private IEnumerable<string> EnumerateFilesSafe(string path, SearchOption searchOption)
@@ -1606,20 +1667,14 @@ namespace Locus.Storage
         /// </summary>
         private async Task<bool> IsFileReadyForImportAsync(
             string filePath,
+            IFileInfo fileInfo,
             TimeSpan fileAge,
             FileWatcherConfiguration configuration,
             CancellationToken ct)
         {
             try
             {
-                // Method 1: Try to open file exclusively
-                // If file is being written, this will fail
-                if (!IsFileAccessible(filePath))
-                {
-                    return false;
-                }
-
-                // Old files are unlikely to still be mutating; skip the delay probe to improve throughput.
+                // Old files are unlikely to still be mutating; skip delayed probes to improve throughput.
                 if (fileAge >= configuration.SkipStabilityCheckAfterAge)
                     return true;
 
@@ -1627,15 +1682,16 @@ namespace Locus.Storage
                 if (stabilityDelay <= TimeSpan.Zero)
                     return true;
 
-                // Method 2: Check if file size is stable
+                // Check if file size/write-time remain stable across a short delay.
                 // Wait a short time and verify size hasn't changed
-                var initialSize = _fileSystem.FileInfo.New(filePath).Length;
-                var initialWriteTime = _fileSystem.File.GetLastWriteTimeUtc(filePath);
+                var initialSize = fileInfo.Length;
+                var initialWriteTime = fileInfo.LastWriteTimeUtc;
 
                 await Task.Delay(stabilityDelay, ct);
 
-                var finalSize = _fileSystem.FileInfo.New(filePath).Length;
-                var finalWriteTime = _fileSystem.File.GetLastWriteTimeUtc(filePath);
+                fileInfo.Refresh();
+                var finalSize = fileInfo.Length;
+                var finalWriteTime = fileInfo.LastWriteTimeUtc;
 
                 // If size or write time changed, file is still being written
                 if (initialSize != finalSize || initialWriteTime != finalWriteTime)
@@ -1652,38 +1708,28 @@ namespace Locus.Storage
             }
         }
 
-        /// <summary>
-        /// Check if file can be opened exclusively (not being used by another process).
-        /// </summary>
-        private bool IsFileAccessible(string filePath)
+        private Stream? TryOpenImportStream(string filePath)
         {
             try
             {
-                // Try to open file with exclusive access
-                // If another process is writing, this will throw IOException
-                using (var stream = _fileSystem.File.Open(
+                return _fileSystem.File.Open(
                     filePath,
                     FileMode.Open,
                     FileAccess.Read,
-                    FileShare.None))
-                {
-                    return true;
-                }
+                    FileShare.None);
             }
             catch (IOException)
             {
-                // File is being used by another process
-                return false;
+                return null;
             }
             catch (UnauthorizedAccessException)
             {
-                // No permission to access file
-                return false;
+                return null;
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Error checking file accessibility for {FilePath}", filePath);
-                return false;
+                _logger.LogDebug(ex, "Error opening file for import {FilePath}", filePath);
+                return null;
             }
         }
     }

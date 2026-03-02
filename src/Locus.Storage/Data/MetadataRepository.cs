@@ -62,6 +62,7 @@ namespace Locus.Storage.Data
         // Queue maintains arrival order so callers get FIFO scheduling without any sorting.
         private readonly ConcurrentDictionary<string, ConcurrentQueue<PendingQueueEntry>> _pendingKeys;
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, long>> _pendingGenerations;
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<FileMetadata>> _prefetchedPendingByTenant;
 
         // Per-tenant delayed queue for Pending files that are not yet available for processing.
         // Ordered by AvailableForProcessingAt (min-heap) to promote ready items efficiently.
@@ -431,6 +432,7 @@ namespace Locus.Storage.Data
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<PendingQueueEntry>>();
             _pendingGenerations = new ConcurrentDictionary<string, ConcurrentDictionary<string, long>>();
+            _prefetchedPendingByTenant = new ConcurrentDictionary<string, ConcurrentQueue<FileMetadata>>();
             _pendingFileCounts = new ConcurrentDictionary<string, int>();
             _processingByStartTime = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _processingByStartTimeLocks = new ConcurrentDictionary<string, object>();
@@ -1371,19 +1373,47 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
+            if (TryTakePrefetchedPending(tenantId, out var prefetched))
+                return prefetched;
+
             // Fast-path: if no pending files, skip taking the tenant lock.
             if (_pendingFileCounts.TryGetValue(tenantId, out var pendingCount) && pendingCount <= 0)
-                return null;
+            {
+                var gate = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+                if (gate.Wait(0))
+                {
+                    gate.Release();
+                    return null;
+                }
+
+                await gate.WaitAsync(ct);
+                gate.Release();
+
+                if (TryTakePrefetchedPending(tenantId, out prefetched))
+                    return prefetched;
+
+                if (_pendingFileCounts.TryGetValue(tenantId, out pendingCount) && pendingCount <= 0)
+                    return null;
+            }
 
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             ConcurrentDictionary<string, FileMetadata>? cacheRef = null;
-            FileMetadata? selected = null;
-            FileMetadata? selectedPrevious = null;
+            var lockContended = !tenantLock.Wait(0);
+            if (lockContended)
+                await tenantLock.WaitAsync(ct);
+
+            var maxAllocations = lockContended ? PendingSingleAllocatorPrefetchCount : 1;
+            var transitions = new List<(FileMetadata Previous, FileMetadata Updated)>(maxAllocations);
             var dequeuedAttempts = 0;
             var staleSkips = 0;
-            await tenantLock.WaitAsync(ct);
+            FileMetadata? prefetchedInsideLock = null;
             try
             {
+                if (TryTakePrefetchedPending(tenantId, out var prefetchedUnderLock))
+                {
+                    prefetchedInsideLock = prefetchedUnderLock;
+                }
+
                 var cache = GetCache(tenantId);
                 cacheRef = cache;
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
@@ -1391,8 +1421,12 @@ namespace Locus.Storage.Data
                 PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotions);
                 pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
                 var maxDequeues = Math.Min(Math.Max(pendingCount + 64, 64), MaxSinglePendingDequeues);
+                var targetAllocations = Math.Min(Math.Max(1, pendingCount), maxAllocations);
 
-                while (dequeuedAttempts++ < maxDequeues && pendingQueue.TryDequeue(out var entry))
+                while (prefetchedInsideLock == null
+                       && dequeuedAttempts++ < maxDequeues
+                       && transitions.Count < targetAllocations
+                       && pendingQueue.TryDequeue(out var entry))
                 {
                     if (!IsGenerationCurrent(tenantId, entry))
                     {
@@ -1429,10 +1463,11 @@ namespace Locus.Storage.Data
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                     InvalidatePendingGeneration(tenantId, updated.FileKey);
-                    selected = updated;
-                    selectedPrevious = candidate;
-                    break;
+                    transitions.Add((candidate, updated));
                 }
+
+                for (var i = 1; i < transitions.Count; i++)
+                    EnqueuePrefetchedPending(tenantId, transitions[i].Updated);
             }
             finally
             {
@@ -1445,11 +1480,20 @@ namespace Locus.Storage.Data
             if (cacheRef != null)
                 MaybeCompactPendingQueueForStaleRatio(tenantId, cacheRef, staleSkips, dequeuedAttempts);
 
-            if (selected == null)
+            if (prefetchedInsideLock != null)
+                return prefetchedInsideLock;
+
+            if (transitions.Count == 0)
                 return null;
 
-            IndexStatusCandidate(selectedPrevious, selected);
-            EnqueuePersistence(new PersistenceOperation(selected));
+            for (var i = 0; i < transitions.Count; i++)
+            {
+                var transition = transitions[i];
+                IndexStatusCandidate(transition.Previous, transition.Updated);
+                EnqueuePersistence(new PersistenceOperation(transition.Updated));
+            }
+
+            var selected = transitions[0].Updated;
             _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", selected.FileKey, tenantId);
             return selected;
         }
@@ -1469,16 +1513,43 @@ namespace Locus.Storage.Data
             if (batchSize <= 0)
                 throw new ArgumentException("Batch size must be greater than zero", nameof(batchSize));
 
+            FileMetadata prefetched;
+            var results = new List<FileMetadata>(batchSize);
+            while (results.Count < batchSize && TryTakePrefetchedPending(tenantId, out prefetched))
+                results.Add(prefetched);
+
+            if (results.Count >= batchSize)
+                return results;
+
             // Fast-path: if no pending files, skip taking the tenant lock.
             if (_pendingFileCounts.TryGetValue(tenantId, out var pendingCount) && pendingCount <= 0)
-                return Enumerable.Empty<FileMetadata>();
+            {
+                var gate = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+                if (!gate.Wait(0))
+                {
+                    await gate.WaitAsync(ct);
+                    gate.Release();
+
+                    while (results.Count < batchSize && TryTakePrefetchedPending(tenantId, out prefetched))
+                        results.Add(prefetched);
+
+                    if (results.Count >= batchSize)
+                        return results;
+                }
+                else
+                {
+                    gate.Release();
+                }
+
+                if (_pendingFileCounts.TryGetValue(tenantId, out pendingCount) && pendingCount <= 0)
+                    return results;
+            }
 
             // Get or create tenant-specific lock (shared with GetNextPendingFileAsync)
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
             ConcurrentDictionary<string, FileMetadata>? cacheRef = null;
             var transitions = new List<(FileMetadata Previous, FileMetadata Updated)>(batchSize);
-            var results = new List<FileMetadata>(batchSize);
             var dequeued = 0;
             var staleSkips = 0;
 
@@ -1486,6 +1557,12 @@ namespace Locus.Storage.Data
             await tenantLock.WaitAsync(ct);
             try
             {
+                while (results.Count < batchSize && TryTakePrefetchedPending(tenantId, out prefetched))
+                    results.Add(prefetched);
+
+                if (results.Count >= batchSize)
+                    return results;
+
                 var cache = GetCache(tenantId);
                 cacheRef = cache;
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
@@ -1495,9 +1572,10 @@ namespace Locus.Storage.Data
                 // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
                 // are present. Tie the cap to pendingCount and batchSize to bound lock hold time.
                 pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
-                var maxDequeues = Math.Min(pendingCount + 64, batchSize * 2 + 64);
+                var targetBatchSize = batchSize - results.Count;
+                var maxDequeues = Math.Min(pendingCount + 64, targetBatchSize * 2 + 64);
 
-                while (results.Count < batchSize
+                while (transitions.Count < targetBatchSize
                        && dequeued++ < maxDequeues
                        && pendingQueue.TryDequeue(out var entry))
                 {
@@ -1535,7 +1613,6 @@ namespace Locus.Storage.Data
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                     InvalidatePendingGeneration(tenantId, updated.FileKey);
-                    results.Add(updated);
                     transitions.Add((candidate, updated));
                 }
             }
@@ -1551,6 +1628,7 @@ namespace Locus.Storage.Data
                 var transition = transitions[i];
                 IndexStatusCandidate(transition.Previous, transition.Updated);
                 EnqueuePersistence(new PersistenceOperation(transition.Updated));
+                results.Add(transition.Updated);
             }
 
             RecordPendingDequeueStats(dequeued, staleSkips);
@@ -1559,6 +1637,27 @@ namespace Locus.Storage.Data
 
             _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
             return results;
+        }
+
+        private bool TryTakePrefetchedPending(string tenantId, out FileMetadata metadata)
+        {
+            metadata = null!;
+            if (!_prefetchedPendingByTenant.TryGetValue(tenantId, out var queue))
+                return false;
+
+            if (!queue.TryDequeue(out var item))
+                return false;
+
+            metadata = item;
+            return true;
+        }
+
+        private void EnqueuePrefetchedPending(string tenantId, FileMetadata metadata)
+        {
+            var queue = _prefetchedPendingByTenant.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentQueue<FileMetadata>());
+            queue.Enqueue(metadata);
         }
         /// <summary>
         /// Resets files that have been in Processing status for longer than the timeout.
@@ -1781,6 +1880,7 @@ namespace Locus.Storage.Data
             _physicalPathIndex.TryRemove(tenantId, out _);
             _pendingKeys.TryRemove(tenantId, out _);
             _pendingGenerations.TryRemove(tenantId, out _);
+            _prefetchedPendingByTenant.TryRemove(tenantId, out _);
             _pendingFileCounts.TryRemove(tenantId, out _);
             _processingByStartTime.TryRemove(tenantId, out _);
             _processingByStartTimeLocks.TryRemove(tenantId, out _);
@@ -1852,6 +1952,7 @@ namespace Locus.Storage.Data
                 _physicalPathIndex.TryRemove(tenantId, out _);
                 _pendingKeys.TryRemove(tenantId, out _);
                 _pendingGenerations.TryRemove(tenantId, out _);
+                _prefetchedPendingByTenant.TryRemove(tenantId, out _);
                 _pendingFileCounts.TryRemove(tenantId, out _);
                 _processingByStartTime.TryRemove(tenantId, out _);
                 _processingByStartTimeLocks.TryRemove(tenantId, out _);
@@ -1900,6 +2001,7 @@ namespace Locus.Storage.Data
         private const int DefaultDrainBatchSize = 2_000;
         private const int DefaultPersistenceQueueSoftMergeThresholdPercent = 90;
         private const int DefaultStartupLoadBatchSize = 2_000;
+        private const int PendingSingleAllocatorPrefetchCount = 4;
 
         // Compact pending queues every N drain cycles to reclaim memory from stale entries.
         // At ~one drain-cycle per 5 s, 20 cycles 鈮?every ~100 seconds.
@@ -2310,6 +2412,7 @@ namespace Locus.Storage.Data
             _physicalPathIndex.Clear();
             _pendingKeys.Clear();
             _pendingGenerations.Clear();
+            _prefetchedPendingByTenant.Clear();
             _pendingFileCounts.Clear();
             _processingByStartTime.Clear();
             _processingByStartTimeLocks.Clear();

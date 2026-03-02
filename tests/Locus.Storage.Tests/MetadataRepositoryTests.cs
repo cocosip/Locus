@@ -209,6 +209,37 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetNextPendingFileAsync_UnderLockContention_PrefetchesAndBatchCanDrainRemaining()
+        {
+            const int fileCount = 4;
+            for (var i = 0; i < fileCount; i++)
+            {
+                var metadata = CreateMetadata($"prefetch-{i:D2}", FileProcessingStatus.Pending);
+                metadata.CreatedAt = DateTime.UtcNow.AddTicks(i);
+                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            }
+
+            var tenantLocks = GetTenantLocks(_repository);
+            var tenantLock = tenantLocks.GetOrAdd(_tenantId, _ => new SemaphoreSlim(1, 1));
+
+            await tenantLock.WaitAsync();
+            var firstTask = _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            Assert.False(firstTask.IsCompleted);
+            tenantLock.Release();
+
+            var first = await firstTask;
+            Assert.NotNull(first);
+            Assert.Equal(0, GetPendingCount(_repository, _tenantId));
+
+            var remaining = (await _repository.GetNextPendingBatchAsync(_tenantId, fileCount - 1, CancellationToken.None)).ToList();
+            Assert.Equal(fileCount - 1, remaining.Count);
+
+            var allocated = remaining.Prepend(first!).ToList();
+            Assert.Equal(fileCount, allocated.Select(x => x.FileKey).Distinct().Count());
+            Assert.All(allocated, x => Assert.Equal(FileProcessingStatus.Processing, x.Status));
+        }
+
+        [Fact]
         public async Task GetNextPendingBatchAsync_ConcurrentAllocators_DoNotOverlapFileKeys()
         {
             const int batchSize = 8;
@@ -480,6 +511,14 @@ namespace Locus.Storage.Tests
             Assert.NotNull(field);
 
             return (ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>)field!.GetValue(repository)!;
+        }
+
+        private static ConcurrentDictionary<string, SemaphoreSlim> GetTenantLocks(MetadataRepository repository)
+        {
+            var field = typeof(MetadataRepository).GetField("_tenantLocks", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+
+            return (ConcurrentDictionary<string, SemaphoreSlim>)field!.GetValue(repository)!;
         }
 
         private static int GetPrivateIntField(MetadataRepository repository, string fieldName)

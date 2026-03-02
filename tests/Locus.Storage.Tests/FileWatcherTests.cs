@@ -228,6 +228,61 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_ConfigurationOverload_WithoutWatcherId_ImportsWithPatternMatching()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-no-id";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var matchingPath = Path.Combine(watchPath, "file1.txt");
+            var skippedPath = Path.Combine(watchPath, "file2.csv");
+            _fileSystem.File.WriteAllText(matchingPath, "content1");
+            _fileSystem.File.WriteAllText(skippedPath, "content2");
+            _fileSystem.File.SetLastWriteTimeUtc(matchingPath, DateTime.UtcNow.AddMinutes(-1));
+            _fileSystem.File.SetLastWriteTimeUtc(skippedPath, DateTime.UtcNow.AddMinutes(-1));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var config = new FileWatcherConfiguration
+            {
+                WatcherId = string.Empty,
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                MinFileAge = TimeSpan.Zero,
+                SkipStabilityCheckAfterAge = TimeSpan.Zero,
+                MaxConcurrentImports = 1,
+                PostImportAction = PostImportAction.Keep,
+                FilePatterns = new List<string> { "*.txt" }
+            };
+
+            var result = await _fileWatcher.ScanNowAsync(config, CancellationToken.None);
+
+            Assert.True(
+                result.FilesImported == 1,
+                $"Imported={result.FilesImported}, Discovered={result.FilesDiscovered}, Skipped={result.FilesSkipped}, Failed={result.FilesFailed}, Errors={string.Join(" | ", result.Errors)}");
+            Assert.Equal(1, result.FilesDiscovered);
+            Assert.Equal(0, result.FilesSkipped);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task ScanNowAsync_ConcurrentScans_DoNotImportDuplicateFile()
         {
             // Arrange

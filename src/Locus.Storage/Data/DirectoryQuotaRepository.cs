@@ -558,7 +558,8 @@ namespace Locus.Storage.Data
             var cache = _quotaCache.GetOrAdd(
                 tenantId,
                 _ => new ConcurrentDictionary<string, DirectoryQuota>());
-            var dirtySnapshots = new List<(string DirectoryPath, AtomicQuotaState State, DirectoryQuota Snapshot)>();
+            var dirtySnapshots = new List<(string DirectoryPath, AtomicQuotaState State, DirectoryQuota Snapshot)>(dirtyDirectories.Count);
+            var nowUtc = DateTime.UtcNow;
 
             foreach (var directoryPath in dirtyDirectories.Keys)
             {
@@ -580,27 +581,23 @@ namespace Locus.Storage.Data
                 // Get or create the cache entry; if it doesn't exist yet (first-ever
                 // increment for this directory before GetOrCreateAsync was called),
                 // create a minimal entry so we can persist it.
-                var existing = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
+                if (!cache.TryGetValue(directoryPath, out var snapshot))
                 {
-                    DirectoryPath = path,
-                    CurrentCount = count,
-                    MaxCount = atomicState.MaxCount,
-                    Enabled = atomicState.Enabled,
-                    CreatedAt = DateTime.UtcNow,
-                    LastUpdated = DateTime.UtcNow
-                });
+                    snapshot = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
+                    {
+                        DirectoryPath = path,
+                        CurrentCount = count,
+                        MaxCount = atomicState.MaxCount,
+                        Enabled = atomicState.Enabled,
+                        CreatedAt = nowUtc,
+                        LastUpdated = nowUtc
+                    });
+                }
 
-                var snapshot = new DirectoryQuota
-                {
-                    DirectoryPath = existing.DirectoryPath,
-                    CurrentCount = count,
-                    MaxCount = atomicState.MaxCount,
-                    Enabled = atomicState.Enabled,
-                    CreatedAt = existing.CreatedAt,
-                    LastUpdated = DateTime.UtcNow
-                };
-
-                // Atomically replace the cached entry with the updated snapshot.
+                snapshot.CurrentCount = count;
+                snapshot.MaxCount = atomicState.MaxCount;
+                snapshot.Enabled = atomicState.Enabled;
+                snapshot.LastUpdated = nowUtc;
                 cache[directoryPath] = snapshot;
                 dirtySnapshots.Add((directoryPath, atomicState, snapshot));
             }
