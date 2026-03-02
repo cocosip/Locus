@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Threading;
@@ -24,6 +25,8 @@ namespace Locus.Storage
         private readonly bool _autoRecoverCorruptedDatabases;
         private readonly bool _failFastOnRecoveryFailure;
         private readonly TimeSpan _startupDelay;
+        private const int HasAnyFilesMaxDepth = 3;
+        private const int HasAnyFilesMaxDirectoryBudget = 2048;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DatabaseHealthCheckService"/> class.
@@ -364,16 +367,72 @@ namespace Locus.Storage
         {
             try
             {
-                // Use EnumerateFiles with FirstOrDefault for lazy evaluation
-                // This stops as soon as one file is found
-                return _fileSystem.Directory
-                    .EnumerateFiles(directoryPath, "*", System.IO.SearchOption.AllDirectories)
-                    .Any();
+                if (EnumerateFilesSafe(directoryPath).Any())
+                    return true;
+
+                var queue = new Queue<(string Path, int Depth)>();
+                foreach (var subdirectory in EnumerateDirectoriesSafe(directoryPath))
+                {
+                    queue.Enqueue((subdirectory, 1));
+                }
+
+                var scannedDirectories = 0;
+                while (queue.Count > 0)
+                {
+                    var current = queue.Dequeue();
+                    scannedDirectories++;
+
+                    if (scannedDirectories > HasAnyFilesMaxDirectoryBudget)
+                    {
+                        _logger.LogWarning(
+                            "Tenant directory scan budget exceeded when checking orphaned files: Root={Root}, Budget={Budget}",
+                            directoryPath,
+                            HasAnyFilesMaxDirectoryBudget);
+                        break;
+                    }
+
+                    if (EnumerateFilesSafe(current.Path).Any())
+                        return true;
+
+                    if (current.Depth >= HasAnyFilesMaxDepth)
+                        continue;
+
+                    foreach (var child in EnumerateDirectoriesSafe(current.Path))
+                    {
+                        queue.Enqueue((child, current.Depth + 1));
+                    }
+                }
+
+                return false;
             }
             catch
             {
                 // Ignore access denied or other errors
                 return false;
+            }
+        }
+
+        private IEnumerable<string> EnumerateFilesSafe(string directoryPath)
+        {
+            try
+            {
+                return _fileSystem.Directory.EnumerateFiles(directoryPath, "*", SearchOption.TopDirectoryOnly);
+            }
+            catch
+            {
+                return Enumerable.Empty<string>();
+            }
+        }
+
+        private IEnumerable<string> EnumerateDirectoriesSafe(string directoryPath)
+        {
+            try
+            {
+                return _fileSystem.Directory.EnumerateDirectories(directoryPath);
+            }
+            catch
+            {
+                return Enumerable.Empty<string>();
             }
         }
 

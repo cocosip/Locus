@@ -41,13 +41,17 @@ namespace Locus.Storage
         private long _lastImportedHistoryFlushUtcTicks;
         private long _lastImportedFilesPruneUtcTicks;
         private int _pruneInProgress;
+        private int _importedPruneCursor;
+        private string[]? _importedPruneSnapshot;
         private readonly ConcurrentDictionary<string, PatternMatcherCacheEntry> _patternMatcherCache;
+        private readonly ConcurrentDictionary<string, AutoCreateTenantDirectoryCacheEntry> _autoCreateTenantDirectoryCache;
         private readonly SemaphoreSlim _watcherCacheLock;
         private volatile IReadOnlyList<FileWatcherConfiguration>? _cachedWatchers;
         private long _watchersCacheExpiresAtTicks;
 
         // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
         private const int MaxImportedFilesCacheSize = 10_000;
+        private const int ImportedFilesPruneBudgetPerScan = 500;
         private const string InFlightImportMarker = "__LOCUS_IN_FLIGHT__";
         private const string ImportedFilesCheckpointFileName = "imported-files.json";
         private const string ImportedFilesJournalFileName = "imported-files.journal.jsonl";
@@ -58,6 +62,7 @@ namespace Locus.Storage
         private const int MinImportQueueCapacity = 64;
         private const int MaxImportQueueCapacity = 1024;
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
+        private static readonly TimeSpan DefaultAutoCreateTenantDirectoriesCacheTtl = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan DefaultImportedHistoryFlushInterval = TimeSpan.FromSeconds(2);
 
@@ -104,6 +109,7 @@ namespace Locus.Storage
             _coalescedImportedHistoryOperations = new ConcurrentDictionary<string, ImportedHistoryOperation>(StringComparer.Ordinal);
             _watcherLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _patternMatcherCache = new ConcurrentDictionary<string, PatternMatcherCacheEntry>(StringComparer.Ordinal);
+            _autoCreateTenantDirectoryCache = new ConcurrentDictionary<string, AutoCreateTenantDirectoryCacheEntry>(StringComparer.Ordinal);
             _historySaveLock = new SemaphoreSlim(1, 1);
             _watcherCacheLock = new SemaphoreSlim(1, 1);
 
@@ -164,9 +170,35 @@ namespace Locus.Storage
         /// </summary>
         private void PruneStaleImportedEntries()
         {
-            int pruned = 0;
-            foreach (var key in _importedFiles.Keys.ToList())
+            if (_importedFiles.Count == 0)
+                return;
+
+            var snapshot = _importedPruneSnapshot;
+            if (snapshot == null || snapshot.Length == 0 || _importedPruneCursor >= snapshot.Length)
             {
+                snapshot = _importedFiles.Keys
+                    .Where(path => !string.IsNullOrWhiteSpace(path))
+                    .ToArray();
+                _importedPruneSnapshot = snapshot;
+                _importedPruneCursor = 0;
+            }
+
+            if (snapshot.Length == 0)
+                return;
+
+            int pruned = 0;
+            var processed = 0;
+            while (_importedPruneCursor < snapshot.Length && processed < ImportedFilesPruneBudgetPerScan)
+            {
+                var key = snapshot[_importedPruneCursor++];
+                processed++;
+
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+
+                if (!_importedFiles.ContainsKey(key))
+                    continue;
+
                 if (!_fileSystem.File.Exists(key))
                 {
                     if (TryRemoveImportedFileRecord(key))
@@ -174,11 +206,19 @@ namespace Locus.Storage
                 }
             }
 
+            if (_importedPruneCursor >= snapshot.Length)
+            {
+                _importedPruneSnapshot = null;
+                _importedPruneCursor = 0;
+            }
+
             if (pruned > 0)
             {
                 _logger.LogInformation(
-                    "Pruned {Count} stale imported file entries (source files no longer exist at watch path)",
-                    pruned);
+                    "Pruned {Count} stale imported file entries (processed {Processed} of {Total} this round)",
+                    pruned,
+                    processed,
+                    snapshot.Length);
             }
         }
 
@@ -596,6 +636,14 @@ namespace Locus.Storage
             _patternMatcherCache.TryRemove(watcherId, out _);
         }
 
+        private void InvalidateAutoCreateTenantDirectoryCache(string watcherId)
+        {
+            if (string.IsNullOrWhiteSpace(watcherId))
+                return;
+
+            _autoCreateTenantDirectoryCache.TryRemove(watcherId, out _);
+        }
+
         /// <inheritdoc/>
         public async Task RegisterWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct)
         {
@@ -636,6 +684,7 @@ namespace Locus.Storage
                 configuration.UpdatedAt = DateTime.UtcNow;
 
                 await SaveConfigurationAsync(configuration, ct);
+                InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
 
                 _logger.LogInformation(
                     "Registered file watcher {WatcherId} for tenant {TenantId} at path {WatchPath}",
@@ -665,6 +714,7 @@ namespace Locus.Storage
                 configuration.UpdatedAt = DateTime.UtcNow;
 
                 await SaveConfigurationAsync(configuration, ct);
+                InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
 
                 _logger.LogInformation("Updated file watcher {WatcherId}", configuration.WatcherId);
             }
@@ -688,6 +738,7 @@ namespace Locus.Storage
                     _fileSystem.File.Delete(configPath);
                     InvalidateWatchersCache();
                     InvalidatePatternMatcherCache(watcherId);
+                    InvalidateAutoCreateTenantDirectoryCache(watcherId);
                     _logger.LogInformation("Removed file watcher {WatcherId}", watcherId);
                 }
             }
@@ -869,34 +920,20 @@ namespace Locus.Storage
 
         private async Task ScanMultiTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct)
         {
+            var tenantDirectories = _fileSystem.Directory.GetDirectories(configuration.WatchPath);
+
             // Auto-create tenant directories if enabled
             if (configuration.AutoCreateTenantDirectories)
             {
                 try
                 {
-                    _logger.LogDebug("Auto-creating tenant directories in {WatchPath}", configuration.WatchPath);
-
-                    // Get all tenants from the system
-                    var allTenants = await _tenantManager.GetAllTenantsAsync(ct);
-
-                    foreach (var tenant in allTenants)
-                    {
-                        var tenantDir = _fileSystem.Path.Combine(configuration.WatchPath, tenant.TenantId);
-                        if (!_fileSystem.Directory.Exists(tenantDir))
-                        {
-                            _fileSystem.Directory.CreateDirectory(tenantDir);
-                            _logger.LogInformation("Auto-created tenant directory: {TenantDirectory}", tenantDir);
-                        }
-                    }
+                    tenantDirectories = await EnsureTenantDirectoriesAsync(configuration, tenantDirectories, ct);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to auto-create tenant directories in {WatchPath}", configuration.WatchPath);
                 }
             }
-
-            // Get all immediate subdirectories (each represents a tenant)
-            var tenantDirectories = _fileSystem.Directory.GetDirectories(configuration.WatchPath);
 
             foreach (var tenantDirectory in tenantDirectories)
             {
@@ -960,6 +997,68 @@ namespace Locus.Storage
                     _logger.LogError(ex, "Error scanning tenant directory {TenantDirectory}", tenantDirectory);
                 }
             }
+        }
+
+        private async Task<string[]> EnsureTenantDirectoriesAsync(
+            FileWatcherConfiguration configuration,
+            string[] existingDirectories,
+            CancellationToken ct)
+        {
+            _logger.LogDebug("Auto-creating tenant directories in {WatchPath}", configuration.WatchPath);
+
+            var tenants = await GetTenantsForAutoCreateAsync(configuration, ct);
+            var mergedDirectories = existingDirectories.ToList();
+            var existingTenantIds = new HashSet<string>(
+                existingDirectories.Select(path => _fileSystem.Path.GetFileName(path)),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var tenantId in tenants)
+            {
+                if (existingTenantIds.Contains(tenantId))
+                    continue;
+
+                var tenantDir = _fileSystem.Path.Combine(configuration.WatchPath, tenantId);
+                _fileSystem.Directory.CreateDirectory(tenantDir);
+                mergedDirectories.Add(tenantDir);
+                existingTenantIds.Add(tenantId);
+
+                _logger.LogInformation("Auto-created tenant directory: {TenantDirectory}", tenantDir);
+            }
+
+            return mergedDirectories.ToArray();
+        }
+
+        private async Task<string[]> GetTenantsForAutoCreateAsync(
+            FileWatcherConfiguration configuration,
+            CancellationToken ct)
+        {
+            var watcherId = string.IsNullOrWhiteSpace(configuration.WatcherId)
+                ? configuration.WatchPath
+                : configuration.WatcherId;
+
+            var now = DateTime.UtcNow;
+            var cacheTtl = NormalizeInterval(
+                configuration.AutoCreateTenantDirectoriesCacheTtl,
+                DefaultAutoCreateTenantDirectoriesCacheTtl);
+
+            if (_autoCreateTenantDirectoryCache.TryGetValue(watcherId, out var cached)
+                && now < cached.ExpiresAtUtc)
+            {
+                return cached.TenantIds;
+            }
+
+            var allTenants = await _tenantManager.GetAllTenantsAsync(ct);
+            var tenantIds = allTenants
+                .Select(tenant => tenant.TenantId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            _autoCreateTenantDirectoryCache[watcherId] = new AutoCreateTenantDirectoryCacheEntry(
+                tenantIds,
+                now.Add(cacheTtl));
+
+            return tenantIds;
         }
 
         private async Task<int> ProcessFilesAsync(
@@ -1427,11 +1526,25 @@ namespace Locus.Storage
 
             InvalidateWatchersCache();
             InvalidatePatternMatcherCache(configuration.WatcherId);
+            InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
         }
 
         private string GetConfigurationPath(string watcherId)
         {
             return _fileSystem.Path.Combine(_configurationRoot, $"{watcherId}.json");
+        }
+
+        private readonly struct AutoCreateTenantDirectoryCacheEntry
+        {
+            public AutoCreateTenantDirectoryCacheEntry(string[] tenantIds, DateTime expiresAtUtc)
+            {
+                TenantIds = tenantIds;
+                ExpiresAtUtc = expiresAtUtc;
+            }
+
+            public string[] TenantIds { get; }
+
+            public DateTime ExpiresAtUtc { get; }
         }
 
         private readonly struct PatternMatcherCacheEntry

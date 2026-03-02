@@ -161,6 +161,22 @@ namespace Locus.MultiTenant.Tests
         }
 
         [Fact]
+        public async Task GetAllTenantsAsync_UsesSnapshotCache_ForShortInterval()
+        {
+            await _tenantManager.CreateTenantAsync("tenant-001", CancellationToken.None);
+            await _tenantManager.CreateTenantAsync("tenant-002", CancellationToken.None);
+
+            var firstSnapshot = await _tenantManager.GetAllTenantsAsync(CancellationToken.None);
+            Assert.Equal(2, System.Linq.Enumerable.Count(firstSnapshot));
+
+            // Remove one metadata file; cache should keep previous snapshot until TTL expires.
+            _fileSystem.File.Delete(".locus/tenants/tenant-002.json");
+
+            var secondSnapshot = await _tenantManager.GetAllTenantsAsync(CancellationToken.None);
+            Assert.Equal(2, System.Linq.Enumerable.Count(secondSnapshot));
+        }
+
+        [Fact]
         public async Task GetTenantAsync_UsesCaching_ForRepeatedCalls()
         {
             // Arrange

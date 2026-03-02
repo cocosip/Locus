@@ -305,6 +305,38 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_FallsBackToRootQuota_WhenDirectoryPathIsEmpty()
+        {
+            var physicalPath = Path.Combine(_volumePath, "failed-empty-dir.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+
+            var failedMetadata = new FileMetadata
+            {
+                FileKey = "file-empty-dir",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = string.Empty,
+                FileSize = 14,
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-10),
+                CreatedAt = DateTime.UtcNow.AddDays(-10)
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/", default);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/", default);
+
+            await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "file-empty-dir", default);
+            Assert.Null(metadata);
+
+            var rootQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/", default);
+            Assert.Equal(0, rootQuota.CurrentCount);
+        }
+
+        [Fact]
         public async Task CleanupFilesByStatusAsync_ResetsTimedOutAndRemovesOldFailed()
         {
             var processing1 = new FileMetadata

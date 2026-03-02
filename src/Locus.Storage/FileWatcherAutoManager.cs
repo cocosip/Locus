@@ -200,6 +200,7 @@ namespace Locus.Storage
                 WatchPath = rootConfig.RootPath,
                 MultiTenantMode = true,
                 AutoCreateTenantDirectories = rootConfig.AutoCreateTenantDirectories,
+                AutoCreateTenantDirectoriesCacheTtl = rootConfig.AutoCreateTenantDirectoriesCacheTtl,
                 Enabled = rootConfig.Enabled,
                 IncludeSubdirectories = rootConfig.IncludeSubdirectories,
                 FilePatterns = rootConfig.FilePatterns,

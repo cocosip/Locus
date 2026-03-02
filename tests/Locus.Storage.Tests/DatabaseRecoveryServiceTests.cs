@@ -284,6 +284,88 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildMetadataDatabaseAsync_NormalizesRootDirectoryPathToSlash()
+        {
+            var tenantId = $"tenant-root-dir-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var tenantPath = Path.Combine(_volumePath, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+
+            var rootFile = Path.Combine(tenantPath, "root-file.txt");
+            _fileSystem.File.WriteAllText(rootFile, "content");
+
+            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
+            {
+                await tempRepo.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = "temp",
+                    TenantId = tenantId,
+                    VolumeId = "vol",
+                    PhysicalPath = "/temp",
+                    DirectoryPath = "/",
+                    Status = FileProcessingStatus.Pending,
+                    CreatedAt = DateTime.UtcNow
+                }, default);
+            }
+
+            await Task.Delay(100);
+
+            var garbage = new byte[512];
+            new Random().NextBytes(garbage);
+            using (var stream = _fileSystem.File.Open(dbPath, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write(garbage, 0, garbage.Length);
+            }
+
+            var result = await _recoveryService.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+
+            var metadata = (await _metadataRepository.GetByTenantAsync(tenantId, default)).Single();
+            Assert.Equal("/", metadata.DirectoryPath);
+        }
+
+        [Fact]
+        public async Task RebuildMetadataDatabaseAsync_DoesNotReleaseUnheldLock_WhenCancelledBeforeAcquire()
+        {
+            var tenantId = $"tenant-cancel-lock-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
+            {
+                await tempRepo.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = "temp",
+                    TenantId = tenantId,
+                    VolumeId = "vol",
+                    PhysicalPath = "/temp",
+                    DirectoryPath = "/",
+                    Status = FileProcessingStatus.Pending,
+                    CreatedAt = DateTime.UtcNow
+                }, default);
+            }
+
+            await Task.Delay(100);
+
+            using (var cts = new CancellationTokenSource())
+            {
+                cts.Cancel();
+
+                var result = await _recoveryService.RebuildMetadataDatabaseAsync(
+                    tenantId,
+                    new[] { _volumePath },
+                    cts.Token);
+
+                Assert.False(result.Success);
+                Assert.DoesNotContain(
+                    result.Errors,
+                    message => message.Contains("SemaphoreFullException", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        [Fact]
         public async Task RebuildMetadataDatabaseAsync_ReturnsSuccessWhenNoDatabaseExists()
         {
             // Arrange

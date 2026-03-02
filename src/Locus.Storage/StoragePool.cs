@@ -24,6 +24,7 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
         private readonly MetadataRepository _metadataRepository;
         private readonly ITenantQuotaManager _tenantQuotaManager;
+        private readonly IDirectoryQuotaManager _directoryQuotaManager;
         private readonly ITenantManager _tenantManager;
         private readonly ILogger<StoragePool> _logger;
         private readonly IFileScheduler _fileScheduler;
@@ -49,12 +50,14 @@ namespace Locus.Storage
         public StoragePool(
             MetadataRepository metadataRepository,
             ITenantQuotaManager tenantQuotaManager,
+            IDirectoryQuotaManager directoryQuotaManager,
             ITenantManager tenantManager,
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
+                directoryQuotaManager,
                 tenantManager,
                 fileScheduler,
                 logger,
@@ -68,6 +71,7 @@ namespace Locus.Storage
         public StoragePool(
             MetadataRepository metadataRepository,
             ITenantQuotaManager tenantQuotaManager,
+            IDirectoryQuotaManager directoryQuotaManager,
             ITenantManager tenantManager,
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger,
@@ -75,6 +79,7 @@ namespace Locus.Storage
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
+            _directoryQuotaManager = directoryQuotaManager ?? throw new ArgumentNullException(nameof(directoryQuotaManager));
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -184,10 +189,13 @@ namespace Locus.Storage
 
             // 2. Check tenant quota
             await _tenantQuotaManager.IncrementFileCountAsync(tenant.TenantId, ct);
+            var tenantQuotaIncremented = true;
 
             string? physicalPath = null;
+            string? directoryPath = null;
             IStorageVolume? volume = null;
             bool fileWritten = false;
+            bool directoryQuotaIncremented = false;
 
             try
             {
@@ -209,19 +217,26 @@ namespace Locus.Storage
 
                 // Derive the shard directory from the physical path so directory-level quotas
                 // are tracked per actual shard directory rather than a single root "/".
-                var directoryPath = Path.GetDirectoryName(physicalPath) ?? "/";
+                var tenantRootPath = Path.Combine(volume.MountPath, tenant.TenantId);
+                directoryPath = DirectoryPathNormalizer.NormalizeFromPhysicalPath(
+                    tenantRootPath,
+                    Path.GetDirectoryName(physicalPath));
 
-                // 7. Capture the bytes that will be written: from current position to end.
+                // 7. Reserve directory quota after tenant quota succeeds.
+                await _directoryQuotaManager.IncrementFileCountAsync(tenant.TenantId, directoryPath, ct);
+                directoryQuotaIncremented = true;
+
+                // 8. Capture the bytes that will be written: from current position to end.
                 // Must be read BEFORE WriteAsync because CopyToAsync advances Position to the end.
                 // Using content.Length alone is wrong for streams not at position 0 — it would
                 // report the total stream size rather than the bytes actually written.
                 var fileSize = content.CanSeek ? content.Length - content.Position : 0;
 
-                // 8. Write file to volume
+                // 9. Write file to volume
                 await volume.WriteAsync(physicalPath, content, ct);
                 fileWritten = true; // Mark that physical file was written
 
-                // 9. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
+                // 10. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
                 // AddOrUpdateAsync never throws from the caller's perspective. If LiteDB is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
@@ -259,7 +274,30 @@ namespace Locus.Storage
                 // (e.g. in AddOrUpdateAsync) does not incorrectly decrement the quota.
                 if (!fileWritten)
                 {
-                    await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, CancellationToken.None);
+                    if (directoryQuotaIncremented && !string.IsNullOrWhiteSpace(directoryPath))
+                    {
+                        var rollbackDirectoryPath = directoryPath!;
+                        try
+                        {
+                            await _directoryQuotaManager.DecrementFileCountAsync(
+                                tenant.TenantId,
+                                rollbackDirectoryPath,
+                                CancellationToken.None);
+                        }
+                        catch (Exception rollbackEx)
+                        {
+                            _logger.LogError(
+                                rollbackEx,
+                                "Failed to rollback directory quota after write failure: Tenant={TenantId}, Directory={DirectoryPath}",
+                                tenant.TenantId,
+                                rollbackDirectoryPath);
+                        }
+                    }
+
+                    if (tenantQuotaIncremented)
+                    {
+                        await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, CancellationToken.None);
+                    }
                 }
 
                 // If the write to the selected volume failed, invalidate the volume-selection cache
@@ -417,7 +455,9 @@ namespace Locus.Storage
             // 5. Remove metadata
             await _metadataRepository.RemoveAsync(tenant.TenantId, fileKey, ct);
 
-            // 6. Decrement tenant quota
+            // 6. Decrement quotas
+            var normalizedDirectoryPath = NormalizeDirectoryPathForQuota(metadata.DirectoryPath);
+            await _directoryQuotaManager.DecrementFileCountAsync(tenant.TenantId, normalizedDirectoryPath, ct);
             await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, ct);
 
             _logger.LogInformation("File deleted successfully: {FileKey} for tenant {TenantId}", fileKey, tenant.TenantId);
@@ -476,8 +516,43 @@ namespace Locus.Storage
                 // Delegate physical deletion + metadata removal to file scheduler.
                 await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
 
+                var normalizedDirectoryPath = NormalizeDirectoryPathForQuota(metadata.DirectoryPath);
+                var directoryQuotaDecremented = false;
+
                 // Cancellation here would leave quota inflated after deletion, so use None.
-                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                await _directoryQuotaManager.DecrementFileCountAsync(
+                    metadata.TenantId,
+                    normalizedDirectoryPath,
+                    CancellationToken.None);
+                directoryQuotaDecremented = true;
+
+                try
+                {
+                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                }
+                catch
+                {
+                    if (directoryQuotaDecremented)
+                    {
+                        try
+                        {
+                            await _directoryQuotaManager.IncrementFileCountAsync(
+                                metadata.TenantId,
+                                normalizedDirectoryPath,
+                                CancellationToken.None);
+                        }
+                        catch (Exception compensationEx)
+                        {
+                            _logger.LogError(
+                                compensationEx,
+                                "Failed to compensate directory quota after tenant quota decrement failure: Tenant={TenantId}, Directory={DirectoryPath}",
+                                metadata.TenantId,
+                                normalizedDirectoryPath);
+                        }
+                    }
+
+                    throw;
+                }
             }
             finally
             {
@@ -599,6 +674,11 @@ namespace Locus.Storage
         {
             var hash = StringComparer.Ordinal.GetHashCode(fileKey) & int.MaxValue;
             return _completionGuards[hash % _completionGuards.Length];
+        }
+
+        private static string NormalizeDirectoryPathForQuota(string? directoryPath)
+        {
+            return DirectoryPathNormalizer.Normalize(directoryPath);
         }
 
         /// <summary>

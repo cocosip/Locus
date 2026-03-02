@@ -178,6 +178,7 @@ namespace Locus
             {
                 var metadataRepo = sp.GetRequiredService<MetadataRepository>();
                 var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
+                var directoryQuotaManager = sp.GetRequiredService<IDirectoryQuotaManager>();
                 var tenantManager = sp.GetRequiredService<ITenantManager>();
                 var fileScheduler = sp.GetRequiredService<IFileScheduler>();
                 var logger = sp.GetRequiredService<ILogger<StoragePool>>();
@@ -187,6 +188,7 @@ namespace Locus
                 return new StoragePool(
                     metadataRepo,
                     tenantQuotaManager,
+                    directoryQuotaManager,
                     tenantManager,
                     fileScheduler,
                     logger,

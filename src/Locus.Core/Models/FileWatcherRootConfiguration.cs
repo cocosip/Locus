@@ -121,5 +121,11 @@ namespace Locus.Core.Models
         /// Default is false.
         /// </summary>
         public bool AutoCreateTenantDirectories { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets the cache TTL used while auto-creating tenant directories.
+        /// Default is 60 seconds.
+        /// </summary>
+        public TimeSpan AutoCreateTenantDirectoriesCacheTtl { get; set; } = TimeSpan.FromSeconds(60);
     }
 }

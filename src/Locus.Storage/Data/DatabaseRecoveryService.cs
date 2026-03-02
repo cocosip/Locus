@@ -24,6 +24,7 @@ namespace Locus.Storage.Data
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
         private readonly IReadOnlyDictionary<string, string> _volumeIdByPath;
+        private const int MetadataRebuildProgressCheckpoint = 1000;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DatabaseRecoveryService"/> class.
@@ -134,10 +135,12 @@ namespace Locus.Storage.Data
 
             _logger.LogWarning("Starting THREAD-SAFE metadata database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
+            var rebuildLockHeld = false;
             try
             {
                 // Step 1: Begin rebuild (acquires lock, backs up and deletes corrupted DB)
                 result.BackupPath = await _metadataRepository.BeginDatabaseRebuildAsync(tenantId, ct);
+                rebuildLockHeld = true;
 
                 if (result.BackupPath == null)
                 {
@@ -148,24 +151,30 @@ namespace Locus.Storage.Data
 
                 // Step 2: Scan physical files and rebuild metadata
                 var rebuiltFiles = 0;
+                var scannedFiles = 0;
+                var failedFiles = 0;
                 foreach (var volumePath in volumePaths)
                 {
                     var tenantPath = _fileSystem.Path.Combine(volumePath, tenantId);
                     if (!_fileSystem.Directory.Exists(tenantPath))
                         continue;
 
-                    var files = _fileSystem.Directory.GetFiles(tenantPath, "*", SearchOption.AllDirectories);
+                    var files = _fileSystem.Directory.EnumerateFiles(tenantPath, "*", SearchOption.AllDirectories);
 
                     foreach (var filePath in files)
                     {
                         ct.ThrowIfCancellationRequested();
+                        scannedFiles++;
 
                         try
                         {
                             var fileInfo = _fileSystem.FileInfo.New(filePath);
                             var volumeId = ResolveVolumeId(volumePath);
-                            var relativePath = filePath.Substring(tenantPath.Length + 1);
-                            var directoryPath = _fileSystem.Path.GetDirectoryName(relativePath) ?? "/";
+                            var relativePath = filePath.Length > tenantPath.Length
+                                ? filePath.Substring(tenantPath.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                                : string.Empty;
+                            var directoryPath = Locus.Storage.DirectoryPathNormalizer.NormalizeFromRelativePath(
+                                _fileSystem.Path.GetDirectoryName(relativePath));
 
                             // Use the physical file name as key so rebuild is deterministic.
                             var fileName = _fileSystem.Path.GetFileName(filePath);
@@ -173,6 +182,7 @@ namespace Locus.Storage.Data
                             if (string.IsNullOrWhiteSpace(fileKey))
                             {
                                 result.Errors.Add($"Failed to rebuild metadata for {filePath}: invalid file name");
+                                failedFiles++;
                                 continue;
                             }
 
@@ -182,7 +192,7 @@ namespace Locus.Storage.Data
                                 TenantId = tenantId,
                                 VolumeId = volumeId,
                                 PhysicalPath = filePath,
-                                DirectoryPath = directoryPath.Replace("\\", "/"),
+                                DirectoryPath = directoryPath,
                                 FileSize = fileInfo.Length,
                                 Status = FileProcessingStatus.Pending, // Unknown status, mark as pending
                                 CreatedAt = fileInfo.CreationTimeUtc,
@@ -197,11 +207,20 @@ namespace Locus.Storage.Data
                             await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
                             rebuiltFiles++;
 
-                            _logger.LogDebug("Rebuilt metadata for file: {FilePath}", filePath);
+                            if (scannedFiles % MetadataRebuildProgressCheckpoint == 0)
+                            {
+                                _logger.LogInformation(
+                                    "Metadata rebuild progress for tenant {TenantId}: scanned={Scanned}, rebuilt={Rebuilt}, failed={Failed}",
+                                    tenantId,
+                                    scannedFiles,
+                                    rebuiltFiles,
+                                    failedFiles);
+                            }
                         }
                         catch (Exception ex)
                         {
                             result.Errors.Add($"Failed to rebuild metadata for {filePath}: {ex.Message}");
+                            failedFiles++;
                             _logger.LogWarning(ex, "Failed to rebuild metadata for file {FilePath}", filePath);
                         }
                     }
@@ -211,8 +230,11 @@ namespace Locus.Storage.Data
                 result.Success = true;
 
                 _logger.LogInformation(
-                    "Metadata database rebuild completed for tenant {TenantId}. Rebuilt {Count} records",
-                    tenantId, rebuiltFiles);
+                    "Metadata database rebuild completed for tenant {TenantId}. Scanned={Scanned}, Rebuilt={Rebuilt}, Failed={Failed}",
+                    tenantId,
+                    scannedFiles,
+                    rebuiltFiles,
+                    failedFiles);
             }
             catch (Exception ex)
             {
@@ -222,8 +244,11 @@ namespace Locus.Storage.Data
             }
             finally
             {
-                // Step 3: Always release the lock
-                _metadataRepository.FinishDatabaseRebuild(tenantId);
+                // Step 3: Release lock only when rebuild path actually acquired it.
+                if (rebuildLockHeld)
+                {
+                    _metadataRepository.FinishDatabaseRebuild(tenantId);
+                }
             }
 
             return result;

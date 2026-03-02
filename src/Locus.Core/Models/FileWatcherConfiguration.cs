@@ -36,6 +36,13 @@ namespace Locus.Core.Models
         public bool AutoCreateTenantDirectories { get; set; } = false;
 
         /// <summary>
+        /// Gets or sets the cache TTL used by auto-create tenant directory discovery.
+        /// During this window, tenant list reads reuse cache to avoid repeated full scans.
+        /// Default is 60 seconds.
+        /// </summary>
+        public TimeSpan AutoCreateTenantDirectoriesCacheTtl { get; set; } = TimeSpan.FromSeconds(60);
+
+        /// <summary>
         /// Gets or sets the root directory path to monitor.
         /// This directory and all subdirectories will be scanned recursively.
         /// </summary>

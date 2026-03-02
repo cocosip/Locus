@@ -59,6 +59,11 @@ namespace Locus.Benchmarks
             tenantQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
             tenantQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
 
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            directoryQuotaManager.Setup(m => m.CanAddFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+            directoryQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+            directoryQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
             var tenantManager = new Mock<ITenantManager>();
             var tenantContext = new Mock<ITenantContext>();
             tenantContext.Setup(t => t.TenantId).Returns("benchmark-tenant");
@@ -69,7 +74,7 @@ namespace Locus.Benchmarks
             var fileScheduler = new Mock<IFileScheduler>();
 
             var poolLogger = NullLogger<StoragePool>.Instance;
-            _storagePool = new StoragePool(_metadataRepository, tenantQuotaManager.Object, tenantManager.Object, fileScheduler.Object, poolLogger);
+            _storagePool = new StoragePool(_metadataRepository, tenantQuotaManager.Object, directoryQuotaManager.Object, tenantManager.Object, fileScheduler.Object, poolLogger);
 
             // Local filesystem — skip startup delays (no K8s PVC synchronization needed).
             var volumeLogger = NullLogger<LocalFileSystemVolume>.Instance;

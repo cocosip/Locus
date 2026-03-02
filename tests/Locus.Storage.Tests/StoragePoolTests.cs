@@ -23,6 +23,7 @@ namespace Locus.Storage.Tests
         private readonly MetadataRepository _metadataRepository;
         private readonly DirectoryQuotaRepository _quotaRepository;
         private readonly Mock<ITenantQuotaManager> _tenantQuotaManager;
+        private readonly Mock<IDirectoryQuotaManager> _directoryQuotaManager;
         private readonly Mock<ITenantManager> _tenantManager;
         private readonly Mock<IFileScheduler> _fileScheduler;
         private readonly Mock<ILogger<StoragePool>> _logger;
@@ -62,6 +63,14 @@ namespace Locus.Storage.Tests
             _tenantQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
 
+            _directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            _directoryQuotaManager.Setup(m => m.CanAddFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+            _directoryQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            _directoryQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
             // Setup tenant manager
             _tenantManager = new Mock<ITenantManager>();
 
@@ -95,6 +104,7 @@ namespace Locus.Storage.Tests
             _storagePool = new StoragePool(
                 _metadataRepository,
                 _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
                 _tenantManager.Object,
                 _fileScheduler.Object,
                 _logger.Object);
@@ -443,6 +453,46 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task WriteFileAsync_RollsBackTenantQuota_WhenDirectoryQuotaRejected()
+        {
+            _directoryQuotaManager
+                .Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new DirectoryQuotaExceededException("/a", 1, 1));
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("quota-fail"));
+
+            await Assert.ThrowsAsync<DirectoryQuotaExceededException>(() =>
+                _storagePool.WriteFileAsync(_tenant.Object, content, null, default));
+
+            _tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            _directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_RollsBackBothQuotas_WhenPhysicalWriteFails()
+        {
+            _volume2
+                .Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("disk full"));
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("write-fail"));
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                _storagePool.WriteFileAsync(_tenant.Object, content, null, default));
+
+            _tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            _directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task WriteFileAsync_PreservesFileExtension()
         {
             // Arrange
@@ -536,6 +586,9 @@ namespace Locus.Storage.Tests
             _tenantQuotaManager.Verify(
                 m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
                 Times.Once);
+            _directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Once);
 
             var metadataAfterCompletion = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.Null(metadataAfterCompletion);
@@ -547,6 +600,7 @@ namespace Locus.Storage.Tests
             Assert.Throws<ArgumentOutOfRangeException>(() => new StoragePool(
                 _metadataRepository,
                 _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
                 _tenantManager.Object,
                 _fileScheduler.Object,
                 _logger.Object,

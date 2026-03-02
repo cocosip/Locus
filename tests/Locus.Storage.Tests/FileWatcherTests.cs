@@ -358,6 +358,49 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_MultiTenantAutoCreate_UsesTenantSnapshotCacheWithinTtl()
+        {
+            var watchPath = @"C:\watch-auto-create";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var tenantA = new Mock<ITenantContext>();
+            tenantA.Setup(t => t.TenantId).Returns("tenant-001");
+            tenantA.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            var tenantB = new Mock<ITenantContext>();
+            tenantB.Setup(t => t.TenantId).Returns("tenant-002");
+            tenantB.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+
+            _tenantManager.Setup(m => m.GetAllTenantsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { tenantA.Object, tenantB.Object });
+
+            _tenantManager.Setup(m => m.GetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(tenantA.Object);
+            _tenantManager.Setup(m => m.GetTenantAsync("tenant-002", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(tenantB.Object);
+            _tenantManager.Setup(m => m.IsTenantEnabledAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            var config = new FileWatcherConfiguration
+            {
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = true,
+                AutoCreateTenantDirectories = true,
+                AutoCreateTenantDirectoriesCacheTtl = TimeSpan.FromMinutes(5),
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+
+            await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+            await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            Assert.True(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-001")));
+            Assert.True(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-002")));
+            _tenantManager.Verify(m => m.GetAllTenantsAsync(It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task ScanNowAsync_SkipsDisabledTenants()
         {
             // Arrange

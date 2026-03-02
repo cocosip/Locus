@@ -64,6 +64,14 @@ namespace Locus.Benchmarks
                 .Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
 
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            directoryQuotaManager
+                .Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
             var tenantContext = new Mock<ITenantContext>();
             tenantContext.Setup(t => t.TenantId).Returns("bench-tenant");
             tenantContext.Setup(t => t.Status).Returns(TenantStatus.Enabled);
@@ -78,6 +86,7 @@ namespace Locus.Benchmarks
             _storagePool = new StoragePool(
                 _metadataRepository,
                 tenantQuotaManager.Object,
+                directoryQuotaManager.Object,
                 tenantManager.Object,
                 fileScheduler.Object,
                 NullLogger<StoragePool>.Instance);
@@ -172,6 +181,14 @@ namespace Locus.Benchmarks
                 .Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
 
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            directoryQuotaManager
+                .Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
             var tenantContext = new Mock<ITenantContext>();
             tenantContext.Setup(t => t.TenantId).Returns("bench-tenant");
             tenantContext.Setup(t => t.Status).Returns(TenantStatus.Enabled);
@@ -186,6 +203,7 @@ namespace Locus.Benchmarks
             _storagePool = new StoragePool(
                 _metadataRepository,
                 tenantQuotaManager.Object,
+                directoryQuotaManager.Object,
                 tenantManager.Object,
                 fileScheduler.Object,
                 NullLogger<StoragePool>.Instance);

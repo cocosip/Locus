@@ -31,6 +31,9 @@ namespace Locus.MultiTenant
 
         // Locks for file operations per tenant
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
+        private readonly SemaphoreSlim _allTenantsCacheLock;
+        private volatile AllTenantsCacheEntry? _allTenantsCache;
+        private static readonly TimeSpan DefaultAllTenantsCacheTtl = TimeSpan.FromSeconds(60);
 
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
@@ -61,6 +64,7 @@ namespace Locus.MultiTenant
 
             _cache = new ConcurrentDictionary<string, (ITenantContext, DateTime)>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _allTenantsCacheLock = new SemaphoreSlim(1, 1);
 
             // Ensure metadata directory exists
             if (!_fileSystem.Directory.Exists(_metadataRoot))
@@ -198,6 +202,7 @@ namespace Locus.MultiTenant
                 _fileSystem.Directory.CreateDirectory(storagePath);
 
             _cache.TryRemove(tenantId, out _);
+            InvalidateAllTenantsCache();
 
             _logger.LogInformation("Tenant {TenantId} created successfully", tenantId);
         }
@@ -205,38 +210,59 @@ namespace Locus.MultiTenant
         /// <inheritdoc/>
         public async Task<IEnumerable<ITenantContext>> GetAllTenantsAsync(CancellationToken ct)
         {
-            var metadataFiles = _fileSystem.Directory.GetFiles(_metadataRoot, "*.json");
-            var tenants = new List<ITenantContext>(metadataFiles.Length);
+            var cachedSnapshot = _allTenantsCache;
+            if (cachedSnapshot != null && DateTime.UtcNow < cachedSnapshot.ExpiresAtUtc)
+                return cachedSnapshot.Tenants;
 
-            foreach (var filePath in metadataFiles)
+            await _allTenantsCacheLock.WaitAsync(ct);
+            try
             {
-                ct.ThrowIfCancellationRequested();
-                try
+                cachedSnapshot = _allTenantsCache;
+                if (cachedSnapshot != null && DateTime.UtcNow < cachedSnapshot.ExpiresAtUtc)
+                    return cachedSnapshot.Tenants;
+
+                var metadataFiles = _fileSystem.Directory.GetFiles(_metadataRoot, "*.json");
+                var tenants = new List<ITenantContext>(metadataFiles.Length);
+
+                foreach (var filePath in metadataFiles)
                 {
-                    // Read the JSON file directly — bypasses GetTenantAsync's per-tenant lock
-                    // and avoids N sequential lock acquisitions for large tenant counts.
-                    TenantMetadata? metadata;
-                    using (var stream = _fileSystem.File.OpenRead(filePath))
+                    ct.ThrowIfCancellationRequested();
+                    try
                     {
-                        metadata = await JsonSerializer.DeserializeAsync<TenantMetadata>(stream, JsonOptions, ct);
+                        // Read the JSON file directly — bypasses GetTenantAsync's per-tenant lock
+                        // and avoids N sequential lock acquisitions for large tenant counts.
+                        TenantMetadata? metadata;
+                        using (var stream = _fileSystem.File.OpenRead(filePath))
+                        {
+                            metadata = await JsonSerializer.DeserializeAsync<TenantMetadata>(stream, JsonOptions, ct);
+                        }
+
+                        if (metadata == null)
+                            continue;
+
+                        var context = new TenantContext(metadata.TenantId, metadata.Status);
+                        tenants.Add(context);
+
+                        // Populate cache so subsequent GetTenantAsync calls are served from memory.
+                        _cache[metadata.TenantId] = (context, DateTime.UtcNow.Add(_cacheExpiration));
                     }
-
-                    if (metadata == null)
-                        continue;
-
-                    var context = new TenantContext(metadata.TenantId, metadata.Status);
-                    tenants.Add(context);
-
-                    // Populate cache so subsequent GetTenantAsync calls are served from memory.
-                    _cache[metadata.TenantId] = (context, DateTime.UtcNow.Add(_cacheExpiration));
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to load tenant metadata from {FilePath}", filePath);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to load tenant metadata from {FilePath}", filePath);
-                }
+
+                var snapshot = tenants.ToArray();
+                var ttl = _cacheExpiration <= TimeSpan.Zero
+                    ? DefaultAllTenantsCacheTtl
+                    : (_cacheExpiration < DefaultAllTenantsCacheTtl ? _cacheExpiration : DefaultAllTenantsCacheTtl);
+                _allTenantsCache = new AllTenantsCacheEntry(snapshot, DateTime.UtcNow.Add(ttl));
+                return snapshot;
             }
-
-            return tenants;
+            finally
+            {
+                _allTenantsCacheLock.Release();
+            }
         }
 
         private async Task UpdateTenantStatusAsync(string tenantId, TenantStatus newStatus, CancellationToken ct)
@@ -259,6 +285,7 @@ namespace Locus.MultiTenant
 
                 // Invalidate cache
                 _cache.TryRemove(tenantId, out _);
+                InvalidateAllTenantsCache();
             }
             finally
             {
@@ -309,6 +336,24 @@ namespace Locus.MultiTenant
         private string GetTenantMetadataPath(string tenantId)
         {
             return _fileSystem.Path.Combine(_metadataRoot, $"{tenantId}.json");
+        }
+
+        private void InvalidateAllTenantsCache()
+        {
+            _allTenantsCache = null;
+        }
+
+        private sealed class AllTenantsCacheEntry
+        {
+            public AllTenantsCacheEntry(IReadOnlyList<ITenantContext> tenants, DateTime expiresAtUtc)
+            {
+                Tenants = tenants;
+                ExpiresAtUtc = expiresAtUtc;
+            }
+
+            public IReadOnlyList<ITenantContext> Tenants { get; }
+
+            public DateTime ExpiresAtUtc { get; }
         }
     }
 }

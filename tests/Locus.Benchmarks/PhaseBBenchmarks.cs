@@ -255,6 +255,14 @@ namespace Locus.Benchmarks
                 .Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
 
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
             var tenantManager = new Mock<ITenantManager>();
             var scheduler = new Mock<IFileScheduler>();
             scheduler
@@ -269,6 +277,7 @@ namespace Locus.Benchmarks
             _storagePool = new StoragePool(
                 _metadataRepository,
                 tenantQuotaManager.Object,
+                directoryQuotaManager.Object,
                 tenantManager.Object,
                 scheduler.Object,
                 NullLogger<StoragePool>.Instance,

@@ -434,8 +434,11 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 return null;
 
-            var fileInfo      = _fileSystem.FileInfo.New(physicalPath);
-            var directoryPath = Path.GetDirectoryName(physicalPath) ?? string.Empty;
+            var fileInfo = _fileSystem.FileInfo.New(physicalPath);
+            var tenantRootPath = Path.Combine(volume.MountPath, tenantId);
+            var directoryPath = DirectoryPathNormalizer.NormalizeFromPhysicalPath(
+                tenantRootPath,
+                Path.GetDirectoryName(physicalPath));
 
             return new FileMetadata
             {
@@ -604,7 +607,17 @@ namespace Locus.Storage
                     }
 
                     await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
-                    await _quotaRepository.DecrementAsync(metadata.TenantId, metadata.DirectoryPath, ct);
+
+                    var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+                    if (string.IsNullOrWhiteSpace(metadata.DirectoryPath))
+                    {
+                        _logger.LogWarning(
+                            "Encountered empty directory path in metadata during cleanup. Falling back to root '/'. Tenant={TenantId}, FileKey={FileKey}",
+                            metadata.TenantId,
+                            metadata.FileKey);
+                    }
+
+                    await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, ct);
                     removedCount++;
                 }
 
