@@ -218,7 +218,7 @@ namespace Locus.Storage
                     watcher.MultiTenantMode ? "multi-tenant" : "single-tenant",
                     watcher.WatchPath);
 
-                var result = await _fileWatcher.ScanNowAsync(watcher.WatcherId, ct);
+                var result = await _fileWatcher.ScanNowAsync(watcher, ct);
 
                 if (result.FilesImported > 0 || result.FilesFailed > 0)
                 {

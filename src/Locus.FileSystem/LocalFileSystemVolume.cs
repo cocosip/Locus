@@ -599,7 +599,8 @@ namespace Locus.FileSystem
         {
             _knownDirectories.TryAdd(directory, 0);
 
-            if (_knownDirectories.Count <= _knownDirectoryCacheMaxEntries)
+            var observedCount = _knownDirectories.Count;
+            if (observedCount <= _knownDirectoryCacheMaxEntries)
                 return;
 
             if (Interlocked.CompareExchange(ref _knownDirectoryTrimInProgress, 1, 0) != 0)
@@ -608,15 +609,21 @@ namespace Locus.FileSystem
             try
             {
                 var targetSize = Math.Max(1, _knownDirectoryCacheMaxEntries / 2);
+                var removeBudget = Math.Max(0, observedCount - targetSize);
+                if (removeBudget == 0)
+                    return;
+
+                var removed = 0;
                 foreach (var cachedDirectory in _knownDirectories.Keys)
                 {
-                    if (_knownDirectories.Count <= targetSize)
+                    if (removed >= removeBudget)
                         break;
 
                     if (string.Equals(cachedDirectory, _mountPath, _pathComparison))
                         continue;
 
-                    _knownDirectories.TryRemove(cachedDirectory, out _);
+                    if (_knownDirectories.TryRemove(cachedDirectory, out _))
+                        removed++;
                 }
 
                 _knownDirectories.TryAdd(_mountPath, 0);

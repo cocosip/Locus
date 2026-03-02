@@ -188,6 +188,51 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetNextPendingFileAsync_ConcurrentAllocators_DoNotDuplicateAllocations()
+        {
+            const int fileCount = 128;
+            for (var i = 0; i < fileCount; i++)
+            {
+                var metadata = CreateMetadata($"concurrent-single-{i:D3}", FileProcessingStatus.Pending);
+                metadata.CreatedAt = DateTime.UtcNow.AddTicks(i);
+                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            }
+
+            var allocations = await Task.WhenAll(
+                Enumerable.Range(0, fileCount)
+                    .Select(_ => _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None)));
+
+            var allocated = allocations.Where(x => x != null).Select(x => x!).ToList();
+            Assert.Equal(fileCount, allocated.Count);
+            Assert.Equal(fileCount, allocated.Select(x => x.FileKey).Distinct().Count());
+            Assert.All(allocated, x => Assert.Equal(FileProcessingStatus.Processing, x.Status));
+        }
+
+        [Fact]
+        public async Task GetNextPendingBatchAsync_ConcurrentAllocators_DoNotOverlapFileKeys()
+        {
+            const int batchSize = 8;
+            const int workerCount = 16;
+            var totalFiles = batchSize * workerCount;
+
+            for (var i = 0; i < totalFiles; i++)
+            {
+                var metadata = CreateMetadata($"concurrent-batch-{i:D3}", FileProcessingStatus.Pending);
+                metadata.CreatedAt = DateTime.UtcNow.AddTicks(i);
+                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            }
+
+            var batches = await Task.WhenAll(
+                Enumerable.Range(0, workerCount)
+                    .Select(_ => _repository.GetNextPendingBatchAsync(_tenantId, batchSize, CancellationToken.None)));
+
+            var allocated = batches.SelectMany(x => x).ToList();
+            Assert.Equal(totalFiles, allocated.Count);
+            Assert.Equal(totalFiles, allocated.Select(x => x.FileKey).Distinct().Count());
+            Assert.All(allocated, x => Assert.Equal(FileProcessingStatus.Processing, x.Status));
+        }
+
+        [Fact]
         public async Task GetProcessingTimedOutAsync_DoesNotRepeatAfterStatusTransition()
         {
             var oldA = CreateMetadata("proc-a", FileProcessingStatus.Processing);

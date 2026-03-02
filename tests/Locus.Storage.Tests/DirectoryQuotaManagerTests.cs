@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Exceptions;
@@ -356,6 +358,69 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, count2);
             Assert.Equal(5, limit1);
             Assert.Equal(10, limit2);
+        }
+
+        [Fact]
+        public async Task DirtyIndexFlush_TracksOnlyTouchedDirectoriesAndClearsAfterFlush()
+        {
+            var isolatedQuotaDir = Path.Combine(_quotaDir, $"dirty-index-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(isolatedQuotaDir);
+            var repository = new DirectoryQuotaRepository(
+                _fileSystem,
+                new Mock<ILogger<DirectoryQuotaRepository>>().Object,
+                isolatedQuotaDir,
+                enableBackgroundFlush: false);
+
+            try
+            {
+                const string tenantId = "dirty-index-tenant";
+                const string coldDirectory = "/bench/cold";
+                const string hotDirectory = "/bench/hot";
+
+                await repository.TryIncrementAsync(tenantId, coldDirectory, CancellationToken.None);
+                await repository.TryIncrementAsync(tenantId, hotDirectory, CancellationToken.None);
+                InvokeFlushDirtyCounters(repository);
+
+                await repository.TryIncrementAsync(tenantId, hotDirectory, CancellationToken.None);
+
+                var dirtyByTenant = GetPrivateField<ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>>(
+                    repository,
+                    "_dirtyDirectoryKeysByTenant");
+                Assert.True(dirtyByTenant.TryGetValue(tenantId, out var dirtyDirectories));
+                Assert.Single(dirtyDirectories!);
+                Assert.True(dirtyDirectories!.ContainsKey(hotDirectory));
+                Assert.False(dirtyDirectories.ContainsKey(coldDirectory));
+
+                var dirtyTenants = GetPrivateField<ConcurrentDictionary<string, byte>>(repository, "_dirtyTenants");
+                Assert.True(dirtyTenants.ContainsKey(tenantId));
+
+                InvokeFlushDirtyCounters(repository);
+
+                Assert.False(dirtyDirectories.ContainsKey(hotDirectory));
+                Assert.False(dirtyTenants.ContainsKey(tenantId));
+            }
+            finally
+            {
+                repository.Dispose();
+                if (_fileSystem.Directory.Exists(isolatedQuotaDir))
+                    _fileSystem.Directory.Delete(isolatedQuotaDir, recursive: true);
+            }
+        }
+
+        private static void InvokeFlushDirtyCounters(DirectoryQuotaRepository repository)
+        {
+            var flushMethod = typeof(DirectoryQuotaRepository).GetMethod(
+                "DoFlushAllDirtyCounters",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(flushMethod);
+            flushMethod!.Invoke(repository, null);
+        }
+
+        private static T GetPrivateField<T>(object target, string fieldName)
+        {
+            var field = target.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            return (T)field!.GetValue(target)!;
         }
     }
 }

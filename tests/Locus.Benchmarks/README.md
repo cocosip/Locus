@@ -34,6 +34,25 @@ dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolConcurrencyBenchmark
 
 # Volume 健康检查基准测试
 dotnet run -c Release --filter "Locus.Benchmarks.VolumeHealthCheckBenchmarks*"
+
+# 待处理文件分配锁竞争（第7点）基准测试
+dotnet run -c Release --filter "Locus.Benchmarks.PendingAllocationContentionBenchmarks*"
+
+# 第5/6点基准测试（脏键刷盘 + known-dir 裁剪）
+dotnet run -c Release --filter "Locus.Benchmarks.DirectoryQuotaDirtyFlushBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.KnownDirectoryTrimBenchmarks*"
+
+# 第1~4点基准测试（FileWatcher 主路径）
+dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherLargeDirectoryBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherConfigurationDispatchBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherMultiTenantStatusBenchmarks*"
+dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherPrunePressureBenchmarks*"
+
+# 生成第5/6点参数矩阵对比面板（会自动跑基准并输出 Markdown）
+pwsh ./tests/Locus.Benchmarks/build-phase56-matrix-panel.ps1
+
+# 生成第1~4点基准对比面板（会自动跑基准并输出 Markdown）
+pwsh ./tests/Locus.Benchmarks/build-phase14-benchmark-panel.ps1
 ```
 
 > **注意**: BenchmarkDotNet 过滤器使用全限定名 `namespace.typeName.methodName`，不支持 `|` OR 语法。每次只能过滤一个类。
@@ -102,6 +121,52 @@ dotnet run -c Release --filter "*AddOrUpdateAsync_Single*"
 - **10 concurrent writers**: 10 线程并发写入
 - **50 concurrent writers**: 50 线程并发写入
 - **100 concurrent writers**: 100 线程并发写入
+
+### 8. PendingAllocationContentionBenchmarks
+测试 `MetadataRepository` 在单租户高并发下的待处理文件分配竞争:
+- **pending allocation contention (single-file API)**: 并发 `GetNextPendingFileAsync` + 回填 Pending
+- **pending allocation contention (batch API)**: 并发 `GetNextPendingBatchAsync` + 回填 Pending
+
+### 9. DirectoryQuotaDirtyFlushBenchmarks
+测试 `DirectoryQuotaRepository` 在大目录总量下的“脏键索引”刷盘路径:
+- **directory quota flush (indexed sparse dirty set)**: 仅刷脏目录的后台 flush
+- 参数矩阵：`TotalDirectories = [20000, 100000]` × `DirtyDirectories = [32, 128, 512]`
+
+### 10. KnownDirectoryTrimBenchmarks
+测试 `LocalFileSystemVolume` known-directory 缓存在高 churn 下的裁剪路径:
+- **known-directory cache trim under churn**: 高频新增目录触发缓存裁剪
+- 参数矩阵：`CacheMaxEntries = [256, 512, 2048]` × `DirectoryAddsPerOperation = [2048, 4096, 8192]`
+
+### 11. Phase56 Matrix Panel（对比面板）
+用于把第5/6点矩阵结果汇总成一个可对比的 Markdown 面板：
+- 输出文件：`BenchmarkDotNet.Artifacts/results/Locus.Benchmarks.Phase56-Matrix-Panel.md`
+- 源数据：`Locus.Benchmarks.DirectoryQuotaDirtyFlushBenchmarks-report.csv` + `Locus.Benchmarks.KnownDirectoryTrimBenchmarks-report.csv`
+- 明细表包含 `RatioVsBaseline`（相对基线倍率，x）
+
+### 12. FileWatcherLargeDirectoryBenchmarks
+测试第1点（流式扫描 + 小队列）在大目录下的扫描性能:
+- **point1 large-directory streamed scan**: 单租户大目录扫描与导入
+- 参数矩阵：`FileCount = [2000, 10000]` × `MaxConcurrentImports = [1, 8]`
+
+### 13. FileWatcherConfigurationDispatchBenchmarks
+测试第2点（按配置对象扫描）调度路径:
+- **point2 scan dispatch by watcher id (forced config load)**: 强制按 watcherId 重载配置
+- **point2 scan dispatch by configuration snapshot**: 直接按配置对象扫描
+
+### 14. FileWatcherMultiTenantStatusBenchmarks
+测试第3点（复用 GetTenantAsync 状态）在多租户扫描下的表现:
+- **point3 multi-tenant scan with status reuse**
+- 参数矩阵：`TenantDirectoryCount = [40, 160]` × `DisabledRatioPercent = [0, 50]`
+
+### 15. FileWatcherPrunePressureBenchmarks
+测试第4点（prune 脱离热路径）在历史压力下的扫描表现:
+- **point4 scan under imported-history prune pressure**
+- 参数矩阵：`ExistingImportedEntries = [60000, 120000]` × `NewFiles = [256, 1024]`
+
+### 16. Phase14 Benchmark Panel（对比面板）
+用于把第1~4点基准结果汇总成一个可对比的 Markdown 面板：
+- 输出文件：`BenchmarkDotNet.Artifacts/results/Locus.Benchmarks.Phase14-Benchmark-Panel.md`
+- 明细表包含 `RatioVsBaseline`（相对基线倍率，x）
 
 ## 性能指标说明
 

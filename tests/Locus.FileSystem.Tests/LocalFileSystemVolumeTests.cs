@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.IO.Abstractions.TestingHelpers;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -92,6 +94,30 @@ namespace Locus.FileSystem.Tests
             // Assert
             Assert.True(_fileSystem.File.Exists(filePath));
             Assert.True(_fileSystem.Directory.Exists(Path.Combine(_mountPath, "subdir")));
+        }
+
+        [Fact]
+        public async Task WriteAsync_KnownDirectoryCacheTrim_KeepsMountPathAndBoundsSize()
+        {
+            // Use a tiny cache to force trim pressure in a short loop.
+            var volume = new LocalFileSystemVolume(
+                _fileSystem,
+                _logger.Object,
+                "vol-001",
+                _mountPath,
+                knownDirectoryCacheMaxEntries: 16);
+
+            for (var i = 0; i < 80; i++)
+            {
+                var directoryPath = Path.Combine(_mountPath, $"trim-{i:D3}");
+                var filePath = Path.Combine(directoryPath, "file.txt");
+                using var content = new MemoryStream(Encoding.UTF8.GetBytes("x"));
+                await volume.WriteAsync(filePath, content, CancellationToken.None);
+            }
+
+            var knownDirectories = GetPrivateField<ConcurrentDictionary<string, byte>>(volume, "_knownDirectories");
+            Assert.True(knownDirectories.ContainsKey(_mountPath));
+            Assert.True(knownDirectories.Count <= 16);
         }
 
         [Fact]
@@ -359,6 +385,13 @@ namespace Locus.FileSystem.Tests
             var path4 = volume.BuildPhysicalPath("tenant-004", "AaBbCcDd");
             var expected4 = Path.Combine(_mountPath, "tenant-004", "Aa", "Bb", "AaBbCcDd");
             Assert.Equal(Path.GetFullPath(expected4), path4);
+        }
+
+        private static T GetPrivateField<T>(object target, string fieldName)
+        {
+            var field = target.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            return (T)field!.GetValue(target)!;
         }
     }
 }

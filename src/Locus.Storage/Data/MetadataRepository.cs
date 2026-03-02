@@ -1376,17 +1376,21 @@ namespace Locus.Storage.Data
                 return null;
 
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            ConcurrentDictionary<string, FileMetadata>? cacheRef = null;
+            FileMetadata? selected = null;
+            FileMetadata? selectedPrevious = null;
+            var dequeuedAttempts = 0;
+            var staleSkips = 0;
             await tenantLock.WaitAsync(ct);
             try
             {
                 var cache = GetCache(tenantId);
+                cacheRef = cache;
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
                 var now = DateTime.UtcNow;
                 PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotions);
                 pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
                 var maxDequeues = Math.Min(Math.Max(pendingCount + 64, 64), MaxSinglePendingDequeues);
-                var dequeuedAttempts = 0;
-                var staleSkips = 0;
 
                 while (dequeuedAttempts++ < maxDequeues && pendingQueue.TryDequeue(out var entry))
                 {
@@ -1425,23 +1429,29 @@ namespace Locus.Storage.Data
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                     InvalidatePendingGeneration(tenantId, updated.FileKey);
-                    IndexStatusCandidate(candidate, updated);
-                    EnqueuePersistence(new PersistenceOperation(updated));
-                    RecordPendingDequeueStats(dequeuedAttempts, staleSkips);
-                    MaybeCompactPendingQueueForStaleRatio(tenantId, cache, staleSkips, dequeuedAttempts);
-
-                    _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", updated.FileKey, tenantId);
-                    return updated;
+                    selected = updated;
+                    selectedPrevious = candidate;
+                    break;
                 }
-
-                RecordPendingDequeueStats(dequeuedAttempts, staleSkips);
-                MaybeCompactPendingQueueForStaleRatio(tenantId, cache, staleSkips, dequeuedAttempts);
-                return null;
             }
             finally
             {
                 tenantLock.Release();
             }
+
+            // Non-critical follow-up work is intentionally done outside the tenant lock
+            // to reduce contention among concurrent allocators for the same tenant.
+            RecordPendingDequeueStats(dequeuedAttempts, staleSkips);
+            if (cacheRef != null)
+                MaybeCompactPendingQueueForStaleRatio(tenantId, cacheRef, staleSkips, dequeuedAttempts);
+
+            if (selected == null)
+                return null;
+
+            IndexStatusCandidate(selectedPrevious, selected);
+            EnqueuePersistence(new PersistenceOperation(selected));
+            _logger.LogDebug("Allocated file for processing: {FileKey}, Tenant: {TenantId}", selected.FileKey, tenantId);
+            return selected;
         }
         /// <summary>
         /// Gets a batch of pending files for processing (atomic operation).
@@ -1466,22 +1476,26 @@ namespace Locus.Storage.Data
             // Get or create tenant-specific lock (shared with GetNextPendingFileAsync)
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
+            ConcurrentDictionary<string, FileMetadata>? cacheRef = null;
+            var transitions = new List<(FileMetadata Previous, FileMetadata Updated)>(batchSize);
+            var results = new List<FileMetadata>(batchSize);
+            var dequeued = 0;
+            var staleSkips = 0;
+
             // Acquire lock to ensure atomic dequeue-and-mark across concurrent callers
             await tenantLock.WaitAsync(ct);
             try
             {
                 var cache = GetCache(tenantId);
+                cacheRef = cache;
                 var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
                 var now = DateTime.UtcNow;
                 PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotionsBatch);
 
-                var results = new List<FileMetadata>(batchSize);
                 // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
                 // are present. Tie the cap to pendingCount and batchSize to bound lock hold time.
                 pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
                 var maxDequeues = Math.Min(pendingCount + 64, batchSize * 2 + 64);
-                var dequeued = 0;
-                var staleSkips = 0;
 
                 while (results.Count < batchSize
                        && dequeued++ < maxDequeues
@@ -1521,20 +1535,30 @@ namespace Locus.Storage.Data
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                     InvalidatePendingGeneration(tenantId, updated.FileKey);
-                    IndexStatusCandidate(candidate, updated);
-                    EnqueuePersistence(new PersistenceOperation(updated));
                     results.Add(updated);
+                    transitions.Add((candidate, updated));
                 }
-
-                RecordPendingDequeueStats(dequeued, staleSkips);
-                MaybeCompactPendingQueueForStaleRatio(tenantId, cache, staleSkips, dequeued);
-                _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
-                return results;
             }
             finally
             {
                 tenantLock.Release();
             }
+
+            // Non-critical follow-up work is intentionally done outside the tenant lock
+            // to reduce contention among concurrent allocators for the same tenant.
+            for (var i = 0; i < transitions.Count; i++)
+            {
+                var transition = transitions[i];
+                IndexStatusCandidate(transition.Previous, transition.Updated);
+                EnqueuePersistence(new PersistenceOperation(transition.Updated));
+            }
+
+            RecordPendingDequeueStats(dequeued, staleSkips);
+            if (cacheRef != null)
+                MaybeCompactPendingQueueForStaleRatio(tenantId, cacheRef, staleSkips, dequeued);
+
+            _logger.LogDebug("Allocated {Count} files for processing, Tenant: {TenantId}", results.Count, tenantId);
+            return results;
         }
         /// <summary>
         /// Resets files that have been in Processing status for longer than the timeout.

@@ -57,6 +57,8 @@ namespace Locus.Storage.Data
         }
 
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>> _atomicCounters;
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _dirtyDirectoryKeysByTenant;
+        private readonly ConcurrentDictionary<string, byte> _dirtyTenants;
         private readonly Timer? _flushTimer;
         private readonly bool _enableBackgroundFlush;
         private const int FlushIntervalMs = 5_000; // 5 seconds
@@ -88,6 +90,8 @@ namespace Locus.Storage.Data
             _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _atomicCounters = new ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>>();
+            _dirtyDirectoryKeysByTenant = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>();
+            _dirtyTenants = new ConcurrentDictionary<string, byte>();
 
             // Ensure quota directory exists
             if (!_fileSystem.Directory.Exists(_quotaDirectory))
@@ -486,6 +490,20 @@ namespace Locus.Storage.Data
         // -----------------------------------------------------------------
 
         /// <summary>
+        /// Marks a quota counter dirty and indexes it for targeted background flush.
+        /// </summary>
+        private void MarkDirty(string tenantId, string directoryPath, AtomicQuotaState state)
+        {
+            state.Dirty = true;
+
+            var dirtyDirectories = _dirtyDirectoryKeysByTenant.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+            dirtyDirectories[directoryPath] = 0;
+            _dirtyTenants[tenantId] = 0;
+        }
+
+        /// <summary>
         /// Timer callback: flushes all dirty atomic counters to LiteDB.
         /// Non-reentrant: uses Timeout.Infinite period and reschedules after completion.
         /// </summary>
@@ -515,99 +533,114 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Core flush logic: iterates all tenants and writes dirty counter states to LiteDB.
+        /// Core flush logic: drains indexed dirty tenants/directories and writes them to LiteDB.
         /// Safe to call from Dispose for a final drain.
         /// </summary>
         private void DoFlushAllDirtyCounters()
         {
-            foreach (var tenantPair in _atomicCounters)
+            foreach (var tenantId in _dirtyTenants.Keys)
             {
-                var tenantId = tenantPair.Key;
-                var tenantCounters = tenantPair.Value;
-                var cache = _quotaCache.GetOrAdd(
-                    tenantId,
-                    _ => new ConcurrentDictionary<string, DirectoryQuota>());
-                var dirtySnapshots = new List<(string DirectoryPath, AtomicQuotaState State, DirectoryQuota Snapshot)>();
-
-                foreach (var dirPair in tenantCounters)
-                {
-                    var directoryPath = dirPair.Key;
-                    var atomicState = dirPair.Value;
-
-                    if (!atomicState.Dirty)
-                        continue;
-
-                    // Clear dirty BEFORE reading count so any concurrent increments that
-                    // happen during the LiteDB write will mark Dirty=true again and be
-                    // captured in the next flush cycle.
-                    atomicState.Dirty = false;
-                    var count = Volatile.Read(ref atomicState.Count);
-
-                    // Get or create the cache entry; if it doesn't exist yet (first-ever
-                    // increment for this directory before GetOrCreateAsync was called),
-                    // create a minimal entry so we can persist it.
-                    var existing = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
-                    {
-                        DirectoryPath = path,
-                        CurrentCount = count,
-                        MaxCount = atomicState.MaxCount,
-                        Enabled = atomicState.Enabled,
-                        CreatedAt = DateTime.UtcNow,
-                        LastUpdated = DateTime.UtcNow
-                    });
-
-                    var snapshot = new DirectoryQuota
-                    {
-                        DirectoryPath = existing.DirectoryPath,
-                        CurrentCount = count,
-                        MaxCount = atomicState.MaxCount,
-                        Enabled = atomicState.Enabled,
-                        CreatedAt = existing.CreatedAt,
-                        LastUpdated = DateTime.UtcNow
-                    };
-
-                    // Atomically replace the cached entry with the updated snapshot.
-                    cache[directoryPath] = snapshot;
-                    dirtySnapshots.Add((directoryPath, atomicState, snapshot));
-                }
-
-                if (dirtySnapshots.Count == 0)
+                if (!_dirtyTenants.TryRemove(tenantId, out _))
                     continue;
 
+                FlushDirtyCountersForTenant(tenantId);
+            }
+        }
+
+        private void FlushDirtyCountersForTenant(string tenantId)
+        {
+            if (!_dirtyDirectoryKeysByTenant.TryGetValue(tenantId, out var dirtyDirectories))
+                return;
+
+            if (!_atomicCounters.TryGetValue(tenantId, out var tenantCounters))
+                return;
+
+            var cache = _quotaCache.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, DirectoryQuota>());
+            var dirtySnapshots = new List<(string DirectoryPath, AtomicQuotaState State, DirectoryQuota Snapshot)>();
+
+            foreach (var directoryPath in dirtyDirectories.Keys)
+            {
+                if (!dirtyDirectories.TryRemove(directoryPath, out _))
+                    continue;
+
+                if (!tenantCounters.TryGetValue(directoryPath, out var atomicState))
+                    continue;
+
+                if (!atomicState.Dirty)
+                    continue;
+
+                // Clear dirty BEFORE reading count so any concurrent increments that
+                // happen during the LiteDB write will mark Dirty=true again and be
+                // captured in the next flush cycle.
+                atomicState.Dirty = false;
+                var count = Volatile.Read(ref atomicState.Count);
+
+                // Get or create the cache entry; if it doesn't exist yet (first-ever
+                // increment for this directory before GetOrCreateAsync was called),
+                // create a minimal entry so we can persist it.
+                var existing = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
+                {
+                    DirectoryPath = path,
+                    CurrentCount = count,
+                    MaxCount = atomicState.MaxCount,
+                    Enabled = atomicState.Enabled,
+                    CreatedAt = DateTime.UtcNow,
+                    LastUpdated = DateTime.UtcNow
+                });
+
+                var snapshot = new DirectoryQuota
+                {
+                    DirectoryPath = existing.DirectoryPath,
+                    CurrentCount = count,
+                    MaxCount = atomicState.MaxCount,
+                    Enabled = atomicState.Enabled,
+                    CreatedAt = existing.CreatedAt,
+                    LastUpdated = DateTime.UtcNow
+                };
+
+                // Atomically replace the cached entry with the updated snapshot.
+                cache[directoryPath] = snapshot;
+                dirtySnapshots.Add((directoryPath, atomicState, snapshot));
+            }
+
+            if (dirtySnapshots.Count == 0)
+                return;
+
+            try
+            {
+                var db = GetDatabase(tenantId);
+                var quotas = db.GetCollection<DirectoryQuota>("quotas");
+
+                db.BeginTrans();
                 try
                 {
-                    var db = GetDatabase(tenantId);
-                    var quotas = db.GetCollection<DirectoryQuota>("quotas");
-
-                    db.BeginTrans();
-                    try
-                    {
-                        foreach (var item in dirtySnapshots)
-                            quotas.Upsert(item.Snapshot);
-
-                        db.Commit();
-                    }
-                    catch
-                    {
-                        db.Rollback();
-                        throw;
-                    }
-
-                    _logger.LogDebug(
-                        "Flushed {Count} dirty quota counters for tenant {TenantId} in a single transaction",
-                        dirtySnapshots.Count, tenantId);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex,
-                        "Failed to flush dirty quota counters for tenant {TenantId}; will retry on next flush (Count={Count})",
-                        tenantId, dirtySnapshots.Count);
-
                     foreach (var item in dirtySnapshots)
-                    {
-                        // Re-mark dirty so the next flush retries.
-                        item.State.Dirty = true;
-                    }
+                        quotas.Upsert(item.Snapshot);
+
+                    db.Commit();
+                }
+                catch
+                {
+                    db.Rollback();
+                    throw;
+                }
+
+                _logger.LogDebug(
+                    "Flushed {Count} dirty quota counters for tenant {TenantId} in a single transaction",
+                    dirtySnapshots.Count, tenantId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Failed to flush dirty quota counters for tenant {TenantId}; will retry on next flush (Count={Count})",
+                    tenantId, dirtySnapshots.Count);
+
+                foreach (var item in dirtySnapshots)
+                {
+                    // Re-mark dirty so the next flush retries.
+                    MarkDirty(tenantId, item.DirectoryPath, item.State);
                 }
             }
         }
@@ -795,7 +828,7 @@ namespace Locus.Storage.Data
             if (!state.Enabled || state.MaxCount == 0)
             {
                 Interlocked.Increment(ref state.Count);
-                state.Dirty = true;
+                MarkDirty(tenantId, directoryPath, state);
                 return Task.FromResult(true);
             }
 
@@ -823,7 +856,7 @@ namespace Locus.Storage.Data
                 spin.SpinOnce();
             }
 
-            state.Dirty = true;
+            MarkDirty(tenantId, directoryPath, state);
 
             _logger.LogDebug(
                 "Incremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
@@ -867,7 +900,7 @@ namespace Locus.Storage.Data
                 spin.SpinOnce();
             }
 
-            state.Dirty = true;
+            MarkDirty(tenantId, directoryPath, state);
 
             _logger.LogDebug(
                 "Decremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
@@ -921,6 +954,9 @@ namespace Locus.Storage.Data
                     // Also remove atomic state so a future GetOrCreateAtomicState reinitializes cleanly.
                     if (_atomicCounters.TryGetValue(tenantId, out var tenantCounters))
                         tenantCounters.TryRemove(directoryPath, out _);
+
+                    if (_dirtyDirectoryKeysByTenant.TryGetValue(tenantId, out var dirtyDirectories))
+                        dirtyDirectories.TryRemove(directoryPath, out _);
 
                     // Remove from LiteDB
                     var db = GetDatabase(tenantId);
@@ -1086,6 +1122,8 @@ namespace Locus.Storage.Data
             _databases.Clear();
             _quotaCache.Clear();
             _atomicCounters.Clear();
+            _dirtyDirectoryKeysByTenant.Clear();
+            _dirtyTenants.Clear();
 
             // Dispose all tenant locks
             foreach (var lockSem in _tenantLocks.Values)

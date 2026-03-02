@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -54,6 +55,8 @@ namespace Locus.Storage
         private const int ImportedHistoryCompactThresholdOperationCount = 4_000;
         private const long ImportedHistoryCompactThresholdBytes = 4L * 1024 * 1024;
         private const int MaxImportedHistoryChannelSize = 20_000;
+        private const int MinImportQueueCapacity = 64;
+        private const int MaxImportQueueCapacity = 1024;
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
         private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan DefaultImportedHistoryFlushInterval = TimeSpan.FromSeconds(2);
@@ -723,18 +726,57 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task<FileWatcherScanResult> ScanNowAsync(string watcherId, CancellationToken ct)
         {
-            var configuration = await LoadConfigurationAsync(watcherId, ct);
+            // Fast path for BackgroundFileWatcherService: it calls GetAllWatchersAsync first,
+            // so we can reuse the same in-memory snapshot and avoid a second file read.
+            var configuration = TryGetCachedWatcherConfiguration(watcherId);
+            if (configuration == null)
+                configuration = await LoadConfigurationAsync(watcherId, ct);
+
             if (configuration == null)
             {
                 throw new InvalidOperationException($"Watcher '{watcherId}' not found.");
             }
 
+            return await ScanNowAsync(configuration, ct);
+        }
+
+        /// <inheritdoc/>
+        public async Task<FileWatcherScanResult> ScanNowAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        {
+            if (configuration == null)
+                throw new ArgumentNullException(nameof(configuration));
+
+            var watcherId = string.IsNullOrWhiteSpace(configuration.WatcherId)
+                ? "<unknown>"
+                : configuration.WatcherId;
+
             if (!configuration.Enabled)
-            {
                 throw new InvalidOperationException($"Watcher '{watcherId}' is disabled.");
-            }
 
             return await ScanDirectoryAsync(configuration, ct);
+        }
+
+        private FileWatcherConfiguration? TryGetCachedWatcherConfiguration(string watcherId)
+        {
+            if (string.IsNullOrWhiteSpace(watcherId))
+                return null;
+
+            var cached = _cachedWatchers;
+            if (cached == null)
+                return null;
+
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (nowTicks >= Interlocked.Read(ref _watchersCacheExpiresAtTicks))
+                return null;
+
+            for (var i = 0; i < cached.Count; i++)
+            {
+                var candidate = cached[i];
+                if (string.Equals(candidate.WatcherId, watcherId, StringComparison.Ordinal))
+                    return candidate;
+            }
+
+            return null;
         }
 
         /// <inheritdoc/>
@@ -821,9 +863,8 @@ namespace Locus.Storage
                 configuration.FilePatterns,
                 configuration.IncludeSubdirectories);
 
-            result.FilesDiscovered += files.Count;
-
-            await ProcessFilesAsync(configuration, tenant, files, result, ct);
+            var discovered = await ProcessFilesAsync(configuration, tenant, files, result, ct);
+            result.FilesDiscovered += discovered;
         }
 
         private async Task ScanMultiTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct)
@@ -880,12 +921,24 @@ namespace Locus.Storage
                         continue;
                     }
 
-                    // Check if tenant is enabled
-                    if (!await _tenantManager.IsTenantEnabledAsync(tenantId, ct))
+                    // Reuse the status from GetTenantAsync to avoid a second tenant lookup.
+                    // Fallback to IsTenantEnabledAsync only when Status is an unknown value
+                    // (e.g. mocked ITenantContext that does not set Status).
+                    if (tenant.Status != TenantStatus.Enabled)
                     {
-                        _logger.LogDebug("Skipping directory {TenantDirectory} - tenant {TenantId} is disabled",
-                            tenantDirectory, tenantId);
-                        continue;
+                        if (tenant.Status == TenantStatus.Disabled || tenant.Status == TenantStatus.Suspended)
+                        {
+                            _logger.LogDebug("Skipping directory {TenantDirectory} - tenant {TenantId} is disabled",
+                                tenantDirectory, tenantId);
+                            continue;
+                        }
+
+                        if (!await _tenantManager.IsTenantEnabledAsync(tenantId, ct))
+                        {
+                            _logger.LogDebug("Skipping directory {TenantDirectory} - tenant {TenantId} is disabled",
+                                tenantDirectory, tenantId);
+                            continue;
+                        }
                     }
 
                     // Scan tenant directory recursively
@@ -895,12 +948,11 @@ namespace Locus.Storage
                         configuration.FilePatterns,
                         configuration.IncludeSubdirectories);
 
-                    result.FilesDiscovered += files.Count;
+                    var discovered = await ProcessFilesAsync(configuration, tenant, files, result, ct);
+                    result.FilesDiscovered += discovered;
 
                     _logger.LogDebug("Found {FileCount} files in tenant directory {TenantDirectory}",
-                        files.Count, tenantDirectory);
-
-                    await ProcessFilesAsync(configuration, tenant, files, result, ct);
+                        discovered, tenantDirectory);
                 }
                 catch (Exception ex)
                 {
@@ -910,49 +962,46 @@ namespace Locus.Storage
             }
         }
 
-        private async Task ProcessFilesAsync(
+        private async Task<int> ProcessFilesAsync(
             FileWatcherConfiguration configuration,
             ITenantContext tenant,
-            List<string> files,
+            IEnumerable<string> files,
             FileWatcherScanResult result,
             CancellationToken ct)
         {
             // Validate MaxConcurrentImports
             var maxConcurrency = Math.Max(1, configuration.MaxConcurrentImports);
+            var discovered = 0;
 
             try
             {
                 if (maxConcurrency == 1)
                 {
-                    // Sequential processing (no concurrency)
+                    // Sequential processing keeps memory flat by streaming file enumeration.
                     foreach (var filePath in files)
                     {
                         if (ct.IsCancellationRequested)
                             break;
 
+                        discovered++;
                         var fileResult = await ProcessSingleFileAsync(configuration, tenant, filePath, ct);
                         MergeResult(result, fileResult);
                     }
                 }
                 else
                 {
-                    // Concurrent processing with a fixed worker pool.
-                    // Bounded channel keeps the queue size explicit and prevents unbounded growth.
-                    var queue = Channel.CreateBounded<string>(new BoundedChannelOptions(files.Count)
+                    // Concurrent processing with a fixed-size queue keeps memory bounded even when
+                    // directory scans return very large file sets.
+                    var queueCapacity = Math.Min(
+                        MaxImportQueueCapacity,
+                        Math.Max(MinImportQueueCapacity, maxConcurrency * 4));
+                    var queue = Channel.CreateBounded<string>(new BoundedChannelOptions(queueCapacity)
                     {
                         SingleWriter = true,
                         SingleReader = false,
                         FullMode = BoundedChannelFullMode.Wait,
                         AllowSynchronousContinuations = false
                     });
-
-                    foreach (var filePath in files)
-                    {
-                        if (!queue.Writer.TryWrite(filePath))
-                            await queue.Writer.WriteAsync(filePath, ct);
-                    }
-                    queue.Writer.Complete();
-
                     var workers = Enumerable.Range(0, maxConcurrency).Select(async _ =>
                     {
                         var workerResult = new FileWatcherScanResult();
@@ -966,19 +1015,54 @@ namespace Locus.Storage
                         }
                         return workerResult;
                     }).ToArray();
-
-                    var workerResults = await Task.WhenAll(workers);
+                    Exception? producerException = null;
+                    FileWatcherScanResult[] workerResults = Array.Empty<FileWatcherScanResult>();
+                    try
+                    {
+                        foreach (var filePath in files)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            discovered++;
+                            if (!queue.Writer.TryWrite(filePath))
+                                await queue.Writer.WriteAsync(filePath, ct);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        producerException = ex;
+                    }
+                    finally
+                    {
+                        queue.Writer.TryComplete();
+                        try
+                        {
+                            workerResults = await Task.WhenAll(workers);
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                        {
+                            if (producerException == null)
+                                producerException = new OperationCanceledException(ct);
+                        }
+                    }
 
                     foreach (var workerResult in workerResults)
                     {
                         MergeResult(result, workerResult);
                     }
+
+                    if (producerException != null)
+                        ExceptionDispatchInfo.Capture(producerException).Throw();
                 }
             }
             finally
             {
+                // Run stale-history pruning once per scan batch instead of once per file
+                // to keep file-import hot path free of O(n) File.Exists sweeps.
+                TryPruneStaleImportedEntries(configuration);
                 await FlushImportedFilesHistoryIfDirtyAsync(configuration, force: false, ct).ConfigureAwait(false);
             }
+
+            return discovered;
         }
 
         private async Task<FileWatcherScanResult> ProcessSingleFileAsync(
@@ -1046,9 +1130,6 @@ namespace Locus.Storage
                 // Import file
                 using (var stream = _fileSystem.File.OpenRead(filePath))
                 {
-                    // Guard against unbounded growth in Keep mode with interval-based pruning.
-                    TryPruneStaleImportedEntries(configuration);
-
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, stream, fileName, ct);
                     UpsertImportedFileRecord(filePath, fileKey);
@@ -1093,44 +1174,112 @@ namespace Locus.Storage
             target.Errors.AddRange(source.Errors);
         }
 
-        private List<string> GetFilesRecursive(
+        private IEnumerable<string> GetFilesRecursive(
             string watcherId,
             string path,
             List<string> patterns,
             bool includeSubdirectories)
         {
-            var files = new List<string>();
+            List<string> normalizedPatterns;
 
             try
             {
-                var normalizedPatterns = (patterns ?? new List<string> { "*" })
+                normalizedPatterns = (patterns ?? new List<string> { "*" })
                     .Where(p => !string.IsNullOrWhiteSpace(p))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
                 if (normalizedPatterns.Count == 0)
                     normalizedPatterns.Add("*");
-
-                var searchOption = includeSubdirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-
-                if (normalizedPatterns.Count == 1 && normalizedPatterns[0] == "*")
-                    return _fileSystem.Directory.GetFiles(path, "*", searchOption).ToList();
-
-                var matcherCacheEntry = GetOrCreatePatternMatcherCacheEntry(watcherId, normalizedPatterns);
-
-                foreach (var file in _fileSystem.Directory.EnumerateFiles(path, "*", searchOption))
-                {
-                    var fileName = _fileSystem.Path.GetFileName(file);
-                    if (matcherCacheEntry.Matchers.Any(m => m.IsMatch(fileName)))
-                        files.Add(file);
-                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error scanning directory {Path}", path);
+                return Enumerable.Empty<string>();
             }
 
-            return files;
+            var searchOption = includeSubdirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            if (normalizedPatterns.Count == 1 && normalizedPatterns[0] == "*")
+                return EnumerateFilesSafe(path, searchOption);
+
+            var matcherCacheEntry = GetOrCreatePatternMatcherCacheEntry(watcherId, normalizedPatterns);
+            return EnumerateMatchingFiles(path, searchOption, matcherCacheEntry.Matchers);
+        }
+
+        private IEnumerable<string> EnumerateFilesSafe(string path, SearchOption searchOption)
+        {
+            IEnumerator<string>? enumerator;
+            try
+            {
+                enumerator = _fileSystem.Directory.EnumerateFiles(path, "*", searchOption).GetEnumerator();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error scanning directory {Path}", path);
+                return Enumerable.Empty<string>();
+            }
+
+            return EnumerateFiles(path, enumerator);
+        }
+
+        private IEnumerable<string> EnumerateMatchingFiles(string path, SearchOption searchOption, Regex[] matchers)
+        {
+            IEnumerator<string>? enumerator;
+            try
+            {
+                enumerator = _fileSystem.Directory.EnumerateFiles(path, "*", searchOption).GetEnumerator();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error scanning directory {Path}", path);
+                return Enumerable.Empty<string>();
+            }
+
+            return EnumerateFiles(path, enumerator, matchers);
+        }
+
+        private IEnumerable<string> EnumerateFiles(string path, IEnumerator<string> enumerator, Regex[]? matchers = null)
+        {
+            using (enumerator)
+            {
+                while (true)
+                {
+                    string file;
+                    try
+                    {
+                        if (!enumerator.MoveNext())
+                            yield break;
+
+                        file = enumerator.Current;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error scanning directory {Path}", path);
+                        yield break;
+                    }
+
+                    if (matchers == null)
+                    {
+                        yield return file;
+                        continue;
+                    }
+
+                    var fileName = _fileSystem.Path.GetFileName(file);
+                    if (MatchesAnyPattern(fileName, matchers))
+                        yield return file;
+                }
+            }
+        }
+
+        private static bool MatchesAnyPattern(string fileName, Regex[] matchers)
+        {
+            for (var i = 0; i < matchers.Length; i++)
+            {
+                if (matchers[i].IsMatch(fileName))
+                    return true;
+            }
+
+            return false;
         }
 
         private static Regex CreateWildcardMatcher(string pattern)

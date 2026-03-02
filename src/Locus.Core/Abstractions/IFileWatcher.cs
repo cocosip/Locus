@@ -71,6 +71,15 @@ namespace Locus.Core.Abstractions
         Task<FileWatcherScanResult> ScanNowAsync(string watcherId, CancellationToken ct);
 
         /// <summary>
+        /// Manually triggers an immediate scan using an already-loaded watcher configuration.
+        /// This avoids re-reading configuration from disk when the caller already has a snapshot.
+        /// </summary>
+        /// <param name="configuration">The watcher configuration snapshot to scan.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Statistics about the scan operation.</returns>
+        Task<FileWatcherScanResult> ScanNowAsync(FileWatcherConfiguration configuration, CancellationToken ct);
+
+        /// <summary>
         /// Gets all registered watcher configurations.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
