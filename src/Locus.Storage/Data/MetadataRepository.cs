@@ -508,9 +508,10 @@ namespace Locus.Storage.Data
 
                     var files = db.GetCollection<FileMetadata>("files");
                     // FileKey is already BsonId, no need to create additional index
-                    files.EnsureIndex(x => x.Status);
-                    files.EnsureIndex(x => x.CreatedAt);
-                    files.EnsureIndex(x => x.AvailableForProcessingAt);
+                    // Use string-based overload to avoid LinqExpressionVisitor failing on enum types
+                    files.EnsureIndex("Status");
+                    files.EnsureIndex("CreatedAt");
+                    files.EnsureIndex("AvailableForProcessingAt");
 
                     _logger.LogDebug("Created/opened LiteDB database for tenant {TenantId} at {Path}", tid, dbPath);
 
@@ -548,9 +549,9 @@ namespace Locus.Storage.Data
                         var db = new LiteDatabase(connectionString);
 
                         var files = db.GetCollection<FileMetadata>("files");
-                        files.EnsureIndex(x => x.Status);
-                        files.EnsureIndex(x => x.CreatedAt);
-                        files.EnsureIndex(x => x.AvailableForProcessingAt);
+                        files.EnsureIndex("Status");
+                        files.EnsureIndex("CreatedAt");
+                        files.EnsureIndex("AvailableForProcessingAt");
 
                         _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
 
