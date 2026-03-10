@@ -31,6 +31,7 @@ namespace Locus.Storage.Data
 
         // Per-tenant SQLite connections (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<SqliteConnection>> _databases;
+        private readonly ConcurrentDictionary<string, object> _databaseLocks;
 
         // Per-tenant operation locks (used for config operations; NOT used in hot path)
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
@@ -89,6 +90,7 @@ namespace Locus.Storage.Data
             _enableBackgroundFlush = enableBackgroundFlush;
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
             _databases = new ConcurrentDictionary<string, Lazy<SqliteConnection>>();
+            _databaseLocks = new ConcurrentDictionary<string, object>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _atomicCounters = new ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>>();
             _dirtyDirectoryKeysByTenant = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>();
@@ -194,6 +196,11 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
             return lazyConn.Value;
+        }
+
+        private object GetDatabaseLock(string tenantId)
+        {
+            return _databaseLocks.GetOrAdd(tenantId, _ => new object());
         }
 
         private SqliteConnection OpenAndInitializeConnection(string dbPath)
@@ -348,42 +355,46 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 return null;
             }
 
-            // Remove from cache FIRST so no other thread can acquire the disposed instance.
-            _databases.TryRemove(tenantId, out var lazyConn);
-
-            // Dispose the removed connection (safe: it's no longer reachable via cache).
-            if (lazyConn != null && lazyConn.IsValueCreated)
+            lock (GetDatabaseLock(tenantId))
             {
-                try
+                // Remove from cache FIRST so no other thread can acquire the disposed instance.
+                _databases.TryRemove(tenantId, out var lazyConn);
+
+                // Dispose the removed connection (safe: it's no longer reachable via cache).
+                if (lazyConn != null && lazyConn.IsValueCreated)
                 {
-                    lazyConn.Value?.Dispose();
-                    _logger.LogDebug("Disposed SQLite quota connection for rebuild: {TenantId}", tenantId);
+                    try
+                    {
+                        lazyConn.Value?.Dispose();
+                        _logger.LogDebug("Disposed SQLite quota connection for rebuild: {TenantId}", tenantId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error disposing SQLite quota connection for tenant {TenantId}", tenantId);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Error disposing SQLite quota connection for tenant {TenantId}", tenantId);
-                }
+
+                // Force the connection pool to release the OS file handle before deleting the file.
+                // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
+                // This is intentional and necessary: the OS file handle must be released before the
+                // database file can be deleted. Since database rebuild is a rare maintenance operation
+                // (only triggered by corruption), the brief impact on other tenants is acceptable.
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                _quotaCache.TryRemove(tenantId, out _);
+
+                // Backup and delete corrupted database
+                var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+                _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+                _logger.LogInformation("Backed up corrupted quota database: {BackupPath}", backupPath);
+
+                _fileSystem.File.Delete(dbPath);
+                _logger.LogInformation("Deleted corrupted quota database: {DatabasePath}", dbPath);
+
+                // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
+                DeleteSidecarFiles(dbPath);
+
+                return backupPath;
             }
-            // Force the connection pool to release the OS file handle before deleting the file.
-            // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
-            // This is intentional and necessary: the OS file handle must be released before the
-            // database file can be deleted. Since database rebuild is a rare maintenance operation
-            // (only triggered by corruption), the brief impact on other tenants is acceptable.
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            _quotaCache.TryRemove(tenantId, out _);
-
-            // Backup and delete corrupted database
-            var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
-            _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
-            _logger.LogInformation("Backed up corrupted quota database: {BackupPath}", backupPath);
-
-            _fileSystem.File.Delete(dbPath);
-            _logger.LogInformation("Deleted corrupted quota database: {DatabasePath}", dbPath);
-
-            // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
-            DeleteSidecarFiles(dbPath);
-
-            return backupPath;
         }
 
         /// <summary>
@@ -394,8 +405,11 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         {
             try
             {
-                var conn = GetDatabase(tenantId);
-                UpsertQuota(conn, quota);
+                lock (GetDatabaseLock(tenantId))
+                {
+                    var conn = GetDatabase(tenantId);
+                    UpsertQuota(conn, quota);
+                }
 
                 var cache = GetCache(tenantId);
                 cache[quota.DirectoryPath] = quota;
@@ -414,8 +428,11 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         "Quota database rebuilt for tenant {TenantId}. Backup saved at: {BackupPath}",
                         tenantId, backupPath ?? "N/A");
 
-                    var conn = GetDatabase(tenantId);
-                    UpsertQuota(conn, quota);
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        var conn = GetDatabase(tenantId);
+                        UpsertQuota(conn, quota);
+                    }
 
                     var cache = GetCache(tenantId);
                     cache[quota.DirectoryPath] = quota;
@@ -650,27 +667,30 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
 
             try
             {
-                var conn = GetDatabase(tenantId);
-
-                using var txn = conn.BeginTransaction();
-                try
+                lock (GetDatabaseLock(tenantId))
                 {
-                    foreach (var item in dirtySnapshots)
-                        UpsertQuota(conn, txn, item.Snapshot);
+                    var conn = GetDatabase(tenantId);
 
-                    txn.Commit();
-                }
-                catch
-                {
-                    txn.Rollback();
-                    throw;
-                }
+                    using var txn = conn.BeginTransaction();
+                    try
+                    {
+                        foreach (var item in dirtySnapshots)
+                            UpsertQuota(conn, txn, item.Snapshot);
 
-                if (_sqliteOptions.CheckpointAfterBatch)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
-                    cmd.ExecuteNonQuery();
+                        txn.Commit();
+                    }
+                    catch
+                    {
+                        txn.Rollback();
+                        throw;
+                    }
+
+                    if (_sqliteOptions.CheckpointAfterBatch)
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
+                        cmd.ExecuteNonQuery();
+                    }
                 }
 
                 _logger.LogDebug(
@@ -1065,8 +1085,11 @@ ON CONFLICT(directory_path) DO UPDATE SET
                         dirtyDirectories.TryRemove(directoryPath, out _);
 
                     // Remove from SQLite
-                    var conn = GetDatabase(tenantId);
-                    DeleteQuota(conn, directoryPath);
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        var conn = GetDatabase(tenantId);
+                        DeleteQuota(conn, directoryPath);
+                    }
 
                     _logger.LogDebug("Removed quota for directory: {DirectoryPath}, Tenant: {TenantId}", directoryPath, tenantId);
                 }
@@ -1094,11 +1117,14 @@ ON CONFLICT(directory_path) DO UPDATE SET
                 if (_fileSystem.File.Exists(dbPath))
                     sizeBefore = new System.IO.FileInfo(dbPath).Length;
 
-                var conn = GetDatabase(tenantId);
-                using (var cmd = conn.CreateCommand())
+                lock (GetDatabaseLock(tenantId))
                 {
-                    cmd.CommandText = "VACUUM;";
-                    cmd.ExecuteNonQuery();
+                    var conn = GetDatabase(tenantId);
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = "VACUUM;";
+                        cmd.ExecuteNonQuery();
+                    }
                 }
 
                 if (_fileSystem.File.Exists(dbPath))
@@ -1234,6 +1260,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
             }
 
             _databases.Clear();
+            _databaseLocks.Clear();
             _quotaCache.Clear();
             _atomicCounters.Clear();
             _dirtyDirectoryKeysByTenant.Clear();

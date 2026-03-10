@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -18,6 +19,7 @@ namespace Locus.Storage
         private const string GLOBAL_QUOTA_KEY = "_GLOBAL_QUOTA_";
         private readonly DirectoryQuotaRepository _repository;
         private readonly ILogger<TenantQuotaManager> _logger;
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _globalQuotaLocks;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="TenantQuotaManager"/> class.
@@ -28,6 +30,7 @@ namespace Locus.Storage
         {
             _repository = repository ?? throw new ArgumentNullException(nameof(repository));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _globalQuotaLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
         }
 
         /// <inheritdoc/>
@@ -38,7 +41,6 @@ namespace Locus.Storage
 
             var effectiveLimit = await GetEffectiveLimitAsync(tenantId, ct);
 
-            // 0 means unlimited
             if (effectiveLimit == 0)
                 return true;
 
@@ -52,35 +54,48 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            // Resolve effective limit: per-tenant limit takes precedence over global limit.
-            var effectiveLimit = await GetEffectiveLimitAsync(tenantId, ct);
-
-            // If there is a limit and the per-tenant atomic state has not yet been synced
-            // with the effective limit (e.g. only a global quota is configured), propagate
-            // it now so that TryIncrementAsync can enforce it via lock-free CAS.
-            if (effectiveLimit > 0)
+            var tenantQuota = await _repository.GetAsync(tenantId, tenantId, ct);
+            if (tenantQuota != null && tenantQuota.MaxCount > 0)
             {
-                var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
-                if (quota.MaxCount != effectiveLimit)
+                var success = await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+                if (!success)
                 {
-                    quota.MaxCount = effectiveLimit;
-                    quota.Enabled = true;
-                    // UpdateAsync syncs MaxCount/Enabled to the atomic state immediately.
-                    await _repository.UpdateAsync(tenantId, quota, ct);
+                    var currentCount = await GetFileCountAsync(tenantId, ct);
+                    throw new TenantQuotaExceededException(tenantId, currentCount, tenantQuota.MaxCount);
                 }
+
+                _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: {EffectiveLimit})",
+                    tenantId, tenantQuota.MaxCount);
+                return;
             }
 
-            // Use the lock-free atomic CAS increment path — symmetric with DecrementAsync.
-            // This ensures _atomicCounters.Count is always accurate in the current session.
-            var success = await _repository.TryIncrementAsync(tenantId, tenantId, ct);
-            if (!success)
+            var globalLimit = await GetGlobalLimitAsync(ct);
+            if (globalLimit == 0)
+            {
+                await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+                _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: unlimited)", tenantId);
+                return;
+            }
+
+            // Global quota is shared configuration. Keep it out of tenant-specific quota records
+            // so later global limit changes still affect tenants that do not have explicit overrides.
+            var gate = _globalQuotaLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(ct);
+            try
             {
                 var currentCount = await GetFileCountAsync(tenantId, ct);
-                throw new TenantQuotaExceededException(tenantId, currentCount, effectiveLimit);
+                if (currentCount >= globalLimit)
+                    throw new TenantQuotaExceededException(tenantId, currentCount, globalLimit);
+
+                await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+            }
+            finally
+            {
+                gate.Release();
             }
 
             _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: {EffectiveLimit})",
-                tenantId, effectiveLimit == 0 ? "unlimited" : effectiveLimit.ToString());
+                tenantId, globalLimit);
         }
 
         /// <inheritdoc/>
@@ -100,8 +115,8 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var quota = await _repository.GetAsync(tenantId, tenantId, ct);
-            return quota?.CurrentCount ?? 0;
+            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
+            return quota.CurrentCount;
         }
 
         /// <inheritdoc/>
@@ -110,7 +125,6 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            // Try to get tenant-specific quota
             var tenantQuota = await _repository.GetAsync(tenantId, tenantId, ct);
             if (tenantQuota != null && tenantQuota.MaxCount > 0)
             {
@@ -118,7 +132,6 @@ namespace Locus.Storage
                 return tenantQuota.MaxCount;
             }
 
-            // Fall back to global quota
             var globalLimit = await GetGlobalLimitAsync(ct);
             _logger.LogDebug("Using global quota for {TenantId}: {MaxCount}", tenantId, globalLimit);
             return globalLimit;
@@ -151,7 +164,7 @@ namespace Locus.Storage
             var quota = await _repository.GetAsync(tenantId, tenantId, ct);
             if (quota != null)
             {
-                quota.MaxCount = 0;  // 0 means use global quota
+                quota.MaxCount = 0;
                 await _repository.UpdateAsync(tenantId, quota, ct);
                 _logger.LogInformation("Removed tenant-specific quota for {TenantId}, will use global quota", tenantId);
             }
@@ -166,7 +179,7 @@ namespace Locus.Storage
             var globalQuota = await _repository.GetOrCreateAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
             globalQuota.MaxCount = maxFiles;
             globalQuota.Enabled = true;
-            globalQuota.CurrentCount = 0;  // Global quota doesn't track count
+            globalQuota.CurrentCount = 0;
 
             await _repository.UpdateAsync(GLOBAL_QUOTA_KEY, globalQuota, ct);
 
@@ -177,8 +190,18 @@ namespace Locus.Storage
         public async Task<int> GetGlobalLimitAsync(CancellationToken ct)
         {
             var globalQuota = await _repository.GetAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
-            return globalQuota?.MaxCount ?? 0;  // 0 means unlimited
+            return globalQuota?.MaxCount ?? 0;
+        }
+
+        internal async Task CompensateIncrementFileCountAsync(string tenantId, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
+            await _repository.SetCurrentCountAsync(tenantId, tenantId, quota.CurrentCount + 1, ct);
+
+            _logger.LogDebug("Compensated file count for tenant {TenantId}", tenantId);
         }
     }
 }
-

@@ -442,23 +442,93 @@ namespace Locus.Storage
             if (metadata.TenantId != tenant.TenantId)
                 throw new UnauthorizedAccessException($"File {fileKey} does not belong to tenant {tenant.TenantId}");
 
-            // 4. Delete physical file
-            if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
-            {
-                await volume.DeleteAsync(metadata.PhysicalPath, ct);
-            }
-            else
-            {
-                _logger.LogWarning("Volume {VolumeId} not found for file deletion, will remove metadata only", metadata.VolumeId);
-            }
-
-            // 5. Remove metadata
-            await _metadataRepository.RemoveAsync(tenant.TenantId, fileKey, ct);
-
-            // 6. Decrement quotas
             var normalizedDirectoryPath = NormalizeDirectoryPathForQuota(metadata.DirectoryPath);
-            await _directoryQuotaManager.DecrementFileCountAsync(tenant.TenantId, normalizedDirectoryPath, ct);
-            await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, ct);
+
+            // 4. Decrement quotas first. If quota operation fails, do NOT delete file/metadata,
+            // so the operation remains retryable without creating split state.
+            await _directoryQuotaManager.DecrementFileCountAsync(tenant.TenantId, normalizedDirectoryPath, CancellationToken.None);
+            var tenantQuotaDecremented = false;
+
+            try
+            {
+                await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, CancellationToken.None);
+                tenantQuotaDecremented = true;
+            }
+            catch
+            {
+                // Compensate directory quota on partial quota decrement success.
+                try
+                {
+                    await _directoryQuotaManager.IncrementFileCountAsync(
+                        tenant.TenantId,
+                        normalizedDirectoryPath,
+                        CancellationToken.None);
+                }
+                catch (Exception compensationEx)
+                {
+                    _logger.LogError(
+                        compensationEx,
+                        "Failed to compensate directory quota after tenant quota decrement failure during delete: Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                        tenant.TenantId,
+                        normalizedDirectoryPath,
+                        fileKey);
+                }
+
+                throw;
+            }
+
+            try
+            {
+                // 5. Delete physical file (best-effort if volume is gone)
+                if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                {
+                    await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                }
+                else
+                {
+                    _logger.LogWarning("Volume {VolumeId} not found for file deletion, will remove metadata only", metadata.VolumeId);
+                }
+
+                // 6. Remove metadata
+                await _metadataRepository.RemoveAsync(tenant.TenantId, fileKey, ct);
+            }
+            catch
+            {
+                // Deletion path failed after quota decrement; compensate quotas best-effort.
+                if (tenantQuotaDecremented)
+                {
+                    try
+                    {
+                        await CompensateTenantQuotaIncrementAsync(tenant.TenantId);
+                    }
+                    catch (Exception compensationEx)
+                    {
+                        _logger.LogError(
+                            compensationEx,
+                            "Failed to compensate tenant quota after delete failure: Tenant={TenantId}, FileKey={FileKey}",
+                            tenant.TenantId,
+                            fileKey);
+                    }
+                }
+
+                try
+                {
+                    await CompensateDirectoryQuotaIncrementAsync(
+                        tenant.TenantId,
+                        normalizedDirectoryPath);
+                }
+                catch (Exception compensationEx)
+                {
+                    _logger.LogError(
+                        compensationEx,
+                        "Failed to compensate directory quota after delete failure: Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                        tenant.TenantId,
+                        normalizedDirectoryPath,
+                        fileKey);
+                }
+
+                throw;
+            }
 
             _logger.LogInformation("File deleted successfully: {FileKey} for tenant {TenantId}", fileKey, tenant.TenantId);
         }
@@ -495,6 +565,22 @@ namespace Locus.Storage
             return await _fileScheduler.GetNextBatchForProcessingAsync(tenant, batchSize, ct);
         }
 
+        private Task CompensateTenantQuotaIncrementAsync(string tenantId)
+        {
+            if (_tenantQuotaManager is TenantQuotaManager tenantQuotaManager)
+                return tenantQuotaManager.CompensateIncrementFileCountAsync(tenantId, CancellationToken.None);
+
+            return _tenantQuotaManager.IncrementFileCountAsync(tenantId, CancellationToken.None);
+        }
+
+        private Task CompensateDirectoryQuotaIncrementAsync(string tenantId, string directoryPath)
+        {
+            if (_directoryQuotaManager is DirectoryQuotaManager directoryQuotaManager)
+                return directoryQuotaManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+
+            return _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+        }
+
         /// <inheritdoc/>
         public async Task MarkAsCompletedAsync(string fileKey, CancellationToken ct)
         {
@@ -513,42 +599,81 @@ namespace Locus.Storage
                 if (metadata == null)
                     return; // Already completed by another caller.
 
-                // Delegate physical deletion + metadata removal to file scheduler.
-                await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
-
                 var normalizedDirectoryPath = NormalizeDirectoryPathForQuota(metadata.DirectoryPath);
-                var directoryQuotaDecremented = false;
 
-                // Cancellation here would leave quota inflated after deletion, so use None.
+                // Decrement quotas BEFORE physical deletion + metadata removal.
+                // If quota decrement fails, abort completion so the file can be retried later
+                // without creating a "file gone but quota not decremented" split-brain state.
                 await _directoryQuotaManager.DecrementFileCountAsync(
                     metadata.TenantId,
                     normalizedDirectoryPath,
                     CancellationToken.None);
-                directoryQuotaDecremented = true;
 
+                var tenantQuotaDecremented = false;
                 try
                 {
                     await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                    tenantQuotaDecremented = true;
                 }
                 catch
                 {
-                    if (directoryQuotaDecremented)
+                    // Compensate directory quota on partial quota-success.
+                    try
+                    {
+                        await CompensateDirectoryQuotaIncrementAsync(
+                            metadata.TenantId,
+                            normalizedDirectoryPath);
+                    }
+                    catch (Exception compensationEx)
+                    {
+                        _logger.LogError(
+                            compensationEx,
+                            "Failed to compensate directory quota after tenant quota decrement failure: Tenant={TenantId}, Directory={DirectoryPath}",
+                            metadata.TenantId,
+                            normalizedDirectoryPath);
+                    }
+
+                    throw;
+                }
+
+                try
+                {
+                    // Delegate physical deletion + metadata removal to file scheduler.
+                    await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
+                }
+                catch
+                {
+                    // Completion failed after quota decrement; compensate both quotas best-effort.
+                    if (tenantQuotaDecremented)
                     {
                         try
                         {
-                            await _directoryQuotaManager.IncrementFileCountAsync(
-                                metadata.TenantId,
-                                normalizedDirectoryPath,
-                                CancellationToken.None);
+                            await CompensateTenantQuotaIncrementAsync(metadata.TenantId);
                         }
                         catch (Exception compensationEx)
                         {
                             _logger.LogError(
                                 compensationEx,
-                                "Failed to compensate directory quota after tenant quota decrement failure: Tenant={TenantId}, Directory={DirectoryPath}",
+                                "Failed to compensate tenant quota after completion failure: Tenant={TenantId}, FileKey={FileKey}",
                                 metadata.TenantId,
-                                normalizedDirectoryPath);
+                                fileKey);
                         }
+                    }
+
+                    try
+                    {
+                        await CompensateDirectoryQuotaIncrementAsync(
+                            metadata.TenantId,
+                            normalizedDirectoryPath);
+                    }
+                    catch (Exception compensationEx)
+                    {
+                        _logger.LogError(
+                            compensationEx,
+                            "Failed to compensate directory quota after completion failure: Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                            metadata.TenantId,
+                            normalizedDirectoryPath,
+                            fileKey);
                     }
 
                     throw;

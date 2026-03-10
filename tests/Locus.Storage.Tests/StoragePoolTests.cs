@@ -611,6 +611,82 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenCompletionFailsAfterLimitReduction_CompensatesQuotaBypass()
+        {
+            var tenantQuotaManager = new TenantQuotaManager(
+                _quotaRepository,
+                new Mock<ILogger<TenantQuotaManager>>().Object);
+            var directoryQuotaManager = new DirectoryQuotaManager(
+                _quotaRepository,
+                new Mock<ILogger<DirectoryQuotaManager>>().Object);
+            var failingScheduler = new Mock<IFileScheduler>();
+
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _tenantManager.Object,
+                failingScheduler.Object,
+                _logger.Object);
+
+            const string tenantId = "tenant-001";
+            const string directoryPath = "/compensate";
+            const string targetFileKey = "compensate-1";
+
+            await tenantQuotaManager.SetTenantLimitAsync(tenantId, 2, CancellationToken.None);
+            await directoryQuotaManager.SetLimitAsync(tenantId, directoryPath, 2, CancellationToken.None);
+
+            await tenantQuotaManager.IncrementFileCountAsync(tenantId, CancellationToken.None);
+            await tenantQuotaManager.IncrementFileCountAsync(tenantId, CancellationToken.None);
+            await directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+            await directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = targetFileKey,
+                TenantId = tenantId,
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volume1Path, "compensate-1.dat"),
+                DirectoryPath = directoryPath,
+                FileSize = 1,
+                Status = FileProcessingStatus.Processing,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "compensate-2",
+                TenantId = tenantId,
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volume1Path, "compensate-2.dat"),
+                DirectoryPath = directoryPath,
+                FileSize = 1,
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            failingScheduler
+                .Setup(s => s.MarkAsCompletedAsync(targetFileKey, It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    await tenantQuotaManager.SetTenantLimitAsync(tenantId, 1, CancellationToken.None);
+                    await directoryQuotaManager.SetLimitAsync(tenantId, directoryPath, 1, CancellationToken.None);
+                    throw new IOException("forced completion failure");
+                });
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                storagePool.MarkAsCompletedAsync(targetFileKey, CancellationToken.None));
+
+            var tenantCount = await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None);
+            var directoryCount = await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+            var metadata = await _metadataRepository.GetByFileKeyAsync(targetFileKey, CancellationToken.None);
+
+            Assert.Equal(2, tenantCount);
+            Assert.Equal(2, directoryCount);
+            Assert.NotNull(metadata);
+        }
+
+        [Fact]
         public void Constructor_WithNonPositiveCompletionGuardStripeCount_Throws()
         {
             Assert.Throws<ArgumentOutOfRangeException>(() => new StoragePool(

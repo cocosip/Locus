@@ -71,6 +71,7 @@ namespace Locus.Storage.Data
 
         // Per-tenant SQLite connections (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<SqliteConnection>> _databases;
+        private readonly ConcurrentDictionary<string, object> _databaseLocks;
 
         // Per-tenant locks for concurrent file allocation.
         // NOTE: Locks are intentionally retained for the lifetime of the repository even if a
@@ -454,6 +455,7 @@ namespace Locus.Storage.Data
                 : StringComparer.Ordinal;
             _physicalPathIndex = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>();
             _databases = new ConcurrentDictionary<string, Lazy<SqliteConnection>>();
+            _databaseLocks = new ConcurrentDictionary<string, object>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<PendingQueueEntry>>();
             _pendingGenerations = new ConcurrentDictionary<string, ConcurrentDictionary<string, long>>();
@@ -600,6 +602,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
             return lazyConn.Value;
+        }
+
+        private object GetDatabaseLock(string tenantId)
+        {
+            return _databaseLocks.GetOrAdd(tenantId, _ => new object());
         }
 
         private SqliteConnection OpenAndInitializeConnection(string dbPath)
@@ -853,8 +860,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             IndexStatusCandidate(previous, metadata);
 
             // Write directly to SQLite (synchronous -- required for rebuild correctness)
-            var conn = GetDatabase(metadata.TenantId);
-            UpsertFile(conn, metadata);
+            lock (GetDatabaseLock(metadata.TenantId))
+            {
+                var conn = GetDatabase(metadata.TenantId);
+                UpsertFile(conn, metadata);
+            }
 
             return Task.CompletedTask;
         }
@@ -1791,11 +1801,14 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 if (_fileSystem.File.Exists(dbPath))
                     sizeBefore = new System.IO.FileInfo(dbPath).Length;
 
-                var conn = GetDatabase(tenantId);
-                using (var cmd = conn.CreateCommand())
+                lock (GetDatabaseLock(tenantId))
                 {
-                    cmd.CommandText = "VACUUM;";
-                    cmd.ExecuteNonQuery();
+                    var conn = GetDatabase(tenantId);
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = "VACUUM;";
+                        cmd.ExecuteNonQuery();
+                    }
                 }
 
                 if (_fileSystem.File.Exists(dbPath))
@@ -1903,50 +1916,54 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 return null;
             }
 
-            // Remove from cache FIRST so no concurrent thread can acquire the disposed instance.
-            _databases.TryRemove(tenantId, out var existingLazy);
-
-            // Dispose the removed connection (safe: it's no longer reachable via cache).
-            if (existingLazy != null && existingLazy.IsValueCreated)
+            lock (GetDatabaseLock(tenantId))
             {
-                try { existingLazy.Value?.Dispose(); }
-                catch (Exception ex)
+                // Remove from cache FIRST so no concurrent thread can acquire the disposed instance.
+                _databases.TryRemove(tenantId, out var existingLazy);
+
+                // Dispose the removed connection (safe: it's no longer reachable via cache).
+                if (existingLazy != null && existingLazy.IsValueCreated)
                 {
-                    _logger.LogWarning(ex, "Error disposing SQLite connection during lock-free rebuild for tenant {TenantId}", tenantId);
+                    try { existingLazy.Value?.Dispose(); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error disposing SQLite connection during lock-free rebuild for tenant {TenantId}", tenantId);
+                    }
                 }
+
+                // Force the SQLite connection pool to release the OS file handle.
+                // With Cache=Shared, Dispose() returns connections to the pool rather than closing them.
+                // ClearAllPools() ensures the file can be deleted and a fresh connection will open a new file.
+                // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
+                // This is intentional and necessary: the OS file handle must be released before the
+                // database file can be deleted. Since database rebuild is a rare maintenance operation
+                // (only triggered by corruption), the brief impact on other tenants is acceptable.
+                // After the rebuild completes, connections will be automatically re-established on next access.
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
+                    RemoveTenantFromGlobalIndex(staleTenantCache);
+                _physicalPathIndex.TryRemove(tenantId, out _);
+                _pendingKeys.TryRemove(tenantId, out _);
+                _pendingGenerations.TryRemove(tenantId, out _);
+                _prefetchedPendingByTenant.TryRemove(tenantId, out _);
+                _pendingFileCounts.TryRemove(tenantId, out _);
+                _processingByStartTime.TryRemove(tenantId, out _);
+                _processingByStartTimeLocks.TryRemove(tenantId, out _);
+                _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+                _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+
+                var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+                _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+                _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
+
+                _fileSystem.File.Delete(dbPath);
+                _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
+
+                // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
+                DeleteSidecarFiles(dbPath);
+
+                return backupPath;
             }
-            // Force the SQLite connection pool to release the OS file handle.
-            // With Cache=Shared, Dispose() returns connections to the pool rather than closing them.
-            // ClearAllPools() ensures the file can be deleted and a fresh connection will open a new file.
-            // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
-            // This is intentional and necessary: the OS file handle must be released before the
-            // database file can be deleted. Since database rebuild is a rare maintenance operation
-            // (only triggered by corruption), the brief impact on other tenants is acceptable.
-            // After the rebuild completes, connections will be automatically re-established on next access.
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
-                RemoveTenantFromGlobalIndex(staleTenantCache);
-            _physicalPathIndex.TryRemove(tenantId, out _);
-            _pendingKeys.TryRemove(tenantId, out _);
-            _pendingGenerations.TryRemove(tenantId, out _);
-            _prefetchedPendingByTenant.TryRemove(tenantId, out _);
-            _pendingFileCounts.TryRemove(tenantId, out _);
-            _processingByStartTime.TryRemove(tenantId, out _);
-            _processingByStartTimeLocks.TryRemove(tenantId, out _);
-            _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-            _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
-
-            var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
-            _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
-            _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
-
-            _fileSystem.File.Delete(dbPath);
-            _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
-
-            // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
-            DeleteSidecarFiles(dbPath);
-
-            return backupPath;
         }
 
         /// <summary>
@@ -1982,55 +1999,59 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
                 _logger.LogWarning("Beginning database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
-                // Step 1: Remove from cache FIRST so no other thread can acquire the disposed instance.
-                _databases.TryRemove(tenantId, out var lazyConn);
-
-                // Step 2: Dispose the removed connection (safe: it's no longer reachable via cache).
-                if (lazyConn != null && lazyConn.IsValueCreated)
+                lock (GetDatabaseLock(tenantId))
                 {
-                    try
+                    // Step 1: Remove from cache FIRST so no other thread can acquire the disposed instance.
+                    _databases.TryRemove(tenantId, out var lazyConn);
+
+                    // Step 2: Dispose the removed connection (safe: it's no longer reachable via cache).
+                    if (lazyConn != null && lazyConn.IsValueCreated)
                     {
-                        lazyConn.Value?.Dispose();
-                        _logger.LogDebug("Disposed SQLite connection for rebuild: {TenantId}", tenantId);
+                        try
+                        {
+                            lazyConn.Value?.Dispose();
+                            _logger.LogDebug("Disposed SQLite connection for rebuild: {TenantId}", tenantId);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error disposing SQLite connection for tenant {TenantId}", tenantId);
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Error disposing SQLite connection for tenant {TenantId}", tenantId);
-                    }
+
+                    // Force the connection pool to release the OS file handle before deleting the file.
+                    // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
+                    // This is intentional and necessary: the OS file handle must be released before the
+                    // database file can be deleted. Since database rebuild is a rare maintenance operation
+                    // (only triggered by corruption), the brief impact on other tenants is acceptable.
+                    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+                    // Step 3: Clear in-memory cache and pending index
+                    if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
+                        RemoveTenantFromGlobalIndex(staleTenantCache);
+                    _physicalPathIndex.TryRemove(tenantId, out _);
+                    _pendingKeys.TryRemove(tenantId, out _);
+                    _pendingGenerations.TryRemove(tenantId, out _);
+                    _prefetchedPendingByTenant.TryRemove(tenantId, out _);
+                    _pendingFileCounts.TryRemove(tenantId, out _);
+                    _processingByStartTime.TryRemove(tenantId, out _);
+                    _processingByStartTimeLocks.TryRemove(tenantId, out _);
+                    _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+                    _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+
+                    // Step 4: Backup corrupted database
+                    var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+                    _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+                    _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
+
+                    // Step 5: Delete corrupted database
+                    _fileSystem.File.Delete(dbPath);
+                    _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
+
+                    // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
+                    DeleteSidecarFiles(dbPath);
+
+                    return backupPath;
                 }
-                // Force the connection pool to release the OS file handle before deleting the file.
-                // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
-                // This is intentional and necessary: the OS file handle must be released before the
-                // database file can be deleted. Since database rebuild is a rare maintenance operation
-                // (only triggered by corruption), the brief impact on other tenants is acceptable.
-                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-
-                // Step 3: Clear in-memory cache and pending index
-                if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
-                    RemoveTenantFromGlobalIndex(staleTenantCache);
-                _physicalPathIndex.TryRemove(tenantId, out _);
-                _pendingKeys.TryRemove(tenantId, out _);
-                _pendingGenerations.TryRemove(tenantId, out _);
-                _prefetchedPendingByTenant.TryRemove(tenantId, out _);
-                _pendingFileCounts.TryRemove(tenantId, out _);
-                _processingByStartTime.TryRemove(tenantId, out _);
-                _processingByStartTimeLocks.TryRemove(tenantId, out _);
-                _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-                _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
-
-                // Step 4: Backup corrupted database
-                var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
-                _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
-                _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
-
-                // Step 5: Delete corrupted database
-                _fileSystem.File.Delete(dbPath);
-                _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
-
-                // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
-                DeleteSidecarFiles(dbPath);
-
-                return backupPath;
             }
             catch
             {
@@ -2285,37 +2306,40 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         {
             try
             {
-                var conn = GetDatabase(tenantId);
-
-                using var txn = conn.BeginTransaction();
-                try
+                lock (GetDatabaseLock(tenantId))
                 {
-                    foreach (var op in ops)
+                    var conn = GetDatabase(tenantId);
+
+                    using var txn = conn.BeginTransaction();
+                    try
                     {
-                        if (op.IsDelete)
-                            DeleteFile(conn, txn, op.FileKey);
-                        else
-                            UpsertFile(conn, txn, op.Metadata!);
+                        foreach (var op in ops)
+                        {
+                            if (op.IsDelete)
+                                DeleteFile(conn, txn, op.FileKey);
+                            else
+                                UpsertFile(conn, txn, op.Metadata!);
+                        }
+
+                        txn.Commit();
+
+                        // Explicitly checkpoint after every commit so the WAL is merged into the main
+                        // database file promptly. This reduces the risk of data loss on a crash during
+                        // a later automatic checkpoint and keeps the WAL file small.
+                        if (_sqliteOptions.CheckpointAfterBatch)
+                        {
+                            using var cmd = conn.CreateCommand();
+                            cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
+                            cmd.ExecuteNonQuery();
+                        }
+
+                        _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
                     }
-
-                    txn.Commit();
-
-                    // Explicitly checkpoint after every commit so the WAL is merged into the main
-                    // database file promptly. This reduces the risk of data loss on a crash during
-                    // a later automatic checkpoint and keeps the WAL file small.
-                    if (_sqliteOptions.CheckpointAfterBatch)
+                    catch
                     {
-                        using var cmd = conn.CreateCommand();
-                        cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
-                        cmd.ExecuteNonQuery();
+                        txn.Rollback();
+                        throw;
                     }
-
-                    _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
-                }
-                catch
-                {
-                    txn.Rollback();
-                    throw;
                 }
             }
             catch (Exception ex)
@@ -2560,6 +2584,7 @@ ON CONFLICT(file_key) DO UPDATE SET
             _delayedQueues.Clear();
             _delayedQueueLocks.Clear();
             _coalescedPersistenceOps.Clear();
+            _databaseLocks.Clear();
 
             // 4. Dispose all tenant locks
             foreach (var semaphore in _tenantLocks.Values)

@@ -202,6 +202,7 @@ namespace Locus
             {
                 var metadataRepo = sp.GetRequiredService<MetadataRepository>();
                 var quotaRepo = sp.GetRequiredService<DirectoryQuotaRepository>();
+                var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
 
@@ -209,6 +210,7 @@ namespace Locus
                 return new StorageCleanupService(
                     metadataRepo,
                     quotaRepo,
+                    tenantQuotaManager,
                     fileSystem,
                     logger,
                     options.MetadataDirectory,

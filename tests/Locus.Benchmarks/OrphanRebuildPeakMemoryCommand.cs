@@ -215,9 +215,13 @@ namespace Locus.Benchmarks
                 fileSystem,
                 NullLogger<DirectoryQuotaRepository>.Instance,
                 quotaDir);
+            var tenantQuotaManager = new TenantQuotaManager(
+                quotaRepository,
+                NullLogger<TenantQuotaManager>.Instance);
             var cleanupService = new StorageCleanupService(
                 metadataRepository,
                 quotaRepository,
+                tenantQuotaManager,
                 fileSystem,
                 NullLogger<StorageCleanupService>.Instance,
                 metadataDir,

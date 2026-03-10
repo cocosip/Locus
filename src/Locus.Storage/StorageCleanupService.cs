@@ -22,6 +22,7 @@ namespace Locus.Storage
     {
         private readonly MetadataRepository _metadataRepository;
         private readonly DirectoryQuotaRepository _quotaRepository;
+        private readonly ITenantQuotaManager _tenantQuotaManager;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
@@ -58,6 +59,7 @@ namespace Locus.Storage
         public StorageCleanupService(
             MetadataRepository metadataRepository,
             DirectoryQuotaRepository quotaRepository,
+            ITenantQuotaManager tenantQuotaManager,
             IFileSystem fileSystem,
             ILogger<StorageCleanupService> logger,
             string metadataDirectory,
@@ -66,6 +68,7 @@ namespace Locus.Storage
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
+            _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
@@ -594,14 +597,21 @@ namespace Locus.Storage
 
                 foreach (var metadata in batch)
                 {
+                    var physicalFileRemoved = false;
                     if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
                     {
                         try
                         {
                             if (_fileSystem.File.Exists(metadata.PhysicalPath))
                             {
-                                spaceFreed += metadata.FileSize;
                                 await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                physicalFileRemoved = !_fileSystem.File.Exists(metadata.PhysicalPath);
+                                if (physicalFileRemoved)
+                                    spaceFreed += metadata.FileSize;
+                            }
+                            else
+                            {
+                                physicalFileRemoved = true;
                             }
                         }
                         catch (Exception ex)
@@ -609,6 +619,20 @@ namespace Locus.Storage
                             _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
                         }
                     }
+                    else if (!_fileSystem.File.Exists(metadata.PhysicalPath))
+                    {
+                        physicalFileRemoved = true;
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "Skipping permanently failed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
+                            metadata.VolumeId,
+                            metadata.PhysicalPath);
+                    }
+
+                    if (!physicalFileRemoved)
+                        continue;
 
                     await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
 
@@ -622,6 +646,7 @@ namespace Locus.Storage
                     }
 
                     await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, ct);
+                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, ct);
                     removedCount++;
                 }
 

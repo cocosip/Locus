@@ -21,6 +21,7 @@ namespace Locus.Storage.Tests
         private readonly IFileSystem _fileSystem;
         private readonly MetadataRepository _metadataRepository;
         private readonly DirectoryQuotaRepository _quotaRepository;
+        private readonly ITenantQuotaManager _tenantQuotaManager;
         private readonly Mock<ILogger<StorageCleanupService>> _logger;
         private readonly StorageCleanupService _cleanupService;
         private readonly Mock<IStorageVolume> _volume;
@@ -46,12 +47,16 @@ namespace Locus.Storage.Tests
 
             var quotaRepoLogger = new Mock<ILogger<DirectoryQuotaRepository>>();
             _quotaRepository = new DirectoryQuotaRepository(_fileSystem, quotaRepoLogger.Object, _quotaDir);
+            _tenantQuotaManager = new TenantQuotaManager(
+                _quotaRepository,
+                new Mock<ILogger<TenantQuotaManager>>().Object);
 
             // Setup cleanup service
             _logger = new Mock<ILogger<StorageCleanupService>>();
             _cleanupService = new StorageCleanupService(
                 _metadataRepository,
                 _quotaRepository,
+                _tenantQuotaManager,
                 _fileSystem,
                 _logger.Object,
                 _metadataDir,
@@ -278,6 +283,9 @@ namespace Locus.Storage.Tests
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
             Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
             Assert.True(stats.SpaceFreed > 0);
+
+            var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", default);
+            Assert.Equal(0, tenantCount);
         }
 
         [Fact]
@@ -336,6 +344,46 @@ namespace Locus.Storage.Tests
 
             var rootQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/", default);
             Assert.Equal(0, rootQuota.CurrentCount);
+        }
+
+        [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_KeepsMetadataAndQuotas_WhenPhysicalDeleteFails()
+        {
+            var physicalPath = Path.Combine(_volumePath, "failed-delete-throws.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+
+            var failedMetadata = new FileMetadata
+            {
+                FileKey = "file-delete-throws",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 14,
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-10),
+                CreatedAt = DateTime.UtcNow.AddDays(-10)
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
+            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", default);
+
+            _volume.Setup(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("file is locked"));
+
+            await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "file-delete-throws", default);
+            Assert.NotNull(metadata);
+            Assert.True(_fileSystem.File.Exists(physicalPath));
+
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
+            var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", default);
+            Assert.Equal(1, tenantCount);
         }
 
         [Fact]
@@ -508,6 +556,7 @@ namespace Locus.Storage.Tests
             var cleanupWithSmallCache = new StorageCleanupService(
                 _metadataRepository,
                 _quotaRepository,
+                _tenantQuotaManager,
                 _fileSystem,
                 _logger.Object,
                 _metadataDir,

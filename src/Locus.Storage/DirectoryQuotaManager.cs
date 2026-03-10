@@ -132,5 +132,22 @@ namespace Locus.Storage
             _logger.LogInformation("Set limit for directory {DirectoryPath}, Tenant: {TenantId}: {MaxFiles}",
                 directoryPath, tenantId, maxFiles);
         }
+
+        internal async Task CompensateIncrementFileCountAsync(string tenantId, string directoryPath, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(directoryPath))
+                throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
+
+            var quota = await _repository.GetOrCreateAsync(tenantId, directoryPath, ct);
+            await _repository.SetCurrentCountAsync(tenantId, directoryPath, quota.CurrentCount + 1, ct);
+
+            _logger.LogDebug(
+                "Compensated directory file count for directory: {DirectoryPath}, Tenant: {TenantId}",
+                directoryPath,
+                tenantId);
+        }
     }
 }
