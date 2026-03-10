@@ -576,6 +576,18 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task WriteFileAsync_NonSeekableStream_PersistsActualFileSize()
+        {
+            using var nonSeekable = new NonSeekableReadStream(Encoding.UTF8.GetBytes("non-seekable-content"));
+
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, nonSeekable, "payload.bin", default);
+            var info = await _storagePool.GetFileInfoAsync(_tenant.Object, fileKey, default);
+
+            Assert.NotNull(info);
+            Assert.Equal("non-seekable-content".Length, info!.FileSize);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_ConcurrentDuplicateCalls_DecrementsQuotaOnce()
         {
             // Arrange
@@ -697,6 +709,62 @@ namespace Locus.Storage.Tests
                 _fileScheduler.Object,
                 _logger.Object,
                 completionGuardStripeCount: 0));
+        }
+
+        private sealed class NonSeekableReadStream : Stream
+        {
+            private readonly MemoryStream _inner;
+
+            public NonSeekableReadStream(byte[] bytes)
+            {
+                _inner = new MemoryStream(bytes);
+            }
+
+            public override bool CanRead => true;
+
+            public override bool CanSeek => false;
+
+            public override bool CanWrite => false;
+
+            public override long Length => throw new NotSupportedException();
+
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush()
+            {
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                return _inner.Read(buffer, offset, count);
+            }
+
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void SetLength(long value)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                throw new NotSupportedException();
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                    _inner.Dispose();
+
+                base.Dispose(disposing);
+            }
         }
     }
 }

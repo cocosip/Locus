@@ -24,6 +24,7 @@ namespace Locus.Storage
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<FileScheduler> _logger;
         private readonly FileRetryPolicy _retryPolicy;
+        private readonly StorageVolumeRegistry? _volumeRegistry;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FileScheduler"/> class.
@@ -32,12 +33,14 @@ namespace Locus.Storage
             MetadataRepository repository,
             IFileSystem fileSystem,
             ILogger<FileScheduler> logger,
-            FileRetryPolicy? retryPolicy = null)
+            FileRetryPolicy? retryPolicy = null,
+            StorageVolumeRegistry? volumeRegistry = null)
         {
             _repository = repository ?? throw new ArgumentNullException(nameof(repository));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _retryPolicy = retryPolicy ?? new FileRetryPolicy();
+            _volumeRegistry = volumeRegistry;
         }
 
         /// <inheritdoc/>
@@ -135,7 +138,7 @@ namespace Locus.Storage
             {
                 try
                 {
-                    _fileSystem.File.Delete(metadata.PhysicalPath);
+                    await DeletePhysicalFileAsync(metadata, ct);
                     _logger.LogDebug("Deleted physical file: {PhysicalPath}", metadata.PhysicalPath);
                 }
                 catch (Exception ex) when (ex is System.IO.FileNotFoundException || ex is System.IO.DirectoryNotFoundException)
@@ -345,6 +348,19 @@ namespace Locus.Storage
                 LastFailedAt = metadata.LastFailedAt,
                 LastError = metadata.LastError
             };
+        }
+
+        private Task DeletePhysicalFileAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            if (_volumeRegistry != null
+                && !string.IsNullOrWhiteSpace(metadata.VolumeId)
+                && _volumeRegistry.TryGetVolume(metadata.VolumeId, out var volume))
+            {
+                return volume.DeleteAsync(metadata.PhysicalPath, ct);
+            }
+
+            _fileSystem.File.Delete(metadata.PhysicalPath);
+            return Task.CompletedTask;
         }
     }
 }

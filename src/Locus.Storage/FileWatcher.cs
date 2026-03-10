@@ -61,6 +61,7 @@ namespace Locus.Storage
         private const int MaxImportedHistoryChannelSize = 20_000;
         private const int MinImportQueueCapacity = 64;
         private const int MaxImportQueueCapacity = 1024;
+        private const string ImportedFileFingerprintPrefix = "fp:v1:";
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
         private static readonly TimeSpan DefaultAutoCreateTenantDirectoriesCacheTtl = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
@@ -134,28 +135,35 @@ namespace Locus.Storage
                 var checkpoint = LoadImportedHistoryCheckpoint();
                 var journalResult = ReplayImportedHistoryJournal(checkpoint);
                 var loaded = 0;
+                var upgradedLegacyEntries = 0;
 
                 foreach (var kvp in checkpoint)
                 {
-                    // Skip entries whose source file no longer exists.
-                    // This discards stale Delete/Move records that survived a crash
-                    // (the file was deleted/moved but the history save happened before the journal delete op flushed).
-                    if (_fileSystem.File.Exists(kvp.Key))
+                    // Skip entries whose source file no longer exists or whose current fingerprint
+                    // no longer matches the recorded import snapshot.
+                    var resolvedValue = ResolveImportedHistoryValue(kvp.Key, kvp.Value);
+                    if (resolvedValue != null)
                     {
-                        _importedFiles.TryAdd(kvp.Key, kvp.Value);
+                        _importedFiles.TryAdd(kvp.Key, resolvedValue);
                         loaded++;
+                        if (!string.Equals(resolvedValue, kvp.Value, StringComparison.Ordinal))
+                            upgradedLegacyEntries++;
                     }
                 }
+
+                if (upgradedLegacyEntries > 0)
+                    MarkImportedFilesHistoryDirty();
 
                 if (checkpoint.Count > 0 || journalResult.AppliedOperations > 0 || journalResult.InvalidLines > 0)
                 {
                     _logger.LogInformation(
-                        "Loaded {Loaded}/{Total} imported file records from history checkpoint + journal ({Skipped} stale, JournalOps={JournalOps}, InvalidJournalLines={InvalidLines})",
+                        "Loaded {Loaded}/{Total} imported file records from history checkpoint + journal ({Skipped} stale, JournalOps={JournalOps}, InvalidJournalLines={InvalidLines}, UpgradedLegacy={UpgradedLegacy})",
                         loaded,
                         checkpoint.Count,
                         checkpoint.Count - loaded,
                         journalResult.AppliedOperations,
-                        journalResult.InvalidLines);
+                        journalResult.InvalidLines,
+                        upgradedLegacyEntries);
                 }
             }
             catch (Exception ex)
@@ -446,10 +454,10 @@ namespace Locus.Storage
             return (applied, invalid);
         }
 
-        private void UpsertImportedFileRecord(string path, string fileKey)
+        private void UpsertImportedFileRecord(string path, string fingerprint)
         {
-            _importedFiles[path] = fileKey;
-            EnqueueImportedHistoryOperation(ImportedHistoryOperation.CreateUpsert(path, fileKey));
+            _importedFiles[path] = fingerprint;
+            EnqueueImportedHistoryOperation(ImportedHistoryOperation.CreateUpsert(path, fingerprint));
         }
 
         private bool TryRemoveImportedFileRecord(string path)
@@ -1217,18 +1225,19 @@ namespace Locus.Storage
                 if (ct.IsCancellationRequested)
                     return fileResult;
 
+                // Get file info for validation (single stat object reused by stability probes).
+                var fileInfo = _fileSystem.FileInfo.New(filePath);
+                var fileSize = fileInfo.Length;
+                var lastWriteTime = fileInfo.LastWriteTimeUtc;
+                var importFingerprint = CreateImportedFileFingerprint(fileSize, lastWriteTime);
+
                 // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
-                if (!_importedFiles.TryAdd(filePath, InFlightImportMarker))
+                if (!TryAcquireImportSlot(filePath, importFingerprint))
                 {
                     fileResult.FilesSkipped++;
                     return fileResult;
                 }
                 importSlotTaken = true;
-
-                // Get file info for validation (single stat object reused by stability probes).
-                var fileInfo = _fileSystem.FileInfo.New(filePath);
-                var fileSize = fileInfo.Length;
-                var lastWriteTime = fileInfo.LastWriteTimeUtc;
 
                 // Skip empty files (0 bytes)
                 if (fileSize == 0)
@@ -1280,7 +1289,7 @@ namespace Locus.Storage
                 {
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, importStream, fileName, ct);
-                    UpsertImportedFileRecord(filePath, fileKey);
+                    UpsertImportedFileRecord(filePath, importFingerprint);
                     importSlotTaken = false;
 
                     fileResult.FilesImported++;
@@ -1460,6 +1469,67 @@ namespace Locus.Storage
                 .Replace("\\?", ".") + "$";
 
             return new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+        }
+
+        private bool TryAcquireImportSlot(string filePath, string fingerprint)
+        {
+            while (true)
+            {
+                if (!_importedFiles.TryGetValue(filePath, out var currentValue))
+                    return _importedFiles.TryAdd(filePath, InFlightImportMarker);
+
+                if (string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal)
+                    || string.Equals(currentValue, fingerprint, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                if (_importedFiles.TryUpdate(filePath, InFlightImportMarker, currentValue))
+                    return true;
+            }
+        }
+
+        private string? ResolveImportedHistoryValue(string path, string storedFingerprint)
+        {
+            if (!_fileSystem.File.Exists(path))
+                return null;
+
+            if (!IsFingerprintValue(storedFingerprint))
+            {
+                try
+                {
+                    var legacyFileInfo = _fileSystem.FileInfo.New(path);
+                    return CreateImportedFileFingerprint(legacyFileInfo.Length, legacyFileInfo.LastWriteTimeUtc);
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            try
+            {
+                var fileInfo = _fileSystem.FileInfo.New(path);
+                var currentFingerprint = CreateImportedFileFingerprint(fileInfo.Length, fileInfo.LastWriteTimeUtc);
+                return string.Equals(storedFingerprint, currentFingerprint, StringComparison.Ordinal)
+                    ? storedFingerprint
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool IsFingerprintValue(string value)
+        {
+            return !string.IsNullOrWhiteSpace(value)
+                && value.StartsWith(ImportedFileFingerprintPrefix, StringComparison.Ordinal);
+        }
+
+        private static string CreateImportedFileFingerprint(long fileSize, DateTime lastWriteTimeUtc)
+        {
+            return $"{ImportedFileFingerprintPrefix}{fileSize}:{lastWriteTimeUtc.Ticks}";
         }
 
         private PatternMatcherCacheEntry GetOrCreatePatternMatcherCacheEntry(

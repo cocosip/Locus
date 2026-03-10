@@ -26,6 +26,7 @@ namespace Locus.Storage
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
+        private readonly StorageVolumeRegistry _volumeRegistry;
         private readonly CleanupStatistics _statistics;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
@@ -64,7 +65,8 @@ namespace Locus.Storage
             ILogger<StorageCleanupService> logger,
             string metadataDirectory,
             string quotaDirectory,
-            CleanupOptions? cleanupOptions = null)
+            CleanupOptions? cleanupOptions = null,
+            StorageVolumeRegistry? volumeRegistry = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
@@ -72,6 +74,7 @@ namespace Locus.Storage
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
+            _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
             _statistics = new CleanupStatistics();
             _orphanScanQueues = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
             _orphanScanLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
@@ -121,6 +124,7 @@ namespace Locus.Storage
                 throw new ArgumentNullException(nameof(volume));
 
             _volumes.TryAdd(volume.VolumeId, volume);
+            _volumeRegistry.Register(volume);
 
             _logger.LogDebug("Registered volume {VolumeId} with cleanup service, mount path: {MountPath}",
                 volume.VolumeId, volume.MountPath);
@@ -554,14 +558,20 @@ namespace Locus.Storage
 
                 foreach (var metadata in batch)
                 {
-                    var updated = metadata.Clone();
-                    updated.Status = FileProcessingStatus.Pending;
-                    updated.ProcessingStartTime = null;
-                    updated.AvailableForProcessingAt = nowUtc;
-                    await _metadataRepository.AddOrUpdateAsync(updated, ct);
-                    resetCount++;
+                    if (!metadata.ProcessingStartTime.HasValue)
+                        continue;
 
-                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", updated.FileKey);
+                    var reset = await _metadataRepository.TryResetTimedOutFileAsync(
+                        tenantId,
+                        metadata.FileKey,
+                        metadata.ProcessingStartTime.Value,
+                        nowUtc,
+                        ct);
+                    if (!reset)
+                        continue;
+
+                    resetCount++;
+                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
                 }
 
                 RecordStatusCleanupIteration("timeout_reset", tenantId, batch.Count, iterationStartedAt);
@@ -634,7 +644,16 @@ namespace Locus.Storage
                     if (!physicalFileRemoved)
                         continue;
 
-                    await _metadataRepository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                    if (!metadata.LastFailedAt.HasValue)
+                        continue;
+
+                    var removed = await _metadataRepository.TryRemovePermanentlyFailedFileAsync(
+                        metadata.TenantId,
+                        metadata.FileKey,
+                        metadata.LastFailedAt.Value,
+                        ct);
+                    if (!removed)
+                        continue;
 
                     var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
                     if (string.IsNullOrWhiteSpace(metadata.DirectoryPath))

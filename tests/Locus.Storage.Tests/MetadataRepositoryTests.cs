@@ -79,6 +79,65 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task TryResetTimedOutFileAsync_ReturnsFalseWhenRecordWasRemovedConcurrently()
+        {
+            var file = CreateMetadata("file-reset-race", FileProcessingStatus.Processing);
+            file.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-15);
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var timedOut = await _repository.GetProcessingTimedOutAsync(
+                _tenantId,
+                DateTime.UtcNow.AddMinutes(-1),
+                1,
+                CancellationToken.None);
+            Assert.Single(timedOut);
+
+            await _repository.RemoveAsync(_tenantId, file.FileKey, CancellationToken.None);
+
+            var reset = await _repository.TryResetTimedOutFileAsync(
+                _tenantId,
+                file.FileKey,
+                timedOut[0].ProcessingStartTime!.Value,
+                DateTime.UtcNow,
+                CancellationToken.None);
+
+            Assert.False(reset);
+            Assert.Null(await _repository.GetAsync(_tenantId, file.FileKey, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task TryRemovePermanentlyFailedFileAsync_ReturnsFalseWhenRecordChangedConcurrently()
+        {
+            var file = CreateMetadata("file-remove-race", FileProcessingStatus.PermanentlyFailed);
+            file.LastFailedAt = DateTime.UtcNow.AddDays(-10);
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var candidates = await _repository.GetPermanentlyFailedOlderThanAsync(
+                _tenantId,
+                DateTime.UtcNow.AddDays(-1),
+                1,
+                CancellationToken.None);
+            Assert.Single(candidates);
+
+            var updated = candidates[0].Clone();
+            updated.Status = FileProcessingStatus.Pending;
+            updated.LastFailedAt = null;
+            await _repository.AddOrUpdateAsync(updated, CancellationToken.None);
+
+            var removed = await _repository.TryRemovePermanentlyFailedFileAsync(
+                _tenantId,
+                file.FileKey,
+                candidates[0].LastFailedAt!.Value,
+                CancellationToken.None);
+
+            Assert.False(removed);
+
+            var current = await _repository.GetAsync(_tenantId, file.FileKey, CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Pending, current!.Status);
+        }
+
+        [Fact]
         public async Task GetAllTenantIdsAsync_IncludesInMemoryTenantWithoutDbFile()
         {
             const string inMemoryTenant = "tenant-memory-only";

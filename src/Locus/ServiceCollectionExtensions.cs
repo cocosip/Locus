@@ -104,6 +104,7 @@ namespace Locus
 
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
+            services.AddSingleton<StorageVolumeRegistry>();
 
             // Register repositories as singletons (they manage their own state)
             services.AddSingleton(sp =>
@@ -169,7 +170,8 @@ namespace Locus
                 var repository = sp.GetRequiredService<MetadataRepository>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<FileScheduler>>();
-                return new FileScheduler(repository, fileSystem, logger, options.RetryPolicy);
+                var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
+                return new FileScheduler(repository, fileSystem, logger, options.RetryPolicy, volumeRegistry);
             });
 
             // Register StoragePool as its concrete type so StorageVolumeInitializationService
@@ -182,6 +184,7 @@ namespace Locus
                 var tenantManager = sp.GetRequiredService<ITenantManager>();
                 var fileScheduler = sp.GetRequiredService<IFileScheduler>();
                 var logger = sp.GetRequiredService<ILogger<StoragePool>>();
+                var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
 
                 // Volumes are NOT mounted here. StorageVolumeInitializationService mounts
                 // them asynchronously in StartAsync, before requests are accepted.
@@ -192,7 +195,8 @@ namespace Locus
                     tenantManager,
                     fileScheduler,
                     logger,
-                    options.StoragePool.CompletionGuardStripeCount);
+                    options.StoragePool.CompletionGuardStripeCount,
+                    volumeRegistry);
             });
             services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 
@@ -205,6 +209,7 @@ namespace Locus
                 var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
+                var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
 
                 // Volumes are registered by StorageVolumeInitializationService after async mount.
                 return new StorageCleanupService(
@@ -215,7 +220,8 @@ namespace Locus
                     logger,
                     options.MetadataDirectory,
                     options.QuotaDirectory,
-                    options.CleanupOptions);
+                    options.CleanupOptions,
+                    volumeRegistry);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 

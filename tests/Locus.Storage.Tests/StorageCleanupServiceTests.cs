@@ -387,6 +387,51 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_DoesNotDecrementQuota_WhenMetadataWasRemovedConcurrently()
+        {
+            var physicalPath = Path.Combine(_volumePath, "failed-concurrent-remove.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+
+            var failedMetadata = new FileMetadata
+            {
+                FileKey = "file-concurrent-remove",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 14,
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-10),
+                CreatedAt = DateTime.UtcNow.AddDays(-10)
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
+            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", default);
+
+            _volume.Setup(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()))
+                .Returns(async (string path, CancellationToken token) =>
+                {
+                    if (_fileSystem.File.Exists(path))
+                        _fileSystem.File.Delete(path);
+
+                    await _metadataRepository.RemoveAsync("tenant-001", "file-concurrent-remove", token);
+                });
+
+            await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
+
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
+            var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", default);
+            Assert.Equal(1, tenantCount);
+
+            var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
+            Assert.Equal(0, stats.PermanentlyFailedFilesRemoved);
+        }
+
+        [Fact]
         public async Task CleanupFilesByStatusAsync_ResetsTimedOutAndRemovesOldFailed()
         {
             var processing1 = new FileMetadata

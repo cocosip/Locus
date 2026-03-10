@@ -28,6 +28,7 @@ namespace Locus.Storage
         private readonly ITenantManager _tenantManager;
         private readonly ILogger<StoragePool> _logger;
         private readonly IFileScheduler _fileScheduler;
+        private readonly StorageVolumeRegistry _volumeRegistry;
 
         // Cache a writable-volume snapshot and refresh periodically.
         // Selection then uses power-of-two choices to avoid pinning traffic to one volume.
@@ -53,7 +54,8 @@ namespace Locus.Storage
             IDirectoryQuotaManager directoryQuotaManager,
             ITenantManager tenantManager,
             IFileScheduler fileScheduler,
-            ILogger<StoragePool> logger)
+            ILogger<StoragePool> logger,
+            StorageVolumeRegistry? volumeRegistry = null)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
@@ -61,7 +63,8 @@ namespace Locus.Storage
                 tenantManager,
                 fileScheduler,
                 logger,
-                DefaultCompletionGuardStripeCount)
+                DefaultCompletionGuardStripeCount,
+                volumeRegistry)
         {
         }
 
@@ -75,7 +78,8 @@ namespace Locus.Storage
             ITenantManager tenantManager,
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger,
-            int completionGuardStripeCount)
+            int completionGuardStripeCount,
+            StorageVolumeRegistry? volumeRegistry = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
@@ -83,6 +87,7 @@ namespace Locus.Storage
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
             if (completionGuardStripeCount <= 0)
                 throw new ArgumentOutOfRangeException(nameof(completionGuardStripeCount), "Completion guard stripe count must be greater than zero.");
 
@@ -168,6 +173,8 @@ namespace Locus.Storage
                 throw new InvalidOperationException($"Volume {volume.VolumeId} is already mounted");
             }
 
+            _volumeRegistry.Register(volume);
+
             _cachedWritableVolumes = Array.Empty<IStorageVolume>();
             Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
 
@@ -196,6 +203,7 @@ namespace Locus.Storage
             IStorageVolume? volume = null;
             bool fileWritten = false;
             bool directoryQuotaIncremented = false;
+            CountingReadStream? countingStream = null;
 
             try
             {
@@ -231,10 +239,19 @@ namespace Locus.Storage
                 // Using content.Length alone is wrong for streams not at position 0 — it would
                 // report the total stream size rather than the bytes actually written.
                 var fileSize = content.CanSeek ? content.Length - content.Position : 0;
+                var contentToWrite = content;
+                if (!content.CanSeek)
+                {
+                    countingStream = new CountingReadStream(content);
+                    contentToWrite = countingStream;
+                }
 
                 // 9. Write file to volume
-                await volume.WriteAsync(physicalPath, content, ct);
+                await volume.WriteAsync(physicalPath, contentToWrite, ct);
                 fileWritten = true; // Mark that physical file was written
+
+                if (countingStream != null)
+                    fileSize = countingStream.BytesRead;
 
                 // 10. Create file metadata — Write-Behind: memory is updated immediately, SQLite write is async.
                 // AddOrUpdateAsync never throws from the caller's perspective. If SQLite is unavailable,
@@ -812,6 +829,77 @@ namespace Locus.Storage
         private string GenerateFileKey()
         {
             return Guid.NewGuid().ToString("N"); // 32-character hex string without dashes
+        }
+
+        private sealed class CountingReadStream : Stream
+        {
+            private readonly Stream _inner;
+
+            public CountingReadStream(Stream inner)
+            {
+                _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+            }
+
+            public long BytesRead { get; private set; }
+
+            public override bool CanRead => _inner.CanRead;
+
+            public override bool CanSeek => _inner.CanSeek;
+
+            public override bool CanWrite => _inner.CanWrite;
+
+            public override long Length => _inner.Length;
+
+            public override long Position
+            {
+                get => _inner.Position;
+                set => _inner.Position = value;
+            }
+
+            public override void Flush()
+            {
+                _inner.Flush();
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                var read = _inner.Read(buffer, offset, count);
+                BytesRead += read;
+                return read;
+            }
+
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                return ReadAsyncInternal(buffer, offset, count, cancellationToken);
+            }
+
+            private async Task<int> ReadAsyncInternal(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                var read = await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+                BytesRead += read;
+                return read;
+            }
+
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                return _inner.Seek(offset, origin);
+            }
+
+            public override void SetLength(long value)
+            {
+                _inner.SetLength(value);
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                _inner.Write(buffer, offset, count);
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                // The caller owns the wrapped stream lifetime.
+                base.Dispose(disposing);
+            }
         }
     }
 }

@@ -251,6 +251,42 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_UsesRegisteredVolumeDeleteWhenAvailable()
+        {
+            var physicalPath = Path.Combine(_metadataDir, "volume-delete.txt");
+            _fileSystem.File.WriteAllText(physicalPath, "test content");
+
+            var file = new FileMetadata
+            {
+                FileKey = "file-volume-delete",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                Status = FileProcessingStatus.Processing
+            };
+
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var volume = new Mock<IStorageVolume>();
+            volume.SetupGet(v => v.VolumeId).Returns("vol-001");
+            volume.Setup(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()))
+                .Returns((string path, CancellationToken _) =>
+                {
+                    _fileSystem.File.Delete(path);
+                    return Task.CompletedTask;
+                });
+
+            var registry = new StorageVolumeRegistry();
+            registry.Register(volume.Object);
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, volumeRegistry: registry);
+
+            await scheduler.MarkAsCompletedAsync("file-volume-delete", CancellationToken.None);
+
+            volume.Verify(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()), Times.Once);
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_WhenDeleteFails_MarksPermanentlyFailedAndThrows()
         {
             // Arrange

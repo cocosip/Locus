@@ -1016,6 +1016,58 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_KeepMode_ReimportsFileWhenPathIsReusedWithNewFingerprint()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-reuse";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var filePath = Path.Combine(watchPath, "keep.txt");
+            _fileSystem.File.WriteAllText(filePath, "payload-v1");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.SetupSequence(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(),
+                    It.IsAny<Stream>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key-1")
+                .ReturnsAsync("generated-key-2");
+
+            var configuration = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(configuration, CancellationToken.None);
+
+            var firstScan = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+            Assert.Equal(1, firstScan.FilesImported);
+
+            _fileSystem.File.WriteAllText(filePath, "payload-v2-longer");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-2));
+
+            var secondScan = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+
+            Assert.Equal(1, secondScan.FilesImported);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
         public async Task RemoveWatcherAsync_DeletesConfiguration()
         {
             // Arrange
