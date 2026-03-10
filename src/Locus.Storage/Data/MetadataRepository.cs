@@ -20,9 +20,34 @@ namespace Locus.Storage.Data
     /// Repository for file metadata storage using per-tenant SQLite with active-data in-memory caching.
     /// Only keeps Pending/Processing/Failed files in memory. Completed files are immediately deleted.
     ///
-    /// Write-Behind architecture: AddOrUpdateAsync and RemoveAsync update in-memory cache first,
-    /// then enqueue SQLite persistence asynchronously. If SQLite is unavailable, file writes continue
-    /// uninterrupted. On process restart, orphaned physical files are recovered by the cleanup service.
+    /// Write-Behind Architecture:
+    /// - AddOrUpdateAsync and RemoveAsync update in-memory cache first, then enqueue SQLite persistence asynchronously.
+    /// - If SQLite is unavailable, file writes continue uninterrupted. The physical file on disk is always safe.
+    /// - If the process crashes before the background persistence loop flushes to SQLite, the in-memory metadata is lost.
+    /// - On process restart, orphaned physical files (files on disk without metadata) are recovered by StorageCleanupService.CleanupOrphanedFilesAsync.
+    ///
+    /// Data Consistency Guarantees:
+    /// - Physical files are ALWAYS written synchronously before metadata is updated.
+    /// - Metadata in memory is immediately visible to all readers within the same process.
+    /// - SQLite persistence is asynchronous and best-effort. If SQLite fails, the operation is logged and retried.
+    /// - If the process crashes before SQLite persistence completes, the physical file becomes an "orphan" and will be
+    ///   recovered on next startup as a Pending file for reprocessing.
+    ///
+    /// Failure Scenarios:
+    /// 1. SQLite unavailable (disk full, locked, etc.):
+    ///    - Physical file exists on disk, metadata in memory is correct.
+    ///    - Persistence queue will retry until SQLite recovers.
+    ///    - If process crashes before retry succeeds, file is recovered as orphan on restart.
+    ///
+    /// 2. Process crash during write:
+    ///    - If crash occurs BEFORE physical write completes: No file on disk, no metadata. Clean state.
+    ///    - If crash occurs AFTER physical write but BEFORE metadata update: Orphan file on disk, recovered on restart.
+    ///    - If crash occurs AFTER metadata update but BEFORE SQLite flush: Metadata in memory lost, but physical file
+    ///      exists. Recovered as orphan on restart (metadata will be rebuilt from physical file).
+    ///
+    /// 3. Persistence queue full:
+    ///    - Operations are coalesced by file key, keeping only the latest state.
+    ///    - Intermediate updates may be lost, but final state is preserved.
     ///
     /// Thread-safe for concurrent access.
     /// </summary>
@@ -1893,6 +1918,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             // Force the SQLite connection pool to release the OS file handle.
             // With Cache=Shared, Dispose() returns connections to the pool rather than closing them.
             // ClearAllPools() ensures the file can be deleted and a fresh connection will open a new file.
+            // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
+            // This is intentional and necessary: the OS file handle must be released before the
+            // database file can be deleted. Since database rebuild is a rare maintenance operation
+            // (only triggered by corruption), the brief impact on other tenants is acceptable.
+            // After the rebuild completes, connections will be automatically re-established on next access.
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                 RemoveTenantFromGlobalIndex(staleTenantCache);
@@ -1946,6 +1976,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 if (!_fileSystem.File.Exists(dbPath))
                 {
                     _logger.LogInformation("No database file to rebuild for tenant {TenantId}", tenantId);
+                    tenantLock.Release();
                     return null;
                 }
 
@@ -1968,6 +1999,10 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     }
                 }
                 // Force the connection pool to release the OS file handle before deleting the file.
+                // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
+                // This is intentional and necessary: the OS file handle must be released before the
+                // database file can be deleted. Since database rebuild is a rare maintenance operation
+                // (only triggered by corruption), the brief impact on other tenants is acceptable.
                 Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
 
                 // Step 3: Clear in-memory cache and pending index

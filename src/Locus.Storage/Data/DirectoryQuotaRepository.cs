@@ -365,6 +365,10 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 }
             }
             // Force the connection pool to release the OS file handle before deleting the file.
+            // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
+            // This is intentional and necessary: the OS file handle must be released before the
+            // database file can be deleted. Since database rebuild is a rare maintenance operation
+            // (only triggered by corruption), the brief impact on other tenants is acceptable.
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             _quotaCache.TryRemove(tenantId, out _);
 

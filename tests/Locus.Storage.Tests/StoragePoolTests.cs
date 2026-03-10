@@ -204,32 +204,46 @@ namespace Locus.Storage.Tests
             await _storagePool.AddVolumeAsync(_volume2.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
         }
 
-        public Task DisposeAsync() => Task.CompletedTask;
+        public async Task DisposeAsync()
+        {
+            // Dispose repositories to release SQLite connections
+            _metadataRepository?.Dispose();
+            _quotaRepository?.Dispose();
+
+            // Clear SQLite connection pool to release file handles
+            SqliteConnection.ClearAllPools();
+
+            // Give the background persistence loop time to flush pending operations
+            await Task.Delay(100);
+
+            // Cleanup temporary test directories
+            // Delete volume paths first (actual data), then metadata and quota paths
+            CleanupTestDirectory(_volume1Path);
+            CleanupTestDirectory(_volume2Path);
+            CleanupTestDirectory(_metadataPath);
+            CleanupTestDirectory(_quotaPath);
+        }
 
         public void Dispose()
         {
-            _metadataRepository?.Dispose();
-            _quotaRepository?.Dispose();
-            SqliteConnection.ClearAllPools();
+            DisposeAsync().GetAwaiter().GetResult();
+        }
 
-            // Cleanup temporary test directories
+        private void CleanupTestDirectory(string path)
+        {
             try
             {
-                if (_fileSystem.Directory.Exists(_metadataPath))
-                    _fileSystem.Directory.Delete(_metadataPath, recursive: true);
-
-                if (_fileSystem.Directory.Exists(_quotaPath))
-                    _fileSystem.Directory.Delete(_quotaPath, recursive: true);
-
-                if (_fileSystem.Directory.Exists(_volume1Path))
-                    _fileSystem.Directory.Delete(_volume1Path, recursive: true);
-
-                if (_fileSystem.Directory.Exists(_volume2Path))
-                    _fileSystem.Directory.Delete(_volume2Path, recursive: true);
+                if (_fileSystem.Directory.Exists(path))
+                {
+                    _fileSystem.Directory.Delete(path, recursive: true);
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore cleanup errors in tests
+                // Log cleanup failures for debugging, but don't fail the test
+                // Cleanup failures are typically due to file handles still being open
+                // or concurrent test execution accessing the same directory
+                System.Diagnostics.Debug.WriteLine($"Failed to cleanup test directory {path}: {ex.Message}");
             }
         }
 

@@ -1302,11 +1302,21 @@ namespace Locus.Storage
             }
             finally
             {
-                if (importSlotTaken
-                    && _importedFiles.TryGetValue(filePath, out var currentValue)
-                    && string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal))
+                // Release import slot if the import was not completed successfully.
+                // importSlotTaken is set to false after successful import (line 1284),
+                // so this block only runs when the import failed or was skipped.
+                if (importSlotTaken)
                 {
-                    _importedFiles.TryRemove(filePath, out _);
+                    // Only remove if the value is still the in-flight marker.
+                    // Another thread might have updated it concurrently (unlikely but possible).
+                    if (_importedFiles.TryGetValue(filePath, out var currentValue)
+                        && string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal))
+                    {
+                        _importedFiles.TryRemove(filePath, out _);
+                    }
+                    // Note: If the value is not the in-flight marker, it means another thread
+                    // has already updated the record (e.g., a concurrent scan imported the file).
+                    // In this case, we don't remove the record to avoid breaking the other import.
                 }
             }
 
