@@ -3,11 +3,10 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>Locus.Storage</PackageId>
-    <Description>Storage pool and metadata management for Locus. Includes StoragePool, FileScheduler, DirectoryQuotaManager with LiteDB-based persistence and active-data caching.</Description>
+    <Description>Storage pool and metadata management for Locus. Includes StoragePool, FileScheduler, DirectoryQuotaManager with SQLite-based persistence and active-data caching.</Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="LiteDB" />
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="Dapper" />
     <PackageReference Include="System.IO.Abstractions" />

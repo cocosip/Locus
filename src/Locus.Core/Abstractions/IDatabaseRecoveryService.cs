@@ -6,7 +6,7 @@ using Locus.Core.Models;
 namespace Locus.Core.Abstractions
 {
     /// <summary>
-    /// Service for recovering and rebuilding corrupted LiteDB databases.
+    /// Service for recovering and rebuilding corrupted SQLite databases.
     /// </summary>
     public interface IDatabaseRecoveryService
     {

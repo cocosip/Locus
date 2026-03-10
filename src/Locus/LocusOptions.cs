@@ -112,12 +112,6 @@ namespace Locus
         public SqliteOptions Sqlite { get; set; } = new SqliteOptions();
 
         /// <summary>
-        /// Gets or sets the LiteDB configuration options.
-        /// </summary>
-        [Obsolete("LiteDB has been replaced by SQLite. Use the Sqlite property instead. This property will be removed in a future version.")]
-        public LiteDBOptions LiteDB { get; set; } = new LiteDBOptions();
-
-        /// <summary>
         /// Gets or sets MetadataRepository tuning options.
         /// Supports appsettings binding under "Locus:MetadataRepository".
         /// </summary>

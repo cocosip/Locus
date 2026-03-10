@@ -72,7 +72,7 @@ namespace Locus.Core.Abstractions
         Task<CleanupStatistics> GetCleanupStatisticsAsync(CancellationToken ct);
 
         /// <summary>
-        /// Optimizes (shrinks) all LiteDB databases by rebuilding them.
+        /// Optimizes (shrinks) all SQLite databases by running VACUUM.
         /// This reclaims space from deleted records and reduces file size.
         /// WARNING: This operation can be time-consuming for large databases.
         /// Should be run during maintenance windows.
@@ -82,9 +82,8 @@ namespace Locus.Core.Abstractions
         Task<DatabaseOptimizationResult> OptimizeDatabasesAsync(CancellationToken ct);
 
         /// <summary>
-        /// Cleans up incorrectly created database files that were mistakenly identified as tenants.
-        /// This includes files created from LiteDB backup files like "tenant-001.db-backup-1.db".
-        /// WARNING: This is a one-time cleanup operation. Only run if you have backup files incorrectly treated as tenants.
+        /// Cleans up SQLite corruption backup files (*.corrupted.*) left over from database rebuild operations.
+        /// These accumulate inside each tenant's subdirectory when a corrupted database is rebuilt.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Number of invalid database files removed and space freed in bytes.</returns>

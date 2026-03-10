@@ -236,8 +236,8 @@ namespace Locus.Storage
                 await volume.WriteAsync(physicalPath, content, ct);
                 fileWritten = true; // Mark that physical file was written
 
-                // 10. Create file metadata — Write-Behind: memory is updated immediately, LiteDB write is async.
-                // AddOrUpdateAsync never throws from the caller's perspective. If LiteDB is unavailable,
+                // 10. Create file metadata — Write-Behind: memory is updated immediately, SQLite write is async.
+                // AddOrUpdateAsync never throws from the caller's perspective. If SQLite is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
                 {

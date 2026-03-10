@@ -4,7 +4,7 @@
 [![NuGet](https://img.shields.io/nuget/v/Locus.svg)](https://www.nuget.org/packages/Locus/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A high-performance, multi-tenant file storage pool system for .NET targeting netstandard2.0 with LiteDB-based metadata management.
+A high-performance, multi-tenant file storage pool system for .NET targeting netstandard2.0 with SQLite-based metadata management.
 
 ## Overview
 
@@ -12,7 +12,7 @@ Locus is designed as a **file queue system** that provides:
 - **Multi-tenant isolation** - Each tenant has isolated storage space with enable/disable controls
 - **Queue-based processing** - Files are processed as a queue with automatic retry on failure
 - **Unlimited storage expansion** - Dynamically mount multiple storage volumes
-- **High concurrency** - Thread-safe operations with per-tenant LiteDB databases and active-data caching
+- **High concurrency** - Thread-safe operations with per-tenant SQLite databases and active-data caching
 - **Automatic management** - System handles directory structure, file placement, and cleanup
 - **Directory-level quota control** - Configurable file count limits per directory
 
@@ -72,7 +72,7 @@ var location = await storagePool.GetFileLocationAsync(tenant, fileKey, ct);
 │   - ConcurrentDictionary for fast lookups   │
 │   - Automatic cache invalidation            │
 ├─────────────────────────────────────────────┤
-│   Persistence Layer (Per-Tenant LiteDB)    │
+│   Persistence Layer (Per-Tenant SQLite)    │
 │   - MetadataRepository: File metadata       │
 │   - DirectoryQuotaRepository: Quota limits  │
 │   - Atomic operations with transactions     │
@@ -92,10 +92,10 @@ var location = await storagePool.GetFileLocationAsync(tenant, fileKey, ct);
 ### Key Design Decisions
 
 - **Unified API**: IStoragePool combines file storage and queue processing in one interface
-- **Per-Tenant LiteDB**: Each tenant has isolated `.db` file for metadata
+- **Per-Tenant SQLite**: Each tenant has an isolated subdirectory with `metadata.db` and `quotas.db`
 - **Active-Data Caching**: Only cache files in Pending/Processing/Failed states
 - **Completed Files**: Automatically removed from cache and database after processing
-- **Atomic Quota Operations**: SemaphoreSlim + LiteDB transactions ensure concurrency safety
+- **Atomic Quota Operations**: Lock-free CAS counters + Write-Behind timer ensure concurrency safety
 - **Startup Volume Configuration**: Storage volumes are configured at startup and managed internally
 
 ## Core APIs
@@ -274,9 +274,9 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 
 | Operation | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
-| AddOrUpdate single file | 1.878 μs | 2.4 KB | ⚡ Memory-first, async LiteDB persistence |
+| AddOrUpdate single file | 1.878 μs | 2.4 KB | ⚡ Memory-first, async SQLite persistence |
 | Get file metadata (cache hit) | 40.91 ns | 72 B | ⚡ ConcurrentDictionary lookup |
-| Get non-existent file (returns null) | 34.87 ns | 0 B | Cache miss → null, no LiteDB fallback |
+| Get non-existent file (returns null) | 34.87 ns | 0 B | Cache miss → null, no SQLite fallback |
 | Batch insert 100 files | 237.9 μs | 63.4 KB | ~2.4 μs per file |
 | Get next pending file (100-file pool) | 2.975 μs | 1.4 KB | ⚡ O(n_pending) scan via `_pendingKeys` |
 
@@ -288,7 +288,7 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 | Check can add (with limit) | 139.07 ns | 176 B | ⚡ Lock-free CAS comparison |
 | Increment file count | 94.80 ns | 72 B | ⚡ Lock-free CAS, near-zero contention |
 | Decrement file count | 231.05 ns | 248 B | Increment + decrement pair |
-| Set directory limit | 2.916 ms | 142.2 KB | LiteDB write (persisted immediately) |
+| Set directory limit | 2.916 ms | 142.2 KB | SQLite write (persisted immediately) |
 | Get file count | 145.41 ns | 232 B | ⚡ AtomicQuotaState read |
 
 #### Volume Health & Space (TTL Cached)
@@ -331,7 +331,7 @@ Last updated: 2026-02-28 (BenchmarkDotNet v0.15.8, .NET 10.0.0, IterationCount=1
 **Key Findings**:
 - ⚡ **Directory quota CAS**: 94.80 ns per increment — lock-free atomic operations (vs. ~200 μs with SemaphoreSlim)
 - ⚡ **Volume health/space**: 17–22 ns — 30-second TTL cache eliminates one disk I/O per write
-- ⚡ **Metadata write-behind**: 1.878 μs per file — memory-first, LiteDB persistence is async
+- ⚡ **Metadata write-behind**: 1.878 μs per file — memory-first, SQLite persistence is async
 - ⚡ **Metadata cache hit**: 40.91 ns — pure ConcurrentDictionary lookup
 - ⚡ **Tenant cache**: 82–90 ns — 5-minute cache keeps tenant lookups near-zero cost
 - ✅ **100 KB write**: ~1.1 ms end-to-end (quota check + disk write + metadata)
@@ -404,10 +404,10 @@ Locus/
 │       ├── LocusBuilder.cs
 │       └── ServiceCollectionExtensions.cs
 ├── tests/
-│   ├── Locus.FileSystem.Tests/  # 40 tests ✅
-│   ├── Locus.Storage.Tests/     # 103 tests ✅
-│   ├── Locus.MultiTenant.Tests/ # 11 tests ✅
-│   ├── Locus.IntegrationTests/  # 6 tests ✅
+│   ├── Locus.FileSystem.Tests/  # 51 tests ✅
+│   ├── Locus.Storage.Tests/     # 179 tests ✅
+│   ├── Locus.MultiTenant.Tests/ # 12 tests ✅
+│   ├── Locus.IntegrationTests/  # 10 tests ✅
 │   └── Locus.Benchmarks/        # Performance benchmarks
 │       ├── MetadataRepositoryBenchmarks.cs
 │       ├── DirectoryQuotaBenchmarks.cs
@@ -419,12 +419,12 @@ Locus/
 
 ## Test Coverage
 
-**All tests passing: 194/194 ✅**
+**All tests passing: 252/252 ✅**
 
-- ✅ FileSystem.Tests: 50 tests
-- ✅ Storage.Tests: 127 tests
-- ✅ MultiTenant.Tests: 11 tests
-- ✅ IntegrationTests: 6 tests
+- ✅ FileSystem.Tests: 51 tests
+- ✅ Storage.Tests: 179 tests
+- ✅ MultiTenant.Tests: 12 tests
+- ✅ IntegrationTests: 10 tests
 
 ## Implementation Status
 
@@ -450,8 +450,8 @@ Locus/
 - ✅ Cross-platform path handling
 
 **Directory Quota Management (Phase 4):**
-- ✅ DirectoryQuotaRepository with LiteDB
-- ✅ Atomic increment/decrement with SemaphoreSlim
+- ✅ DirectoryQuotaRepository with SQLite
+- ✅ Lock-free CAS atomic increment/decrement with Write-Behind persistence
 - ✅ Per-directory file count limits
 - ✅ Concurrent-safe operations
 
@@ -463,14 +463,13 @@ Locus/
 
 **Storage Pool (Phase 6):**
 - ✅ StoragePool with volume management
-- ✅ MetadataRepository with per-tenant LiteDB
+- ✅ MetadataRepository with per-tenant SQLite (WAL mode, per-tenant subdirectory)
 - ✅ Active-data caching strategy
 - ✅ Automatic volume selection
 - ✅ TenantQuotaManager integration
 
 **Testing:**
-- ✅ 160 unit tests (100% passing)
-- ✅ Integration tests
+- ✅ 252 unit/integration tests (100% passing)
 - ✅ Performance benchmarks
 
 ### 🚧 In Progress (Phases 7-8)
@@ -514,7 +513,7 @@ dotnet pack src/Locus/Locus.csproj -c Release
 
 📦 **Multi-Tenant Storage**
 - Tenant isolation with enable/disable controls
-- Per-tenant LiteDB databases for metadata
+- Per-tenant SQLite databases in isolated subdirectories
 - Active-data caching for high concurrency
 - **File extension preservation** - Original file extensions are preserved in physical storage
 

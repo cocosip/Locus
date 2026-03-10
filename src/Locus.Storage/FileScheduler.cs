@@ -168,7 +168,7 @@ namespace Locus.Storage
                 throw new IOException($"Failed to delete physical file for completion: {fileKey}", deleteException);
             }
 
-            // Remove metadata (Write-Behind: memory removed immediately, LiteDB delete queued)
+            // Remove metadata (Write-Behind: memory removed immediately, SQLite delete queued)
             await _repository.RemoveAsync(metadata.TenantId, fileKey, ct);
 
             _logger.LogDebug("Completed and deleted file: {FileKey}", fileKey);

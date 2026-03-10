@@ -8,12 +8,12 @@
     <PackageProjectUrl>https://github.com/cocosip/Locus</PackageProjectUrl>
     <RepositoryUrl>https://github.com/cocosip/Locus</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>storage;file-system;queue;multi-tenant;litedb;netstandard</PackageTags>
+    <PackageTags>storage;file-system;queue;multi-tenant;sqlite;netstandard</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and LiteDB metadata management.</Description>
+    <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and SQLite metadata management.</Description>
 
     <!-- Version information -->
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
 
     <!-- Build configuration -->
     <LangVersion>latest</LangVersion>

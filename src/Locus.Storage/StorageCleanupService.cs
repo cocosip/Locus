@@ -287,7 +287,7 @@ namespace Locus.Storage
 
                                 // Orphaned physical file 鈥?reconstruct metadata and re-queue for processing.
                                 // DO NOT delete the file: it contains real data that was uploaded but whose
-                                // LiteDB record was lost (e.g. process crash during write-behind flush, or
+                                // metadata record was lost (e.g. process crash during write-behind flush, or
                                 // persistence queue overflow).  Rebuilding brings it back into the Pending
                                 // queue so that normal consumers can process it on the next scheduling cycle.
                                 try
@@ -302,7 +302,7 @@ namespace Locus.Storage
                                         continue;
                                     }
 
-                                    // AddOrUpdateDirectAsync writes immediately to LiteDB (not write-behind)
+                                    // AddOrUpdateDirectAsync writes immediately to SQLite (not write-behind)
                                     // so the record survives even if the process crashes right after this call.
                                     await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
                                     if (normalizedPhysical != null && existenceCache != null)
@@ -771,151 +771,75 @@ namespace Locus.Storage
         }
 
         /// <summary>
-        /// Cleans up incorrectly created database files that were mistakenly identified as tenants.
-        /// This includes files created from LiteDB backup files like "tenant-001.db-backup-1.db".
-        /// WARNING: This is a one-time cleanup operation. Only run if you have backup files incorrectly treated as tenants.
+        /// Cleans up SQLite corruption backup files left over from database rebuild operations.
+        /// These are files named like "metadata.db.corrupted.{timestamp}" or "quotas.db.corrupted.{timestamp}"
+        /// that accumulate inside each tenant's subdirectory when a corrupted database is rebuilt.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
-        /// <returns>Number of invalid database files removed and space freed in bytes.</returns>
+        /// <returns>Number of backup files removed and space freed in bytes.</returns>
         public async Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct)
         {
             var filesRemoved = 0;
             long spaceFreed = 0;
 
-            _logger.LogInformation("Starting cleanup of invalid database files (backup files mistakenly treated as tenants)...");
+            _logger.LogInformation("Starting cleanup of SQLite corruption backup files...");
 
-            // Cleanup metadata databases
-            if (_fileSystem.Directory.Exists(_metadataDirectory))
-            {
-                var metadataFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
-                foreach (var dbPath in metadataFiles)
-                {
-                    ct.ThrowIfCancellationRequested();
+            // Scan each tenant subdirectory in the metadata directory
+            var (metaFiles, metaSpace) = CleanupCorruptedDatabaseBackups(_metadataDirectory, ct);
+            filesRemoved += metaFiles;
+            spaceFreed += metaSpace;
 
-                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(dbPath);
+            // Scan each tenant subdirectory in the quota directory
+            var (quotaFiles, quotaSpace) = CleanupCorruptedDatabaseBackups(_quotaDirectory, ct);
+            filesRemoved += quotaFiles;
+            spaceFreed += quotaSpace;
 
-                    // Check if this is an invalid database file (backup file treated as tenant)
-                    if (IsInvalidDatabaseFile(fileName))
-                    {
-                        try
-                        {
-                            var fileSize = _fileSystem.FileInfo.New(dbPath).Length;
-                            _fileSystem.File.Delete(dbPath);
-                            filesRemoved++;
-                            spaceFreed += fileSize;
-                            _logger.LogInformation("Deleted invalid metadata database: {FileName} ({SizeKB:F2} KB)", fileName, fileSize / 1024.0);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Failed to delete invalid metadata database: {FileName}", fileName);
-                        }
-                    }
-                }
-            }
-
-            // Cleanup quota databases
-            if (_fileSystem.Directory.Exists(_quotaDirectory))
-            {
-                var quotaFiles = _fileSystem.Directory.GetFiles(_quotaDirectory, "*-quotas.db");
-                foreach (var dbPath in quotaFiles)
-                {
-                    ct.ThrowIfCancellationRequested();
-
-                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(dbPath);
-
-                    // Check if this is an invalid database file (backup file treated as tenant)
-                    if (IsInvalidDatabaseFile(fileName))
-                    {
-                        try
-                        {
-                            var fileSize = _fileSystem.FileInfo.New(dbPath).Length;
-                            _fileSystem.File.Delete(dbPath);
-                            filesRemoved++;
-                            spaceFreed += fileSize;
-                            _logger.LogInformation("Deleted invalid quota database: {FileName} ({SizeKB:F2} KB)", fileName, fileSize / 1024.0);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Failed to delete invalid quota database: {FileName}", fileName);
-                        }
-                    }
-                }
-            }
-
-            // Also cleanup LiteDB temporary backup files (*.db-backup-*)
-            var (metadataBackupFiles, metadataBackupSpace) = CleanupLiteDbBackupFiles(_metadataDirectory, ct);
-            filesRemoved += metadataBackupFiles;
-            spaceFreed += metadataBackupSpace;
-
-            var (quotaBackupFiles, quotaBackupSpace) = CleanupLiteDbBackupFiles(_quotaDirectory, ct);
-            filesRemoved += quotaBackupFiles;
-            spaceFreed += quotaBackupSpace;
-
-            _logger.LogInformation("Invalid database cleanup completed. Files removed: {FilesRemoved}, Space freed: {SpaceMB:F2} MB",
+            _logger.LogInformation("Corruption backup cleanup completed. Files removed: {FilesRemoved}, Space freed: {SpaceMB:F2} MB",
                 filesRemoved, spaceFreed / 1024.0 / 1024.0);
 
-            return (filesRemoved, spaceFreed);
+            return await Task.FromResult((filesRemoved, spaceFreed));
         }
 
         /// <summary>
-        /// Checks if a database file name represents an invalid database (backup file mistakenly treated as tenant).
-        /// Examples: "tenant-001.db-backup-1", "tenant-001-quotas.db-backup-2", etc.
+        /// Cleans up SQLite corruption backup files (*.corrupted.*) inside each tenant subdirectory.
+        /// Each tenant directory lives under <paramref name="rootDirectory"/>/{tenantId}/.
         /// </summary>
-        private static bool IsInvalidDatabaseFile(string fileName)
-        {
-            if (string.IsNullOrWhiteSpace(fileName))
-                return false;
-
-            // LiteDB backup pattern: contains "-backup"
-            if (fileName.IndexOf("-backup", StringComparison.OrdinalIgnoreCase) >= 0)
-                return true;
-
-            // Corruption backup pattern: contains ".corrupted."
-            if (fileName.IndexOf(".corrupted.", StringComparison.OrdinalIgnoreCase) >= 0)
-                return true;
-
-            // LiteDB journal files
-            if (fileName.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            return false;
-        }
-
-        /// <summary>
-        /// Cleans up LiteDB temporary backup files (*.db-backup-*, *.db.corrupted.*) in a directory.
-        /// </summary>
-        private (int FilesRemoved, long SpaceFreed) CleanupLiteDbBackupFiles(string directory, CancellationToken ct)
+        private (int FilesRemoved, long SpaceFreed) CleanupCorruptedDatabaseBackups(string rootDirectory, CancellationToken ct)
         {
             var filesRemoved = 0;
             long spaceFreed = 0;
 
-            if (!_fileSystem.Directory.Exists(directory))
+            if (!_fileSystem.Directory.Exists(rootDirectory))
                 return (0, 0);
 
-            var allFiles = _fileSystem.Directory.GetFiles(directory);
-            foreach (var filePath in allFiles)
+            // Each tenant has its own subdirectory; scan all of them.
+            var tenantDirs = _fileSystem.Directory.GetDirectories(rootDirectory);
+            foreach (var tenantDir in tenantDirs)
             {
                 ct.ThrowIfCancellationRequested();
 
-                var fileName = _fileSystem.Path.GetFileName(filePath);
-
-                // Match LiteDB backup patterns:
-                // - *.db-backup-* (e.g., "tenant-001.db-backup-1")
-                // - *.db.corrupted.* (e.g., "tenant-001.db.corrupted.20240122120000")
-                if (fileName.IndexOf("-backup-", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    fileName.IndexOf(".corrupted.", StringComparison.OrdinalIgnoreCase) >= 0)
+                var allFiles = _fileSystem.Directory.GetFiles(tenantDir);
+                foreach (var filePath in allFiles)
                 {
-                    try
+                    ct.ThrowIfCancellationRequested();
+
+                    var fileName = _fileSystem.Path.GetFileName(filePath);
+
+                    // Corruption backup files: metadata.db.corrupted.{yyyyMMddHHmmss}
+                    if (fileName.IndexOf(".corrupted.", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        var fileSize = _fileSystem.FileInfo.New(filePath).Length;
-                        _fileSystem.File.Delete(filePath);
-                        filesRemoved++;
-                        spaceFreed += fileSize;
-                        _logger.LogDebug("Deleted LiteDB backup file: {FileName} ({SizeKB:F2} KB)", fileName, fileSize / 1024.0);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to delete LiteDB backup file: {FileName}", fileName);
+                        try
+                        {
+                            var fileSize = _fileSystem.FileInfo.New(filePath).Length;
+                            _fileSystem.File.Delete(filePath);
+                            filesRemoved++;
+                            spaceFreed += fileSize;
+                            _logger.LogDebug("Deleted corruption backup file: {FileName} ({SizeKB:F2} KB)", fileName, fileSize / 1024.0);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to delete corruption backup file: {FileName}", fileName);
+                        }
                     }
                 }
             }

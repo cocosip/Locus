@@ -165,13 +165,13 @@ namespace Locus.Storage
 
         /// <summary>
         /// Gets or sets the retention period for permanently failed files.
-        /// Default: 7 days.
+        /// Default: 3 days.
         /// </summary>
-        public TimeSpan? FailedFileRetentionPeriod { get; set; } = TimeSpan.FromDays(7);
+        public TimeSpan? FailedFileRetentionPeriod { get; set; } = TimeSpan.FromDays(3);
 
         /// <summary>
-        /// Gets or sets whether to optimize (shrink) LiteDB databases periodically.
-        /// Database optimization reclaims space from deleted records by rebuilding the database files.
+        /// Gets or sets whether to optimize (shrink) SQLite databases periodically.
+        /// Database optimization reclaims space from deleted records by running VACUUM on the database files.
         /// This is a heavy operation and should be run during low-activity periods.
         /// Default: true.
         /// </summary>

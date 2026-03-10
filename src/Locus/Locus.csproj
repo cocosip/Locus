@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>Locus</PackageId>
-    <Description>Locus - A high-performance, multi-tenant file storage pool system with queue-based processing, LiteDB metadata management, and unlimited storage expansion. This is the main package that includes all components.</Description>
+    <Description>Locus - A high-performance, multi-tenant file storage pool system with queue-based processing, SQLite metadata management, and unlimited storage expansion. This is the main package that includes all components.</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -50,7 +50,6 @@
     <PackageReference Include="Microsoft.Extensions.Options" />
 
     <!-- Third-party dependencies required by sub-projects -->
-    <PackageReference Include="LiteDB" />
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="Dapper" />
     <PackageReference Include="System.IO.Abstractions" />

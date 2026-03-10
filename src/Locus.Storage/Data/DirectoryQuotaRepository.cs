@@ -543,7 +543,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         }
 
         /// <summary>
-        /// Timer callback: flushes all dirty atomic counters to LiteDB.
+        /// Timer callback: flushes all dirty atomic counters to SQLite.
         /// Non-reentrant: uses Timeout.Infinite period and reschedules after completion.
         /// </summary>
         private void FlushDirtyCounters(object? state)
@@ -572,7 +572,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         }
 
         /// <summary>
-        /// Core flush logic: drains indexed dirty tenants/directories and writes them to LiteDB.
+        /// Core flush logic: drains indexed dirty tenants/directories and writes them to SQLite.
         /// Safe to call from Dispose for a final drain.
         /// </summary>
         private void DoFlushAllDirtyCounters()
@@ -798,7 +798,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
 
         /// <summary>
         /// Updates a directory quota config (MaxCount, Enabled).
-        /// Persists to LiteDB immediately and syncs the atomic state so the hot path
+        /// Persists to SQLite immediately and syncs the atomic state so the hot path
         /// picks up the new limit without waiting for the next flush.
         /// </summary>
         public async Task UpdateAsync(string tenantId, DirectoryQuota quota, CancellationToken ct)
@@ -913,7 +913,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// <summary>
         /// Atomically increments the file count for a directory.
         /// Lock-free hot path: uses CAS (compare-and-swap) on the atomic counter.
-        /// LiteDB is updated asynchronously by the Write-Behind timer.
+        /// SQLite is updated asynchronously by the Write-Behind timer.
         /// Returns false if the increment would exceed the configured maximum count.
         /// </summary>
         public Task<bool> TryIncrementAsync(string tenantId, string directoryPath, CancellationToken ct)
@@ -970,7 +970,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// <summary>
         /// Atomically decrements the file count for a directory.
         /// Lock-free hot path: uses CAS on the atomic counter.
-        /// LiteDB is updated asynchronously by the Write-Behind timer.
+        /// SQLite is updated asynchronously by the Write-Behind timer.
         /// </summary>
         public Task DecrementAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
