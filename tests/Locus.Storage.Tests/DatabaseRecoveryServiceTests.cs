@@ -134,7 +134,7 @@ namespace Locus.Storage.Tests
             var tenantId = $"tenant-corrupt-test-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
             var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
 
-            // First create a valid LiteDB database
+            // First create a valid SQLite database
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata

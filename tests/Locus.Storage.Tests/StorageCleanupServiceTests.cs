@@ -31,7 +31,7 @@ namespace Locus.Storage.Tests
 
         public StorageCleanupServiceTests()
         {
-            // Use real file system for tests (LiteDB requires real file system)
+            // Use real file system for tests (SQLite requires real file system)
             _fileSystem = new System.IO.Abstractions.FileSystem();
 
             // Setup repositories with unique temporary directories
@@ -413,7 +413,7 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(tenantPath);
             _fileSystem.File.WriteAllText(orphanedFile, "orphaned content");
 
-            // No metadata for this file — it is orphaned (physical file present, no LiteDB record)
+            // No metadata for this file — it is orphaned (physical file present, no SQLite record)
 
             // Act
             await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);

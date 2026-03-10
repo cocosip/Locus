@@ -14,10 +14,10 @@ namespace Locus.Benchmarks
     /// Benchmarks for MetadataRepository operations.
     ///
     /// Architecture notes:
-    ///   - GetAsync only reads from the in-memory active-files cache (no LiteDB fallback).
+    ///   - GetAsync only reads from the in-memory active-files cache (no SQLite fallback).
     ///     There is no traditional "cache miss → DB" path; a missing key returns null immediately.
     ///   - AddOrUpdateAsync is memory-first (O(1) ConcurrentDictionary update) with async
-    ///     Write-Behind to LiteDB; its cost does not grow with cache size.
+    ///     Write-Behind to SQLite; its cost does not grow with cache size.
     ///   - GetNextPendingFileAsync does a linear scan over the active cache for the tenant
     ///     (under a per-tenant SemaphoreSlim). Pool size is held stable at 100 files to keep
     ///     measurement conditions consistent across all invocations.
@@ -85,7 +85,7 @@ namespace Locus.Benchmarks
         public async Task GetAsync_NotFound()
         {
             // Key absent from cache — ConcurrentDictionary.TryGetValue returns false immediately.
-            // This is the actual "miss" cost in Write-Behind architecture (no LiteDB fallback).
+            // This is the actual "miss" cost in Write-Behind architecture (no SQLite fallback).
             await _repository.GetAsync(_tenantId, "nonexistent-key-xyz-000", CancellationToken.None);
         }
 

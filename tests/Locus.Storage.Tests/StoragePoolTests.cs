@@ -39,7 +39,7 @@ namespace Locus.Storage.Tests
 
         public StoragePoolTests()
         {
-            // Use real file system for tests (LiteDB requires real file system)
+            // Use real file system for tests (SQLite requires real file system)
             _fileSystem = new System.IO.Abstractions.FileSystem();
 
             // Setup repositories with unique temporary directories
