@@ -522,12 +522,12 @@ namespace Locus.Storage.Data
 
                     return db;
                 }
-                catch (LiteException ex) when (ex.Message.Contains("ReadFull") || ex.Message.Contains("PAGE_SIZE") || ex.Message.Contains("Checkpoint"))
+                catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
                     // Database is corrupted during initialization - attempt automatic recovery.
-                    // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here 鈥?it acquires _tenantLocks[tid],
+                    // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here - it acquires _tenantLocks[tid],
                     // which another thread may already hold while waiting for this Lazy to complete,
-                    // causing a deadlock (Lazy lock 鈫?tenant lock cycle).
+                    // causing a deadlock (Lazy lock -> tenant lock cycle).
                     // Instead call the lock-free internal helper directly.
                     _logger.LogError(ex, "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...", tid);
 
@@ -1848,6 +1848,28 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Checks whether an exception indicates a recoverable database corruption scenario.
+        /// Consistent with DirectoryQuotaRepository.IsRecoverableDatabaseException.
+        /// </summary>
+        private static bool IsRecoverableDatabaseException(Exception ex)
+        {
+            if (ex is ArgumentOutOfRangeException || ex is OverflowException || ex is IOException)
+                return true;
+
+            if (ex is LiteException liteEx)
+            {
+                var message = liteEx.Message ?? string.Empty;
+                return message.Contains("ReadFull")
+                    || message.Contains("PAGE_SIZE")
+                    || message.Contains("Checkpoint")
+                    || message.Contains("invalid")
+                    || message.Contains("corrupt");
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Backs up and deletes the corrupted database file WITHOUT acquiring the tenant lock.
         /// Must only be called from within the Lazy factory (GetDatabase) where acquiring the
         /// tenant lock would risk a deadlock with threads that hold the lock while waiting for
@@ -1864,8 +1886,11 @@ namespace Locus.Storage.Data
                 return null;
             }
 
-            // Dispose any existing connection held by a previously created Lazy.
-            if (_databases.TryGetValue(tenantId, out var existingLazy) && existingLazy.IsValueCreated)
+            // Remove from cache FIRST so no concurrent thread can acquire the disposed instance.
+            _databases.TryRemove(tenantId, out var existingLazy);
+
+            // Dispose the removed connection (safe: it's no longer reachable via cache).
+            if (existingLazy != null && existingLazy.IsValueCreated)
             {
                 try { existingLazy.Value?.Dispose(); }
                 catch (Exception ex)
@@ -1873,8 +1898,6 @@ namespace Locus.Storage.Data
                     _logger.LogWarning(ex, "Error disposing database connection during lock-free rebuild for tenant {TenantId}", tenantId);
                 }
             }
-
-            _databases.TryRemove(tenantId, out _);
             if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                 RemoveTenantFromGlobalIndex(staleTenantCache);
             _physicalPathIndex.TryRemove(tenantId, out _);
@@ -1929,8 +1952,11 @@ namespace Locus.Storage.Data
 
                 _logger.LogWarning("Beginning database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
-                // Step 1: Dispose existing database connection
-                if (_databases.TryGetValue(tenantId, out var lazyDb) && lazyDb.IsValueCreated)
+                // Step 1: Remove from cache FIRST so no other thread can acquire the disposed instance.
+                _databases.TryRemove(tenantId, out var lazyDb);
+
+                // Step 2: Dispose the removed connection (safe: it's no longer reachable via cache).
+                if (lazyDb != null && lazyDb.IsValueCreated)
                 {
                     try
                     {
@@ -1942,9 +1968,6 @@ namespace Locus.Storage.Data
                         _logger.LogWarning(ex, "Error disposing database connection for tenant {TenantId}", tenantId);
                     }
                 }
-
-                // Step 2: Remove from cache to prevent reconnection
-                _databases.TryRemove(tenantId, out _);
 
                 // Step 3: Clear in-memory cache and pending index
                 if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
@@ -2237,6 +2260,13 @@ namespace Locus.Storage.Data
                             files.Upsert(op.Metadata!);
                     }
                     db.Commit();
+
+                    // Explicitly checkpoint after every commit to merge the WAL journal into the
+                    // main database file. Without this, the WAL accumulates across many batches
+                    // and a process crash during the eventual auto-checkpoint can leave the
+                    // database in an inconsistent state. The slight extra I/O is far outweighed
+                    // by the reliability benefit for metadata files.
+                    db.Checkpoint();
 
                     _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
                 }

@@ -308,8 +308,11 @@ namespace Locus.Storage.Data
                 return null;
             }
 
-            // Dispose existing database connection
-            if (_databases.TryGetValue(tenantId, out var lazyDb) && lazyDb.IsValueCreated)
+            // Remove from cache FIRST so no other thread can acquire the disposed instance.
+            _databases.TryRemove(tenantId, out var lazyDb);
+
+            // Dispose the removed connection (safe: it's no longer reachable via cache).
+            if (lazyDb != null && lazyDb.IsValueCreated)
             {
                 try
                 {
@@ -321,9 +324,6 @@ namespace Locus.Storage.Data
                     _logger.LogWarning(ex, "Error disposing quota database connection for tenant {TenantId}", tenantId);
                 }
             }
-
-            // Remove from caches before rebuilding
-            _databases.TryRemove(tenantId, out _);
             _quotaCache.TryRemove(tenantId, out _);
 
             // Backup and delete corrupted database

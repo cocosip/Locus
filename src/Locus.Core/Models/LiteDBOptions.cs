@@ -20,17 +20,20 @@ namespace Locus.Core.Models
         public bool EnableJournal { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets the number of transactions before automatic WAL checkpoint.
+        /// Gets or sets the number of WAL pages before automatic LiteDB checkpoint.
         /// A checkpoint merges the WAL journal into the main database file and clears the journal.
-        /// Lower values = smaller journal files, more frequent checkpoints (may impact performance).
-        /// Higher values = larger journal files, fewer checkpoints (better performance).
+        /// Each WAL page is 4 KB, so the default of 200 caps the journal at ~800 KB before
+        /// LiteDB automatically checkpoints. This limits the amount of unflushed data that can
+        /// be lost if the process is killed during a checkpoint operation.
+        /// Lower values = smaller journal files at risk, more frequent checkpoints (slightly more I/O).
+        /// Higher values = larger journal files, fewer checkpoints (higher corruption risk on crash).
         /// Recommended values:
-        /// - Low concurrency (&lt; 100 writes/sec): 500
-        /// - Medium concurrency (100-500 writes/sec): 1000 (default)
-        /// - High concurrency (&gt; 500 writes/sec): 2000
-        /// Default: 1000
+        /// - Stable environment (local SSD): 500
+        /// - Default (balanced stability / performance): 200
+        /// - High-reliability (network storage, frequent crashes): 50
+        /// Default: 200
         /// </summary>
-        public int CheckpointInterval { get; set; } = 1000;
+        public int CheckpointInterval { get; set; } = 200;
 
         /// <summary>
         /// Gets or sets the database lock timeout in seconds.

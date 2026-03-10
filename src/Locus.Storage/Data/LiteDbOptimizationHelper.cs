@@ -56,8 +56,13 @@ namespace Locus.Storage.Data
                 logger.LogInformation("Optimizing {DbType} database for tenant {TenantId}. Current size: {SizeMB:F2} MB",
                     dbTypeName, tenantId, sizeBefore / 1024.0 / 1024.0);
 
-                // Step 1: Dispose existing database connection
-                if (databases.TryGetValue(tenantId, out var lazyDb) && lazyDb.IsValueCreated)
+                // Step 1: Remove from cache FIRST so no other thread can acquire the disposed instance.
+                // Removing before disposing ensures that any concurrent GetDatabase() call will
+                // create a fresh Lazy<LiteDatabase> rather than returning the about-to-be-disposed one.
+                databases.TryRemove(tenantId, out var lazyDb);
+
+                // Step 2: Dispose the removed connection (safe: it's no longer reachable via cache).
+                if (lazyDb != null && lazyDb.IsValueCreated)
                 {
                     try
                     {
@@ -71,9 +76,6 @@ namespace Locus.Storage.Data
                             dbTypeName, tenantId);
                     }
                 }
-
-                // Step 2: Remove from cache to force reconnection
-                databases.TryRemove(tenantId, out _);
 
                 // Step 3: Perform rebuild with a new connection
                 await Task.Run(() =>
