@@ -9,6 +9,7 @@ using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Locus.Storage.Data;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -62,6 +63,7 @@ namespace Locus.Storage.Tests
         {
             _metadataRepository?.Dispose();
             _quotaRepository?.Dispose();
+            SqliteConnection.ClearAllPools();
 
             try
             {
@@ -124,7 +126,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var tenantId = $"tenant-corrupted-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
 
             // Create a valid database first
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
@@ -143,6 +145,7 @@ namespace Locus.Storage.Tests
 
             // Wait for database to be fully written
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Now corrupt it
             var garbage = new byte[512];
@@ -330,7 +333,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var tenantId = $"tenant-auto-recover-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
-            var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
+            var dbPath = Path.Combine(_quotaDir, tenantId, "quotas.db");
 
             // Create a valid quota database first
             using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
@@ -339,6 +342,7 @@ namespace Locus.Storage.Tests
             }
 
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Corrupt it
             var garbage = new byte[512];

@@ -114,7 +114,7 @@ namespace Locus
                     fileSystem,
                     logger,
                     options.MetadataDirectory,
-                    options.LiteDB,
+                    options.Sqlite,
                     enableBackgroundPersistence: options.MetadataRepository.EnableBackgroundPersistence,
                     maxDrainBatchSize: options.MetadataRepository.DrainBatchSize,
                     persistenceQueueSoftMergeThresholdPercent: options.MetadataRepository.SoftMergeThresholdPercent,
@@ -126,7 +126,7 @@ namespace Locus
             {
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<DirectoryQuotaRepository>>();
-                return new DirectoryQuotaRepository(fileSystem, logger, options.QuotaDirectory, options.LiteDB);
+                return new DirectoryQuotaRepository(fileSystem, logger, options.QuotaDirectory, options.Sqlite);
             });
 
             // Register tenant manager

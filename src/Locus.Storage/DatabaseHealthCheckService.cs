@@ -271,31 +271,16 @@ namespace Locus.Storage
                 return Task.CompletedTask;
             }
 
-            // Get existing database tenant IDs
+            // Get existing database tenant IDs from subdirectories: {metadataDirectory}/{tenantId}/metadata.db
             var existingTenantIds = new HashSet<string>();
             if (_fileSystem.Directory.Exists(_metadataDirectory))
             {
-                var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
-                var dbFileNames = new HashSet<string>(
-                    dbFiles
-                        .Select(path => _fileSystem.Path.GetFileNameWithoutExtension(path))
-                        .Where(name => !string.IsNullOrWhiteSpace(name)),
-                    StringComparer.OrdinalIgnoreCase);
-
-                foreach (var dbFile in dbFiles)
+                var tenantDirs = _fileSystem.Directory.GetDirectories(_metadataDirectory);
+                foreach (var dir in tenantDirs)
                 {
-                    var tenantId = _fileSystem.Path.GetFileNameWithoutExtension(dbFile);
-
-                    // Skip backup files created by LiteDB Rebuild() or corruption recovery
-                    // Examples: "tenant-001.db-backup-1", "tenant-001.db.corrupted.20240122120000"
-                    if (IsBackupFile(tenantId))
-                        continue;
-
-                    // Skip LiteDB sidecar log files like "{tenantId}-log.db"
-                    if (IsMetadataLogSidecar(tenantId, dbFileNames))
-                        continue;
-
-                    existingTenantIds.Add(tenantId);
+                    var tenantId = _fileSystem.Path.GetFileName(dir);
+                    if (!string.IsNullOrWhiteSpace(tenantId))
+                        existingTenantIds.Add(tenantId);
                 }
             }
 
@@ -434,42 +419,6 @@ namespace Locus.Storage
             {
                 return Enumerable.Empty<string>();
             }
-        }
-
-        /// <summary>
-        /// Checks if a tenant ID represents a backup file rather than a real tenant.
-        /// LiteDB Rebuild() creates temporary backup files like "tenant-001.db-backup-1".
-        /// Corruption recovery creates backups like "tenant-001.db.corrupted.20240122120000".
-        /// </summary>
-        private static bool IsBackupFile(string tenantId)
-        {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                return true;
-
-            // LiteDB Rebuild backup pattern: ends with "-backup" or "-backup-N"
-            // Examples: "tenant-001.db-backup-1", "tenant-001.db-backup-2"
-            if (tenantId.Contains("-backup", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            // Corruption recovery backup pattern: contains ".corrupted."
-            // Examples: "tenant-001.db.corrupted.20240122120000"
-            if (tenantId.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            // LiteDB journal files
-            if (tenantId.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            return false;
-        }
-
-        private static bool IsMetadataLogSidecar(string tenantId, HashSet<string> dbFileNames)
-        {
-            if (!tenantId.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var baseTenantId = tenantId.Substring(0, tenantId.Length - 4);
-            return dbFileNames.Contains(baseTenantId);
         }
 
         /// <inheritdoc/>

@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Models;
 using Locus.Storage.Data;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -65,6 +66,7 @@ namespace Locus.Storage.Tests
         {
             _metadataRepository?.Dispose();
             _quotaRepository?.Dispose();
+            SqliteConnection.ClearAllPools();
 
             try
             {
@@ -96,7 +98,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange - use unique tenant ID and temporary repository
             var tenantId = $"tenant-healthy-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
 
             // Create a temporary repository to create the database, then dispose it
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
@@ -116,6 +118,7 @@ namespace Locus.Storage.Tests
 
             // Wait a moment for file system to release locks
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Act
             var result = _recoveryService.IsDatabaseCorrupted(dbPath);
@@ -129,7 +132,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var tenantId = $"tenant-corrupt-test-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
 
             // First create a valid LiteDB database
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
@@ -148,6 +151,7 @@ namespace Locus.Storage.Tests
 
             // Wait for database to be fully written and closed
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Now corrupt it by overwriting with random data
             var garbage = new byte[512]; // Smaller size to corrupt header
@@ -180,7 +184,7 @@ namespace Locus.Storage.Tests
             _fileSystem.File.WriteAllText(file2, "content2");
 
             // Create a valid database first, then corrupt it
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
@@ -196,6 +200,7 @@ namespace Locus.Storage.Tests
             }
 
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Corrupt the database
             var garbage = new byte[512];
@@ -232,7 +237,7 @@ namespace Locus.Storage.Tests
             var physicalFile = Path.Combine(tenantPath, "invoice-001.pdf");
             _fileSystem.File.WriteAllText(physicalFile, "content");
 
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
@@ -248,6 +253,7 @@ namespace Locus.Storage.Tests
             }
 
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
             new Random().NextBytes(garbage);
@@ -293,7 +299,7 @@ namespace Locus.Storage.Tests
             var rootFile = Path.Combine(tenantPath, "root-file.txt");
             _fileSystem.File.WriteAllText(rootFile, "content");
 
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
             using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
             {
                 await tempRepo.AddOrUpdateAsync(new FileMetadata
@@ -309,6 +315,7 @@ namespace Locus.Storage.Tests
             }
 
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
             new Random().NextBytes(garbage);
@@ -403,13 +410,14 @@ namespace Locus.Storage.Tests
             _fileSystem.File.WriteAllText(Path.Combine(dir2, "image.png"), "content");
 
             // Create a valid database first, then corrupt it
-            var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
+            var dbPath = Path.Combine(_quotaDir, tenantId, "quotas.db");
             using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
             {
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
 
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Corrupt the database
             var garbage = new byte[512];
@@ -445,13 +453,14 @@ namespace Locus.Storage.Tests
             _fileSystem.File.WriteAllText(Path.Combine(docsPath, "a.txt"), "a");
             _fileSystem.File.WriteAllText(Path.Combine(docsPath, "b.txt"), "b");
 
-            var dbPath = Path.Combine(_quotaDir, $"{tenantId}-quotas.db");
+            var dbPath = Path.Combine(_quotaDir, tenantId, "quotas.db");
             using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
             {
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
 
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
             new Random().NextBytes(garbage);
@@ -543,10 +552,11 @@ namespace Locus.Storage.Tests
 
             // Wait for databases to be fully written
             await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
 
             // Now corrupt both databases
-            var metaDbPath = Path.Combine(_metadataDir, $"{tenant1}.db");
-            var quotaDbPath = Path.Combine(_quotaDir, $"{tenant2}-quotas.db");
+            var metaDbPath = Path.Combine(_metadataDir, tenant1, "metadata.db");
+            var quotaDbPath = Path.Combine(_quotaDir, tenant2, "quotas.db");
 
             var garbage = new byte[512];
             new Random().NextBytes(garbage);
@@ -632,7 +642,9 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var tenantId = "tenant-no-volumes";
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var tenantSubDir = Path.Combine(_metadataDir, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantSubDir);
+            var dbPath = Path.Combine(tenantSubDir, "metadata.db");
             _fileSystem.File.WriteAllText(dbPath, "corrupted");
 
             // Act
@@ -651,7 +663,9 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var tenantId = "tenant-missing-volumes";
-            var dbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
+            var tenantSubDir = Path.Combine(_metadataDir, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantSubDir);
+            var dbPath = Path.Combine(tenantSubDir, "metadata.db");
             _fileSystem.File.WriteAllText(dbPath, "corrupted");
 
             var nonExistentVolume = Path.Combine(Path.GetTempPath(), $"non-existent-{_testId}");

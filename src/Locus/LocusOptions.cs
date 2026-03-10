@@ -106,10 +106,15 @@ namespace Locus
         public string FileWatcherConfigurationDirectory { get; set; } = "./locus-watchers";
 
         /// <summary>
-        /// Gets or sets the LiteDB configuration options.
-        /// These settings control database performance and reliability, especially important
-        /// for Kubernetes + network storage (NFS/Ceph) environments.
+        /// Gets or sets the SQLite configuration options.
+        /// Controls journal mode, synchronous level, cache size and checkpoint behavior.
         /// </summary>
+        public SqliteOptions Sqlite { get; set; } = new SqliteOptions();
+
+        /// <summary>
+        /// Gets or sets the LiteDB configuration options.
+        /// </summary>
+        [Obsolete("LiteDB has been replaced by SQLite. Use the Sqlite property instead. This property will be removed in a future version.")]
         public LiteDBOptions LiteDB { get; set; } = new LiteDBOptions();
 
         /// <summary>

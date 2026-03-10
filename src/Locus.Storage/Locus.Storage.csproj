@@ -8,6 +8,8 @@
 
   <ItemGroup>
     <PackageReference Include="LiteDB" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="Dapper" />
     <PackageReference Include="System.IO.Abstractions" />
     <PackageReference Include="System.Threading.Channels" />
     <PackageReference Include="System.Text.Json" />

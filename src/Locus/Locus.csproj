@@ -50,10 +50,12 @@
     <PackageReference Include="Microsoft.Extensions.Options" />
 
     <!-- Third-party dependencies required by sub-projects -->
-    <PackageReference Include="System.IO.Abstractions" />
     <PackageReference Include="LiteDB" />
-    <PackageReference Include="System.Text.Json" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="Dapper" />
+    <PackageReference Include="System.IO.Abstractions" />
     <PackageReference Include="System.Threading.Channels" />
+    <PackageReference Include="System.Text.Json" />
   </ItemGroup>
 
 </Project>

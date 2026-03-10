@@ -9,19 +9,19 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
-using LiteDB;
+using Dapper;
 using Locus.Core.Models;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
-using LiteDBOptions = Locus.Core.Models.LiteDBOptions;
 
 namespace Locus.Storage.Data
 {
     /// <summary>
-    /// Repository for file metadata storage using per-tenant LiteDB with active-data in-memory caching.
+    /// Repository for file metadata storage using per-tenant SQLite with active-data in-memory caching.
     /// Only keeps Pending/Processing/Failed files in memory. Completed files are immediately deleted.
     ///
     /// Write-Behind architecture: AddOrUpdateAsync and RemoveAsync update in-memory cache first,
-    /// then enqueue LiteDB persistence asynchronously. If LiteDB crashes, file writes continue
+    /// then enqueue SQLite persistence asynchronously. If SQLite is unavailable, file writes continue
     /// uninterrupted. On process restart, orphaned physical files are recovered by the cleanup service.
     ///
     /// Thread-safe for concurrent access.
@@ -31,7 +31,7 @@ namespace Locus.Storage.Data
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<MetadataRepository> _logger;
         private readonly string _metadataDirectory;
-        private readonly LiteDBOptions _liteDbOptions;
+        private readonly SqliteOptions _sqliteOptions;
 
         // Per-tenant in-memory cache (only active files: Pending/Processing/Failed)
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
@@ -44,8 +44,8 @@ namespace Locus.Storage.Data
         // This avoids rebuilding large per-run HashSet snapshots in StorageCleanupService.
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> _physicalPathIndex;
 
-        // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
-        private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
+        // Per-tenant SQLite connections (using Lazy for thread-safe initialization)
+        private readonly ConcurrentDictionary<string, Lazy<SqliteConnection>> _databases;
 
         // Per-tenant locks for concurrent file allocation.
         // NOTE: Locks are intentionally retained for the lifetime of the repository even if a
@@ -87,10 +87,10 @@ namespace Locus.Storage.Data
         private long _statusIndexSequence;
         private long _statusIndexStaleSkips;
 
-        // --- Write-Behind: async LiteDB persistence (netstandard2.0 compatible) ---
-        // Memory is always updated first. LiteDB writes are decoupled via this queue.
-        // If LiteDB is unavailable, writes buffer in memory and are retried by the background loop.
-        // On crash, in-flight writes are lost 鈥?physical files stay on disk as orphans and are
+        // --- Write-Behind: async SQLite persistence (netstandard2.0 compatible) ---
+        // Memory is always updated first. SQLite writes are decoupled via this queue.
+        // If SQLite is unavailable, writes buffer in memory and are retried by the background loop.
+        // On crash, in-flight writes are lost -- physical files stay on disk as orphans and are
         // recovered by the cleanup service on next startup.
         private readonly Channel<PersistenceOperation> _persistenceChannel;
         private readonly ChannelWriter<PersistenceOperation> _persistenceWriter;
@@ -389,7 +389,7 @@ namespace Locus.Storage.Data
             IFileSystem fileSystem,
             ILogger<MetadataRepository> logger,
             string metadataDirectory,
-            LiteDBOptions? liteDbOptions = null,
+            SqliteOptions? sqliteOptions = null,
             bool enableBackgroundPersistence = true,
             int maxDrainBatchSize = DefaultDrainBatchSize,
             int persistenceQueueSoftMergeThresholdPercent = DefaultPersistenceQueueSoftMergeThresholdPercent,
@@ -416,7 +416,7 @@ namespace Locus.Storage.Data
                 throw new ArgumentException("Startup load batch size must be greater than zero", nameof(startupLoadBatchSize));
 
             _metadataDirectory = metadataDirectory;
-            _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
+            _sqliteOptions = sqliteOptions ?? new SqliteOptions();
             _enableBackgroundPersistence = enableBackgroundPersistence;
             _maxPersistenceQueueSize = maxPersistenceQueueSize;
             _maxDrainBatchSize = Math.Min(maxDrainBatchSize, _maxPersistenceQueueSize);
@@ -428,7 +428,7 @@ namespace Locus.Storage.Data
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
             _physicalPathIndex = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>();
-            _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
+            _databases = new ConcurrentDictionary<string, Lazy<SqliteConnection>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _pendingKeys = new ConcurrentDictionary<string, ConcurrentQueue<PendingQueueEntry>>();
             _pendingGenerations = new ConcurrentDictionary<string, ConcurrentDictionary<string, long>>();
@@ -462,20 +462,20 @@ namespace Locus.Storage.Data
             }
 
             _logger.LogInformation(
-                "MetadataRepository initialized at {Directory} with LiteDB write-behind: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s, DrainBatch={DrainBatch}, SoftMergeThreshold={SoftMergeThreshold}",
+                "MetadataRepository initialized at {Directory} with SQLite write-behind: JournalMode={JournalMode}, SynchronousMode={SynchronousMode}, BusyTimeout={BusyTimeout}ms, DrainBatch={DrainBatch}, SoftMergeThreshold={SoftMergeThreshold}",
                 _metadataDirectory,
-                _liteDbOptions.EnableJournal,
-                _liteDbOptions.CheckpointInterval,
-                _liteDbOptions.TimeoutSeconds,
+                _sqliteOptions.JournalMode,
+                _sqliteOptions.SynchronousMode,
+                _sqliteOptions.BusyTimeoutMs,
                 _maxDrainBatchSize,
                 _persistenceQueueSoftMergeThreshold);
 
             if (_enableBackgroundPersistence)
             {
-                // Start background persistence loop LAST 鈥?all fields are fully initialized at this point.
+                // Start background persistence loop LAST -- all fields are fully initialized at this point.
                 // The task blocks on ChannelReader.WaitToReadAsync until items are available.
                 // Dispose() cancels _persistenceCts and waits
-                // for the task to drain remaining items before closing databases.
+                // for the task to drain remaining items before closing connections.
                 _persistenceTask = Task.Run(() => RunPersistenceLoopAsync(_persistenceCts.Token));
             }
             else
@@ -485,42 +485,55 @@ namespace Locus.Storage.Data
             }
         }
 
+        private const string FilesDdl = @"
+CREATE TABLE IF NOT EXISTS files (
+    file_key TEXT PRIMARY KEY NOT NULL,
+    tenant_id TEXT NOT NULL,
+    volume_id TEXT NOT NULL,
+    physical_path TEXT NOT NULL,
+    directory_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    status INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_failed_at TEXT,
+    last_error TEXT,
+    processing_start_time TEXT,
+    available_for_processing_at TEXT,
+    original_file_name TEXT,
+    file_extension TEXT,
+    metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
+CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);
+CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_processing_at);";
+
         /// <summary>
-        /// Gets or creates a LiteDB database for a tenant.
+        /// Gets or creates a SQLite connection for a tenant.
         /// Auto-recovery: Rebuilds corrupted database on initialization failure.
         /// </summary>
-        private LiteDatabase GetDatabase(string tenantId)
+        private SqliteConnection GetDatabase(string tenantId)
         {
-            // Use Lazy<LiteDatabase> to ensure thread-safe initialization
-            // This prevents multiple threads from simultaneously creating the database instance
-            var lazyDb = _databases.GetOrAdd(tenantId, tid => new Lazy<LiteDatabase>(() =>
+            // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
+            // This prevents multiple threads from simultaneously creating the connection instance.
+            var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
             {
                 try
                 {
-                    // Ensure metadata directory exists (thread-safe in case of concurrent access)
-                    if (!_fileSystem.Directory.Exists(_metadataDirectory))
-                    {
-                        _fileSystem.Directory.CreateDirectory(_metadataDirectory);
-                    }
+                    // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
+                    var tenantDir = _fileSystem.Path.Combine(_metadataDirectory, tid);
+                    if (!_fileSystem.Directory.Exists(tenantDir))
+                        _fileSystem.Directory.CreateDirectory(tenantDir);
 
-                    var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tid}.db");
-                    // Use configured LiteDB options (WAL mode strongly recommended for K8s/network storage)
-                    var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
-                    var db = new LiteDatabase(connectionString);
+                    var dbPath = _fileSystem.Path.Combine(tenantDir, "metadata.db");
+                    var conn = OpenAndInitializeConnection(dbPath);
 
-                    var files = db.GetCollection<FileMetadata>("files");
-                    // FileKey is already BsonId, no need to create additional index
-                    // Use string-based overload to avoid LinqExpressionVisitor failing on enum types
-                    files.EnsureIndex("Status");
-                    files.EnsureIndex("CreatedAt");
-                    files.EnsureIndex("AvailableForProcessingAt");
-
-                    _logger.LogDebug("Created/opened LiteDB database for tenant {TenantId} at {Path}", tid, dbPath);
+                    _logger.LogDebug("Created/opened SQLite database for tenant {TenantId} at {Path}", tid, dbPath);
 
                     // Load active files into memory on first access
-                    LoadActiveFilesForTenant(tid, files);
+                    LoadActiveFilesForTenant(tid, conn);
 
-                    return db;
+                    return conn;
                 }
                 catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
@@ -545,36 +558,52 @@ namespace Locus.Storage.Data
 
                         _logger.LogWarning("Metadata database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}", tid, backupPath ?? "N/A");
 
-                        // Retry initialization with configured LiteDB options
-                        var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tid}.db");
-                        var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
-                        var db = new LiteDatabase(connectionString);
-
-                        var files = db.GetCollection<FileMetadata>("files");
-                        files.EnsureIndex("Status");
-                        files.EnsureIndex("CreatedAt");
-                        files.EnsureIndex("AvailableForProcessingAt");
+                        // Retry initialization
+                        var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tid, "metadata.db");
+                        var conn = OpenAndInitializeConnection(dbPath);
 
                         _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
 
-                        return db;
+                        return conn;
                     }
                     catch (Exception recoveryEx)
                     {
                         _logger.LogError(recoveryEx, "Failed to recover corrupted metadata database for tenant {TenantId} during initialization", tid);
-                        throw; // Re-throw if recovery fails
+                        throw;
                     }
                 }
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
-            // Access the Value property to trigger initialization if needed
-            return lazyDb.Value;
+            return lazyConn.Value;
+        }
+
+        private SqliteConnection OpenAndInitializeConnection(string dbPath)
+        {
+            var connStr = _sqliteOptions.BuildConnectionString(dbPath);
+            var conn = new SqliteConnection(connStr);
+            conn.Open();
+
+            // Apply PRAGMAs
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = _sqliteOptions.BuildPragmaSql();
+                cmd.ExecuteNonQuery();
+            }
+
+            // Create schema (idempotent)
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = FilesDdl;
+                cmd.ExecuteNonQuery();
+            }
+
+            return conn;
         }
 
         /// <summary>
         /// Loads active files (Pending/Processing/Failed) into memory for a tenant.
         /// </summary>
-        private void LoadActiveFilesForTenant(string tenantId, ILiteCollection<FileMetadata> collection)
+        private void LoadActiveFilesForTenant(string tenantId, SqliteConnection conn)
         {
             var cache = _activeFiles.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, FileMetadata>());
             var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
@@ -587,45 +616,21 @@ namespace Locus.Storage.Data
             // Process non-pending statuses first; pending files are loaded in CreatedAt order afterwards
             // to rebuild FIFO scheduling without materializing all active records into one large list.
             totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId,
-                collection,
-                cache,
-                pendingQueue,
-                FileProcessingStatus.Processing,
-                orderByCreatedAt: false,
-                nowUtc,
-                ref pendingCount,
-                ref batchCount);
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.Processing, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId,
-                collection,
-                cache,
-                pendingQueue,
-                FileProcessingStatus.Failed,
-                orderByCreatedAt: false,
-                nowUtc,
-                ref pendingCount,
-                ref batchCount);
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.Failed, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId,
-                collection,
-                cache,
-                pendingQueue,
-                FileProcessingStatus.PermanentlyFailed,
-                orderByCreatedAt: false,
-                nowUtc,
-                ref pendingCount,
-                ref batchCount);
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.PermanentlyFailed, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId,
-                collection,
-                cache,
-                pendingQueue,
-                FileProcessingStatus.Pending,
-                orderByCreatedAt: true,
-                nowUtc,
-                ref pendingCount,
-                ref batchCount);
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.Pending, orderByCreatedAt: true,
+                nowUtc, ref pendingCount, ref batchCount);
 
             if (totalLoaded == 0)
                 return;
@@ -635,15 +640,12 @@ namespace Locus.Storage.Data
 
             _logger.LogInformation(
                 "Loaded {Count} active files for tenant {TenantId} into memory in {BatchCount} startup batch(es) (batchSize={BatchSize})",
-                totalLoaded,
-                tenantId,
-                batchCount,
-                _startupLoadBatchSize);
+                totalLoaded, tenantId, batchCount, _startupLoadBatchSize);
         }
 
         private int LoadActiveFilesByStatusInBatches(
             string tenantId,
-            ILiteCollection<FileMetadata> collection,
+            SqliteConnection conn,
             ConcurrentDictionary<string, FileMetadata> cache,
             ConcurrentQueue<PendingQueueEntry> pendingQueue,
             FileProcessingStatus status,
@@ -652,38 +654,28 @@ namespace Locus.Storage.Data
             ref int pendingCount,
             ref int batchCount)
         {
-            var query = collection.Query().Where(f => f.Status == status);
-            if (orderByCreatedAt)
-                query = query.OrderBy(f => f.CreatedAt);
+            var orderClause = orderByCreatedAt ? "ORDER BY created_at ASC" : string.Empty;
+            var sql = $"SELECT * FROM files WHERE status = @status {orderClause}";
 
             var loaded = 0;
             var batch = new List<FileMetadata>(_startupLoadBatchSize);
-            foreach (var metadata in query.ToEnumerable())
+
+            // Stream rows via Dapper buffered=false to avoid loading all rows into one list.
+            var rows = conn.Query<FileMetadataRow>(sql, new { status = (int)status }, buffered: false);
+            foreach (var row in rows)
             {
-                batch.Add(metadata);
+                batch.Add(row.ToFileMetadata());
                 if (batch.Count < _startupLoadBatchSize)
                     continue;
 
-                loaded += ApplyStartupLoadBatch(
-                    tenantId,
-                    cache,
-                    pendingQueue,
-                    batch,
-                    nowUtc,
-                    ref pendingCount);
+                loaded += ApplyStartupLoadBatch(tenantId, cache, pendingQueue, batch, nowUtc, ref pendingCount);
                 batch.Clear();
                 batchCount++;
             }
 
             if (batch.Count > 0)
             {
-                loaded += ApplyStartupLoadBatch(
-                    tenantId,
-                    cache,
-                    pendingQueue,
-                    batch,
-                    nowUtc,
-                    ref pendingCount);
+                loaded += ApplyStartupLoadBatch(tenantId, cache, pendingQueue, batch, nowUtc, ref pendingCount);
                 batchCount++;
             }
 
@@ -726,7 +718,7 @@ namespace Locus.Storage.Data
         /// </summary>
         private ConcurrentDictionary<string, FileMetadata> GetCache(string tenantId)
         {
-            // Ensure database is initialized (which also loads active files)
+            // Ensure connection is initialized (which also loads active files)
             GetDatabase(tenantId);
             return _activeFiles.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, FileMetadata>());
         }
@@ -734,12 +726,12 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Adds or updates file metadata.
         /// Write-Behind: updates in-memory cache immediately (never fails from caller's perspective),
-        /// then enqueues LiteDB persistence asynchronously via background loop.
-        /// If LiteDB is unavailable, the write is queued and retried; the file on disk remains safe.
+        /// then enqueues SQLite persistence asynchronously via background loop.
+        /// If SQLite is unavailable, the write is queued and retried; the file on disk remains safe.
         /// On process crash before flush, the physical file becomes an orphan recovered by cleanup service.
         /// </summary>
         /// <remarks>
-        /// For maintenance operations (database rebuild) that require immediate LiteDB persistence,
+        /// For maintenance operations (database rebuild) that require immediate SQLite persistence,
         /// use <see cref="AddOrUpdateDirectAsync"/> instead.
         /// </remarks>
         public Task AddOrUpdateAsync(FileMetadata metadata, CancellationToken ct)
@@ -753,7 +745,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            // 1. Update in-memory cache FIRST 鈥?always succeeds, immediately visible to readers.
+            // 1. Update in-memory cache FIRST -- always succeeds, immediately visible to readers.
             //    Capture the previous status (if any) to maintain the O(1) pending count accurately.
             var cache = _activeFiles.GetOrAdd(metadata.TenantId,
                 _ => new ConcurrentDictionary<string, FileMetadata>());
@@ -766,7 +758,7 @@ namespace Locus.Storage.Data
             // 2. Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
             //    This keeps CompactPendingQueues O(1) instead of O(N).
             bool wasP = previous?.Status == FileProcessingStatus.Pending;
-            bool isP  = metadata.Status == FileProcessingStatus.Pending;
+            bool isP  = metadata.Status  == FileProcessingStatus.Pending;
             if (!wasP && isP)
                 _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
             else if (wasP && !isP)
@@ -786,15 +778,15 @@ namespace Locus.Storage.Data
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
 
-            // Queue LiteDB persistence 鈥?caller is not blocked; background loop drains the queue.
+            // Queue SQLite persistence -- caller is not blocked; background loop drains the queue.
             EnqueuePersistence(new PersistenceOperation(metadata));
 
             return Task.CompletedTask;
         }
 
         /// <summary>
-        /// Adds or updates file metadata with immediate synchronous LiteDB write.
-        /// Bypasses the Write-Behind queue 鈥?use only for maintenance operations such as
+        /// Adds or updates file metadata with immediate synchronous SQLite write.
+        /// Bypasses the Write-Behind queue -- use only for maintenance operations such as
         /// database rebuild where the caller needs the data persisted before returning.
         /// </summary>
         internal Task AddOrUpdateDirectAsync(FileMetadata metadata, CancellationToken ct)
@@ -835,10 +827,9 @@ namespace Locus.Storage.Data
 
             IndexStatusCandidate(previous, metadata);
 
-            // Write directly to LiteDB (synchronous 鈥?required for rebuild correctness)
-            var db = GetDatabase(metadata.TenantId);
-            var files = db.GetCollection<FileMetadata>("files");
-            files.Upsert(metadata);
+            // Write directly to SQLite (synchronous -- required for rebuild correctness)
+            var conn = GetDatabase(metadata.TenantId);
+            UpsertFile(conn, metadata);
 
             return Task.CompletedTask;
         }
@@ -891,7 +882,7 @@ namespace Locus.Storage.Data
                 // O(1) keyed removal. The stale entry (if any) will be skipped by the
                 // dequeue-and-validate loop in GetNextPendingFileAsync.
 
-                // Queue LiteDB deletion 鈥?caller is not blocked by disk I/O
+                // Queue SQLite deletion -- caller is not blocked by disk I/O
                 EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
 
                 _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
@@ -1662,7 +1653,7 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Resets files that have been in Processing status for longer than the timeout.
         /// Uses Write-Behind (same as AddOrUpdateAsync) for consistency with the rest of the
-        /// repository: memory is updated first, LiteDB persistence is async via the background loop.
+        /// repository: memory is updated first, SQLite persistence is async via the background loop.
         /// </summary>
         public Task<int> ResetTimedOutFilesAsync(TimeSpan timeout, CancellationToken ct)
         {
@@ -1690,7 +1681,7 @@ namespace Locus.Storage.Data
                     updated.ProcessingStartTime = null;
                     updated.AvailableForProcessingAt = null;
 
-                    // Atomically replace cache entry then enqueue for LiteDB persistence.
+                    // Atomically replace cache entry then enqueue for SQLite persistence.
                     cache.TryGetValue(updated.FileKey, out var previous);
                     cache[updated.FileKey] = updated;
                     if (previous?.Status != FileProcessingStatus.Pending)
@@ -1765,17 +1756,34 @@ namespace Locus.Storage.Data
         /// <returns>Tuple of (size before, size after) in bytes.</returns>
         public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
         {
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+            ct.ThrowIfCancellationRequested();
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
 
-            return LiteDbOptimizationHelper.OptimizeDatabaseAsync(
-                tenantId,
-                dbPath,
-                _databases,
-                _tenantLocks,
-                _fileSystem,
-                _logger,
-                "metadata",
-                ct);
+            long sizeBefore = 0;
+            long sizeAfter = 0;
+            try
+            {
+                if (_fileSystem.File.Exists(dbPath))
+                    sizeBefore = new System.IO.FileInfo(dbPath).Length;
+
+                var conn = GetDatabase(tenantId);
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "VACUUM;";
+                    cmd.ExecuteNonQuery();
+                }
+
+                if (_fileSystem.File.Exists(dbPath))
+                    sizeAfter = new System.IO.FileInfo(dbPath).Length;
+
+                _logger.LogDebug("SQLite VACUUM completed for tenant {TenantId}: {Before} -> {After} bytes", tenantId, sizeBefore, sizeAfter);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to optimize SQLite database for tenant {TenantId}", tenantId);
+            }
+
+            return Task.FromResult((sizeBefore, sizeAfter));
         }
 
         /// <summary>
@@ -1789,47 +1797,18 @@ namespace Locus.Storage.Data
 
             if (_fileSystem.Directory.Exists(_metadataDirectory))
             {
-                // Use the file system directly to get the database files
-                var dbFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
-                var diskNames = dbFiles
-                    .Select(f => _fileSystem.Path.GetFileNameWithoutExtension(f))
-                    .Where(n => !string.IsNullOrWhiteSpace(n))
-                    .ToList();
-                var diskNameSet = new HashSet<string>(diskNames, StringComparer.OrdinalIgnoreCase);
-
-                foreach (var fileName in diskNames)
+                // Each tenant database lives in its own subdirectory: {metadataDirectory}/{tenantId}/metadata.db
+                // Enumerate subdirectories to discover tenant IDs without any filename filtering.
+                var tenantDirs = _fileSystem.Directory.GetDirectories(_metadataDirectory);
+                foreach (var dir in tenantDirs)
                 {
-                    if (IsMetadataLogSidecar(fileName, diskNameSet))
-                        continue;
-
-                    if (!IsValidTenantDatabaseName(fileName))
-                        continue;
-
-                    tenantIds.Add(fileName);
+                    var tid = _fileSystem.Path.GetFileName(dir);
+                    if (!string.IsNullOrWhiteSpace(tid))
+                        tenantIds.Add(tid);
                 }
             }
 
             return await Task.FromResult<IEnumerable<string>>(tenantIds);
-        }
-
-        private static bool IsValidTenantDatabaseName(string? fileName)
-        {
-            if (string.IsNullOrWhiteSpace(fileName))
-                return false;
-
-            var tenantDatabaseName = fileName!;
-
-            // Filter LiteDB maintenance sidecar files and backups.
-            if (tenantDatabaseName.Contains("-backup", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            if (tenantDatabaseName.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            if (tenantDatabaseName.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            return true;
         }
 
         private void RemoveTenantFromGlobalIndex(ConcurrentDictionary<string, FileMetadata> tenantCache)
@@ -1838,13 +1817,28 @@ namespace Locus.Storage.Data
                 _fileKeyTenantIndex.TryRemove(fileKey, out _);
         }
 
-        private static bool IsMetadataLogSidecar(string fileName, HashSet<string> diskNameSet)
+        /// <summary>
+        /// Deletes SQLite WAL and SHM sidecar files for a given database path.
+        /// Called after deleting a corrupted database so the new database starts clean.
+        /// </summary>
+        private void DeleteSidecarFiles(string dbPath)
         {
-            if (!fileName.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var baseName = fileName.Substring(0, fileName.Length - 4);
-            return diskNameSet.Contains(baseName);
+            foreach (var suffix in new[] { "-wal", "-shm" })
+            {
+                var sidecarPath = dbPath + suffix;
+                if (_fileSystem.File.Exists(sidecarPath))
+                {
+                    try
+                    {
+                        _fileSystem.File.Delete(sidecarPath);
+                        _logger.LogInformation("Deleted SQLite sidecar file: {Path}", sidecarPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to delete SQLite sidecar file: {Path}", sidecarPath);
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -1853,17 +1847,15 @@ namespace Locus.Storage.Data
         /// </summary>
         private static bool IsRecoverableDatabaseException(Exception ex)
         {
-            if (ex is ArgumentOutOfRangeException || ex is OverflowException || ex is IOException)
+            if (ex is IOException)
                 return true;
 
-            if (ex is LiteException liteEx)
+            if (ex is SqliteException sqliteEx)
             {
-                var message = liteEx.Message ?? string.Empty;
-                return message.Contains("ReadFull")
-                    || message.Contains("PAGE_SIZE")
-                    || message.Contains("Checkpoint")
-                    || message.Contains("invalid")
-                    || message.Contains("corrupt");
+                // SQLITE_CORRUPT (11), SQLITE_NOTADB (26), SQLITE_IOERR (10)
+                return sqliteEx.SqliteErrorCode == 11
+                    || sqliteEx.SqliteErrorCode == 26
+                    || sqliteEx.SqliteErrorCode == 10;
             }
 
             return false;
@@ -1878,7 +1870,7 @@ namespace Locus.Storage.Data
         /// <returns>Backup file path, or null if no database file existed.</returns>
         private string? RebuildDatabaseFileNoLock(string tenantId)
         {
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
 
             if (!_fileSystem.File.Exists(dbPath))
             {
@@ -1895,9 +1887,13 @@ namespace Locus.Storage.Data
                 try { existingLazy.Value?.Dispose(); }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Error disposing database connection during lock-free rebuild for tenant {TenantId}", tenantId);
+                    _logger.LogWarning(ex, "Error disposing SQLite connection during lock-free rebuild for tenant {TenantId}", tenantId);
                 }
             }
+            // Force the SQLite connection pool to release the OS file handle.
+            // With Cache=Shared, Dispose() returns connections to the pool rather than closing them.
+            // ClearAllPools() ensures the file can be deleted and a fresh connection will open a new file.
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                 RemoveTenantFromGlobalIndex(staleTenantCache);
             _physicalPathIndex.TryRemove(tenantId, out _);
@@ -1917,6 +1913,9 @@ namespace Locus.Storage.Data
             _fileSystem.File.Delete(dbPath);
             _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
 
+            // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
+            DeleteSidecarFiles(dbPath);
+
             return backupPath;
         }
 
@@ -1933,7 +1932,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
 
             // Get or create tenant lock (same lock used for all operations)
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
@@ -1953,21 +1952,23 @@ namespace Locus.Storage.Data
                 _logger.LogWarning("Beginning database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
                 // Step 1: Remove from cache FIRST so no other thread can acquire the disposed instance.
-                _databases.TryRemove(tenantId, out var lazyDb);
+                _databases.TryRemove(tenantId, out var lazyConn);
 
                 // Step 2: Dispose the removed connection (safe: it's no longer reachable via cache).
-                if (lazyDb != null && lazyDb.IsValueCreated)
+                if (lazyConn != null && lazyConn.IsValueCreated)
                 {
                     try
                     {
-                        lazyDb.Value?.Dispose();
-                        _logger.LogDebug("Disposed database connection for rebuild: {TenantId}", tenantId);
+                        lazyConn.Value?.Dispose();
+                        _logger.LogDebug("Disposed SQLite connection for rebuild: {TenantId}", tenantId);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Error disposing database connection for tenant {TenantId}", tenantId);
+                        _logger.LogWarning(ex, "Error disposing SQLite connection for tenant {TenantId}", tenantId);
                     }
                 }
+                // Force the connection pool to release the OS file handle before deleting the file.
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
 
                 // Step 3: Clear in-memory cache and pending index
                 if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
@@ -1990,6 +1991,9 @@ namespace Locus.Storage.Data
                 // Step 5: Delete corrupted database
                 _fileSystem.File.Delete(dbPath);
                 _logger.LogInformation("Deleted corrupted database: {DatabasePath}", dbPath);
+
+                // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
+                DeleteSidecarFiles(dbPath);
 
                 return backupPath;
             }
@@ -2018,7 +2022,7 @@ namespace Locus.Storage.Data
         }
 
         // Maximum number of operations allowed in the persistence queue.
-        // If LiteDB is unavailable for an extended period, the queue may fill up. When near or
+        // If SQLite is unavailable for an extended period, the queue may fill up. When near or
         // at capacity, operations are coalesced by file key so only the latest state is retained.
         private const int DefaultMaxPersistenceQueueSize = 100_000;
         private const int DefaultDrainBatchSize = 2_000;
@@ -2033,7 +2037,7 @@ namespace Locus.Storage.Data
         private const int CompactionIntervalCycles = 20;
 
         // Enqueues an operation for background persistence.
-        // If the queue is full (LiteDB has been unavailable for a long time), the operation
+        // If the queue is full (SQLite has been unavailable for a long time), the operation
         // is dropped with a warning - memory state is already correct, so data is not lost
         // within this process lifetime. On restart, the cleanup service reconciles disk vs metadata.
         private void EnqueuePersistence(PersistenceOperation op)
@@ -2104,8 +2108,8 @@ namespace Locus.Storage.Data
         }
 
         // Background loop: waits for channel data or periodic timeout, then drains in one pass,
-        // grouping operations by tenant so each tenant gets a single LiteDB transaction
-        // instead of one transaction per operation. This dramatically reduces LiteDB overhead
+        // grouping operations by tenant so each tenant gets a single SQLite transaction
+        // instead of one transaction per operation. This dramatically reduces SQLite overhead
         // under burst writes (e.g. 1000 concurrent file writes -> 1 transaction per tenant).
         private async Task RunPersistenceLoopAsync(CancellationToken ct)
         {
@@ -2169,7 +2173,7 @@ namespace Locus.Storage.Data
         }
 
         // Drains queued and coalesced operations in bounded batches.
-        // Operations are grouped by tenantId and flushed in a single LiteDB transaction
+        // Operations are grouped by tenantId and flushed in a single SQLite transaction
         // per tenant, minimising fsync overhead and memory spikes.
         private void DrainPersistenceQueue()
         {
@@ -2240,49 +2244,119 @@ namespace Locus.Storage.Data
             bucket.Add(op);
         }
 
-        // Writes a batch of operations for a single tenant inside one LiteDB transaction.
-        // Errors are logged but never propagated 鈥?LiteDB unavailability must never fail writes.
+        // Writes a batch of operations for a single tenant inside one SQLite transaction.
+        // Errors are logged but never propagated -- SQLite unavailability must never fail writes.
         private void ExecuteBatch(string tenantId, List<PersistenceOperation> ops)
         {
             try
             {
-                var db = GetDatabase(tenantId);
-                var files = db.GetCollection<FileMetadata>("files");
+                var conn = GetDatabase(tenantId);
 
-                db.BeginTrans();
+                using var txn = conn.BeginTransaction();
                 try
                 {
                     foreach (var op in ops)
                     {
                         if (op.IsDelete)
-                            files.Delete(op.FileKey);
+                            DeleteFile(conn, txn, op.FileKey);
                         else
-                            files.Upsert(op.Metadata!);
+                            UpsertFile(conn, txn, op.Metadata!);
                     }
-                    db.Commit();
 
-                    // Explicitly checkpoint after every commit to merge the WAL journal into the
-                    // main database file. Without this, the WAL accumulates across many batches
-                    // and a process crash during the eventual auto-checkpoint can leave the
-                    // database in an inconsistent state. The slight extra I/O is far outweighed
-                    // by the reliability benefit for metadata files.
-                    db.Checkpoint();
+                    txn.Commit();
+
+                    // Explicitly checkpoint after every commit so the WAL is merged into the main
+                    // database file promptly. This reduces the risk of data loss on a crash during
+                    // a later automatic checkpoint and keeps the WAL file small.
+                    if (_sqliteOptions.CheckpointAfterBatch)
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
+                        cmd.ExecuteNonQuery();
+                    }
 
                     _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
                 }
                 catch
                 {
-                    db.Rollback();
+                    txn.Rollback();
                     throw;
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "LiteDB batch write failed for tenant {TenantId} ({Count} operations). " +
-                    "Physical files are safe on disk; metadata may be lost if process restarts before LiteDB recovers.",
+                    "SQLite batch write failed for tenant {TenantId} ({Count} operations). " +
+                    "Physical files are safe on disk; metadata may be lost if process restarts before SQLite recovers.",
                     tenantId, ops.Count);
             }
+        }
+
+        private static void UpsertFile(SqliteConnection conn, FileMetadata m)
+        {
+            using var txn = conn.BeginTransaction();
+            UpsertFile(conn, txn, m);
+            txn.Commit();
+        }
+
+        private static void UpsertFile(SqliteConnection conn, SqliteTransaction txn, FileMetadata m)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = @"
+INSERT INTO files (
+    file_key, tenant_id, volume_id, physical_path, directory_path, file_size,
+    created_at, status, retry_count, last_failed_at, last_error,
+    processing_start_time, available_for_processing_at,
+    original_file_name, file_extension, metadata_json)
+VALUES (
+    @file_key, @tenant_id, @volume_id, @physical_path, @directory_path, @file_size,
+    @created_at, @status, @retry_count, @last_failed_at, @last_error,
+    @processing_start_time, @available_for_processing_at,
+    @original_file_name, @file_extension, @metadata_json)
+ON CONFLICT(file_key) DO UPDATE SET
+    tenant_id                  = excluded.tenant_id,
+    volume_id                  = excluded.volume_id,
+    physical_path              = excluded.physical_path,
+    directory_path             = excluded.directory_path,
+    file_size                  = excluded.file_size,
+    created_at                 = excluded.created_at,
+    status                     = excluded.status,
+    retry_count                = excluded.retry_count,
+    last_failed_at             = excluded.last_failed_at,
+    last_error                 = excluded.last_error,
+    processing_start_time      = excluded.processing_start_time,
+    available_for_processing_at= excluded.available_for_processing_at,
+    original_file_name         = excluded.original_file_name,
+    file_extension             = excluded.file_extension,
+    metadata_json              = excluded.metadata_json;";
+
+            cmd.Parameters.AddWithValue("@file_key",                   m.FileKey);
+            cmd.Parameters.AddWithValue("@tenant_id",                  m.TenantId);
+            cmd.Parameters.AddWithValue("@volume_id",                  m.VolumeId);
+            cmd.Parameters.AddWithValue("@physical_path",              m.PhysicalPath);
+            cmd.Parameters.AddWithValue("@directory_path",             m.DirectoryPath);
+            cmd.Parameters.AddWithValue("@file_size",                  m.FileSize);
+            cmd.Parameters.AddWithValue("@created_at",                 m.CreatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("@status",                     (int)m.Status);
+            cmd.Parameters.AddWithValue("@retry_count",                m.RetryCount);
+            cmd.Parameters.AddWithValue("@last_failed_at",             m.LastFailedAt.HasValue ? (object)m.LastFailedAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@last_error",                 (object?)m.LastError ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@processing_start_time",      m.ProcessingStartTime.HasValue ? (object)m.ProcessingStartTime.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@available_for_processing_at",m.AvailableForProcessingAt.HasValue ? (object)m.AvailableForProcessingAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@original_file_name",         (object?)m.OriginalFileName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@file_extension",             (object?)m.FileExtension ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@metadata_json",              m.Metadata != null ? (object)System.Text.Json.JsonSerializer.Serialize(m.Metadata) : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void DeleteFile(SqliteConnection conn, SqliteTransaction txn, string fileKey)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = "DELETE FROM files WHERE file_key = @file_key;";
+            cmd.Parameters.AddWithValue("@file_key", fileKey);
+            cmd.ExecuteNonQuery();
         }
 
         // Rebuilds _pendingKeys / _delayedQueues for any tenant whose queues are significantly larger than
@@ -2392,9 +2466,9 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Disposes the repository and closes all databases.
+        /// Disposes the repository and closes all SQLite connections.
         /// Signals the write-behind background task to stop, waits up to 5 seconds
-        /// for it to drain remaining queued writes, then closes all LiteDB connections.
+        /// for it to drain remaining queued writes, then closes all SQLite connections.
         /// </summary>
         public void Dispose()
         {
@@ -2409,9 +2483,9 @@ namespace Locus.Storage.Data
                 _persistenceCts.Cancel();
 
                 // 2. Wait for the background task to drain remaining queued items (up to 5 seconds).
-                // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach LiteDB.
-                // If LiteDB is unavailable or the queue is too large to drain in time, remaining items
-                // are discarded 鈥?physical files are safe on disk and recovered by cleanup service on restart.
+                // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach SQLite.
+                // If SQLite is unavailable or the queue is too large to drain in time, remaining items
+                // are discarded -- physical files are safe on disk and recovered by cleanup service on restart.
                 try
                 {
                     _persistenceTask.Wait(TimeSpan.FromSeconds(5));
@@ -2422,17 +2496,17 @@ namespace Locus.Storage.Data
                 }
             }
 
-            // 3. Close all databases AFTER the drain is complete
-            foreach (var lazyDb in _databases.Values)
+            // 3. Close all connections AFTER the drain is complete
+            foreach (var lazyConn in _databases.Values)
             {
                 try
                 {
-                    if (lazyDb.IsValueCreated)
-                        lazyDb.Value?.Dispose();
+                    if (lazyConn.IsValueCreated)
+                        lazyConn.Value?.Dispose();
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error closing LiteDB database");
+                    _logger.LogError(ex, "Error closing SQLite connection");
                 }
             }
 

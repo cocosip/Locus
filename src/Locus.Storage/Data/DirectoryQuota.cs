@@ -1,5 +1,4 @@
 using System;
-using LiteDB;
 
 namespace Locus.Storage.Data
 {
@@ -9,9 +8,8 @@ namespace Locus.Storage.Data
     public class DirectoryQuota
     {
         /// <summary>
-        /// Gets or sets the directory path (used as unique identifier).
+        /// Gets or sets the directory path (used as unique identifier / primary key).
         /// </summary>
-        [BsonId]
         public string DirectoryPath { get; set; } = string.Empty;
 
         /// <summary>

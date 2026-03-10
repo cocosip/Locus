@@ -6,16 +6,17 @@ using System.IO.Abstractions;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using LiteDB;
+using Dapper;
+using Locus.Core.Models;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
-using LiteDBOptions = Locus.Core.Models.LiteDBOptions;
 
 namespace Locus.Storage.Data
 {
     /// <summary>
-    /// Repository for directory quota storage using per-tenant LiteDB with in-memory caching.
+    /// Repository for directory quota storage using per-tenant SQLite with in-memory caching.
     /// Hot path (TryIncrementAsync / DecrementAsync) is lock-free using CAS atomic counters.
-    /// LiteDB writes are deferred via a Write-Behind timer (every 5 seconds) for performance.
+    /// SQLite writes are deferred via a Write-Behind timer (every 5 seconds) for performance.
     /// Thread-safe for concurrent access.
     /// </summary>
     public class DirectoryQuotaRepository : IDisposable
@@ -23,13 +24,13 @@ namespace Locus.Storage.Data
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<DirectoryQuotaRepository> _logger;
         private readonly string _quotaDirectory;
-        private readonly LiteDBOptions _liteDbOptions;
+        private readonly SqliteOptions _sqliteOptions;
 
         // Per-tenant in-memory cache (source of truth for MaxCount / Enabled config)
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>> _quotaCache;
 
-        // Per-tenant LiteDB databases (using Lazy for thread-safe initialization)
-        private readonly ConcurrentDictionary<string, Lazy<LiteDatabase>> _databases;
+        // Per-tenant SQLite connections (using Lazy for thread-safe initialization)
+        private readonly ConcurrentDictionary<string, Lazy<SqliteConnection>> _databases;
 
         // Per-tenant operation locks (used for config operations; NOT used in hot path)
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantLocks;
@@ -39,7 +40,7 @@ namespace Locus.Storage.Data
 
         /// <summary>
         /// Per-tenant atomic counter state for lock-free hot path.
-        /// Count is the authoritative live value; LiteDB is updated asynchronously.
+        /// Count is the authoritative live value; SQLite is updated asynchronously.
         /// </summary>
         private sealed class AtomicQuotaState
         {
@@ -52,7 +53,7 @@ namespace Locus.Storage.Data
             /// <summary>Whether quota enforcement is active. Updated by UpdateAsync.</summary>
             public volatile bool Enabled;
 
-            /// <summary>True when Count has changed since last LiteDB flush.</summary>
+            /// <summary>True when Count has changed since last SQLite flush.</summary>
             public volatile bool Dirty;
         }
 
@@ -74,7 +75,7 @@ namespace Locus.Storage.Data
             IFileSystem fileSystem,
             ILogger<DirectoryQuotaRepository> logger,
             string quotaDirectory,
-            LiteDBOptions? liteDbOptions = null,
+            SqliteOptions? sqliteOptions = null,
             bool enableBackgroundFlush = true)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -84,10 +85,10 @@ namespace Locus.Storage.Data
                 throw new ArgumentException("Quota directory cannot be empty", nameof(quotaDirectory));
 
             _quotaDirectory = quotaDirectory;
-            _liteDbOptions = liteDbOptions ?? new LiteDBOptions();
+            _sqliteOptions = sqliteOptions ?? new SqliteOptions();
             _enableBackgroundFlush = enableBackgroundFlush;
             _quotaCache = new ConcurrentDictionary<string, ConcurrentDictionary<string, DirectoryQuota>>();
-            _databases = new ConcurrentDictionary<string, Lazy<LiteDatabase>>();
+            _databases = new ConcurrentDictionary<string, Lazy<SqliteConnection>>();
             _tenantLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _atomicCounters = new ConcurrentDictionary<string, ConcurrentDictionary<string, AtomicQuotaState>>();
             _dirtyDirectoryKeysByTenant = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>();
@@ -100,11 +101,11 @@ namespace Locus.Storage.Data
             }
 
             _logger.LogInformation(
-                "DirectoryQuotaRepository initialized at {Directory} with LiteDB: Journal={Journal}, Checkpoint={Checkpoint}, Timeout={Timeout}s",
+                "DirectoryQuotaRepository initialized at {Directory} with SQLite: JournalMode={JournalMode}, SynchronousMode={SynchronousMode}, BusyTimeout={BusyTimeout}ms",
                 _quotaDirectory,
-                _liteDbOptions.EnableJournal,
-                _liteDbOptions.CheckpointInterval,
-                _liteDbOptions.TimeoutSeconds);
+                _sqliteOptions.JournalMode,
+                _sqliteOptions.SynchronousMode,
+                _sqliteOptions.BusyTimeoutMs);
 
             if (_enableBackgroundFlush)
             {
@@ -117,38 +118,41 @@ namespace Locus.Storage.Data
             }
         }
 
+        private const string QuotaDdl = @"
+CREATE TABLE IF NOT EXISTS quotas (
+    directory_path TEXT PRIMARY KEY NOT NULL,
+    current_count  INTEGER NOT NULL DEFAULT 0,
+    max_count      INTEGER NOT NULL DEFAULT 0,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    last_updated   TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
+
         /// <summary>
-        /// Gets or creates a LiteDB database for a tenant.
+        /// Gets or creates a SQLite connection for a tenant.
         /// </summary>
-        private LiteDatabase GetDatabase(string tenantId)
+        private SqliteConnection GetDatabase(string tenantId)
         {
-            // Use Lazy<LiteDatabase> to ensure thread-safe initialization
-            // This prevents multiple threads from simultaneously creating the database instance
-            var lazyDb = _databases.GetOrAdd(tenantId, tid => new Lazy<LiteDatabase>(() =>
+            // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
+            var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
             {
                 try
                 {
-                    // Ensure quota directory exists (thread-safe in case of concurrent access)
-                    if (!_fileSystem.Directory.Exists(_quotaDirectory))
-                    {
-                        _fileSystem.Directory.CreateDirectory(_quotaDirectory);
-                    }
+                    // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
+                    var tenantDir = _fileSystem.Path.Combine(_quotaDirectory, tid);
+                    if (!_fileSystem.Directory.Exists(tenantDir))
+                        _fileSystem.Directory.CreateDirectory(tenantDir);
 
-                    var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tid}-quotas.db");
-                    // Use configured LiteDB options (WAL mode strongly recommended for K8s/network storage)
-                    var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
-                    var db = new LiteDatabase(connectionString);
+                    var dbPath = _fileSystem.Path.Combine(tenantDir, "quotas.db");
+                    var conn = OpenAndInitializeConnection(dbPath);
 
-                    var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                    quotas.EnsureIndex(x => x.DirectoryPath, unique: true);
-                    quotas.EnsureIndex(x => x.Enabled);
-
-                    _logger.LogDebug("Created/opened LiteDB quota database for tenant {TenantId} at {Path}", tid, dbPath);
+                    _logger.LogDebug("Created/opened SQLite quota database for tenant {TenantId} at {Path}", tid, dbPath);
 
                     // Load all quotas into memory on first access
-                    LoadQuotasForTenant(tid, quotas);
+                    LoadQuotasForTenant(tid, conn);
 
-                    return db;
+                    return conn;
                 }
                 catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
@@ -169,20 +173,15 @@ namespace Locus.Storage.Data
                             "Quota database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}",
                             tid, backupPath ?? "N/A");
 
-                        // Retry initialization with configured LiteDB options
-                        var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tid}-quotas.db");
-                        var connectionString = _liteDbOptions.BuildConnectionString(dbPath);
-                        var db = new LiteDatabase(connectionString);
-
-                        var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                        quotas.EnsureIndex(x => x.DirectoryPath, unique: true);
-                        quotas.EnsureIndex(x => x.Enabled);
+                        // Retry initialization
+                        var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tid, "quotas.db");
+                        var conn = OpenAndInitializeConnection(dbPath);
 
                         _logger.LogInformation(
                             "Successfully recovered and initialized quota database for tenant {TenantId}",
                             tid);
 
-                        return db;
+                        return conn;
                     }
                     catch (Exception recoveryEx)
                     {
@@ -194,28 +193,47 @@ namespace Locus.Storage.Data
                 }
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
-            // Access the Value property to trigger initialization if needed
-            return lazyDb.Value;
+            return lazyConn.Value;
+        }
+
+        private SqliteConnection OpenAndInitializeConnection(string dbPath)
+        {
+            var connStr = _sqliteOptions.BuildConnectionString(dbPath);
+            var conn = new SqliteConnection(connStr);
+            conn.Open();
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = _sqliteOptions.BuildPragmaSql();
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = QuotaDdl;
+                cmd.ExecuteNonQuery();
+            }
+
+            return conn;
         }
 
         /// <summary>
         /// Loads all quotas into memory for a tenant.
         /// </summary>
-        private void LoadQuotasForTenant(string tenantId, ILiteCollection<DirectoryQuota> collection)
+        private void LoadQuotasForTenant(string tenantId, SqliteConnection conn)
         {
-            var quotas = collection.FindAll().ToList();
-
-            if (quotas.Count > 0)
+            var rows = conn.Query<QuotaRow>("SELECT * FROM quotas", buffered: true);
+            var count = 0;
+            var cache = _quotaCache.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, DirectoryQuota>());
+            foreach (var row in rows)
             {
-                var cache = _quotaCache.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, DirectoryQuota>());
-                foreach (var quota in quotas)
-                {
-                    cache[quota.DirectoryPath] = quota;
-                }
-
-                _logger.LogInformation("Loaded {Count} directory quotas for tenant {TenantId} into memory",
-                    quotas.Count, tenantId);
+                var quota = row.ToDirectoryQuota();
+                cache[quota.DirectoryPath] = quota;
+                count++;
             }
+
+            if (count > 0)
+                _logger.LogInformation("Loaded {Count} directory quotas for tenant {TenantId} into memory", count, tenantId);
         }
 
         /// <summary>
@@ -274,21 +292,43 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
+        /// Deletes SQLite WAL and SHM sidecar files for a given database path.
+        /// Called after deleting a corrupted database so the new database starts clean.
+        /// </summary>
+        private void DeleteSidecarFiles(string dbPath)
+        {
+            foreach (var suffix in new[] { "-wal", "-shm" })
+            {
+                var sidecarPath = dbPath + suffix;
+                if (_fileSystem.File.Exists(sidecarPath))
+                {
+                    try
+                    {
+                        _fileSystem.File.Delete(sidecarPath);
+                        _logger.LogInformation("Deleted SQLite sidecar file: {Path}", sidecarPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to delete SQLite sidecar file: {Path}", sidecarPath);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Checks whether the exception indicates a recoverable database corruption scenario.
         /// </summary>
         private static bool IsRecoverableDatabaseException(Exception ex)
         {
-            if (ex is ArgumentOutOfRangeException || ex is OverflowException || ex is IOException)
+            if (ex is IOException)
                 return true;
 
-            if (ex is LiteException liteEx)
+            if (ex is SqliteException sqliteEx)
             {
-                var message = liteEx.Message ?? string.Empty;
-                return message.Contains("ReadFull")
-                    || message.Contains("PAGE_SIZE")
-                    || message.Contains("Checkpoint")
-                    || message.Contains("invalid")
-                    || message.Contains("corrupt");
+                // SQLITE_CORRUPT (11), SQLITE_NOTADB (26), SQLITE_IOERR (10)
+                return sqliteEx.SqliteErrorCode == 11
+                    || sqliteEx.SqliteErrorCode == 26
+                    || sqliteEx.SqliteErrorCode == 10;
             }
 
             return false;
@@ -300,7 +340,7 @@ namespace Locus.Storage.Data
         /// </summary>
         private string? RebuildDatabaseNoLock(string tenantId)
         {
-            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tenantId}-quotas.db");
+            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
 
             if (!_fileSystem.File.Exists(dbPath))
             {
@@ -309,21 +349,23 @@ namespace Locus.Storage.Data
             }
 
             // Remove from cache FIRST so no other thread can acquire the disposed instance.
-            _databases.TryRemove(tenantId, out var lazyDb);
+            _databases.TryRemove(tenantId, out var lazyConn);
 
             // Dispose the removed connection (safe: it's no longer reachable via cache).
-            if (lazyDb != null && lazyDb.IsValueCreated)
+            if (lazyConn != null && lazyConn.IsValueCreated)
             {
                 try
                 {
-                    lazyDb.Value?.Dispose();
-                    _logger.LogDebug("Disposed quota database connection for rebuild: {TenantId}", tenantId);
+                    lazyConn.Value?.Dispose();
+                    _logger.LogDebug("Disposed SQLite quota connection for rebuild: {TenantId}", tenantId);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Error disposing quota database connection for tenant {TenantId}", tenantId);
+                    _logger.LogWarning(ex, "Error disposing SQLite quota connection for tenant {TenantId}", tenantId);
                 }
             }
+            // Force the connection pool to release the OS file handle before deleting the file.
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             _quotaCache.TryRemove(tenantId, out _);
 
             // Backup and delete corrupted database
@@ -333,6 +375,9 @@ namespace Locus.Storage.Data
 
             _fileSystem.File.Delete(dbPath);
             _logger.LogInformation("Deleted corrupted quota database: {DatabasePath}", dbPath);
+
+            // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
+            DeleteSidecarFiles(dbPath);
 
             return backupPath;
         }
@@ -345,13 +390,8 @@ namespace Locus.Storage.Data
         {
             try
             {
-                var db = GetDatabase(tenantId);
-                var quotas = db.GetCollection<DirectoryQuota>("quotas");
-
-                if (useUpsert)
-                    quotas.Upsert(quota);
-                else
-                    quotas.Update(quota);
+                var conn = GetDatabase(tenantId);
+                UpsertQuota(conn, quota);
 
                 var cache = GetCache(tenantId);
                 cache[quota.DirectoryPath] = quota;
@@ -370,9 +410,8 @@ namespace Locus.Storage.Data
                         "Quota database rebuilt for tenant {TenantId}. Backup saved at: {BackupPath}",
                         tenantId, backupPath ?? "N/A");
 
-                    var db = GetDatabase(tenantId);
-                    var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                    quotas.Upsert(quota);
+                    var conn = GetDatabase(tenantId);
+                    UpsertQuota(conn, quota);
 
                     var cache = GetCache(tenantId);
                     cache[quota.DirectoryPath] = quota;
@@ -573,7 +612,7 @@ namespace Locus.Storage.Data
                     continue;
 
                 // Clear dirty BEFORE reading count so any concurrent increments that
-                // happen during the LiteDB write will mark Dirty=true again and be
+                // happen during the SQLite write will mark Dirty=true again and be
                 // captured in the next flush cycle.
                 atomicState.Dirty = false;
                 var count = Volatile.Read(ref atomicState.Count);
@@ -607,21 +646,27 @@ namespace Locus.Storage.Data
 
             try
             {
-                var db = GetDatabase(tenantId);
-                var quotas = db.GetCollection<DirectoryQuota>("quotas");
+                var conn = GetDatabase(tenantId);
 
-                db.BeginTrans();
+                using var txn = conn.BeginTransaction();
                 try
                 {
                     foreach (var item in dirtySnapshots)
-                        quotas.Upsert(item.Snapshot);
+                        UpsertQuota(conn, txn, item.Snapshot);
 
-                    db.Commit();
+                    txn.Commit();
                 }
                 catch
                 {
-                    db.Rollback();
+                    txn.Rollback();
                     throw;
+                }
+
+                if (_sqliteOptions.CheckpointAfterBatch)
+                {
+                    using var cmd = conn.CreateCommand();
+                    cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
+                    cmd.ExecuteNonQuery();
                 }
 
                 _logger.LogDebug(
@@ -645,6 +690,66 @@ namespace Locus.Storage.Data
         // -----------------------------------------------------------------
         // Public API
         // -----------------------------------------------------------------
+
+        private static void UpsertQuota(SqliteConnection conn, DirectoryQuota q)
+        {
+            using var txn = conn.BeginTransaction();
+            UpsertQuota(conn, txn, q);
+            txn.Commit();
+        }
+
+        private static void UpsertQuota(SqliteConnection conn, SqliteTransaction txn, DirectoryQuota q)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = @"
+INSERT INTO quotas (directory_path, current_count, max_count, enabled, last_updated, created_at)
+VALUES (@dir, @cur, @max, @enabled, @updated, @created)
+ON CONFLICT(directory_path) DO UPDATE SET
+    current_count = excluded.current_count,
+    max_count     = excluded.max_count,
+    enabled       = excluded.enabled,
+    last_updated  = excluded.last_updated;";
+            cmd.Parameters.AddWithValue("@dir",     q.DirectoryPath);
+            cmd.Parameters.AddWithValue("@cur",     q.CurrentCount);
+            cmd.Parameters.AddWithValue("@max",     q.MaxCount);
+            cmd.Parameters.AddWithValue("@enabled", q.Enabled ? 1 : 0);
+            cmd.Parameters.AddWithValue("@updated", q.LastUpdated.ToString("O"));
+            cmd.Parameters.AddWithValue("@created", q.CreatedAt.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void DeleteQuota(SqliteConnection conn, string directoryPath)
+        {
+            using var txn = conn.BeginTransaction();
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = "DELETE FROM quotas WHERE directory_path = @dir;";
+            cmd.Parameters.AddWithValue("@dir", directoryPath);
+            cmd.ExecuteNonQuery();
+            txn.Commit();
+        }
+
+        // Dapper read DTO for the quotas table
+        private sealed class QuotaRow
+        {
+            public string directory_path { get; set; } = string.Empty;
+            public int    current_count  { get; set; }
+            public int    max_count      { get; set; }
+            public int    enabled        { get; set; }
+            public string last_updated   { get; set; } = string.Empty;
+            public string created_at     { get; set; } = string.Empty;
+
+            public DirectoryQuota ToDirectoryQuota() => new DirectoryQuota
+            {
+                DirectoryPath = directory_path,
+                CurrentCount  = current_count,
+                MaxCount      = max_count,
+                Enabled       = enabled != 0,
+                LastUpdated   = DateTime.Parse(last_updated, null, System.Globalization.DateTimeStyles.RoundtripKind),
+                CreatedAt     = DateTime.Parse(created_at,   null, System.Globalization.DateTimeStyles.RoundtripKind)
+            };
+        }
 
         /// <summary>
         /// Gets or creates a directory quota.
@@ -955,10 +1060,9 @@ namespace Locus.Storage.Data
                     if (_dirtyDirectoryKeysByTenant.TryGetValue(tenantId, out var dirtyDirectories))
                         dirtyDirectories.TryRemove(directoryPath, out _);
 
-                    // Remove from LiteDB
-                    var db = GetDatabase(tenantId);
-                    var quotas = db.GetCollection<DirectoryQuota>("quotas");
-                    quotas.Delete(directoryPath);
+                    // Remove from SQLite
+                    var conn = GetDatabase(tenantId);
+                    DeleteQuota(conn, directoryPath);
 
                     _logger.LogDebug("Removed quota for directory: {DirectoryPath}, Tenant: {TenantId}", directoryPath, tenantId);
                 }
@@ -972,23 +1076,38 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Optimizes (rebuilds) a specific tenant's quota database to reclaim space.
-        /// This method is thread-safe and will block all operations for this tenant during optimization.
-        /// WARNING: This is a heavy operation. Should be called during maintenance windows.
+        /// Optimizes a specific tenant's quota database via SQLite VACUUM to reclaim space.
         /// </summary>
         public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
         {
-            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tenantId}-quotas.db");
+            ct.ThrowIfCancellationRequested();
+            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
 
-            return LiteDbOptimizationHelper.OptimizeDatabaseAsync(
-                tenantId,
-                dbPath,
-                _databases,
-                _tenantLocks,
-                _fileSystem,
-                _logger,
-                "quota",
-                ct);
+            long sizeBefore = 0;
+            long sizeAfter = 0;
+            try
+            {
+                if (_fileSystem.File.Exists(dbPath))
+                    sizeBefore = new System.IO.FileInfo(dbPath).Length;
+
+                var conn = GetDatabase(tenantId);
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "VACUUM;";
+                    cmd.ExecuteNonQuery();
+                }
+
+                if (_fileSystem.File.Exists(dbPath))
+                    sizeAfter = new System.IO.FileInfo(dbPath).Length;
+
+                _logger.LogDebug("SQLite VACUUM completed for quota tenant {TenantId}: {Before} -> {After} bytes", tenantId, sizeBefore, sizeAfter);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to optimize SQLite quota database for tenant {TenantId}", tenantId);
+            }
+
+            return Task.FromResult((sizeBefore, sizeAfter));
         }
 
         /// <summary>
@@ -999,18 +1118,12 @@ namespace Locus.Storage.Data
             if (!_fileSystem.Directory.Exists(_quotaDirectory))
                 return Task.FromResult<IEnumerable<string>>(Array.Empty<string>());
 
-            var dbFiles = _fileSystem.Directory.GetFiles(_quotaDirectory, "*-quotas.db");
-            var tenantIds = dbFiles
-                .Select(f =>
-                {
-                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(f);
-                    // Remove "-quotas" suffix
-                    return fileName.EndsWith("-quotas") ? fileName.Substring(0, fileName.Length - 7) : fileName;
-                })
-                .Where(name => !string.IsNullOrWhiteSpace(name)
-                    && !name.Contains("-backup", StringComparison.OrdinalIgnoreCase)    // Filter LiteDB backup files: "tenant-001-quotas.db-backup-1"
-                    && !name.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase) // Filter corruption backups
-                    && !name.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))   // Filter LiteDB journal files
+            // Each tenant quota database lives in its own subdirectory: {quotaDirectory}/{tenantId}/quotas.db
+            // Enumerate subdirectories to discover tenant IDs without any filename filtering.
+            var tenantDirs = _fileSystem.Directory.GetDirectories(_quotaDirectory);
+            var tenantIds = tenantDirs
+                .Select(d => _fileSystem.Path.GetFileName(d))
+                .Where(n => !string.IsNullOrWhiteSpace(n))
                 .ToList();
 
             return Task.FromResult<IEnumerable<string>>(tenantIds);
@@ -1062,7 +1175,7 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Disposes the repository: stops the flush timer, performs a final LiteDB flush of all
+        /// Disposes the repository: stops the flush timer, performs a final SQLite flush of all
         /// dirty counters, and closes all database connections.
         /// </summary>
         public void Dispose()
@@ -1102,17 +1215,17 @@ namespace Locus.Storage.Data
                 _logger.LogError(ex, "Error during final quota counter flush on dispose");
             }
 
-            // Close all databases
-            foreach (var lazyDb in _databases.Values)
+            // Close all connections
+            foreach (var lazyConn in _databases.Values)
             {
                 try
                 {
-                    if (lazyDb.IsValueCreated)
-                        lazyDb.Value?.Dispose();
+                    if (lazyConn.IsValueCreated)
+                        lazyConn.Value?.Dispose();
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error closing LiteDB quota database");
+                    _logger.LogError(ex, "Error closing SQLite quota connection");
                 }
             }
 

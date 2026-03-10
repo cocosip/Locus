@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Locus.Core.Exceptions;
 using Locus.Storage;
 using Locus.Storage.Data;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -45,6 +46,7 @@ namespace Locus.Storage.Tests
         public void Dispose()
         {
             _repository?.Dispose();
+            SqliteConnection.ClearAllPools();
 
             // Cleanup temporary test directory
             try
@@ -402,6 +404,7 @@ namespace Locus.Storage.Tests
             finally
             {
                 repository.Dispose();
+                SqliteConnection.ClearAllPools();
                 if (_fileSystem.Directory.Exists(isolatedQuotaDir))
                     _fileSystem.Directory.Delete(isolatedQuotaDir, recursive: true);
             }

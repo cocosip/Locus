@@ -1,5 +1,4 @@
 using System;
-using LiteDB;
 using Locus.Core.Models;
 
 namespace Locus.Storage.Data
@@ -10,9 +9,8 @@ namespace Locus.Storage.Data
     public class FileMetadata
     {
         /// <summary>
-        /// Gets or sets the unique file key (identifier).
+        /// Gets or sets the unique file key (identifier). Primary key in the database.
         /// </summary>
-        [BsonId]
         public string FileKey { get; set; } = string.Empty;
 
         /// <summary>

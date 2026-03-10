@@ -9,6 +9,7 @@ using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Locus.Storage.Data;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -84,6 +85,7 @@ namespace Locus.Storage.Tests
         {
             _metadataRepository?.Dispose();
             _quotaRepository?.Dispose();
+            SqliteConnection.ClearAllPools();
 
             // Cleanup temporary test directories
             try

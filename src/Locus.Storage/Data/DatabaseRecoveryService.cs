@@ -5,15 +5,15 @@ using System.IO.Abstractions;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using LiteDB;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.Storage.Data
 {
     /// <summary>
-    /// Service for recovering and rebuilding corrupted LiteDB databases.
+    /// Service for recovering and rebuilding corrupted SQLite databases.
     /// </summary>
     public class DatabaseRecoveryService : IDatabaseRecoveryService
     {
@@ -59,53 +59,57 @@ namespace Locus.Storage.Data
 
             try
             {
-                var connectionString = $"Filename={dbPath};Mode=Shared";
-                using (var db = new LiteDatabase(connectionString))
+                var connectionString = $"Data Source={dbPath};Cache=Shared;Mode=ReadOnly";
+                using (var conn = new SqliteConnection(connectionString))
                 {
-                    // Try to read collections to verify database integrity
-                    var collections = db.GetCollectionNames().ToList();
-                    return false; // Database is accessible
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        // integrity_check returns "ok" for a healthy database.
+                        // Any other result (including multiple rows) means corruption.
+                        cmd.CommandText = "PRAGMA integrity_check(1);";
+                        var result = cmd.ExecuteScalar() as string;
+                        if (result == "ok")
+                            return false;
+
+                        _logger.LogError(
+                            "SQLite integrity_check failed for {DatabasePath}: {Result}",
+                            dbPath, result);
+                        return true;
+                    }
                 }
             }
-            catch (LiteException ex)
+            catch (SqliteException ex)
             {
-                // Distinguish between file locking and actual corruption
-                var errorMessage = ex.Message.ToLowerInvariant();
-
-                _logger.LogDebug(
-                    "LiteException when checking database: {DatabasePath}. " +
-                    "ErrorCode: {ErrorCode}, Message: {Message}",
-                    dbPath, ex.ErrorCode, ex.Message);
-
-                // Check for file locking issues (NOT corruption)
-                if (errorMessage.Contains("being used by another process") ||
-                    errorMessage.Contains("sharing violation") ||
-                    ex.ErrorCode == 32 || // Win32: ERROR_SHARING_VIOLATION
-                    ex.ErrorCode == 33)   // Win32: ERROR_LOCK_VIOLATION
+                // SQLITE_CORRUPT (11), SQLITE_NOTADB (26), SQLITE_IOERR (10)
+                if (ex.SqliteErrorCode == 11 || ex.SqliteErrorCode == 26 || ex.SqliteErrorCode == 10)
                 {
-                    _logger.LogDebug(
-                        "Database is temporarily locked (not corrupted): {DatabasePath}. " +
-                        "This is normal during startup when multiple services initialize.",
-                        dbPath);
-                    return false; // NOT corrupted, just locked
+                    _logger.LogError(ex,
+                        "SQLite database corruption detected: {DatabasePath}. ErrorCode: {ErrorCode}",
+                        dbPath, ex.SqliteErrorCode);
+                    return true;
                 }
 
-                // Any other LiteException indicates corruption or invalid database
-                _logger.LogError(ex,
-                    "Database corruption or invalid format detected: {DatabasePath}. " +
-                    "ErrorCode: {ErrorCode}",
-                    dbPath, ex.ErrorCode);
-                return true; // Assume corruption for all other LiteDB errors
+                // SQLITE_BUSY (5) / SQLITE_LOCKED (6) -- temporarily unavailable, not corrupted
+                if (ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6)
+                {
+                    _logger.LogDebug(
+                        "SQLite database is temporarily locked (not corrupted): {DatabasePath}",
+                        dbPath);
+                    return false;
+                }
+
+                _logger.LogWarning(ex,
+                    "SqliteException when checking database: {DatabasePath}. ErrorCode: {ErrorCode}. Assuming corrupted.",
+                    dbPath, ex.SqliteErrorCode);
+                return true;
             }
             catch (Exception ex)
             {
-                // Non-LiteDB exceptions (e.g., IOException) also indicate problems
-                // This could be file corruption, permission issues, or file system errors
                 _logger.LogWarning(ex,
-                    "Exception when checking database: {DatabasePath}. " +
-                    "Exception type: {ExceptionType}. Assuming corrupted.",
+                    "Exception when checking database: {DatabasePath}. ExceptionType: {ExceptionType}. Assuming corrupted.",
                     dbPath, ex.GetType().Name);
-                return true; // If we can't open the database, assume it's corrupted
+                return true;
             }
         }
 
@@ -125,7 +129,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, $"{tenantId}.db");
+            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
             var result = new DatabaseRebuildResult
             {
                 DatabaseType = "Metadata",
@@ -270,7 +274,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, $"{tenantId}-quotas.db");
+            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
             var result = new DatabaseRebuildResult
             {
                 DatabaseType = "Quota",
@@ -394,29 +398,18 @@ namespace Locus.Storage.Data
         {
             var report = new DatabaseHealthReport();
 
-            // Check metadata databases
+            // Check metadata databases: each tenant has its own subdirectory {metadataDirectory}/{tenantId}/metadata.db
             if (_fileSystem.Directory.Exists(_metadataDirectory))
             {
-                var metadataFiles = _fileSystem.Directory.GetFiles(_metadataDirectory, "*.db");
-                var metadataFileNames = new HashSet<string>(
-                    metadataFiles
-                        .Select(p => _fileSystem.Path.GetFileNameWithoutExtension(p))
-                        .Where(n => !string.IsNullOrWhiteSpace(n)),
-                    StringComparer.OrdinalIgnoreCase);
-
-                foreach (var dbPath in metadataFiles)
+                var tenantDirs = _fileSystem.Directory.GetDirectories(_metadataDirectory);
+                foreach (var dir in tenantDirs)
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    var tenantId = _fileSystem.Path.GetFileNameWithoutExtension(dbPath);
+                    var tenantId = _fileSystem.Path.GetFileName(dir);
+                    var dbPath = _fileSystem.Path.Combine(dir, "metadata.db");
 
-                    // Skip backup files created by LiteDB Rebuild() or corruption recovery
-                    // Examples: "tenant-001.db-backup-1", "tenant-001.db.corrupted.20240122120000"
-                    if (IsBackupFile(tenantId))
-                        continue;
-
-                    // Skip LiteDB sidecar log files like "{tenantId}-log.db"
-                    if (IsMetadataLogSidecar(tenantId, metadataFileNames))
+                    if (!_fileSystem.File.Exists(dbPath))
                         continue;
 
                     var isCorrupted = IsDatabaseCorrupted(dbPath);
@@ -438,24 +431,19 @@ namespace Locus.Storage.Data
                 }
             }
 
-            // Check quota databases
+            // Check quota databases: each tenant has its own subdirectory {quotaDirectory}/{tenantId}/quotas.db
             if (_fileSystem.Directory.Exists(_quotaDirectory))
             {
-                var quotaFiles = _fileSystem.Directory.GetFiles(_quotaDirectory, "*-quotas.db");
-                foreach (var dbPath in quotaFiles)
+                var tenantDirs = _fileSystem.Directory.GetDirectories(_quotaDirectory);
+                foreach (var dir in tenantDirs)
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    var fileName = _fileSystem.Path.GetFileNameWithoutExtension(dbPath);
+                    var tenantId = _fileSystem.Path.GetFileName(dir);
+                    var dbPath = _fileSystem.Path.Combine(dir, "quotas.db");
 
-                    // Skip backup files before extracting tenant ID
-                    // Examples: "tenant-001-quotas.db-backup-1", "tenant-001-quotas.db.corrupted.20240122120000"
-                    if (IsBackupFile(fileName))
+                    if (!_fileSystem.File.Exists(dbPath))
                         continue;
-
-                    var tenantId = fileName.EndsWith("-quotas")
-                        ? fileName.Substring(0, fileName.Length - 7)
-                        : fileName;
 
                     var isCorrupted = IsDatabaseCorrupted(dbPath);
 
@@ -514,40 +502,5 @@ namespace Locus.Storage.Data
             return fallback;
         }
 
-        /// <summary>
-        /// Checks if a tenant ID represents a backup file rather than a real tenant.
-        /// LiteDB Rebuild() creates temporary backup files like "tenant-001.db-backup-1".
-        /// Corruption recovery creates backups like "tenant-001.db.corrupted.20240122120000".
-        /// </summary>
-        private static bool IsBackupFile(string tenantId)
-        {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                return true;
-
-            // LiteDB Rebuild backup pattern: ends with "-backup" or "-backup-N"
-            // Examples: "tenant-001.db-backup-1", "tenant-001.db-backup-2"
-            if (tenantId.Contains("-backup", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            // Corruption recovery backup pattern: contains ".corrupted."
-            // Examples: "tenant-001.db.corrupted.20240122120000"
-            if (tenantId.Contains(".corrupted.", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            // LiteDB journal files
-            if (tenantId.EndsWith("-journal", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            return false;
-        }
-
-        private static bool IsMetadataLogSidecar(string tenantId, HashSet<string> metadataFileNames)
-        {
-            if (!tenantId.EndsWith("-log", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var baseTenantId = tenantId.Substring(0, tenantId.Length - 4);
-            return metadataFileNames.Contains(baseTenantId);
-        }
     }
 }

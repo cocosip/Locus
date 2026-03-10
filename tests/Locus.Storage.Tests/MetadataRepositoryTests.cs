@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Models;
 using Locus.Storage.Data;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -90,18 +91,22 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task GetAllTenantIdsAsync_IgnoresLiteDbLogSidecarFiles()
+        public async Task GetAllTenantIdsAsync_EnumeratesSubdirectoriesAsTenantIds()
         {
-            const string tenantId = "tenant-log-filter";
-            var mainDbPath = Path.Combine(_metadataDir, $"{tenantId}.db");
-            var logDbPath = Path.Combine(_metadataDir, $"{tenantId}-log.db");
-            _fileSystem.File.WriteAllText(mainDbPath, "main");
-            _fileSystem.File.WriteAllText(logDbPath, "log");
+            // Each tenant gets its own subdirectory; only directory names are returned as tenant IDs.
+            const string tenantA = "tenant-subdir-a";
+            const string tenantB = "tenant-subdir-b";
+            _fileSystem.Directory.CreateDirectory(Path.Combine(_metadataDir, tenantA));
+            _fileSystem.Directory.CreateDirectory(Path.Combine(_metadataDir, tenantB));
+            // A stray file in the root dir should not appear as a tenant ID.
+            _fileSystem.File.WriteAllText(Path.Combine(_metadataDir, "stray.db"), "data");
 
             var tenantIds = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
 
-            Assert.Contains(tenantId, tenantIds);
-            Assert.DoesNotContain($"{tenantId}-log", tenantIds);
+            Assert.Contains(tenantA, tenantIds);
+            Assert.Contains(tenantB, tenantIds);
+            Assert.DoesNotContain("stray", tenantIds);
+            Assert.DoesNotContain("stray.db", tenantIds);
         }
 
         [Fact]
@@ -395,6 +400,7 @@ namespace Locus.Storage.Tests
             finally
             {
                 saturatedRepo.Dispose();
+                SqliteConnection.ClearAllPools();
                 if (_fileSystem.Directory.Exists(saturatedDir))
                     _fileSystem.Directory.Delete(saturatedDir, recursive: true);
             }
@@ -469,6 +475,7 @@ namespace Locus.Storage.Tests
         public void Dispose()
         {
             _repository.Dispose();
+            SqliteConnection.ClearAllPools();
 
             try
             {
