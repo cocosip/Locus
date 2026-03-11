@@ -194,6 +194,41 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetByFileKeyAsync_ReturnsDetachedClone()
+        {
+            var original = CreateMetadata("file-clone", FileProcessingStatus.Pending);
+            await _repository.AddOrUpdateAsync(original, CancellationToken.None);
+
+            var snapshot = await _repository.GetByFileKeyAsync("file-clone", CancellationToken.None);
+            Assert.NotNull(snapshot);
+
+            snapshot!.Status = FileProcessingStatus.PermanentlyFailed;
+            snapshot.LastError = "mutated-outside";
+
+            var current = await _repository.GetAsync(_tenantId, "file-clone", CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Pending, current!.Status);
+            Assert.Null(current.LastError);
+        }
+
+        [Fact]
+        public async Task GetByTenantAsync_ReturnsDetachedClones()
+        {
+            var original = CreateMetadata("tenant-clone", FileProcessingStatus.Pending);
+            await _repository.AddOrUpdateAsync(original, CancellationToken.None);
+
+            var tenantEntries = (await _repository.GetByTenantAsync(_tenantId, CancellationToken.None)).ToList();
+            var snapshot = Assert.Single(tenantEntries);
+            snapshot.Status = FileProcessingStatus.Processing;
+            snapshot.LastError = "mutated-outside";
+
+            var current = await _repository.GetAsync(_tenantId, "tenant-clone", CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Pending, current!.Status);
+            Assert.Null(current.LastError);
+        }
+
+        [Fact]
         public async Task GetByFileKeyAsync_ReturnsNullAfterRemove()
         {
             await _repository.AddOrUpdateAsync(CreateMetadata("file-remove", FileProcessingStatus.Pending), CancellationToken.None);

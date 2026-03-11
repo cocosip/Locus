@@ -52,6 +52,7 @@ namespace Locus.Storage
         // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
         private const int MaxImportedFilesCacheSize = 10_000;
         private const int ImportedFilesPruneBudgetPerScan = 500;
+        private const int MaxRecordedErrorsPerScanResult = 100;
         private const string InFlightImportMarker = "__LOCUS_IN_FLIGHT__";
         private const string ImportedFilesCheckpointFileName = "imported-files.json";
         private const string ImportedFilesJournalFileName = "imported-files.journal.jsonl";
@@ -944,7 +945,7 @@ namespace Locus.Storage
             }
             catch (Exception ex)
             {
-                result.Errors.Add($"Scan error: {ex.Message}");
+                AppendError(result, $"Scan error: {ex.Message}");
                 _logger.LogError(ex, "Error scanning directory for watcher {WatcherId}", configuration.WatcherId);
             }
 
@@ -1041,7 +1042,7 @@ namespace Locus.Storage
                 }
                 catch (Exception ex)
                 {
-                    result.Errors.Add($"Error scanning tenant directory {tenantDirectory}: {ex.Message}");
+                    AppendError(result, $"Error scanning tenant directory {tenantDirectory}: {ex.Message}");
                     _logger.LogError(ex, "Error scanning tenant directory {TenantDirectory}", tenantDirectory);
                 }
             }
@@ -1307,7 +1308,7 @@ namespace Locus.Storage
             catch (Exception ex)
             {
                 fileResult.FilesFailed++;
-                fileResult.Errors.Add($"{filePath}: {ex.Message}");
+                AppendError(fileResult, $"{filePath}: {ex.Message}");
                 _logger.LogError(ex, "Failed to import file {FilePath}", filePath);
             }
             finally
@@ -1339,7 +1340,17 @@ namespace Locus.Storage
             target.FilesSkipped += source.FilesSkipped;
             target.FilesFailed += source.FilesFailed;
             target.BytesImported += source.BytesImported;
-            target.Errors.AddRange(source.Errors);
+
+            foreach (var error in source.Errors)
+                AppendError(target, error);
+        }
+
+        private static void AppendError(FileWatcherScanResult result, string error)
+        {
+            if (result.Errors.Count >= MaxRecordedErrorsPerScanResult)
+                return;
+
+            result.Errors.Add(error);
         }
 
         private IEnumerable<string> GetFilesRecursive(
@@ -1747,10 +1758,38 @@ namespace Locus.Storage
         private async Task SaveConfigurationAsync(FileWatcherConfiguration configuration, CancellationToken ct)
         {
             var configPath = GetConfigurationPath(configuration.WatcherId);
+            var tempPath = configPath + ".tmp." + Guid.NewGuid().ToString("N");
 
-            using (var stream = _fileSystem.File.Create(configPath))
+            try
             {
-                await JsonSerializer.SerializeAsync(stream, configuration, JsonOptions, ct);
+                using (var stream = _fileSystem.File.Create(tempPath))
+                {
+                    await JsonSerializer.SerializeAsync(stream, configuration, JsonOptions, ct);
+                    await stream.FlushAsync(ct);
+                }
+
+                if (_fileSystem.File.Exists(configPath))
+                {
+                    _fileSystem.File.Replace(tempPath, configPath, null);
+                }
+                else
+                {
+                    _fileSystem.File.Move(tempPath, configPath);
+                }
+            }
+            catch
+            {
+                try
+                {
+                    if (_fileSystem.File.Exists(tempPath))
+                        _fileSystem.File.Delete(tempPath);
+                }
+                catch
+                {
+                    // Best-effort cleanup only.
+                }
+
+                throw;
             }
 
             InvalidateWatchersCache();

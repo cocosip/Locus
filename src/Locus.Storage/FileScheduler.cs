@@ -328,8 +328,9 @@ namespace Locus.Storage
                             metadata.FileKey, metadata.PhysicalPath);
 
                         // Decrement quota counters before removing metadata so they stay consistent.
-                        // Using CancellationToken.None so a mid-flight cancellation of the outer
-                        // scan does not leave quota and metadata in an inconsistent state.
+                        // Use CancellationToken.None for the full cleanup sequence once a candidate
+                        // orphan has been selected; otherwise a mid-flight cancellation could leave
+                        // quotas decremented while the metadata row remains present.
                         if (_tenantQuotaManager != null)
                         {
                             try
@@ -354,7 +355,7 @@ namespace Locus.Storage
                             }
                         }
 
-                        await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
+                        await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, CancellationToken.None);
                         removedCount++;
                     }
                 }

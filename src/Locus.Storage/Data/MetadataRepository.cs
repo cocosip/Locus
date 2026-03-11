@@ -573,8 +573,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
                     try
                     {
-                        // Remove from cache to force rebuild
-                        _databases.TryRemove(tid, out _);
+                        // IMPORTANT: do NOT remove _databases[tid] from inside this Lazy factory.
+                        // Doing so would allow a concurrent caller to race in and install a second
+                        // Lazy for the same tenant while this factory is still rebuilding the file.
+                        // Clear only the tenant-specific in-memory indexes; the current Lazy instance
+                        // will remain the single publisher and will return the recovered connection.
                         if (_activeFiles.TryRemove(tid, out var staleTenantCache))
                             RemoveTenantFromGlobalIndex(staleTenantCache);
                         _physicalPathIndex.TryRemove(tid, out _);
@@ -886,7 +889,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
             var cache = GetCache(tenantId);
             cache.TryGetValue(fileKey, out var metadata);
-            return Task.FromResult<FileMetadata?>(metadata);
+            return Task.FromResult<FileMetadata?>(metadata?.Clone());
         }
 
         /// <summary>
@@ -1052,7 +1055,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
             var cache = GetCache(tenantId);
-            var results = cache.Values.ToList();
+            var results = cache.Values.Select(m => m.Clone()).ToList();
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
         }
 
@@ -1176,7 +1179,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
             foreach (var kvp in _activeFiles)
             {
-                var tenantFiles = kvp.Value.Values.Where(m => m.Status == status);
+                var tenantFiles = kvp.Value.Values.Where(m => m.Status == status).Select(m => m.Clone());
                 results.AddRange(tenantFiles);
             }
 
@@ -1880,7 +1883,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 && _activeFiles.TryGetValue(tenantId, out var indexedTenantFiles)
                 && indexedTenantFiles.TryGetValue(fileKey, out var indexedMetadata))
             {
-                return Task.FromResult<FileMetadata?>(indexedMetadata);
+                return Task.FromResult<FileMetadata?>(indexedMetadata.Clone());
             }
 
             // Fallback: recover from stale/missing index entries (rare, e.g. after crash recovery).
@@ -1890,7 +1893,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     continue;
 
                 _fileKeyTenantIndex[fileKey] = tenantEntry.Key;
-                return Task.FromResult<FileMetadata?>(metadata);
+                return Task.FromResult<FileMetadata?>(metadata.Clone());
             }
 
             _fileKeyTenantIndex.TryRemove(fileKey, out _);
@@ -1906,7 +1909,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
             foreach (var kvp in _activeFiles)
             {
-                results.AddRange(kvp.Value.Values);
+                results.AddRange(kvp.Value.Values.Select(m => m.Clone()));
             }
 
             return Task.FromResult<IEnumerable<FileMetadata>>(results);

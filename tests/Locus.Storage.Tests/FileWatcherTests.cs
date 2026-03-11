@@ -717,6 +717,52 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_ErrorList_IsCappedToPreventUnboundedGrowth()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-errors";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            for (var i = 0; i < 150; i++)
+            {
+                var filePath = Path.Combine(watchPath, $"file-{i:D3}.txt");
+                _fileSystem.File.WriteAllText(filePath, "content");
+                _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-1));
+            }
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("boom"));
+
+            var config = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                MaxConcurrentImports = 8,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+
+            var result = await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            Assert.Equal(150, result.FilesDiscovered);
+            Assert.Equal(150, result.FilesFailed);
+            Assert.Equal(100, result.Errors.Count);
+        }
+
+        [Fact]
         public async Task EnableWatcherAsync_UpdatesWatcherStatus()
         {
             // Arrange

@@ -200,6 +200,49 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupOrphanedMetadataAsync_IgnoresCancellationAfterQuotaDecrementAndRemovesMetadata()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>();
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            var fileKey = "orphan-cleanup";
+            var physicalPath = Path.Combine(_metadataDir, "missing-file.txt");
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            using var cts = new CancellationTokenSource();
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns((string _, CancellationToken __) =>
+                {
+                    cts.Cancel();
+                    return Task.CompletedTask;
+                });
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(cts.Token);
+
+            Assert.Equal(1, removed);
+            Assert.Null(await _repository.GetAsync("tenant-001", fileKey, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAndDeleteAsync_RemovesMetadata()
         {
             // Arrange

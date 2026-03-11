@@ -334,9 +334,37 @@ namespace Locus.MultiTenant
                 _fileSystem.Directory.CreateDirectory(directory);
             }
 
-            using (var stream = _fileSystem.File.Create(metadataPath))
+            var tempPath = metadataPath + ".tmp." + Guid.NewGuid().ToString("N");
+            try
             {
-                await JsonSerializer.SerializeAsync(stream, metadata, JsonOptions, ct);
+                using (var stream = _fileSystem.File.Create(tempPath))
+                {
+                    await JsonSerializer.SerializeAsync(stream, metadata, JsonOptions, ct);
+                    await stream.FlushAsync(ct);
+                }
+
+                if (_fileSystem.File.Exists(metadataPath))
+                {
+                    _fileSystem.File.Replace(tempPath, metadataPath, null);
+                }
+                else
+                {
+                    _fileSystem.File.Move(tempPath, metadataPath);
+                }
+            }
+            catch
+            {
+                try
+                {
+                    if (_fileSystem.File.Exists(tempPath))
+                        _fileSystem.File.Delete(tempPath);
+                }
+                catch
+                {
+                    // Best-effort cleanup only.
+                }
+
+                throw;
             }
         }
 

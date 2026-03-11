@@ -200,6 +200,23 @@ namespace Locus.MultiTenant.Tests
         }
 
         [Fact]
+        public async Task SaveTenantMetadataAsync_UsesAtomicReplaceWithoutLeavingTempFiles()
+        {
+            var tenantId = "tenant-atomic";
+            await _tenantManager.CreateTenantAsync(tenantId, CancellationToken.None);
+            await _tenantManager.DisableTenantAsync(tenantId, CancellationToken.None);
+
+            var metadataPath = $".locus/tenants/{tenantId}.json";
+            Assert.True(_fileSystem.File.Exists(metadataPath));
+            Assert.DoesNotContain(
+                _fileSystem.AllFiles,
+                path => path.Contains(".tmp.", System.StringComparison.OrdinalIgnoreCase));
+
+            var tenant = await _tenantManager.GetTenantAsync(tenantId, CancellationToken.None);
+            Assert.Equal(TenantStatus.Disabled, tenant.Status);
+        }
+
+        [Fact]
         public async Task DisableTenantAsync_InvalidatesCache()
         {
             // Arrange
