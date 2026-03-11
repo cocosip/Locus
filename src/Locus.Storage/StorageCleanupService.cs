@@ -484,20 +484,11 @@ namespace Locus.Storage
 
             // Orphan rebuild restores files that already exist physically, so quota counters must
             // reflect reality even if the current configured limit would reject a normal increment.
-            // Use direct counter compensation rather than TryIncrementAsync's limit-enforcing path.
-            var tenantQuota = await _quotaRepository.GetOrCreateAsync(metadata.TenantId, metadata.TenantId, ct);
-            await _quotaRepository.SetCurrentCountAsync(
-                metadata.TenantId,
-                metadata.TenantId,
-                tenantQuota.CurrentCount + 1,
-                ct);
-
-            var directoryQuota = await _quotaRepository.GetOrCreateAsync(metadata.TenantId, normalizedDirectoryPath, ct);
-            await _quotaRepository.SetCurrentCountAsync(
-                metadata.TenantId,
-                normalizedDirectoryPath,
-                directoryQuota.CurrentCount + 1,
-                ct);
+            // Use ForceIncrementAsync (unconditional atomic increment) to avoid the TOCTOU race
+            // in the old GetOrCreateAsync + SetCurrentCountAsync(count+1) pattern: concurrent writers
+            // or decrements occurring between the read and the write would be silently lost.
+            await _quotaRepository.ForceIncrementAsync(metadata.TenantId, metadata.TenantId, ct);
+            await _quotaRepository.ForceIncrementAsync(metadata.TenantId, normalizedDirectoryPath, ct);
         }
 
         /// <inheritdoc/>

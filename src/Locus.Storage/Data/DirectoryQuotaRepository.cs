@@ -164,26 +164,51 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
 
                     try
                     {
-                        // Remove from cache to force rebuild
-                        _databases.TryRemove(tid, out _);
-                        _quotaCache.TryRemove(tid, out _);
+                        // IMPORTANT: Do NOT call _databases.TryRemove(tid) or RebuildDatabaseNoLock(tid)
+                        // from inside the Lazy factory:
+                        //   - TryRemove would allow a concurrent thread to insert a competing Lazy
+                        //     into _databases while this factory is still executing, creating a race
+                        //     where two threads initialize the same database file simultaneously.
+                        //   - RebuildDatabaseNoLock calls lazyConn.Value which would deadlock because
+                        //     the Lazy lock (ExecutionAndPublication) is already held by this thread.
+                        // Instead, perform the file-level rebuild operations inline here.
+                        // The Lazy lock itself guarantees that only this thread is running this path.
+                        var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tid, "quotas.db");
 
-                        // Rebuild database synchronously (we're in Lazy initialization)
-                        var backupPath = RebuildDatabaseNoLock(tid);
+                        // Clear stale in-memory state so the Write-Behind timer cannot flush
+                        // old counts into the freshly rebuilt database.
+                        _quotaCache.TryRemove(tid, out _);
+                        _atomicCounters.TryRemove(tid, out _);
+                        _dirtyDirectoryKeysByTenant.TryRemove(tid, out _);
+                        _dirtyTenants.TryRemove(tid, out _);
+
+                        if (_fileSystem.File.Exists(dbPath))
+                        {
+                            // Release OS file handles before deleting (required on Windows).
+                            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+                            var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+                            _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+                            _logger.LogInformation("Backed up corrupted quota database: {BackupPath}", backupPath);
+
+                            _fileSystem.File.Delete(dbPath);
+                            _logger.LogInformation("Deleted corrupted quota database: {DatabasePath}", dbPath);
+
+                            DeleteSidecarFiles(dbPath);
+                        }
+
+                        // Open fresh connection and reload quotas into the in-memory cache.
+                        var recoveredConn = OpenAndInitializeConnection(dbPath);
+                        LoadQuotasForTenant(tid, recoveredConn);
 
                         _logger.LogWarning(
-                            "Quota database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}",
-                            tid, backupPath ?? "N/A");
-
-                        // Retry initialization
-                        var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tid, "quotas.db");
-                        var conn = OpenAndInitializeConnection(dbPath);
-
+                            "Quota database rebuilt for tenant {TenantId} during initialization.",
+                            tid);
                         _logger.LogInformation(
                             "Successfully recovered and initialized quota database for tenant {TenantId}",
                             tid);
 
-                        return conn;
+                        return recoveredConn;
                     }
                     catch (Exception recoveryEx)
                     {
@@ -1055,6 +1080,33 @@ ON CONFLICT(directory_path) DO UPDATE SET
         }
 
         /// <summary>
+        /// Unconditionally increments the file count for a directory, bypassing limit checks.
+        /// Used only for compensation (rollback of a prior failed decrement) to restore
+        /// an accurate counter without risk of spurious quota rejection.
+        /// Lock-free hot path: uses Interlocked.Increment on the atomic counter.
+        /// SQLite is updated asynchronously by the Write-Behind timer.
+        /// </summary>
+        public Task ForceIncrementAsync(string tenantId, string directoryPath, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(directoryPath))
+                throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
+
+            var state = GetOrCreateAtomicState(tenantId, directoryPath);
+
+            Interlocked.Increment(ref state.Count);
+            MarkDirty(tenantId, directoryPath, state);
+
+            _logger.LogDebug(
+                "Force-incremented count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
+                directoryPath, tenantId, Volatile.Read(ref state.Count), state.MaxCount);
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
         /// Gets all directory quotas for a tenant.
         /// Each entry's CurrentCount reflects the live atomic value.
         /// No lock needed: GetDatabase uses LazyThreadSafetyMode.ExecutionAndPublication
@@ -1136,7 +1188,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
                 if (!_fileSystem.File.Exists(dbPath))
                     return Task.FromResult((0L, 0L));
 
-                sizeBefore = new System.IO.FileInfo(dbPath).Length;
+                sizeBefore = _fileSystem.FileInfo.New(dbPath).Length;
 
                 // VACUUM requires exclusive write access to the database file.
                 // Running it on the shared long-lived connection (Cache=Shared) can fail
@@ -1182,7 +1234,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
                 }
 
                 if (_fileSystem.File.Exists(dbPath))
-                    sizeAfter = new System.IO.FileInfo(dbPath).Length;
+                    sizeAfter = _fileSystem.FileInfo.New(dbPath).Length;
 
                 _logger.LogDebug("SQLite VACUUM completed for quota tenant {TenantId}: {Before} -> {After} bytes", tenantId, sizeBefore, sizeAfter);
             }
@@ -1214,16 +1266,57 @@ ON CONFLICT(directory_path) DO UPDATE SET
         }
 
         /// <summary>
+        /// A scoped handle returned by <see cref="BeginDatabaseRebuildAsync"/> that holds
+        /// the exclusive tenant lock for the duration of a quota database rebuild operation.
+        /// Disposing this handle releases the lock and unblocks all pending operations
+        /// for the tenant. Use with a <c>using</c> declaration to guarantee release.
+        /// </summary>
+        public sealed class DatabaseRebuildLockHandle : IDisposable
+        {
+            private readonly DirectoryQuotaRepository _owner;
+            private readonly string _tenantId;
+            private int _disposed;
+
+            /// <summary>Path to the backup of the corrupted database, or null if no database existed.</summary>
+            public string? BackupPath { get; }
+
+            internal DatabaseRebuildLockHandle(DirectoryQuotaRepository owner, string tenantId, string? backupPath)
+            {
+                _owner = owner;
+                _tenantId = tenantId;
+                BackupPath = backupPath;
+            }
+
+            /// <summary>
+            /// Releases the exclusive tenant lock, unblocking all pending operations.
+            /// Safe to call multiple times (idempotent).
+            /// </summary>
+            public void Dispose()
+            {
+                if (System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0)
+                    _owner.FinishDatabaseRebuild(_tenantId);
+            }
+        }
+
+        /// <summary>
         /// Prepares for database rebuild by safely disposing connections and backing up the database.
         /// Thread-safe: Acquires exclusive lock for this tenant, blocking all operations.
-        /// IMPORTANT: Caller must call FinishDatabaseRebuild() to release the lock.
+        /// Returns a <see cref="DatabaseRebuildLockHandle"/> that MUST be disposed (via a
+        /// <c>using</c> declaration) to release the lock and unblock operations for the tenant.
         /// </summary>
-        public async Task<string?> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
+        /// <param name="tenantId">The tenant ID.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>
+        /// A handle whose <see cref="DatabaseRebuildLockHandle.BackupPath"/> is the path to the
+        /// corrupted database backup, or <c>null</c> if no database file existed.
+        /// </returns>
+        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            // Acquire exclusive lock - this will block all operations for this tenant
+            // Acquire exclusive lock - this will block all operations for this tenant.
+            // The lock is released when the caller disposes the returned handle.
             var tenantLock = GetTenantLock(tenantId);
             await tenantLock.WaitAsync(ct);
 
@@ -1231,24 +1324,24 @@ ON CONFLICT(directory_path) DO UPDATE SET
             {
                 AddTenantLockBypass(tenantId);
                 _logger.LogWarning("Beginning quota database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
-                return RebuildDatabaseNoLock(tenantId);
+                var backupPath = RebuildDatabaseNoLock(tenantId);
+                return new DatabaseRebuildLockHandle(this, tenantId, backupPath);
             }
             catch
             {
-                // If anything fails, release the lock immediately
+                // If anything fails, release the lock immediately before propagating the exception.
                 RemoveTenantLockBypass(tenantId);
                 tenantLock.Release();
                 throw;
             }
-
-            // NOTE: Lock is NOT released here - it will be released in FinishDatabaseRebuild()
         }
 
         /// <summary>
-        /// Finishes database rebuild by releasing the tenant lock.
-        /// IMPORTANT: Must be called after BeginDatabaseRebuildAsync() to unblock operations.
+        /// Releases the exclusive tenant lock acquired by <see cref="BeginDatabaseRebuildAsync"/>.
+        /// Called automatically by <see cref="DatabaseRebuildLockHandle.Dispose"/>;
+        /// callers should not invoke this directly.
         /// </summary>
-        public void FinishDatabaseRebuild(string tenantId)
+        private void FinishDatabaseRebuild(string tenantId)
         {
             if (_tenantLocks.TryGetValue(tenantId, out var tenantLock))
             {

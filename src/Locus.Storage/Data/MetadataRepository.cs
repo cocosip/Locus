@@ -1527,6 +1527,10 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 if (gate.Wait(0))
                 {
                     gate.Release();
+                    // Re-check prefetch buffer: a concurrent writer may have enqueued an entry
+                    // between the pendingCount check above and the gate acquisition.
+                    if (TryTakePrefetchedPending(tenantId, out prefetched))
+                        return prefetched;
                     return null;
                 }
 
@@ -1928,7 +1932,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 if (!_fileSystem.File.Exists(dbPath))
                     return Task.FromResult((0L, 0L));
 
-                sizeBefore = new System.IO.FileInfo(dbPath).Length;
+                sizeBefore = _fileSystem.FileInfo.New(dbPath).Length;
 
                 // VACUUM requires exclusive write access to the database file.
                 // Running it on the shared long-lived connection (Cache=Shared) can fail
@@ -1971,7 +1975,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 }
 
                 if (_fileSystem.File.Exists(dbPath))
-                    sizeAfter = new System.IO.FileInfo(dbPath).Length;
+                    sizeAfter = _fileSystem.FileInfo.New(dbPath).Length;
 
                 _logger.LogDebug("SQLite VACUUM completed for tenant {TenantId}: {Before} -> {After} bytes", tenantId, sizeBefore, sizeAfter);
             }
@@ -2005,7 +2009,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 }
             }
 
-            return await Task.FromResult<IEnumerable<string>>(tenantIds);
+            return tenantIds;
         }
 
         private void RemoveTenantFromGlobalIndex(ConcurrentDictionary<string, FileMetadata> tenantCache)
@@ -2135,19 +2139,51 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         }
 
         /// <summary>
+        /// A scoped handle returned by <see cref="BeginDatabaseRebuildAsync"/> that holds
+        /// the exclusive tenant lock for the duration of a database rebuild operation.
+        /// Disposing this handle releases the lock and unblocks all pending operations
+        /// for the tenant. Use with a <c>using</c> declaration to guarantee release.
+        /// </summary>
+        public sealed class DatabaseRebuildLockHandle : IDisposable
+        {
+            private readonly MetadataRepository _owner;
+            private readonly string _tenantId;
+            private int _disposed;
+
+            /// <summary>Path to the backup of the corrupted database, or null if no database existed.</summary>
+            public string? BackupPath { get; }
+
+            internal DatabaseRebuildLockHandle(MetadataRepository owner, string tenantId, string? backupPath)
+            {
+                _owner = owner;
+                _tenantId = tenantId;
+                BackupPath = backupPath;
+            }
+
+            /// <summary>
+            /// Releases the exclusive tenant lock, unblocking all pending operations.
+            /// Safe to call multiple times (idempotent).
+            /// </summary>
+            public void Dispose()
+            {
+                if (System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0)
+                    _owner.FinishDatabaseRebuild(_tenantId);
+            }
+        }
+
+        /// <summary>
         /// Prepares for database rebuild by safely disposing connections and backing up the database.
         /// Thread-safe: Acquires exclusive lock for this tenant, blocking all operations.
-        /// IMPORTANT: Caller must call FinishDatabaseRebuildAsync() to release the lock.
+        /// Returns a <see cref="DatabaseRebuildLockHandle"/> that MUST be disposed (via a
+        /// <c>using</c> declaration) to release the lock and unblock operations for the tenant.
         /// </summary>
         /// <param name="tenantId">The tenant ID.</param>
         /// <param name="ct">Cancellation token.</param>
-        /// <returns>Path to the backup file, or null if no database exists.</returns>
-        /// <remarks>
-        /// The tenant lock is ALWAYS held when this method returns (whether or not a backup
-        /// was created). The caller must always call <see cref="FinishDatabaseRebuild"/> to
-        /// release the lock, regardless of the return value.
-        /// </remarks>
-        public async Task<string?> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
+        /// <returns>
+        /// A handle whose <see cref="DatabaseRebuildLockHandle.BackupPath"/> is the path to the
+        /// corrupted database backup, or <c>null</c> if no database file existed.
+        /// </returns>
+        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -2158,21 +2194,22 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
             // Acquire exclusive lock - this will block all operations for this tenant.
-            // The lock is held until the caller invokes FinishDatabaseRebuild().
+            // The lock is released when the caller disposes the returned handle.
             await tenantLock.WaitAsync(ct);
 
             try
             {
-                // If database doesn't exist, nothing to backup. Return null with lock still held
-                // so the caller always releases via FinishDatabaseRebuild() (consistent contract).
+                // If database doesn't exist, nothing to backup. Return a handle with null BackupPath;
+                // the lock is still held so the caller can safely create a fresh database.
                 if (!_fileSystem.File.Exists(dbPath))
                 {
                     _logger.LogInformation("No database file to rebuild for tenant {TenantId}", tenantId);
-                    return null;
+                    return new DatabaseRebuildLockHandle(this, tenantId, backupPath: null);
                 }
 
                 _logger.LogWarning("Beginning database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
+                string backupPath;
                 lock (GetDatabaseLock(tenantId))
                 {
                     // Step 1: Remove from cache FIRST so no other thread can acquire the disposed instance.
@@ -2215,7 +2252,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                     // Step 4: Backup corrupted database
-                    var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+                    backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                     _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
                     _logger.LogInformation("Backed up corrupted database: {BackupPath}", backupPath);
 
@@ -2225,26 +2262,24 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
                     // Also delete SQLite WAL and SHM sidecar files so the new database starts clean.
                     DeleteSidecarFiles(dbPath);
-
-                    return backupPath;
                 }
+
+                return new DatabaseRebuildLockHandle(this, tenantId, backupPath);
             }
             catch
             {
-                // If anything fails, release the lock immediately
+                // If anything fails, release the lock immediately before propagating the exception.
                 tenantLock.Release();
                 throw;
             }
-
-            // NOTE: Lock is NOT released here - it will be released in FinishDatabaseRebuildAsync()
         }
 
         /// <summary>
-        /// Finishes database rebuild by releasing the tenant lock.
-        /// IMPORTANT: Must be called after BeginDatabaseRebuildAsync() to unblock operations.
+        /// Releases the exclusive tenant lock acquired by <see cref="BeginDatabaseRebuildAsync"/>.
+        /// Called automatically by <see cref="DatabaseRebuildLockHandle.Dispose"/>;
+        /// callers should not invoke this directly.
         /// </summary>
-        /// <param name="tenantId">The tenant ID.</param>
-        public void FinishDatabaseRebuild(string tenantId)
+        private void FinishDatabaseRebuild(string tenantId)
         {
             if (_tenantLocks.TryGetValue(tenantId, out var tenantLock))
             {

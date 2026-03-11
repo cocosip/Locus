@@ -43,8 +43,10 @@ namespace Locus.MultiTenant.Tests
             // Verify metadata file exists
             Assert.True(_fileSystem.File.Exists($".locus/tenants/{tenantId}.json"));
 
-            // Verify storage directory exists
-            Assert.True(_fileSystem.Directory.Exists($"storage/{tenantId}"));
+            // Verify storage directory exists alongside the metadata root (not at CWD/storage).
+            // TenantManager derives the storage path from _metadataRoot's parent to avoid CWD dependency:
+            // metadataRoot=".locus/tenants" => storagePath=".locus/storage/{tenantId}"
+            Assert.True(_fileSystem.Directory.Exists($".locus/storage/{tenantId}"));
         }
 
         [Fact]

@@ -186,13 +186,20 @@ namespace Locus.MultiTenant
             if (_fileSystem.File.Exists(metadataPath))
                 throw new InvalidOperationException($"Tenant '{tenantId}' already exists.");
 
+            // Derive storage path relative to the metadata root's parent directory so the
+            // storage directory stays alongside metadata rather than anchoring to the process CWD.
+            // e.g. _metadataRoot = "/data/locus-metadata" => storage = "/data/storage/{tenantId}"
+            //      _metadataRoot = ".locus/tenants"       => storage = ".locus/storage/{tenantId}"
+            var metadataParent = _fileSystem.Path.GetDirectoryName(_metadataRoot) ?? string.Empty;
+            var resolvedStoragePath = _fileSystem.Path.Combine(metadataParent, "storage", tenantId);
+
             var metadata = new TenantMetadata
             {
                 TenantId = tenantId,
                 Status = TenantStatus.Enabled,
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow,
-                StoragePath = Path.Combine("storage", tenantId)
+                StoragePath = resolvedStoragePath
             };
 
             await SaveTenantMetadataAsync(metadata, ct);

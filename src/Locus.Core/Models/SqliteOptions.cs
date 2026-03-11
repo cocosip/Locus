@@ -44,13 +44,13 @@ namespace Locus.Core.Models
         /// <summary>
         /// Gets or sets whether to run a WAL checkpoint after every batch commit.
         /// When true, each write cycle calls PRAGMA wal_checkpoint(PASSIVE) after COMMIT,
-        /// which merges committed WAL pages into the main database file. This keeps the WAL
-        /// small and reduces the risk of corruption if the process is killed during a later
-        /// automatic checkpoint. The slight extra I/O is outweighed by reliability gains for
-        /// small metadata files.
-        /// Default: true
+        /// which merges committed WAL pages into the main database file. This can reduce WAL
+        /// growth, but it also adds extra I/O and can reduce write throughput when commits are
+        /// frequent. Prefer leaving this disabled for normal operation and trigger checkpoints
+        /// from explicit maintenance workflows when needed.
+        /// Default: false
         /// </summary>
-        public bool CheckpointAfterBatch { get; set; } = true;
+        public bool CheckpointAfterBatch { get; set; } = false;
 
         /// <summary>
         /// Builds the SQLite connection string for the given database file path.

@@ -198,8 +198,11 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
-            await _repository.SetCurrentCountAsync(tenantId, tenantId, quota.CurrentCount + 1, ct);
+            // Use ForceIncrementAsync (unconditional atomic increment) rather than
+            // GetOrCreateAsync + SetCurrentCountAsync to avoid the TOCTOU race where a
+            // concurrent writer could read the same stale CurrentCount and both add 1,
+            // or a concurrent decrement could be lost.
+            await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
 
             _logger.LogDebug("Compensated file count for tenant {TenantId}", tenantId);
         }

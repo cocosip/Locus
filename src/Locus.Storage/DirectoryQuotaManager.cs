@@ -141,8 +141,11 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(directoryPath))
                 throw new ArgumentException("Directory path cannot be empty", nameof(directoryPath));
 
-            var quota = await _repository.GetOrCreateAsync(tenantId, directoryPath, ct);
-            await _repository.SetCurrentCountAsync(tenantId, directoryPath, quota.CurrentCount + 1, ct);
+            // Use ForceIncrementAsync (unconditional atomic increment) rather than
+            // GetOrCreateAsync + SetCurrentCountAsync to avoid the TOCTOU race where a
+            // concurrent writer could read the same stale CurrentCount and both add 1,
+            // or a concurrent decrement could be lost.
+            await _repository.ForceIncrementAsync(tenantId, directoryPath, ct);
 
             _logger.LogDebug(
                 "Compensated directory file count for directory: {DirectoryPath}, Tenant: {TenantId}",

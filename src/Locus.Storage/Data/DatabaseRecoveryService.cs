@@ -139,14 +139,14 @@ namespace Locus.Storage.Data
 
             _logger.LogWarning("Starting THREAD-SAFE metadata database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
-            var rebuildLockHeld = false;
             try
             {
-                // Step 1: Begin rebuild (acquires lock, backs up and deletes corrupted DB)
-                result.BackupPath = await _metadataRepository.BeginDatabaseRebuildAsync(tenantId, ct);
-                // Lock is ALWAYS held after BeginDatabaseRebuildAsync returns (regardless of
-                // whether a backup exists). FinishDatabaseRebuild() must be called in finally.
-                rebuildLockHeld = true;
+                // BeginDatabaseRebuildAsync acquires the exclusive tenant lock and returns a handle
+                // that releases the lock on Dispose. The using declaration inside this try block
+                // guarantees the lock is released when the block exits (normally or via exception),
+                // while the catch block below handles all failures (including cancellation) uniformly.
+                using var rebuildHandle = await _metadataRepository.BeginDatabaseRebuildAsync(tenantId, ct);
+                result.BackupPath = rebuildHandle.BackupPath;
 
                 if (result.BackupPath == null)
                 {
@@ -248,14 +248,6 @@ namespace Locus.Storage.Data
                 result.Errors.Add($"Rebuild failed: {ex.Message}");
                 _logger.LogError(ex, "Failed to rebuild metadata database for tenant {TenantId}", tenantId);
             }
-            finally
-            {
-                // Step 3: Release the lock (always held after a successful BeginDatabaseRebuildAsync call).
-                if (rebuildLockHeld)
-                {
-                    _metadataRepository.FinishDatabaseRebuild(tenantId);
-                }
-            }
 
             return result;
         }
@@ -286,12 +278,14 @@ namespace Locus.Storage.Data
 
             _logger.LogWarning("Starting THREAD-SAFE quota database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
 
-            var rebuildLockHeld = false;
             try
             {
-                // Step 1: Begin rebuild (acquires lock, backs up and deletes corrupted DB)
-                result.BackupPath = await _quotaRepository.BeginDatabaseRebuildAsync(tenantId, ct);
-                rebuildLockHeld = true;
+                // BeginDatabaseRebuildAsync acquires the exclusive tenant lock and returns a handle
+                // that releases the lock on Dispose. The using declaration inside this try block
+                // guarantees the lock is released when the block exits (normally or via exception),
+                // while the catch block below handles all failures (including cancellation) uniformly.
+                using var rebuildHandle = await _quotaRepository.BeginDatabaseRebuildAsync(tenantId, ct);
+                result.BackupPath = rebuildHandle.BackupPath;
 
                 if (result.BackupPath == null)
                 {
@@ -320,7 +314,7 @@ namespace Locus.Storage.Data
 
                     try
                     {
-                        // BeginDatabaseRebuildAsync already holds the tenant lock until FinishDatabaseRebuild.
+                        // BeginDatabaseRebuildAsync already holds the tenant lock (via the handle).
                         // Use the rebuild-specific path to avoid re-acquiring the same lock and deadlocking.
                         await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, kvp.Key, kvp.Value, ct);
                         rebuiltQuotas++;
@@ -347,14 +341,6 @@ namespace Locus.Storage.Data
                 result.Success = false;
                 result.Errors.Add($"Rebuild failed: {ex.Message}");
                 _logger.LogError(ex, "Failed to rebuild quota database for tenant {TenantId}", tenantId);
-            }
-            finally
-            {
-                // Step 3: Always release the lock
-                if (rebuildLockHeld)
-                {
-                    _quotaRepository.FinishDatabaseRebuild(tenantId);
-                }
             }
 
             return result;
