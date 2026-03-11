@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace Locus.Core.Models
 {
@@ -67,12 +68,32 @@ namespace Locus.Core.Models
             return $"Data Source={databasePath};Cache=Shared;Mode=ReadWriteCreate";
         }
 
+        // Whitelists for PRAGMA values that are user-configurable strings.
+        // CacheSizeKb and BusyTimeoutMs are integers so no whitelist is needed there.
+        private static readonly HashSet<string> ValidJournalModes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF" };
+
+        private static readonly HashSet<string> ValidSynchronousModes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "OFF", "NORMAL", "FULL", "EXTRA", "0", "1", "2", "3" };
+
         /// <summary>
         /// Builds the PRAGMA initialization SQL to run immediately after opening a connection.
         /// </summary>
         /// <returns>A SQL string containing all PRAGMA statements separated by semicolons.</returns>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when <see cref="JournalMode"/> or <see cref="SynchronousMode"/> contain values
+        /// outside the known-safe whitelist, preventing PRAGMA SQL injection.
+        /// </exception>
         public string BuildPragmaSql()
         {
+            if (!ValidJournalModes.Contains(JournalMode))
+                throw new InvalidOperationException(
+                    $"Invalid SQLite journal mode '{JournalMode}'. Allowed values: {string.Join(", ", ValidJournalModes)}");
+
+            if (!ValidSynchronousModes.Contains(SynchronousMode))
+                throw new InvalidOperationException(
+                    $"Invalid SQLite synchronous mode '{SynchronousMode}'. Allowed values: {string.Join(", ", ValidSynchronousModes)}");
+
             return
                 $"PRAGMA journal_mode={JournalMode};" +
                 $"PRAGMA synchronous={SynchronousMode};" +

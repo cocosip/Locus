@@ -134,7 +134,7 @@ namespace Locus.Storage.Data
         private int _persistenceChannelPeakDepth;
         private int _coalescedDepth;
 
-        private bool _disposed;
+        private volatile bool _disposed;
 
         // Discriminated union for channel messages
         private readonly struct PersistenceOperation
@@ -768,6 +768,9 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// </remarks>
         public Task AddOrUpdateAsync(FileMetadata metadata, CancellationToken ct)
         {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MetadataRepository));
+
             if (metadata == null)
                 throw new ArgumentNullException(nameof(metadata));
 
@@ -853,7 +856,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             if (wasP && !isP)
                 InvalidatePendingGeneration(metadata.TenantId, metadata.FileKey);
 
-            // Enqueue when Pending 鈥?stale entries skipped on dequeue (same as AddOrUpdateAsync).
+            // Enqueue when Pending -- stale entries skipped on dequeue (same as AddOrUpdateAsync).
             if (isP)
                 EnqueuePendingCandidate(metadata);
 
@@ -892,6 +895,9 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// </summary>
         public Task<bool> RemoveAsync(string tenantId, string fileKey, CancellationToken ct)
         {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MetadataRepository));
+
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
@@ -1367,6 +1373,12 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             }
         }
 
+        // Maximum number of stale index entries to discard in a single GetStatusBatchFromIndex call.
+        // Bounds the work done per cleanup call when the index contains many stale entries
+        // (e.g. files that were deleted between index insertion and cleanup scan).
+        // Stale entries that are not processed this cycle will be retried on the next cleanup run.
+        private const int MaxStatusIndexStaleSkipsPerCall = 500;
+
         private IReadOnlyList<FileMetadata> GetStatusBatchFromIndex(
             string tenantId,
             DateTime cutoffUtc,
@@ -1388,7 +1400,9 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
             lock (indexLock)
             {
-                while (results.Count < limit && index.TryPeek(out var peek))
+                while (results.Count < limit
+                    && staleSkips < MaxStatusIndexStaleSkipsPerCall
+                    && index.TryPeek(out var peek))
                 {
                     if (peek.TimestampUtc >= cutoffUtc)
                         break;
@@ -2061,7 +2075,14 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 return null;
             }
 
-            lock (GetDatabaseLock(tenantId))
+            // IMPORTANT: Do NOT acquire GetDatabaseLock here.
+            // This method is only called from within the Lazy<SqliteConnection> factory in GetDatabase,
+            // which holds the Lazy.ExecutionAndPublication lock for this tenant.
+            // If we try to acquire GetDatabaseLock we risk a deadlock:
+            //   Thread A: inside Lazy factory (holds Lazy lock) → wants GetDatabaseLock
+            //   Thread B: inside AddOrUpdateDirectAsync (holds GetDatabaseLock) → waits on Lazy.Value
+            // The Lazy lock already serializes all concurrent callers for this tenantId, so all
+            // ConcurrentDictionary updates and file operations below are safe without an extra lock.
             {
                 // Remove from cache FIRST so no concurrent thread can acquire the disposed instance.
                 _databases.TryRemove(tenantId, out var existingLazy);
@@ -2242,7 +2263,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         private const int PendingSingleAllocatorPrefetchCount = 4;
 
         // Compact pending queues every N drain cycles to reclaim memory from stale entries.
-        // At ~one drain-cycle per 5 s, 20 cycles 鈮?every ~100 seconds.
+        // At ~one drain-cycle per 5 s, 20 cycles ~= every ~100 seconds.
         // A shorter interval limits queue bloat when files are retried frequently,
         // reducing the window in which a retried file is delayed from being re-allocated.
         private const int CompactionIntervalCycles = 20;
@@ -2736,7 +2757,7 @@ ON CONFLICT(file_key) DO UPDATE SET
                 }
                 catch (AggregateException)
                 {
-                    // OperationCanceledException wrapped in AggregateException 鈥?expected on cancellation
+                    // OperationCanceledException wrapped in AggregateException -- expected on cancellation
                 }
             }
 

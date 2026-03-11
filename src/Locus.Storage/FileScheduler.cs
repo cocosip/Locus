@@ -25,6 +25,8 @@ namespace Locus.Storage
         private readonly ILogger<FileScheduler> _logger;
         private readonly FileRetryPolicy _retryPolicy;
         private readonly StorageVolumeRegistry? _volumeRegistry;
+        private readonly ITenantQuotaManager? _tenantQuotaManager;
+        private readonly IDirectoryQuotaManager? _directoryQuotaManager;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FileScheduler"/> class.
@@ -34,13 +36,17 @@ namespace Locus.Storage
             IFileSystem fileSystem,
             ILogger<FileScheduler> logger,
             FileRetryPolicy? retryPolicy = null,
-            StorageVolumeRegistry? volumeRegistry = null)
+            StorageVolumeRegistry? volumeRegistry = null,
+            ITenantQuotaManager? tenantQuotaManager = null,
+            IDirectoryQuotaManager? directoryQuotaManager = null)
         {
             _repository = repository ?? throw new ArgumentNullException(nameof(repository));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _retryPolicy = retryPolicy ?? new FileRetryPolicy();
             _volumeRegistry = volumeRegistry;
+            _tenantQuotaManager = tenantQuotaManager;
+            _directoryQuotaManager = directoryQuotaManager;
         }
 
         /// <inheritdoc/>
@@ -314,6 +320,33 @@ namespace Locus.Storage
                     {
                         _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
                             metadata.FileKey, metadata.PhysicalPath);
+
+                        // Decrement quota counters before removing metadata so they stay consistent.
+                        // Using CancellationToken.None so a mid-flight cancellation of the outer
+                        // scan does not leave quota and metadata in an inconsistent state.
+                        if (_tenantQuotaManager != null)
+                        {
+                            try
+                            {
+                                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to decrement tenant quota for orphaned file: {FileKey}", metadata.FileKey);
+                            }
+                        }
+
+                        if (_directoryQuotaManager != null && !string.IsNullOrWhiteSpace(metadata.DirectoryPath))
+                        {
+                            try
+                            {
+                                await _directoryQuotaManager.DecrementFileCountAsync(metadata.TenantId, metadata.DirectoryPath, CancellationToken.None);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to decrement directory quota for orphaned file: {FileKey}", metadata.FileKey);
+                            }
+                        }
 
                         await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, ct);
                         removedCount++;

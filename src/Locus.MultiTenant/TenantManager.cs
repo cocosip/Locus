@@ -335,6 +335,11 @@ namespace Locus.MultiTenant
 
         private string GetTenantMetadataPath(string tenantId)
         {
+            // Reject tenant IDs that contain path separators or ".." segments to prevent
+            // directory traversal (e.g. tenantId = "../admin" escaping _metadataRoot).
+            if (tenantId.IndexOf('/') >= 0 || tenantId.IndexOf('\\') >= 0 || tenantId.Contains(".."))
+                throw new ArgumentException($"Tenant ID contains invalid path characters: '{tenantId}'", nameof(tenantId));
+
             return _fileSystem.Path.Combine(_metadataRoot, $"{tenantId}.json");
         }
 

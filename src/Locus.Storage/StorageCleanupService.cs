@@ -179,7 +179,7 @@ namespace Locus.Storage
                     var subdirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
                     foreach (var subdirectory in subdirectories)
                     {
-                        // Each subdirectory is a tenant root 鈥?protect it from deletion.
+                        // Each subdirectory is a tenant root -- protect it from deletion.
                         removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true);
                     }
                 }
@@ -292,7 +292,7 @@ namespace Locus.Storage
                                     continue;
                                 }
 
-                                // Orphaned physical file 鈥?reconstruct metadata and re-queue for processing.
+                                // Orphaned physical file -- reconstruct metadata and re-queue for processing.
                                 // DO NOT delete the file: it contains real data that was uploaded but whose
                                 // metadata record was lost (e.g. process crash during write-behind flush, or
                                 // persistence queue overflow).  Rebuilding brings it back into the Pending
@@ -901,7 +901,7 @@ namespace Locus.Storage
         /// A directory is considered empty when it contains no files (other than junk files that are
         /// deleted) and no subdirectories survive after recursive processing.
         /// The <paramref name="isProtectedRoot"/> flag prevents the top-level tenant or volume directory
-        /// from being deleted even when it is empty 鈥?only its children are cleaned up.
+        /// from being deleted even when it is empty -- only its children are cleaned up.
         /// </summary>
         /// <returns>Number of directories deleted.</returns>
         private async Task<int> CleanupJunkFilesRecursiveAsync(
@@ -950,7 +950,7 @@ namespace Locus.Storage
                 }
             }
 
-            // 3. Delete the directory itself if it is now empty 鈥?but never delete protected roots
+            // 3. Delete the directory itself if it is now empty -- but never delete protected roots
             //    (volume mount paths, tenant root directories) to avoid recreating them on next write.
             if (!isProtectedRoot && IsDirectoryEmpty(directoryPath))
             {

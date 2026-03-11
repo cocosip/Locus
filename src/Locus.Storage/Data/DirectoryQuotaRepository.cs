@@ -229,7 +229,10 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// </summary>
         private void LoadQuotasForTenant(string tenantId, SqliteConnection conn)
         {
-            var rows = conn.Query<QuotaRow>("SELECT * FROM quotas", buffered: true);
+            // buffered: false streams rows directly into the cache loop instead of loading
+            // the full result set into a List<T> first, reducing peak memory for tenants
+            // with many quota entries.
+            var rows = conn.Query<QuotaRow>("SELECT * FROM quotas", buffered: false);
             var count = 0;
             var cache = _quotaCache.GetOrAdd(tenantId, _ => new ConcurrentDictionary<string, DirectoryQuota>());
             foreach (var row in rows)

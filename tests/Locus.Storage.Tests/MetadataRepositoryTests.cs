@@ -64,17 +64,29 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task ResetTimedOutFilesAsync_IncrementsPendingCounter()
+        public async Task TryResetTimedOutFileAsync_IncrementsPendingCounter()
         {
+            var processingStart = DateTime.UtcNow.AddMinutes(-10);
             var file = CreateMetadata("file-001", FileProcessingStatus.Processing);
-            file.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-10);
+            file.ProcessingStartTime = processingStart;
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
             Assert.Equal(0, GetPendingCount(_repository, _tenantId));
 
-            var resetCount = await _repository.ResetTimedOutFilesAsync(TimeSpan.FromMinutes(1), CancellationToken.None);
+            // Use the modern per-file API: first discover timed-out files, then reset each one.
+            var cutoff = DateTime.UtcNow.AddMinutes(-1);
+            var timedOut = await _repository.GetProcessingTimedOutAsync(_tenantId, cutoff, 10, CancellationToken.None);
 
-            Assert.Equal(1, resetCount);
+            Assert.Single(timedOut);
+
+            var reset = await _repository.TryResetTimedOutFileAsync(
+                _tenantId,
+                timedOut[0].FileKey,
+                timedOut[0].ProcessingStartTime!.Value,
+                DateTime.UtcNow,
+                CancellationToken.None);
+
+            Assert.True(reset);
             Assert.Equal(1, GetPendingCount(_repository, _tenantId));
         }
 

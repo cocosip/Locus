@@ -15,7 +15,9 @@ namespace Locus.Storage
         private readonly IStorageCleanupService _cleanupService;
         private readonly ILogger<BackgroundCleanupService> _logger;
         private readonly CleanupOptions _options;
-        private DateTime _lastDatabaseOptimization = DateTime.MinValue;
+        // Initialized to UtcNow so the first optimization is deferred by a full
+        // DatabaseOptimizationInterval rather than running immediately on startup.
+        private DateTime _lastDatabaseOptimization;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BackgroundCleanupService"/> class.
@@ -28,6 +30,7 @@ namespace Locus.Storage
             _cleanupService = cleanupService ?? throw new ArgumentNullException(nameof(cleanupService));
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _lastDatabaseOptimization = DateTime.UtcNow;
         }
 
         /// <inheritdoc/>

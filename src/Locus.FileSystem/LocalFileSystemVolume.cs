@@ -132,7 +132,12 @@ namespace Locus.FileSystem
                 : (long)(cacheDuration.TotalSeconds * Stopwatch.Frequency);
             _spaceCacheDurationTicks = _healthCacheDurationTicks;
 
-            _knownDirectories = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            // Use the same case-sensitivity as _pathComparison so that cache hits on Linux
+            // (case-sensitive FS) are never falsely triggered by differently-cased paths.
+            _knownDirectories = new ConcurrentDictionary<string, byte>(
+                _pathComparison == StringComparison.Ordinal
+                    ? StringComparer.Ordinal
+                    : StringComparer.OrdinalIgnoreCase);
 
             // Ensure mount path exists
             if (!_fileSystem.Directory.Exists(_mountPath))
