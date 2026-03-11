@@ -773,9 +773,22 @@ ON CONFLICT(directory_path) DO UPDATE SET
                 CurrentCount  = current_count,
                 MaxCount      = max_count,
                 Enabled       = enabled != 0,
-                LastUpdated   = DateTime.Parse(last_updated, null, System.Globalization.DateTimeStyles.RoundtripKind),
-                CreatedAt     = DateTime.Parse(created_at,   null, System.Globalization.DateTimeStyles.RoundtripKind)
+                LastUpdated   = ParseDateTime(last_updated),
+                CreatedAt     = ParseDateTime(created_at)
             };
+
+            private static DateTime ParseDateTime(string s)
+            {
+                if (DateTime.TryParse(s, null, System.Globalization.DateTimeStyles.RoundtripKind, out var result))
+                    return result;
+
+                // Fallback: handle non-ISO 8601 values written by older tooling or migration scripts.
+                // If that also fails, return UTC epoch so the record stays loadable.
+                if (DateTime.TryParse(s, out result))
+                    return DateTime.SpecifyKind(result, DateTimeKind.Utc);
+
+                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            }
         }
 
         /// <summary>

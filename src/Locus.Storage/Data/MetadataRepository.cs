@@ -1794,6 +1794,12 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// Uses Write-Behind (same as AddOrUpdateAsync) for consistency with the rest of the
         /// repository: memory is updated first, SQLite persistence is async via the background loop.
         /// </summary>
+        /// <remarks>
+        /// This method performs a bulk scan across all tenants. Production code should prefer
+        /// <see cref="TryResetTimedOutFileAsync"/> which operates per-file and is called by
+        /// <see cref="StorageCleanupService"/> after its own timed-out-file scan.
+        /// </remarks>
+        [Obsolete("Use TryResetTimedOutFileAsync for per-file timeout resets. This bulk method is not called by production code.")]
         public Task<int> ResetTimedOutFilesAsync(TimeSpan timeout, CancellationToken ct)
         {
             var cutoffTime = DateTime.UtcNow - timeout;
@@ -2086,6 +2092,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 _pendingGenerations.TryRemove(tenantId, out _);
                 _prefetchedPendingByTenant.TryRemove(tenantId, out _);
                 _pendingFileCounts.TryRemove(tenantId, out _);
+                _delayedQueues.TryRemove(tenantId, out _);
+                _delayedQueueLocks.TryRemove(tenantId, out _);
                 _processingByStartTime.TryRemove(tenantId, out _);
                 _processingByStartTimeLocks.TryRemove(tenantId, out _);
                 _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
@@ -2113,6 +2121,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <param name="tenantId">The tenant ID.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Path to the backup file, or null if no database exists.</returns>
+        /// <remarks>
+        /// The tenant lock is ALWAYS held when this method returns (whether or not a backup
+        /// was created). The caller must always call <see cref="FinishDatabaseRebuild"/> to
+        /// release the lock, regardless of the return value.
+        /// </remarks>
         public async Task<string?> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
@@ -2123,16 +2136,17 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             // Get or create tenant lock (same lock used for all operations)
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
-            // Acquire exclusive lock - this will block all operations for this tenant
+            // Acquire exclusive lock - this will block all operations for this tenant.
+            // The lock is held until the caller invokes FinishDatabaseRebuild().
             await tenantLock.WaitAsync(ct);
 
             try
             {
-                // If database doesn't exist, nothing to backup
+                // If database doesn't exist, nothing to backup. Return null with lock still held
+                // so the caller always releases via FinishDatabaseRebuild() (consistent contract).
                 if (!_fileSystem.File.Exists(dbPath))
                 {
                     _logger.LogInformation("No database file to rebuild for tenant {TenantId}", tenantId);
-                    tenantLock.Release();
                     return null;
                 }
 
@@ -2172,6 +2186,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     _pendingGenerations.TryRemove(tenantId, out _);
                     _prefetchedPendingByTenant.TryRemove(tenantId, out _);
                     _pendingFileCounts.TryRemove(tenantId, out _);
+                    _delayedQueues.TryRemove(tenantId, out _);
+                    _delayedQueueLocks.TryRemove(tenantId, out _);
                     _processingByStartTime.TryRemove(tenantId, out _);
                     _processingByStartTimeLocks.TryRemove(tenantId, out _);
                     _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
@@ -2396,7 +2412,13 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         {
             var byTenant = new Dictionary<string, List<PersistenceOperation>>(StringComparer.Ordinal);
             int drainedCount = 0;
-            var hasCoalesced = Volatile.Read(ref _coalescedDepth) > 0;
+
+            // Use IsEmpty (O(1)) rather than _coalescedDepth > 0 to decide whether coalesced
+            // entries need draining.  _coalescedDepth is a best-effort monitoring counter: a
+            // race between CoalescePersistenceOperation and the drain's TryRemove can leave the
+            // counter at 0 while an entry still exists in the map.  Falling back to IsEmpty
+            // eliminates this blind-spot: if any entry is present it will always be found.
+            var hasCoalesced = !_coalescedPersistenceOps.IsEmpty;
             var maxQueuedThisBatch = hasCoalesced && _maxDrainBatchSize > 1
                 ? _maxDrainBatchSize - 1
                 : _maxDrainBatchSize;
@@ -2408,7 +2430,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 AddOperationToTenantBucket(byTenant, queuedOp);
             }
 
-            if (drainedCount < _maxDrainBatchSize && Volatile.Read(ref _coalescedDepth) > 0)
+            if (drainedCount < _maxDrainBatchSize && !_coalescedPersistenceOps.IsEmpty)
             {
                 foreach (var coalesced in _coalescedPersistenceOps)
                 {

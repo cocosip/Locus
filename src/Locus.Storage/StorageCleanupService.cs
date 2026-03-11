@@ -151,7 +151,7 @@ namespace Locus.Storage
 
             foreach (var volume in _volumes.Values)
             {
-                var tenantPath = Path.Combine(volume.MountPath, tenantId);
+                var tenantPath = _fileSystem.Path.Combine(volume.MountPath, tenantId);
                 if (_fileSystem.Directory.Exists(tenantPath))
                 {
                     // isProtectedRoot=true: never delete the tenant root directory itself.
@@ -225,7 +225,7 @@ namespace Locus.Storage
 
             foreach (var volume in _volumes.Values)
             {
-                var tenantPath = Path.Combine(volume.MountPath, tenant.TenantId);
+                var tenantPath = _fileSystem.Path.Combine(volume.MountPath, tenant.TenantId);
                 if (!_fileSystem.Directory.Exists(tenantPath))
                     continue;
 
@@ -446,10 +446,10 @@ namespace Locus.Storage
                 return null;
 
             var fileInfo = _fileSystem.FileInfo.New(physicalPath);
-            var tenantRootPath = Path.Combine(volume.MountPath, tenantId);
+            var tenantRootPath = _fileSystem.Path.Combine(volume.MountPath, tenantId);
             var directoryPath = DirectoryPathNormalizer.NormalizeFromPhysicalPath(
                 tenantRootPath,
-                Path.GetDirectoryName(physicalPath));
+                _fileSystem.Path.GetDirectoryName(physicalPath));
 
             return new FileMetadata
             {

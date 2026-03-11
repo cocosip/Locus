@@ -144,9 +144,9 @@ namespace Locus.Storage.Data
             {
                 // Step 1: Begin rebuild (acquires lock, backs up and deletes corrupted DB)
                 result.BackupPath = await _metadataRepository.BeginDatabaseRebuildAsync(tenantId, ct);
-                // Lock is held only when BeginDatabaseRebuildAsync returns a backup path.
-                // When no DB exists it returns null and has already released the lock.
-                rebuildLockHeld = result.BackupPath != null;
+                // Lock is ALWAYS held after BeginDatabaseRebuildAsync returns (regardless of
+                // whether a backup exists). FinishDatabaseRebuild() must be called in finally.
+                rebuildLockHeld = true;
 
                 if (result.BackupPath == null)
                 {
@@ -250,7 +250,7 @@ namespace Locus.Storage.Data
             }
             finally
             {
-                // Step 3: Release lock only when rebuild path actually acquired it.
+                // Step 3: Release the lock (always held after a successful BeginDatabaseRebuildAsync call).
                 if (rebuildLockHeld)
                 {
                     _metadataRepository.FinishDatabaseRebuild(tenantId);
