@@ -312,11 +312,13 @@ namespace Locus.Storage
 
             // Process one tenant at a time to avoid allocating a single list of all files
             // across every tenant (O(total_files) memory spike → O(max_tenant_files) peak).
+            // EnumerateTenantMetadataRaw returns the live cache values without cloning — we
+            // only read stable fields (PhysicalPath, TenantId, FileKey) so this is safe.
             foreach (var tenantId in _repository.GetActiveTenantIds())
             {
                 ct.ThrowIfCancellationRequested();
 
-                var tenantMetadata = await _repository.GetByTenantAsync(tenantId, ct);
+                var tenantMetadata = _repository.SnapshotTenantMetadataRaw(tenantId);
 
                 foreach (var metadata in tenantMetadata)
                 {

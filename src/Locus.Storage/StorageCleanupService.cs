@@ -684,8 +684,35 @@ namespace Locus.Storage
                             metadata.FileKey);
                     }
 
-                    await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, ct);
-                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, ct);
+                    // Decrement quotas in independent try-catch blocks.
+                    // Metadata and physical file are already removed at this point; if a quota
+                    // decrement fails the file is permanently gone but the counter is not updated.
+                    // We log a warning and continue rather than re-throwing, which would halt the
+                    // cleanup loop and leave subsequent permanently-failed files unprocessed.
+                    try
+                    {
+                        await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Failed to decrement directory quota after removing permanently-failed file. " +
+                            "Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                            metadata.TenantId, normalizedDirectoryPath, metadata.FileKey);
+                    }
+
+                    try
+                    {
+                        await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Failed to decrement tenant quota after removing permanently-failed file. " +
+                            "Tenant={TenantId}, FileKey={FileKey}",
+                            metadata.TenantId, metadata.FileKey);
+                    }
+
                     removedCount++;
                 }
 
@@ -841,27 +868,20 @@ namespace Locus.Storage
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Number of backup files removed and space freed in bytes.</returns>
-        public async Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct)
+        public Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct)
         {
-            var filesRemoved = 0;
-            long spaceFreed = 0;
-
             _logger.LogInformation("Starting cleanup of SQLite corruption backup files...");
 
-            // Scan each tenant subdirectory in the metadata directory
             var (metaFiles, metaSpace) = CleanupCorruptedDatabaseBackups(_metadataDirectory, ct);
-            filesRemoved += metaFiles;
-            spaceFreed += metaSpace;
-
-            // Scan each tenant subdirectory in the quota directory
             var (quotaFiles, quotaSpace) = CleanupCorruptedDatabaseBackups(_quotaDirectory, ct);
-            filesRemoved += quotaFiles;
-            spaceFreed += quotaSpace;
+
+            var filesRemoved = metaFiles + quotaFiles;
+            var spaceFreed = metaSpace + quotaSpace;
 
             _logger.LogInformation("Corruption backup cleanup completed. Files removed: {FilesRemoved}, Space freed: {SpaceMB:F2} MB",
                 filesRemoved, spaceFreed / 1024.0 / 1024.0);
 
-            return await Task.FromResult((filesRemoved, spaceFreed));
+            return Task.FromResult((filesRemoved, spaceFreed));
         }
 
         /// <summary>

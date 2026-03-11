@@ -49,6 +49,9 @@ namespace Locus.FileSystem
         // Cache is bounded to keep long-running memory usage predictable.
         private readonly ConcurrentDictionary<string, byte> _knownDirectories;
         private int _knownDirectoryTrimInProgress;
+        // Separate O(1) counter so TrackKnownDirectory can check the size without
+        // calling ConcurrentDictionary.Count (which is O(N) due to segment locking).
+        private int _knownDirectoryCount;
 
         private const int DefaultWriteBufferSize = 128 * 1024;
         private const int DefaultCopyBufferSize = 80 * 1024;
@@ -156,7 +159,8 @@ namespace Locus.FileSystem
             }
 
             // Pre-populate mount path in known-directory cache
-            _knownDirectories.TryAdd(_mountPath, 0);
+            if (_knownDirectories.TryAdd(_mountPath, 0))
+                Interlocked.Increment(ref _knownDirectoryCount);
         }
 
         /// <inheritdoc/>
@@ -473,14 +477,15 @@ namespace Locus.FileSystem
 
                 var drives = _fileSystem.DriveInfo.GetDrives();
 
-                // Try RootDirectory.FullName first (works on both Windows and Linux)
+                // Try RootDirectory.FullName first (works on both Windows and Linux).
+                // Use _pathComparison so Linux (Ordinal) and Windows (OrdinalIgnoreCase) behave correctly.
                 var drive = drives.FirstOrDefault(d =>
-                    d.IsReady && d.RootDirectory.FullName.Equals(root, StringComparison.OrdinalIgnoreCase));
+                    d.IsReady && d.RootDirectory.FullName.Equals(root, _pathComparison));
 
                 if (drive == null)
                 {
                     drive = drives.FirstOrDefault(d =>
-                        d.IsReady && d.Name.Equals(root, StringComparison.OrdinalIgnoreCase));
+                        d.IsReady && d.Name.Equals(root, _pathComparison));
                 }
 
                 return drive;
@@ -602,9 +607,11 @@ namespace Locus.FileSystem
 
         private void TrackKnownDirectory(string directory)
         {
-            _knownDirectories.TryAdd(directory, 0);
+            if (_knownDirectories.TryAdd(directory, 0))
+                Interlocked.Increment(ref _knownDirectoryCount);
 
-            var observedCount = _knownDirectories.Count;
+            // Use the O(1) counter instead of ConcurrentDictionary.Count (which is O(N)).
+            var observedCount = Volatile.Read(ref _knownDirectoryCount);
             if (observedCount <= _knownDirectoryCacheMaxEntries)
                 return;
 
@@ -628,10 +635,14 @@ namespace Locus.FileSystem
                         continue;
 
                     if (_knownDirectories.TryRemove(cachedDirectory, out _))
+                    {
+                        Interlocked.Decrement(ref _knownDirectoryCount);
                         removed++;
+                    }
                 }
 
-                _knownDirectories.TryAdd(_mountPath, 0);
+                if (_knownDirectories.TryAdd(_mountPath, 0))
+                    Interlocked.Increment(ref _knownDirectoryCount);
             }
             finally
             {

@@ -35,6 +35,8 @@ namespace Locus.Storage
         private volatile IStorageVolume[] _cachedWritableVolumes = Array.Empty<IStorageVolume>();
         private long _lastVolumeSnapshotTicks;
         private int _volumeSelectionCounter;
+        // Singleflight guard: only the CAS winner rebuilds the snapshot; losers reuse the stale cache.
+        private int _volumeSnapshotRefreshInProgress;
         private static readonly long VolumeSnapshotRefreshTicks = Stopwatch.Frequency; // 1 second
 
         // Serialize completion for the same file key to keep quota decrement idempotent.
@@ -465,20 +467,51 @@ namespace Locus.Storage
             return await _fileScheduler.GetNextBatchForProcessingAsync(tenant, batchSize, ct);
         }
 
-        private Task CompensateTenantQuotaIncrementAsync(string tenantId)
+        private async Task CompensateTenantQuotaIncrementAsync(string tenantId)
         {
             if (_tenantQuotaManager is TenantQuotaManager tenantQuotaManager)
-                return tenantQuotaManager.CompensateIncrementFileCountAsync(tenantId, CancellationToken.None);
+            {
+                await tenantQuotaManager.CompensateIncrementFileCountAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
 
-            return _tenantQuotaManager.IncrementFileCountAsync(tenantId, CancellationToken.None);
+            // Custom ITenantQuotaManager has no force-increment API; fall back to the normal
+            // increment but suppress quota-exceeded exceptions so compensation never masks the
+            // original error or leaves the counter permanently under-counted.
+            try
+            {
+                await _tenantQuotaManager.IncrementFileCountAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (TenantQuotaExceededException)
+            {
+                _logger.LogWarning(
+                    "Could not compensate tenant quota for {TenantId}: limit reached during rollback. " +
+                    "Quota counter may be under-counted by 1.",
+                    tenantId);
+            }
         }
 
-        private Task CompensateDirectoryQuotaIncrementAsync(string tenantId, string directoryPath)
+        private async Task CompensateDirectoryQuotaIncrementAsync(string tenantId, string directoryPath)
         {
             if (_directoryQuotaManager is DirectoryQuotaManager directoryQuotaManager)
-                return directoryQuotaManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+            {
+                await directoryQuotaManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
 
-            return _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None);
+            // Same rationale as CompensateTenantQuotaIncrementAsync: suppress quota-exceeded
+            // exceptions so the rollback path never throws due to limit enforcement.
+            try
+            {
+                await _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (DirectoryQuotaExceededException)
+            {
+                _logger.LogWarning(
+                    "Could not compensate directory quota for {TenantId}/{DirectoryPath}: limit reached during rollback. " +
+                    "Quota counter may be under-counted by 1.",
+                    tenantId, directoryPath);
+            }
         }
 
         /// <inheritdoc/>
@@ -686,13 +719,26 @@ namespace Locus.Storage
             if (lastRefresh != 0 && (nowTicks - lastRefresh) < VolumeSnapshotRefreshTicks)
                 return cached;
 
-            var refreshed = _volumes.Values
-                .Where(v => v.IsHealthy && v.AvailableSpace > 0)
-                .ToArray();
+            // Singleflight: only the CAS winner rebuilds the snapshot.
+            // Concurrent callers return the (slightly stale) cached value — acceptable since
+            // the snapshot is refreshed at most every VolumeSnapshotRefreshTicks (1 s) anyway.
+            if (Interlocked.CompareExchange(ref _volumeSnapshotRefreshInProgress, 1, 0) != 0)
+                return cached;
 
-            _cachedWritableVolumes = refreshed;
-            Interlocked.Exchange(ref _lastVolumeSnapshotTicks, nowTicks);
-            return refreshed;
+            try
+            {
+                var refreshed = _volumes.Values
+                    .Where(v => v.IsHealthy && v.AvailableSpace > 0)
+                    .ToArray();
+
+                _cachedWritableVolumes = refreshed;
+                Interlocked.Exchange(ref _lastVolumeSnapshotTicks, nowTicks);
+                return refreshed;
+            }
+            finally
+            {
+                Volatile.Write(ref _volumeSnapshotRefreshInProgress, 0);
+            }
         }
 
         private SemaphoreSlim GetCompletionGuard(string fileKey)

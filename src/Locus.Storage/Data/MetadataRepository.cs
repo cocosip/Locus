@@ -784,39 +784,12 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
             // 1. Update in-memory cache FIRST -- always succeeds, immediately visible to readers.
-            //    Capture the previous status (if any) to maintain the O(1) pending count accurately.
-            var cache = _activeFiles.GetOrAdd(metadata.TenantId,
-                _ => new ConcurrentDictionary<string, FileMetadata>());
-
-            cache.TryGetValue(metadata.FileKey, out var previous);
-            cache[metadata.FileKey] = metadata;
-            _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
-            IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
-
-            // 2. Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
-            //    This keeps CompactPendingQueues O(1) instead of O(N).
-            bool wasP = previous?.Status == FileProcessingStatus.Pending;
-            bool isP  = metadata.Status  == FileProcessingStatus.Pending;
-            if (!wasP && isP)
-                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
-            else if (wasP && !isP)
-                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
-
-            if (wasP && !isP)
-                InvalidatePendingGeneration(metadata.TenantId, metadata.FileKey);
-
-            // 3. Enqueue file key when it becomes Pending so the allocator can find it in O(1).
-            // Non-Pending transitions are not explicitly removed from the queue; stale entries
-            // are validated and skipped when GetNextPendingFileAsync dequeues them.
-            if (isP)
-                EnqueuePendingCandidate(metadata);
-
-            IndexStatusCandidate(previous, metadata);
+            UpdateCacheAndIndices(metadata);
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
 
-            // Queue SQLite persistence -- caller is not blocked; background loop drains the queue.
+            // 2. Queue SQLite persistence -- caller is not blocked; background loop drains the queue.
             EnqueuePersistence(new PersistenceOperation(metadata));
 
             return Task.CompletedTask;
@@ -838,32 +811,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            // Update in-memory cache.
-            // Maintain _pendingFileCounts for the same reason as AddOrUpdateAsync, so that
-            // CompactPendingQueues has an accurate O(1) bloat estimate even for files added
-            // via this direct path (e.g., orphan recovery in StorageCleanupService).
-            var cache = _activeFiles.GetOrAdd(metadata.TenantId,
-                _ => new ConcurrentDictionary<string, FileMetadata>());
-            cache.TryGetValue(metadata.FileKey, out var previous);
-            cache[metadata.FileKey] = metadata;
-            _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
-            IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
-
-            bool wasP = previous?.Status == FileProcessingStatus.Pending;
-            bool isP  = metadata.Status == FileProcessingStatus.Pending;
-            if (!wasP && isP)
-                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
-            else if (wasP && !isP)
-                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
-
-            if (wasP && !isP)
-                InvalidatePendingGeneration(metadata.TenantId, metadata.FileKey);
-
-            // Enqueue when Pending -- stale entries skipped on dequeue (same as AddOrUpdateAsync).
-            if (isP)
-                EnqueuePendingCandidate(metadata);
-
-            IndexStatusCandidate(previous, metadata);
+            // Update in-memory cache (same logic as AddOrUpdateAsync).
+            UpdateCacheAndIndices(metadata);
 
             // Write directly to SQLite (synchronous -- required for rebuild correctness)
             lock (GetDatabaseLock(metadata.TenantId))
@@ -873,6 +822,47 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             }
 
             return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Applies a metadata upsert to all in-memory structures shared between
+        /// <see cref="AddOrUpdateAsync"/> and <see cref="AddOrUpdateDirectAsync"/>.
+        /// <list type="number">
+        ///   <item>Updates the per-tenant active-file cache and the cross-tenant file-key index.</item>
+        ///   <item>Maintains the O(1) pending-file count used by <c>CompactPendingQueues</c>.</item>
+        ///   <item>Enqueues the file as a pending candidate when it transitions into Pending status.</item>
+        ///   <item>Updates the status-timestamp index for timed-out / permanently-failed queries.</item>
+        /// </list>
+        /// </summary>
+        private void UpdateCacheAndIndices(FileMetadata metadata)
+        {
+            var cache = _activeFiles.GetOrAdd(metadata.TenantId,
+                _ => new ConcurrentDictionary<string, FileMetadata>());
+
+            cache.TryGetValue(metadata.FileKey, out var previous);
+            cache[metadata.FileKey] = metadata;
+            _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
+            IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
+
+            // Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
+            // Keeps CompactPendingQueues O(1) instead of O(N).
+            bool wasP = previous?.Status == FileProcessingStatus.Pending;
+            bool isP  = metadata.Status  == FileProcessingStatus.Pending;
+            if (!wasP && isP)
+                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
+            else if (wasP && !isP)
+                _pendingFileCounts.AddOrUpdate(metadata.TenantId, 0, (_, c) => Math.Max(0, c - 1));
+
+            if (wasP && !isP)
+                InvalidatePendingGeneration(metadata.TenantId, metadata.FileKey);
+
+            // Enqueue file key when it becomes Pending so the allocator can find it in O(1).
+            // Non-Pending transitions are not explicitly removed from the queue; stale entries
+            // are validated and skipped when GetNextPendingFileAsync dequeues them.
+            if (isP)
+                EnqueuePendingCandidate(metadata);
+
+            IndexStatusCandidate(previous, metadata);
         }
 
         /// <summary>
@@ -1057,6 +1047,22 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             var cache = GetCache(tenantId);
             var results = cache.Values.Select(m => m.Clone()).ToList();
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
+        }
+
+        /// <summary>
+        /// Returns a point-in-time reference snapshot of all metadata for a tenant without
+        /// deep-cloning each entry.  Callers MUST NOT mutate the returned objects.
+        /// This is O(N) reference copy vs the O(N × clone_cost) of <see cref="GetByTenantAsync"/>
+        /// and is intended for read-only, best-effort scans such as orphan cleanup.
+        /// </summary>
+        internal FileMetadata[] SnapshotTenantMetadataRaw(string tenantId)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            // ToArray() materialises a point-in-time reference array so concurrent RemoveAsync
+            // calls during iteration do not disturb the enumeration.
+            return GetCache(tenantId).Values.ToArray();
         }
 
         /// <summary>
@@ -1401,6 +1407,10 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             var selectedKeys = new HashSet<string>(StringComparer.Ordinal);
             var staleSkips = 0;
 
+            // First lock section: dequeue candidates and validate them.
+            // Valid entries (added to results) are collected in restoreEntries so they can be
+            // re-enqueued for future cleanup cycles.  The re-enqueue is intentionally done in
+            // a separate, shorter lock section below to reduce the time the lock is held.
             lock (indexLock)
             {
                 while (results.Count < limit
@@ -1447,14 +1457,23 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     results.Add(metadata);
                     restoreEntries.Add(candidate);
                 }
+            }
 
-                foreach (var entry in restoreEntries)
+            // Second lock section: re-enqueue selected entries so future cleanup cycles can
+            // find them again.  Splitting into a separate lock acquisition lets other threads
+            // (e.g. pending-file allocators) progress while we are not touching the heap.
+            if (restoreEntries.Count > 0)
+            {
+                lock (indexLock)
                 {
-                    index.Enqueue(
-                        entry.FileKey,
-                        entry.TimestampUtc,
-                        entry.CreatedAtUtc,
-                        Interlocked.Increment(ref _statusIndexSequence));
+                    foreach (var entry in restoreEntries)
+                    {
+                        index.Enqueue(
+                            entry.FileKey,
+                            entry.TimestampUtc,
+                            entry.CreatedAtUtc,
+                            Interlocked.Increment(ref _statusIndexSequence));
+                    }
                 }
             }
 
@@ -2448,11 +2467,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             // Periodic timeout keeps coalesced-only writes moving even when no new channel items arrive.
             var waitToReadTask = _persistenceReader.WaitToReadAsync(ct).AsTask();
             var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), ct);
-            var completed = await Task.WhenAny(waitToReadTask, timeoutTask);
+            var completed = await Task.WhenAny(waitToReadTask, timeoutTask).ConfigureAwait(false);
             if (ct.IsCancellationRequested)
                 throw new OperationCanceledException(ct);
 
-            if (completed == waitToReadTask && !await waitToReadTask)
+            if (completed == waitToReadTask && !await waitToReadTask.ConfigureAwait(false))
                 throw new OperationCanceledException(ct);
         }
 

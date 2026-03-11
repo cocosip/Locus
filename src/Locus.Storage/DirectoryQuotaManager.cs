@@ -123,11 +123,23 @@ namespace Locus.Storage
             if (maxFiles < 0)
                 throw new ArgumentException("Max files cannot be negative", nameof(maxFiles));
 
-            var quota = await _repository.GetOrCreateAsync(tenantId, directoryPath, ct);
-            quota.MaxCount = maxFiles;
-            quota.Enabled = maxFiles > 0; // Auto-enable if limit > 0, disable if limit = 0
+            var snapshot = await _repository.GetOrCreateAsync(tenantId, directoryPath, ct);
 
-            await _repository.UpdateAsync(tenantId, quota, ct);
+            // Build a fresh object to avoid mutating the shared cached reference returned by
+            // GetOrCreateAsync (which may be the live cache entry when no atomic counter exists).
+            // Preserving CurrentCount from the atomic snapshot ensures UpsertQuota does not
+            // accidentally reset the live file count.
+            var updated = new DirectoryQuota
+            {
+                DirectoryPath = directoryPath,
+                CurrentCount = snapshot.CurrentCount,
+                MaxCount = maxFiles,
+                Enabled = maxFiles > 0,
+                CreatedAt = snapshot.CreatedAt,
+                LastUpdated = snapshot.LastUpdated
+            };
+
+            await _repository.UpdateAsync(tenantId, updated, ct);
 
             _logger.LogInformation("Set limit for directory {DirectoryPath}, Tenant: {TenantId}: {MaxFiles}",
                 directoryPath, tenantId, maxFiles);

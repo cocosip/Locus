@@ -72,7 +72,9 @@ namespace Locus.Storage
             var globalLimit = await GetGlobalLimitAsync(ct);
             if (globalLimit == 0)
             {
-                await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+                // No limit configured — use ForceIncrementAsync so the counter always advances
+                // regardless of any MaxCount value that might exist on the quota record.
+                await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
                 _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: unlimited)", tenantId);
                 return;
             }
@@ -146,11 +148,21 @@ namespace Locus.Storage
             if (maxFiles < 0)
                 throw new ArgumentException("Max files cannot be negative", nameof(maxFiles));
 
-            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
-            quota.MaxCount = maxFiles;
-            quota.Enabled = true;
+            var snapshot = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
 
-            await _repository.UpdateAsync(tenantId, quota, ct);
+            // Build a fresh object instead of mutating the returned reference so we never
+            // accidentally overwrite the live CurrentCount with a stale or zero value.
+            var updated = new DirectoryQuota
+            {
+                DirectoryPath = snapshot.DirectoryPath,
+                CurrentCount = snapshot.CurrentCount,
+                MaxCount = maxFiles,
+                Enabled = true,
+                CreatedAt = snapshot.CreatedAt,
+                LastUpdated = snapshot.LastUpdated
+            };
+
+            await _repository.UpdateAsync(tenantId, updated, ct);
 
             _logger.LogInformation("Set tenant-specific quota for {TenantId}: {MaxFiles} files", tenantId, maxFiles);
         }
