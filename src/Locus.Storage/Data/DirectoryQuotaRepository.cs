@@ -382,6 +382,16 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
                 _quotaCache.TryRemove(tenantId, out _);
 
+                // Clear atomic counters and dirty tracking so stale in-memory state cannot be
+                // flushed back into the freshly rebuilt database by the Write-Behind timer.
+                // Without this, the flush timer would re-populate the new DB with old counts
+                // for directories that may no longer exist after the rebuild.
+                if (_atomicCounters.TryRemove(tenantId, out _))
+                    _logger.LogDebug("Cleared atomic counters for tenant {TenantId} during rebuild", tenantId);
+                if (_dirtyDirectoryKeysByTenant.TryRemove(tenantId, out _))
+                    _logger.LogDebug("Cleared dirty directory keys for tenant {TenantId} during rebuild", tenantId);
+                _dirtyTenants.TryRemove(tenantId, out _);
+
                 // Backup and delete corrupted database
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                 _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -638,26 +648,19 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 atomicState.Dirty = false;
                 var count = Volatile.Read(ref atomicState.Count);
 
-                // Get or create the cache entry; if it doesn't exist yet (first-ever
-                // increment for this directory before GetOrCreateAsync was called),
-                // create a minimal entry so we can persist it.
-                if (!cache.TryGetValue(directoryPath, out var snapshot))
+                // Build a new immutable snapshot so concurrent readers never see a
+                // partially-updated object. Preserve CreatedAt from the existing cache
+                // entry if one exists; fall back to nowUtc for brand-new directories.
+                cache.TryGetValue(directoryPath, out var existing);
+                var snapshot = new DirectoryQuota
                 {
-                    snapshot = cache.GetOrAdd(directoryPath, path => new DirectoryQuota
-                    {
-                        DirectoryPath = path,
-                        CurrentCount = count,
-                        MaxCount = atomicState.MaxCount,
-                        Enabled = atomicState.Enabled,
-                        CreatedAt = nowUtc,
-                        LastUpdated = nowUtc
-                    });
-                }
-
-                snapshot.CurrentCount = count;
-                snapshot.MaxCount = atomicState.MaxCount;
-                snapshot.Enabled = atomicState.Enabled;
-                snapshot.LastUpdated = nowUtc;
+                    DirectoryPath = directoryPath,
+                    CurrentCount  = count,
+                    MaxCount      = atomicState.MaxCount,
+                    Enabled       = atomicState.Enabled,
+                    CreatedAt     = existing?.CreatedAt ?? nowUtc,
+                    LastUpdated   = nowUtc
+                };
                 cache[directoryPath] = snapshot;
                 dirtySnapshots.Add((directoryPath, atomicState, snapshot));
             }
@@ -1114,17 +1117,52 @@ ON CONFLICT(directory_path) DO UPDATE SET
             long sizeAfter = 0;
             try
             {
-                if (_fileSystem.File.Exists(dbPath))
-                    sizeBefore = new System.IO.FileInfo(dbPath).Length;
+                if (!_fileSystem.File.Exists(dbPath))
+                    return Task.FromResult((0L, 0L));
 
+                sizeBefore = new System.IO.FileInfo(dbPath).Length;
+
+                // VACUUM requires exclusive write access to the database file.
+                // Running it on the shared long-lived connection (Cache=Shared) can fail
+                // when concurrent readers hold shared-cache locks on the same file.
+                // Strategy: close and pool-clear the tenant connection, run VACUUM on a
+                // dedicated private connection (no Cache=Shared), then let the next
+                // GetDatabase call transparently re-open the shared connection.
                 lock (GetDatabaseLock(tenantId))
                 {
-                    var conn = GetDatabase(tenantId);
-                    using (var cmd = conn.CreateCommand())
+                    // Flush dirty counters first so no in-memory changes are lost.
+                    FlushDirtyCountersForTenant(tenantId);
+
+                    // Step 1: evict the cached connection so GetDatabase rebuilds it afterwards.
+                    _databases.TryRemove(tenantId, out var lazyConn);
+                    if (lazyConn != null && lazyConn.IsValueCreated)
                     {
-                        cmd.CommandText = "VACUUM;";
-                        cmd.ExecuteNonQuery();
+                        try { lazyConn.Value?.Dispose(); }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error closing quota connection before VACUUM for tenant {TenantId}", tenantId);
+                        }
                     }
+
+                    // Step 2: release all pooled handles so the file is exclusively ours.
+                    SqliteConnection.ClearAllPools();
+
+                    // Step 3: run VACUUM on a dedicated private connection that does NOT use
+                    // Cache=Shared, ensuring SQLite can obtain the required exclusive lock.
+                    var vacuumConnStr = $"Data Source={dbPath};Mode=ReadWriteCreate";
+                    using (var vacuumConn = new SqliteConnection(vacuumConnStr))
+                    {
+                        vacuumConn.Open();
+                        using (var cmd = vacuumConn.CreateCommand())
+                        {
+                            cmd.CommandText = "VACUUM;";
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    // Step 4: release the private connection handle so the shared connection
+                    // can re-open cleanly on next access.
+                    SqliteConnection.ClearAllPools();
                 }
 
                 if (_fileSystem.File.Exists(dbPath))

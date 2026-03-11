@@ -1017,9 +1017,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 _fileKeyTenantIndex.TryRemove(fileKey, out _);
                 RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
 
-                if (current.Status == FileProcessingStatus.Pending)
-                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
-
+                // PermanentlyFailed files are never in the Pending queue, so _pendingFileCounts
+                // does not need adjustment here. The guard is intentionally omitted.
                 InvalidatePendingGeneration(tenantId, fileKey);
                 EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
                 _logger.LogDebug("Conditionally removed permanently failed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
@@ -1815,18 +1814,21 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 
                     var processingDuration = DateTime.UtcNow - file.ProcessingStartTime.Value;
 
-                    // Clone before mutating 鈥?keeps the cache entry consistent for lock-free readers.
+                    // Clone before mutating - keeps the cache entry consistent for lock-free readers.
                     var updated = file.Clone();
                     updated.Status = FileProcessingStatus.Pending;
                     updated.ProcessingStartTime = null;
                     updated.AvailableForProcessingAt = null;
 
-                    // Atomically replace cache entry then enqueue for SQLite persistence.
-                    cache.TryGetValue(updated.FileKey, out var previous);
-                    cache[updated.FileKey] = updated;
-                    if (previous?.Status != FileProcessingStatus.Pending)
-                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-                    IndexStatusCandidate(previous, updated);
+                    // Use TryUpdate (CAS) so that if a concurrent GetNextPendingFileAsync or
+                    // MarkAsFailedAsync already changed this entry since we read it above, we
+                    // skip rather than overwriting with stale data. The `file` reference acts
+                    // as the expected-current-value sentinel.
+                    if (!cache.TryUpdate(updated.FileKey, updated, file))
+                        continue;
+
+                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                    IndexStatusCandidate(file, updated);
                     EnqueuePersistence(new PersistenceOperation(updated));
 
                     // Re-enqueue in the pending queue so the allocator can find it immediately.
@@ -1903,17 +1905,49 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             long sizeAfter = 0;
             try
             {
-                if (_fileSystem.File.Exists(dbPath))
-                    sizeBefore = new System.IO.FileInfo(dbPath).Length;
+                if (!_fileSystem.File.Exists(dbPath))
+                    return Task.FromResult((0L, 0L));
 
+                sizeBefore = new System.IO.FileInfo(dbPath).Length;
+
+                // VACUUM requires exclusive write access to the database file.
+                // Running it on the shared long-lived connection (Cache=Shared) can fail
+                // when concurrent readers hold shared-cache locks on the same file.
+                // Strategy: close and pool-clear the tenant connection, run VACUUM on a
+                // dedicated private connection (no Cache=Shared), then let the next
+                // GetDatabase call transparently re-open the shared connection.
                 lock (GetDatabaseLock(tenantId))
                 {
-                    var conn = GetDatabase(tenantId);
-                    using (var cmd = conn.CreateCommand())
+                    // Step 1: evict the cached connection so GetDatabase rebuilds it afterwards.
+                    _databases.TryRemove(tenantId, out var lazyConn);
+                    if (lazyConn != null && lazyConn.IsValueCreated)
                     {
-                        cmd.CommandText = "VACUUM;";
-                        cmd.ExecuteNonQuery();
+                        try { lazyConn.Value?.Dispose(); }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error closing metadata connection before VACUUM for tenant {TenantId}", tenantId);
+                        }
                     }
+
+                    // Step 2: release all pooled handles so the file is exclusively ours.
+                    SqliteConnection.ClearAllPools();
+
+                    // Step 3: run VACUUM on a dedicated private connection that does NOT use
+                    // Cache=Shared, ensuring SQLite can obtain the required exclusive lock.
+                    var vacuumConnStr = $"Data Source={dbPath};Mode=ReadWriteCreate";
+                    using (var vacuumConn = new SqliteConnection(vacuumConnStr))
+                    {
+                        vacuumConn.Open();
+                        using (var cmd = vacuumConn.CreateCommand())
+                        {
+                            cmd.CommandText = "VACUUM;";
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    // Step 4: release the private connection handle so the shared connection
+                    // can re-open cleanly on next access.
+                    SqliteConnection.ClearAllPools();
                 }
 
                 if (_fileSystem.File.Exists(dbPath))
@@ -2286,14 +2320,28 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     break; // shutdown requested - fall through to drain
                 }
 
-                DrainPersistenceQueue();
+                // Wrap the entire per-cycle work in a broad catch so that an unexpected
+                // exception from CompactPendingQueues or LogPerformanceSnapshotIfNeeded
+                // cannot kill the background persistence thread and silently stop all future
+                // SQLite writes.  DrainPersistenceQueue already catches internally, but
+                // this guard covers the outer cycle as a final safety net.
+                try
+                {
+                    DrainPersistenceQueue();
 
-                // Periodically compact pending queues to reclaim memory occupied by stale
-                // entries left over from completed/failed files that were never explicitly removed.
-                if (++drainCycles % CompactionIntervalCycles == 0)
-                    CompactPendingQueues();
+                    // Periodically compact pending queues to reclaim memory occupied by stale
+                    // entries left over from completed/failed files that were never explicitly removed.
+                    if (++drainCycles % CompactionIntervalCycles == 0)
+                        CompactPendingQueues();
 
-                LogPerformanceSnapshotIfNeeded(drainCycles);
+                    LogPerformanceSnapshotIfNeeded(drainCycles);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Unexpected error in persistence drain cycle {Cycle}; loop will continue",
+                        drainCycles);
+                }
             }
 
             // Drain any items enqueued before cancellation was observed.
@@ -2578,23 +2626,33 @@ ON CONFLICT(file_key) DO UPDATE SET
                 .OrderBy(m => m.CreatedAt)
                 .ToList();
 
-            var generations = _pendingGenerations.GetOrAdd(
+            // Build the new generations map as a fresh dictionary so that concurrent
+            // IncrementPendingGeneration calls (from AddOrUpdateAsync on other threads) cannot
+            // lose their writes into a window opened by generations.Clear().
+            // Using TryUpdate to atomically replace the reference mirrors the same pattern
+            // used for _pendingKeys below, keeping the race window as narrow as possible.
+            var existingGenerations = _pendingGenerations.GetOrAdd(
                 tenantId,
                 _ => new ConcurrentDictionary<string, long>(StringComparer.Ordinal));
-            generations.Clear();
 
             var readyEntries = new List<PendingQueueEntry>(pendingItems.Count);
             var delayedItems = new List<FileMetadata>(pendingItems.Count);
+            var newGenerations = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
 
             foreach (var item in pendingItems)
             {
-                generations[item.FileKey] = 1;
+                newGenerations[item.FileKey] = 1;
                 var entry = new PendingQueueEntry(item.FileKey, 1);
                 if (item.AvailableForProcessingAt.HasValue && item.AvailableForProcessingAt.Value > now)
                     delayedItems.Add(item);
                 else
                     readyEntries.Add(entry);
             }
+
+            // Atomically replace both the generations map and the pending queue so that
+            // concurrent callers that already hold a reference to the old instances
+            // continue to operate correctly (their entries are validated on dequeue).
+            _pendingGenerations.TryUpdate(tenantId, newGenerations, existingGenerations);
 
             // TryUpdate atomically replaces the queue only if _pendingKeys[tenantId] still
             // points to the same instance we observed earlier (i.e., `queue`).  This narrows

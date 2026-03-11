@@ -57,12 +57,32 @@ namespace Locus.Storage.Data
         }
 
         private static DateTime ParseDateTime(string s)
-            => DateTime.Parse(s, null, DateTimeStyles.RoundtripKind);
+        {
+            if (DateTime.TryParse(s, null, DateTimeStyles.RoundtripKind, out var result))
+                return result;
+
+            // Fallback: try general parsing to handle non-ISO 8601 values written by older
+            // tooling or migration scripts.  If that also fails, return UTC epoch so the
+            // record stays loadable and does not trigger an unnecessary DB rebuild.
+            if (DateTime.TryParse(s, out result))
+                return DateTime.SpecifyKind(result, DateTimeKind.Utc);
+
+            return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        }
 
         private static DateTime? ParseNullableDateTime(string? s)
-            => string.IsNullOrEmpty(s)
-                ? (DateTime?)null
-                : DateTime.Parse(s, null, DateTimeStyles.RoundtripKind);
+        {
+            if (string.IsNullOrEmpty(s))
+                return null;
+
+            if (DateTime.TryParse(s, null, DateTimeStyles.RoundtripKind, out var result))
+                return result;
+
+            if (DateTime.TryParse(s, out result))
+                return DateTime.SpecifyKind(result, DateTimeKind.Utc);
+
+            return null;
+        }
 
         private static Dictionary<string, string>? DeserializeMetadata(string? json)
             => string.IsNullOrEmpty(json)
