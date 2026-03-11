@@ -1068,6 +1068,69 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_KeepMode_ReplaysLegacyV1FingerprintAfterRestart()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-legacy-fingerprint";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var filePath = Path.Combine(watchPath, "keep.txt");
+            _fileSystem.File.WriteAllText(filePath, "payload");
+            var lastWriteTime = DateTime.UtcNow.AddMinutes(-5);
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, lastWriteTime);
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var configuration = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(configuration, CancellationToken.None);
+            var firstScan = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+            Assert.Equal(1, firstScan.FilesImported);
+
+            var legacyFingerprint = $"fp:v1:{_fileSystem.FileInfo.New(filePath).Length}:{lastWriteTime.Ticks}";
+            var checkpointPath = Path.Combine(_configRoot, "imported-files.json");
+            var journalPath = Path.Combine(_configRoot, "imported-files.journal.jsonl");
+            _fileSystem.File.WriteAllText(checkpointPath, $"{{\"{filePath.Replace("\\", "\\\\")}\":\"{legacyFingerprint}\"}}");
+            if (_fileSystem.File.Exists(journalPath))
+                _fileSystem.File.Delete(journalPath);
+
+            var restartedWatcher = new FileWatcher(
+                _fileSystem,
+                _storagePool.Object,
+                _tenantManager.Object,
+                _logger.Object,
+                _configRoot);
+
+            var secondScan = await restartedWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+
+            Assert.Equal(0, secondScan.FilesImported);
+            Assert.True(secondScan.FilesSkipped >= 1);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task RemoveWatcherAsync_DeletesConfiguration()
         {
             // Arrange
@@ -1095,6 +1158,29 @@ namespace Locus.Storage.Tests
             // Assert
             var watcher = await _fileWatcher.GetWatcherAsync(config.WatcherId, CancellationToken.None);
             Assert.Null(watcher);
+        }
+
+        [Theory]
+        [InlineData("../escape")]
+        [InlineData("..\\escape")]
+        [InlineData("nested/watcher")]
+        [InlineData("nested\\watcher")]
+        public async Task WatcherOperations_InvalidWatcherId_ThrowsArgumentException(string watcherId)
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _fileWatcher.GetWatcherAsync(watcherId, CancellationToken.None));
+
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _fileWatcher.EnableWatcherAsync(watcherId, CancellationToken.None));
+
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _fileWatcher.DisableWatcherAsync(watcherId, CancellationToken.None));
+
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _fileWatcher.RemoveWatcherAsync(watcherId, CancellationToken.None));
+
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _fileWatcher.ScanNowAsync(watcherId, CancellationToken.None));
         }
     }
 }

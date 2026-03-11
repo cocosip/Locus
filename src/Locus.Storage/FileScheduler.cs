@@ -110,6 +110,12 @@ namespace Locus.Storage
                 throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
             }
 
+            if (metadata.Status != FileProcessingStatus.Pending)
+            {
+                throw new InvalidOperationException(
+                    $"File {fileKey} cannot be marked as processing from status {metadata.Status}. Only Pending files can transition to Processing.");
+            }
+
             // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
             // Mutating it in-place would expose a partial (inconsistent) state to concurrent readers.
             var updated = metadata.Clone();

@@ -558,6 +558,28 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsProcessingAsync_ThrowsWhenStatusIsNotPending()
+        {
+            var file = new FileMetadata
+            {
+                FileKey = "file-failed",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Failed,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1)
+            };
+
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                _scheduler.MarkAsProcessingAsync("file-failed", CancellationToken.None));
+
+            var metadata = await _repository.GetAsync("tenant-001", "file-failed", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Failed, metadata!.Status);
+            Assert.Null(metadata.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task GetFileStatusAsync_ThrowsWhenFileNotFound()
         {
             // Act & Assert

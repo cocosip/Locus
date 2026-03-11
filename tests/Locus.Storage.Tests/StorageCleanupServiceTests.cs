@@ -523,6 +523,11 @@ namespace Locus.Storage.Tests
             Assert.Equal(FileProcessingStatus.Pending, rebuilt.Status);
             Assert.Equal(0, rebuilt.RetryCount);
 
+            var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", default);
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/", default);
+            Assert.Equal(1, tenantCount);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
             Assert.Equal(1, stats.OrphanedFilesRemoved); // counter reused for "rebuilt" count
         }

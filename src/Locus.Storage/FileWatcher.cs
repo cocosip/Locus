@@ -61,7 +61,8 @@ namespace Locus.Storage
         private const int MaxImportedHistoryChannelSize = 20_000;
         private const int MinImportQueueCapacity = 64;
         private const int MaxImportQueueCapacity = 1024;
-        private const string ImportedFileFingerprintPrefix = "fp:v1:";
+        private const string ImportedFileFingerprintPrefix = "fp:v2:";
+        private const string LegacyImportedFileFingerprintPrefix = "fp:v1:";
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
         private static readonly TimeSpan DefaultAutoCreateTenantDirectoriesCacheTtl = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
@@ -1229,7 +1230,7 @@ namespace Locus.Storage
                 var fileInfo = _fileSystem.FileInfo.New(filePath);
                 var fileSize = fileInfo.Length;
                 var lastWriteTime = fileInfo.LastWriteTimeUtc;
-                var importFingerprint = CreateImportedFileFingerprint(fileSize, lastWriteTime);
+                var importFingerprint = CreateImportedFileFingerprint(fileInfo);
 
                 // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
                 if (!TryAcquireImportSlot(filePath, importFingerprint))
@@ -1494,25 +1495,16 @@ namespace Locus.Storage
             if (!_fileSystem.File.Exists(path))
                 return null;
 
-            if (!IsFingerprintValue(storedFingerprint))
-            {
-                try
-                {
-                    var legacyFileInfo = _fileSystem.FileInfo.New(path);
-                    return CreateImportedFileFingerprint(legacyFileInfo.Length, legacyFileInfo.LastWriteTimeUtc);
-                }
-                catch
-                {
-                    return null;
-                }
-            }
-
             try
             {
                 var fileInfo = _fileSystem.FileInfo.New(path);
-                var currentFingerprint = CreateImportedFileFingerprint(fileInfo.Length, fileInfo.LastWriteTimeUtc);
-                return string.Equals(storedFingerprint, currentFingerprint, StringComparison.Ordinal)
-                    ? storedFingerprint
+                var currentFingerprint = CreateImportedFileFingerprint(fileInfo);
+
+                if (!IsFingerprintValue(storedFingerprint))
+                    return currentFingerprint;
+
+                return FingerprintsMatch(storedFingerprint, fileInfo)
+                    ? currentFingerprint
                     : null;
             }
             catch
@@ -1524,12 +1516,108 @@ namespace Locus.Storage
         private static bool IsFingerprintValue(string value)
         {
             return !string.IsNullOrWhiteSpace(value)
-                && value.StartsWith(ImportedFileFingerprintPrefix, StringComparison.Ordinal);
+                && (value.StartsWith(ImportedFileFingerprintPrefix, StringComparison.Ordinal)
+                    || value.StartsWith(LegacyImportedFileFingerprintPrefix, StringComparison.Ordinal));
         }
 
-        private static string CreateImportedFileFingerprint(long fileSize, DateTime lastWriteTimeUtc)
+        private static string CreateImportedFileFingerprint(IFileInfo fileInfo)
         {
-            return $"{ImportedFileFingerprintPrefix}{fileSize}:{lastWriteTimeUtc.Ticks}";
+            if (fileInfo == null)
+                throw new ArgumentNullException(nameof(fileInfo));
+
+            return CreateImportedFileFingerprint(fileInfo.Length, fileInfo.LastWriteTimeUtc, fileInfo.CreationTimeUtc);
+        }
+
+        private static string CreateImportedFileFingerprint(long fileSize, DateTime lastWriteTimeUtc, DateTime creationTimeUtc)
+        {
+            var normalizedLastWrite = NormalizeFingerprintTimestamp(lastWriteTimeUtc);
+            var normalizedCreation = NormalizeFingerprintTimestamp(creationTimeUtc);
+            var effectiveCreation = normalizedCreation > DateTime.MinValue
+                ? normalizedCreation
+                : normalizedLastWrite;
+
+            return $"{ImportedFileFingerprintPrefix}{fileSize}:{normalizedLastWrite.Ticks}:{effectiveCreation.Ticks}";
+        }
+
+        private static bool FingerprintsMatch(string storedFingerprint, IFileInfo fileInfo)
+        {
+            if (!TryParseImportedFileFingerprint(
+                    storedFingerprint,
+                    out var version,
+                    out var storedFileSize,
+                    out var storedLastWriteTicks,
+                    out var storedCreationTicks))
+            {
+                return false;
+            }
+
+            var normalizedLastWrite = NormalizeFingerprintTimestamp(fileInfo.LastWriteTimeUtc);
+            if (storedFileSize != fileInfo.Length || storedLastWriteTicks != normalizedLastWrite.Ticks)
+                return false;
+
+            if (version <= 1)
+                return true;
+
+            var normalizedCreation = NormalizeFingerprintTimestamp(fileInfo.CreationTimeUtc);
+            var effectiveCreationTicks = (normalizedCreation > DateTime.MinValue
+                ? normalizedCreation
+                : normalizedLastWrite).Ticks;
+            return storedCreationTicks == effectiveCreationTicks;
+        }
+
+        private static bool TryParseImportedFileFingerprint(
+            string value,
+            out int version,
+            out long fileSize,
+            out long lastWriteTicks,
+            out long creationTicks)
+        {
+            version = 0;
+            fileSize = 0;
+            lastWriteTicks = 0;
+            creationTicks = 0;
+
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            string payload;
+            if (value.StartsWith(ImportedFileFingerprintPrefix, StringComparison.Ordinal))
+            {
+                version = 2;
+                payload = value.Substring(ImportedFileFingerprintPrefix.Length);
+            }
+            else if (value.StartsWith(LegacyImportedFileFingerprintPrefix, StringComparison.Ordinal))
+            {
+                version = 1;
+                payload = value.Substring(LegacyImportedFileFingerprintPrefix.Length);
+            }
+            else
+            {
+                return false;
+            }
+
+            var parts = payload.Split(':');
+            if (version == 1)
+            {
+                return parts.Length == 2
+                    && long.TryParse(parts[0], out fileSize)
+                    && long.TryParse(parts[1], out lastWriteTicks);
+            }
+
+            return parts.Length == 3
+                && long.TryParse(parts[0], out fileSize)
+                && long.TryParse(parts[1], out lastWriteTicks)
+                && long.TryParse(parts[2], out creationTicks);
+        }
+
+        private static DateTime NormalizeFingerprintTimestamp(DateTime timestampUtc)
+        {
+            if (timestampUtc == DateTime.MinValue)
+                return DateTime.MinValue;
+
+            return timestampUtc.Kind == DateTimeKind.Utc
+                ? timestampUtc
+                : timestampUtc.ToUniversalTime();
         }
 
         private PatternMatcherCacheEntry GetOrCreatePatternMatcherCacheEntry(
@@ -1672,7 +1760,17 @@ namespace Locus.Storage
 
         private string GetConfigurationPath(string watcherId)
         {
+            ValidateWatcherId(watcherId);
             return _fileSystem.Path.Combine(_configurationRoot, $"{watcherId}.json");
+        }
+
+        private static void ValidateWatcherId(string watcherId)
+        {
+            if (string.IsNullOrWhiteSpace(watcherId))
+                throw new ArgumentException("WatcherId cannot be empty.", nameof(watcherId));
+
+            if (watcherId.IndexOf('/') >= 0 || watcherId.IndexOf('\\') >= 0 || watcherId.Contains(".."))
+                throw new ArgumentException($"WatcherId contains invalid path characters: '{watcherId}'", nameof(watcherId));
         }
 
         private readonly struct AutoCreateTenantDirectoryCacheEntry

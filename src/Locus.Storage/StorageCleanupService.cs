@@ -312,6 +312,7 @@ namespace Locus.Storage
                                     // AddOrUpdateDirectAsync writes immediately to SQLite (not write-behind)
                                     // so the record survives even if the process crashes right after this call.
                                     await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+                                    await CompensateRebuiltFileQuotaAsync(metadata, CancellationToken.None);
                                     if (normalizedPhysical != null && existenceCache != null)
                                     {
                                         if (existenceCache.Count < _orphanRebuildLookupCacheSize
@@ -323,7 +324,7 @@ namespace Locus.Storage
 
                                     rebuiltCount++;
                                     _logger.LogInformation(
-                                        "Rebuilt metadata for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
+                                        "Rebuilt metadata and compensated quota for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
                                         metadata.FileKey, metadata.TenantId, physicalPath);
                                 }
                                 catch (Exception ex)
@@ -469,6 +470,34 @@ namespace Locus.Storage
                 // Original file name is unknown for orphaned files.
                 OriginalFileName = null,
             };
+        }
+
+        private async Task CompensateRebuiltFileQuotaAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (string.IsNullOrWhiteSpace(metadata.TenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
+
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+
+            // Orphan rebuild restores files that already exist physically, so quota counters must
+            // reflect reality even if the current configured limit would reject a normal increment.
+            // Use direct counter compensation rather than TryIncrementAsync's limit-enforcing path.
+            var tenantQuota = await _quotaRepository.GetOrCreateAsync(metadata.TenantId, metadata.TenantId, ct);
+            await _quotaRepository.SetCurrentCountAsync(
+                metadata.TenantId,
+                metadata.TenantId,
+                tenantQuota.CurrentCount + 1,
+                ct);
+
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync(metadata.TenantId, normalizedDirectoryPath, ct);
+            await _quotaRepository.SetCurrentCountAsync(
+                metadata.TenantId,
+                normalizedDirectoryPath,
+                directoryQuota.CurrentCount + 1,
+                ct);
         }
 
         /// <inheritdoc/>
