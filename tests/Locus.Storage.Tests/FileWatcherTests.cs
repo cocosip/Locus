@@ -1155,7 +1155,11 @@ namespace Locus.Storage.Tests
             var legacyFingerprint = $"fp:v1:{storedFileInfo.Length}:{storedFileInfo.LastWriteTimeUtc.Ticks}";
             var checkpointPath = Path.Combine(_configRoot, "imported-files.json");
             var journalPath = Path.Combine(_configRoot, "imported-files.journal.jsonl");
-            _fileSystem.File.WriteAllText(checkpointPath, $"{{\"{filePath.Replace("\\", "\\\\")}\":\"{legacyFingerprint}\"}}");
+            // Use the MockFileSystem-normalized path as the checkpoint key so it matches
+            // what EnumerateFiles returns on all platforms (on Linux, relative paths like
+            // "C:\..." are resolved to absolute paths by Path.GetFullPath internally).
+            var normalizedFilePath = _fileSystem.Path.GetFullPath(filePath);
+            _fileSystem.File.WriteAllText(checkpointPath, $"{{\"{normalizedFilePath.Replace("\\", "\\\\")}\":\"{legacyFingerprint}\"}}");
             if (_fileSystem.File.Exists(journalPath))
                 _fileSystem.File.Delete(journalPath);
 
