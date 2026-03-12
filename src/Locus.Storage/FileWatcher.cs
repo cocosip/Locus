@@ -5,6 +5,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -99,7 +100,12 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _configurationRoot = configurationRoot ?? Path.Combine(".locus", "watchers");
 
-            _importedFiles = new ConcurrentDictionary<string, string>();
+            // Use case-insensitive comparison on Windows (NTFS is case-insensitive),
+            // and case-sensitive on Linux/macOS to match the underlying file system behavior.
+            var pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+            _importedFiles = new ConcurrentDictionary<string, string>(pathComparer);
             _pendingImportedHistoryChannel = Channel.CreateBounded<ImportedHistoryOperation>(new BoundedChannelOptions(MaxImportedHistoryChannelSize)
             {
                 SingleReader = true,
@@ -141,12 +147,18 @@ namespace Locus.Storage
 
                 foreach (var kvp in checkpoint)
                 {
+                    // Normalize the path so it is always absolute and uses the current platform's
+                    // separator style. This ensures the key matches what Directory.EnumerateFiles()
+                    // returns on all platforms (e.g. on Linux a Windows-style path recorded in the
+                    // checkpoint would otherwise be treated as a relative path by Path.GetFullPath).
+                    var normalizedKey = _fileSystem.Path.GetFullPath(kvp.Key);
+
                     // Skip entries whose source file no longer exists or whose current fingerprint
                     // no longer matches the recorded import snapshot.
-                    var resolvedValue = ResolveImportedHistoryValue(kvp.Key, kvp.Value);
+                    var resolvedValue = ResolveImportedHistoryValue(normalizedKey, kvp.Value);
                     if (resolvedValue != null)
                     {
-                        _importedFiles.TryAdd(kvp.Key, resolvedValue);
+                        _importedFiles.TryAdd(normalizedKey, resolvedValue);
                         loaded++;
                         if (!string.Equals(resolvedValue, kvp.Value, StringComparison.Ordinal))
                             upgradedLegacyEntries++;
