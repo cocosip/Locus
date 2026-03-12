@@ -1151,7 +1151,8 @@ namespace Locus.Storage.Tests
             var firstScan = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
             Assert.Equal(1, firstScan.FilesImported);
 
-            var legacyFingerprint = $"fp:v1:{_fileSystem.FileInfo.New(filePath).Length}:{lastWriteTime.Ticks}";
+            var storedFileInfo = _fileSystem.FileInfo.New(filePath);
+            var legacyFingerprint = $"fp:v1:{storedFileInfo.Length}:{storedFileInfo.LastWriteTimeUtc.Ticks}";
             var checkpointPath = Path.Combine(_configRoot, "imported-files.json");
             var journalPath = Path.Combine(_configRoot, "imported-files.journal.jsonl");
             _fileSystem.File.WriteAllText(checkpointPath, $"{{\"{filePath.Replace("\\", "\\\\")}\":\"{legacyFingerprint}\"}}");
