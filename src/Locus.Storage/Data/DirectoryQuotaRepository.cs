@@ -173,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         //     the Lazy lock (ExecutionAndPublication) is already held by this thread.
                         // Instead, perform the file-level rebuild operations inline here.
                         // The Lazy lock itself guarantees that only this thread is running this path.
-                        var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tid, "quotas.db");
+                        var dbPath = GetDatabasePath(tid);
 
                         // Clear stale in-memory state so the Write-Behind timer cannot flush
                         // old counts into the freshly rebuilt database.
@@ -186,6 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         {
                             // Release OS file handles before deleting (required on Windows).
                             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                            EnsureWritableDatabaseArtifacts(dbPath);
 
                             var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                             _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -228,25 +229,75 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
             return _databaseLocks.GetOrAdd(tenantId, _ => new object());
         }
 
+        private string GetDatabasePath(string tenantId)
+        {
+            return _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
+        }
+
+        private void EnsureWritableDatabaseArtifacts(string dbPath)
+        {
+            ClearReadOnlyAttributeIfNeeded(dbPath);
+            ClearReadOnlyAttributeIfNeeded(dbPath + "-wal");
+            ClearReadOnlyAttributeIfNeeded(dbPath + "-shm");
+        }
+
+        private void ClearReadOnlyAttributeIfNeeded(string path)
+        {
+            if (!_fileSystem.File.Exists(path))
+                return;
+
+            try
+            {
+                var fileInfo = _fileSystem.FileInfo.New(path);
+                if (!fileInfo.IsReadOnly)
+                    return;
+
+                fileInfo.IsReadOnly = false;
+                _logger.LogWarning("Cleared read-only attribute from SQLite file: {Path}", path);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is NotSupportedException)
+            {
+                _logger.LogWarning(ex, "Failed to clear read-only attribute from SQLite file: {Path}", path);
+            }
+        }
+
+        private InvalidOperationException CreateReadonlyDatabaseException(string dbPath, SqliteException ex)
+        {
+            var directory = _fileSystem.Path.GetDirectoryName(dbPath) ?? _quotaDirectory;
+            return new InvalidOperationException(
+                $"SQLite database '{dbPath}' is read-only or its parent directory '{directory}' is not writable. " +
+                "Ensure the current process has write permission to the database file and directory.",
+                ex);
+        }
+
         private SqliteConnection OpenAndInitializeConnection(string dbPath)
         {
-            var connStr = _sqliteOptions.BuildConnectionString(dbPath);
-            var conn = new SqliteConnection(connStr);
-            conn.Open();
+            EnsureWritableDatabaseArtifacts(dbPath);
 
-            using (var cmd = conn.CreateCommand())
+            try
             {
-                cmd.CommandText = _sqliteOptions.BuildPragmaSql();
-                cmd.ExecuteNonQuery();
-            }
+                var connStr = _sqliteOptions.BuildConnectionString(dbPath);
+                var conn = new SqliteConnection(connStr);
+                conn.Open();
 
-            using (var cmd = conn.CreateCommand())
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = _sqliteOptions.BuildPragmaSql();
+                    cmd.ExecuteNonQuery();
+                }
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = QuotaDdl;
+                    cmd.ExecuteNonQuery();
+                }
+
+                return conn;
+            }
+            catch (SqliteException ex) when (IsReadonlyDatabaseException(ex))
             {
-                cmd.CommandText = QuotaDdl;
-                cmd.ExecuteNonQuery();
+                throw CreateReadonlyDatabaseException(dbPath, ex);
             }
-
-            return conn;
         }
 
         /// <summary>
@@ -339,6 +390,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 {
                     try
                     {
+                        ClearReadOnlyAttributeIfNeeded(sidecarPath);
                         _fileSystem.File.Delete(sidecarPath);
                         _logger.LogInformation("Deleted SQLite sidecar file: {Path}", sidecarPath);
                     }
@@ -369,13 +421,18 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
             return false;
         }
 
+        private static bool IsReadonlyDatabaseException(SqliteException ex)
+        {
+            return ex.SqliteErrorCode == 8;
+        }
+
         /// <summary>
         /// Rebuilds a tenant quota database in-place.
         /// Must be called while holding the tenant lock.
         /// </summary>
         private string? RebuildDatabaseNoLock(string tenantId)
         {
-            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
+            var dbPath = GetDatabasePath(tenantId);
 
             if (!_fileSystem.File.Exists(dbPath))
             {
@@ -421,6 +478,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 _dirtyTenants.TryRemove(tenantId, out _);
 
                 // Backup and delete corrupted database
+                EnsureWritableDatabaseArtifacts(dbPath);
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                 _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
                 _logger.LogInformation("Backed up corrupted quota database: {BackupPath}", backupPath);
@@ -451,6 +509,10 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
 
                 var cache = GetCache(tenantId);
                 cache[quota.DirectoryPath] = quota;
+            }
+            catch (SqliteException ex) when (IsReadonlyDatabaseException(ex))
+            {
+                throw CreateReadonlyDatabaseException(GetDatabasePath(tenantId), ex);
             }
             catch (Exception ex) when (IsRecoverableDatabaseException(ex))
             {
@@ -1179,7 +1241,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
-            var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
+            var dbPath = GetDatabasePath(tenantId);
 
             long sizeBefore = 0;
             long sizeAfter = 0;
@@ -1214,6 +1276,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
 
                     // Step 2: release all pooled handles so the file is exclusively ours.
                     SqliteConnection.ClearAllPools();
+                    EnsureWritableDatabaseArtifacts(dbPath);
 
                     // Step 3: run VACUUM on a dedicated private connection that does NOT use
                     // Cache=Shared, ensuring SQLite can obtain the required exclusive lock.
@@ -1237,6 +1300,10 @@ ON CONFLICT(directory_path) DO UPDATE SET
                     sizeAfter = _fileSystem.FileInfo.New(dbPath).Length;
 
                 _logger.LogDebug("SQLite VACUUM completed for quota tenant {TenantId}: {Before} -> {After} bytes", tenantId, sizeBefore, sizeAfter);
+            }
+            catch (SqliteException ex) when (IsReadonlyDatabaseException(ex))
+            {
+                throw CreateReadonlyDatabaseException(dbPath, ex);
             }
             catch (Exception ex)
             {

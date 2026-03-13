@@ -65,6 +65,35 @@ namespace Locus.Storage.Tests
             Assert.Equal(2, count);
         }
 
+        [Fact]
+        public async Task SetGlobalLimitAsync_ClearsReadOnlyDatabaseAttributeAndPersistsUpdate()
+        {
+            await _manager.SetGlobalLimitAsync(1, CancellationToken.None);
+
+            _repository.Dispose();
+            SqliteConnection.ClearAllPools();
+
+            var tenantDir = Path.Combine(_quotaDir, "_GLOBAL_QUOTA_");
+            var dbPath = Path.Combine(tenantDir, "quotas.db");
+            Assert.True(File.Exists(dbPath));
+
+            File.SetAttributes(dbPath, File.GetAttributes(dbPath) | FileAttributes.ReadOnly);
+
+            using var repository = new DirectoryQuotaRepository(
+                _fileSystem,
+                new Mock<ILogger<DirectoryQuotaRepository>>().Object,
+                _quotaDir,
+                enableBackgroundFlush: false);
+            var manager = new TenantQuotaManager(
+                repository,
+                new Mock<ILogger<TenantQuotaManager>>().Object);
+
+            await manager.SetGlobalLimitAsync(2, CancellationToken.None);
+
+            Assert.False(new FileInfo(dbPath).IsReadOnly);
+            Assert.Equal(2, await manager.GetGlobalLimitAsync(CancellationToken.None));
+        }
+
         public void Dispose()
         {
             _repository.Dispose();
