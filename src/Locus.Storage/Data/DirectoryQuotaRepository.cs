@@ -1253,11 +1253,12 @@ ON CONFLICT(directory_path) DO UPDATE SET
                 sizeBefore = _fileSystem.FileInfo.New(dbPath).Length;
 
                 // VACUUM requires exclusive write access to the database file.
-                // Running it on the shared long-lived connection (Cache=Shared) can fail
-                // when concurrent readers hold shared-cache locks on the same file.
-                // Strategy: close and pool-clear the tenant connection, run VACUUM on a
-                // dedicated private connection (no Cache=Shared), then let the next
-                // GetDatabase call transparently re-open the shared connection.
+                // Microsoft.Data.Sqlite connection pooling means conn.Dispose() returns the
+                // connection to the pool without closing the OS file handle, so concurrent
+                // readers may still hold the file open. Strategy: evict the cached connection,
+                // call ClearAllPools() to flush all pooled handles, run VACUUM on a fresh
+                // dedicated connection, then clear pools again so the next GetDatabase call
+                // opens a clean connection.
                 lock (GetDatabaseLock(tenantId))
                 {
                     // Flush dirty counters first so no in-memory changes are lost.
@@ -1278,8 +1279,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
                     SqliteConnection.ClearAllPools();
                     EnsureWritableDatabaseArtifacts(dbPath);
 
-                    // Step 3: run VACUUM on a dedicated private connection that does NOT use
-                    // Cache=Shared, ensuring SQLite can obtain the required exclusive lock.
+                    // Step 3: run VACUUM on a fresh dedicated connection.
                     var vacuumConnStr = $"Data Source={dbPath};Mode=ReadWriteCreate";
                     using (var vacuumConn = new SqliteConnection(vacuumConnStr))
                     {

@@ -59,7 +59,13 @@ namespace Locus.Storage.Data
 
             try
             {
-                var connectionString = $"Data Source={dbPath};Cache=Shared;Mode=ReadOnly";
+                // Use Mode=ReadOnly with private cache (no Cache=Shared).
+                // Cache=Shared would add this read-only connection to the process-wide SQLite
+                // shared-cache pool; any concurrent write connection on the same file that also
+                // uses Cache=Shared would then see the read-only flag and return SQLITE_READONLY
+                // (Error 8), causing spurious write failures in DirectoryQuotaRepository or
+                // MetadataRepository during startup races with DatabaseHealthCheckService.
+                var connectionString = $"Data Source={dbPath};Mode=ReadOnly";
                 using (var conn = new SqliteConnection(connectionString))
                 {
                     conn.Open();

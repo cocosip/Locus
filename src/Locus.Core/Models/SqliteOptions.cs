@@ -62,10 +62,12 @@ namespace Locus.Core.Models
             if (string.IsNullOrWhiteSpace(databasePath))
                 throw new ArgumentException("Database path cannot be empty", nameof(databasePath));
 
-            // Cache=Shared enables connection-level shared cache within the same process,
-            // allowing concurrent reads from different SqliteConnection instances on the same file.
             // Mode=ReadWriteCreate creates the file if it does not yet exist.
-            return $"Data Source={databasePath};Cache=Shared;Mode=ReadWriteCreate";
+            // Cache=Private (default) is intentional: each repository holds a single persistent
+            // SqliteConnection per tenant (via Lazy<>). Shared-cache mode is only beneficial when
+            // multiple SqliteConnection objects open the same file concurrently; it adds unnecessary
+            // complexity here and can interfere with WAL-mode locking semantics.
+            return $"Data Source={databasePath};Mode=ReadWriteCreate";
         }
 
         // Whitelists for PRAGMA values that are user-configurable strings.

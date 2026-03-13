@@ -189,11 +189,20 @@ namespace Locus.Storage
                 throw new ArgumentException("Max files cannot be negative", nameof(maxFiles));
 
             var globalQuota = await _repository.GetOrCreateAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
-            globalQuota.MaxCount = maxFiles;
-            globalQuota.Enabled = true;
-            globalQuota.CurrentCount = 0;
 
-            await _repository.UpdateAsync(GLOBAL_QUOTA_KEY, globalQuota, ct);
+            // Build a fresh object to avoid mutating the cached reference.
+            // Do NOT overwrite CurrentCount — it tracks real file counts across restarts.
+            var updated = new DirectoryQuota
+            {
+                DirectoryPath = globalQuota.DirectoryPath,
+                CurrentCount = globalQuota.CurrentCount,
+                MaxCount = maxFiles,
+                Enabled = true,
+                CreatedAt = globalQuota.CreatedAt,
+                LastUpdated = globalQuota.LastUpdated
+            };
+
+            await _repository.UpdateAsync(GLOBAL_QUOTA_KEY, updated, ct);
 
             _logger.LogInformation("Set global quota limit: {MaxFiles} files (0 = unlimited)", maxFiles);
         }
