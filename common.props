@@ -29,6 +29,6 @@
 
   <!-- Include README in package -->
   <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>

@@ -1,9 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+  <Import Project="..\..\common.props" />
+
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>Locus</PackageId>
-    <Description>Locus - A high-performance, multi-tenant file storage pool system with queue-based processing, SQLite metadata management, and unlimited storage expansion. This is the main package that includes all components.</Description>
   </PropertyGroup>
 
   <ItemGroup>
