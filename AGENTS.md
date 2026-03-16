@@ -9,6 +9,48 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 - All code comments, XML documentation, and code-related text should be in **English**
 - Code identifiers (class names, method names, variables) must follow English naming conventions
 
+## Project Identity
+
+- Project name: Locus
+- System name: Locus
+- Repository remote: `git@github.com:cocosip/Locus.git`
+- Default memory scope: current project
+
+## Memory Rules
+
+- At the start of a fresh session in this repository, call `memory_bootstrap_session`.
+- Save a memory note when work produces a lasting architectural decision, bugfix insight, reusable discovery, or durable implementation constraint.
+- Save a handoff before pausing, switching tasks, or ending the session.
+- Prefer concise memory entries that reference concrete modules, interfaces, and behavior changes.
+
+## Related Project Policy
+
+- Related-project memory is allowed only when the current task clearly depends on another repository in the same system.
+- Typical examples include shared contracts, generated clients, deployment coordination, or integration debugging.
+- Do not pull memory from unrelated projects by default.
+
+## Preferred Tags
+
+- Use tags where useful, especially: `locus`, `storage-pool`, `dotnet`, `multi-tenant`, `cleanup`, `file-scheduler`
+
+## Project-Specific Notes
+
+- Prefer memory notes for changes that affect tenant isolation, storage allocation, retry policy, cleanup behavior, or file scheduling semantics.
+- When saving notes, mention the affected project area such as `src`, `tests`, FileWatcher, metadata storage, or quota management.
+- Keep new workflow instructions additive; do not remove the detailed repository design guidance below unless explicitly requested.
+
+## System Relationships
+
+- This repository belongs to system: Locus
+- Related repositories may include: none documented yet
+- Use related-project memory only when the current task depends on a confirmed related repository.
+
+## Cross-Repo Memory Rules
+
+- Prefer current-project memory first.
+- Expand to related repositories only for integration-relevant work.
+- When using related-project memory, mention the source repository explicitly in your reasoning and outputs.
+
 ## Project Overview
 
 Locus is a file storage pool system targeting .NET netstandard2.0 that provides:
