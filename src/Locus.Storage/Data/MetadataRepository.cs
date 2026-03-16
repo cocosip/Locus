@@ -1957,12 +1957,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 sizeBefore = _fileSystem.FileInfo.New(dbPath).Length;
 
                 // VACUUM requires exclusive write access to the database file.
-                // Microsoft.Data.Sqlite connection pooling means conn.Dispose() returns the
-                // connection to the pool without closing the OS file handle, so concurrent
-                // readers may still hold the file open. Strategy: evict the cached connection,
-                // call ClearAllPools() to flush all pooled handles, run VACUUM on a fresh
-                // dedicated connection, then clear pools again so the next GetDatabase call
-                // opens a clean connection.
+                // Repository connections use Pooling=False, so disposing the cached tenant
+                // connection releases the underlying file handle without disturbing other tenants.
                 lock (GetDatabaseLock(tenantId))
                 {
                     // Step 1: evict the cached connection so GetDatabase rebuilds it afterwards.
@@ -1976,11 +1972,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                         }
                     }
 
-                    // Step 2: release all pooled handles so the file is exclusively ours.
-                    SqliteConnection.ClearAllPools();
-
-                    // Step 3: run VACUUM on a fresh dedicated connection.
-                    var vacuumConnStr = $"Data Source={dbPath};Mode=ReadWriteCreate";
+                    // Step 2: run VACUUM on a fresh dedicated connection.
+                    var vacuumConnStr = _sqliteOptions.BuildConnectionString(dbPath);
                     using (var vacuumConn = new SqliteConnection(vacuumConnStr))
                     {
                         vacuumConn.Open();
@@ -1991,9 +1984,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                         }
                     }
 
-                    // Step 4: release the private connection handle so the shared connection
-                    // can re-open cleanly on next access.
-                    SqliteConnection.ClearAllPools();
+                    // Step 3: the dedicated connection is disposed here; GetDatabase will open
+                    // a fresh tenant connection lazily on the next access.
                 }
 
                 if (_fileSystem.File.Exists(dbPath))
@@ -2123,16 +2115,6 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     }
                 }
 
-                // Force the SQLite connection pool to release the OS file handle.
-                // Microsoft.Data.Sqlite pooling means Dispose() returns connections to the pool
-                // rather than closing them. ClearAllPools() ensures the file can be deleted and
-                // a fresh connection will open a new file.
-                // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
-                // This is intentional and necessary: the OS file handle must be released before the
-                // database file can be deleted. Since database rebuild is a rare maintenance operation
-                // (only triggered by corruption), the brief impact on other tenants is acceptable.
-                // After the rebuild completes, connections will be automatically re-established on next access.
-                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
                 if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                     RemoveTenantFromGlobalIndex(staleTenantCache);
                 _physicalPathIndex.TryRemove(tenantId, out _);
@@ -2251,13 +2233,6 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                             _logger.LogWarning(ex, "Error disposing SQLite connection for tenant {TenantId}", tenantId);
                         }
                     }
-
-                    // Force the connection pool to release the OS file handle before deleting the file.
-                    // NOTE: ClearAllPools() is a global operation that affects ALL tenant connections.
-                    // This is intentional and necessary: the OS file handle must be released before the
-                    // database file can be deleted. Since database rebuild is a rare maintenance operation
-                    // (only triggered by corruption), the brief impact on other tenants is acceptable.
-                    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
 
                     // Step 3: Clear in-memory cache and pending index
                     if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))

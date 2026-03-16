@@ -38,6 +38,7 @@ namespace Locus.Storage
         private int _importedHistoryDirty;
         private int _pendingImportedHistoryDepth;
         private int _coalescedImportedHistoryDepth;
+        private int _importedFilesCount;
         private int _historyJournalOperationCount;
         private long _lastImportedHistoryFlushUtcTicks;
         private long _lastImportedFilesPruneUtcTicks;
@@ -49,6 +50,8 @@ namespace Locus.Storage
         private readonly SemaphoreSlim _watcherCacheLock;
         private volatile IReadOnlyList<FileWatcherConfiguration>? _cachedWatchers;
         private long _watchersCacheExpiresAtTicks;
+        private readonly StringComparer _tenantIdComparer;
+        private readonly RegexOptions _patternRegexOptions;
 
         // Prune stale entries when the cache exceeds this size to prevent unbounded growth in Keep mode.
         private const int MaxImportedFilesCacheSize = 10_000;
@@ -102,9 +105,16 @@ namespace Locus.Storage
 
             // Use case-insensitive comparison on Windows (NTFS is case-insensitive),
             // and case-sensitive on Linux/macOS to match the underlying file system behavior.
-            var pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            var isCaseInsensitivePlatform = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            var pathComparer = isCaseInsensitivePlatform
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
+            _tenantIdComparer = isCaseInsensitivePlatform
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+            _patternRegexOptions = RegexOptions.CultureInvariant | RegexOptions.Compiled;
+            if (isCaseInsensitivePlatform)
+                _patternRegexOptions |= RegexOptions.IgnoreCase;
             _importedFiles = new ConcurrentDictionary<string, string>(pathComparer);
             _pendingImportedHistoryChannel = Channel.CreateBounded<ImportedHistoryOperation>(new BoundedChannelOptions(MaxImportedHistoryChannelSize)
             {
@@ -158,8 +168,8 @@ namespace Locus.Storage
                     var resolvedValue = ResolveImportedHistoryValue(normalizedKey, kvp.Value);
                     if (resolvedValue != null)
                     {
-                        _importedFiles.TryAdd(normalizedKey, resolvedValue);
-                        loaded++;
+                        if (TryAddImportedFileValue(normalizedKey, resolvedValue))
+                            loaded++;
                         if (!string.Equals(resolvedValue, kvp.Value, StringComparison.Ordinal))
                             upgradedLegacyEntries++;
                     }
@@ -192,7 +202,7 @@ namespace Locus.Storage
         /// </summary>
         private void PruneStaleImportedEntries()
         {
-            if (_importedFiles.Count == 0)
+            if (Volatile.Read(ref _importedFilesCount) == 0)
                 return;
 
             var directoryExistsCache = new Dictionary<string, bool>(StringComparer.Ordinal);
@@ -470,19 +480,45 @@ namespace Locus.Storage
 
         private void UpsertImportedFileRecord(string path, string fingerprint)
         {
-            _importedFiles[path] = fingerprint;
+            SetImportedFileValue(path, fingerprint);
             EnqueueImportedHistoryOperation(ImportedHistoryOperation.CreateUpsert(path, fingerprint));
         }
 
         private bool TryRemoveImportedFileRecord(string path)
         {
-            if (!_importedFiles.TryRemove(path, out var removedFileKey))
+            if (!TryRemoveImportedFileValue(path, out var removedFileKey))
                 return false;
 
             if (string.Equals(removedFileKey, InFlightImportMarker, StringComparison.Ordinal))
                 return true;
 
             EnqueueImportedHistoryOperation(ImportedHistoryOperation.CreateDelete(path));
+            return true;
+        }
+
+        private bool TryAddImportedFileValue(string path, string value)
+        {
+            if (!_importedFiles.TryAdd(path, value))
+                return false;
+
+            Interlocked.Increment(ref _importedFilesCount);
+            return true;
+        }
+
+        private void SetImportedFileValue(string path, string value)
+        {
+            if (TryAddImportedFileValue(path, value))
+                return;
+
+            _importedFiles[path] = value;
+        }
+
+        private bool TryRemoveImportedFileValue(string path, out string removedValue)
+        {
+            if (!_importedFiles.TryRemove(path, out removedValue))
+                return false;
+
+            Interlocked.Decrement(ref _importedFilesCount);
             return true;
         }
 
@@ -652,7 +688,7 @@ namespace Locus.Storage
 
         private void TryPruneStaleImportedEntries(FileWatcherConfiguration configuration)
         {
-            if (_importedFiles.Count < MaxImportedFilesCacheSize)
+            if (Volatile.Read(ref _importedFilesCount) < MaxImportedFilesCacheSize)
                 return;
 
             if (configuration.EnableImportedFilesPruneThrottle)
@@ -1112,7 +1148,7 @@ namespace Locus.Storage
             var tenantIds = allTenants
                 .Select(tenant => tenant.TenantId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Distinct(_tenantIdComparer)
                 .ToArray();
 
             _autoCreateTenantDirectoryCache[watcherId] = new AutoCreateTenantDirectoryCacheEntry(
@@ -1335,7 +1371,7 @@ namespace Locus.Storage
                     if (_importedFiles.TryGetValue(filePath, out var currentValue)
                         && string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal))
                     {
-                        _importedFiles.TryRemove(filePath, out _);
+                        TryRemoveImportedFileValue(filePath, out _);
                     }
                     // Note: If the value is not the in-flight marker, it means another thread
                     // has already updated the record (e.g., a concurrent scan imported the file).
@@ -1485,14 +1521,14 @@ namespace Locus.Storage
             return false;
         }
 
-        private static Regex CreateWildcardMatcher(string pattern)
+        private Regex CreateWildcardMatcher(string pattern)
         {
             var normalized = string.IsNullOrWhiteSpace(pattern) ? "*" : pattern.Trim();
             var regexPattern = "^" + Regex.Escape(normalized)
                 .Replace("\\*", ".*")
                 .Replace("\\?", ".") + "$";
 
-            return new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+            return new Regex(regexPattern, _patternRegexOptions);
         }
 
         private bool TryAcquireImportSlot(string filePath, string fingerprint)
@@ -1500,7 +1536,7 @@ namespace Locus.Storage
             while (true)
             {
                 if (!_importedFiles.TryGetValue(filePath, out var currentValue))
-                    return _importedFiles.TryAdd(filePath, InFlightImportMarker);
+                    return TryAddImportedFileValue(filePath, InFlightImportMarker);
 
                 if (string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal)
                     || string.Equals(currentValue, fingerprint, StringComparison.Ordinal))

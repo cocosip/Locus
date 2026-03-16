@@ -45,6 +45,13 @@ namespace Locus.Core.Abstractions
         Task CleanupOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct);
 
         /// <summary>
+        /// Cleans up orphaned files across all registered storage volumes by discovering tenant
+        /// directories under each volume mount path and rebuilding missing metadata entries.
+        /// </summary>
+        /// <param name="ct">Cancellation token.</param>
+        Task CleanupAllOrphanedFilesAsync(CancellationToken ct);
+
+        /// <summary>
         /// Cleans up files that have been in processing state longer than the timeout threshold.
         /// </summary>
         /// <param name="timeout">The processing timeout threshold.</param>

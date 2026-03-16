@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions.TestingHelpers;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -453,6 +454,48 @@ namespace Locus.Storage.Tests
             Assert.True(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-001")));
             Assert.True(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-002")));
             _tenantManager.Verify(m => m.GetAllTenantsAsync(It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_MultiTenantAutoCreate_DeduplicatesTenantIds_UsingPlatformComparer()
+        {
+            var watchPath = @"C:\watch-auto-create-case";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var tenantA = new Mock<ITenantContext>();
+            tenantA.Setup(t => t.TenantId).Returns("Tenant-Case");
+            tenantA.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            var tenantB = new Mock<ITenantContext>();
+            tenantB.Setup(t => t.TenantId).Returns("tenant-case");
+            tenantB.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+
+            _tenantManager.Setup(m => m.GetAllTenantsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { tenantA.Object, tenantB.Object });
+            _tenantManager.Setup(m => m.IsTenantEnabledAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            var config = new FileWatcherConfiguration
+            {
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = true,
+                AutoCreateTenantDirectories = true,
+                AutoCreateTenantDirectoriesCacheTtl = TimeSpan.Zero,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+            await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            var createdTenantDirectories = _fileSystem.Directory.GetDirectories(watchPath)
+                .Select(Path.GetFileName)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .ToArray();
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                Assert.Single(createdTenantDirectories);
+            else
+                Assert.Equal(2, createdTenantDirectories.Length);
         }
 
         [Fact]
@@ -997,6 +1040,66 @@ namespace Locus.Storage.Tests
                 It.IsAny<Stream>(),
                 It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_PatternMatching_RespectsPlatformCaseSensitivity()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-pattern-case";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var upperCaseFile = Path.Combine(watchPath, "file-a.TXT");
+            _fileSystem.File.WriteAllText(upperCaseFile, "txt");
+            _fileSystem.File.SetLastWriteTimeUtc(upperCaseFile, DateTime.UtcNow.AddMinutes(-5));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var config = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                MinFileAge = TimeSpan.Zero,
+                SkipStabilityCheckAfterAge = TimeSpan.Zero,
+                MaxConcurrentImports = 1,
+                PostImportAction = PostImportAction.Keep,
+                FilePatterns = new List<string> { "*.txt" }
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+            var result = await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                Assert.Equal(1, result.FilesImported);
+                _storagePool.Verify(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(),
+                    It.IsAny<Stream>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<CancellationToken>()), Times.Once);
+            }
+            else
+            {
+                Assert.Equal(0, result.FilesImported);
+                _storagePool.Verify(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(),
+                    It.IsAny<Stream>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<CancellationToken>()), Times.Never);
+            }
         }
 
         [Fact]

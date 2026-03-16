@@ -27,7 +27,6 @@ namespace Locus.Storage
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
         private readonly StorageVolumeRegistry _volumeRegistry;
-        private readonly CleanupStatistics _statistics;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
         private readonly int _statusCleanupBatchSizePerTenant;
@@ -42,6 +41,12 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
         private long _statusCleanupIterationCount;
         private long _statusCleanupIterationStopwatchTicks;
+        private int _emptyDirectoriesRemoved;
+        private int _completedRecordsRemoved;
+        private int _permanentlyFailedFilesRemoved;
+        private int _orphanedFilesRemoved;
+        private int _timedOutFilesReset;
+        private long _spaceFreed;
         
         /// <summary>
         /// System files that should be ignored when checking if a directory is empty.
@@ -75,7 +80,6 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
             _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
-            _statistics = new CleanupStatistics();
             _orphanScanQueues = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
             _orphanScanLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _orphanScanLastRunUtc = new ConcurrentDictionary<string, DateTime>();
@@ -145,7 +149,7 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
 
-            _logger.LogInformation("Starting junk file cleanup for tenant: {TenantId}", tenantId);
+            _logger.LogInformation("Starting junk-file sweep for tenant: {TenantId}", tenantId);
 
             var removedCount = 0;
 
@@ -159,16 +163,17 @@ namespace Locus.Storage
                 }
             }
 
-            // Note: We still use the metric name EmptyDirectoriesRemoved for compatibility, 
-            // but it now represents the number of junk files removed.
-            _statistics.EmptyDirectoriesRemoved += removedCount;
-            _logger.LogInformation("Cleaned up {Count} junk files for tenant {TenantId}", removedCount, tenantId);
+            Interlocked.Add(ref _emptyDirectoriesRemoved, removedCount);
+            _logger.LogInformation(
+                "Junk-file sweep completed for tenant {TenantId}: removed {Count} empty directories",
+                tenantId,
+                removedCount);
         }
 
         /// <inheritdoc/>
         public async Task CleanupAllEmptyDirectoriesAsync(CancellationToken ct)
         {
-            _logger.LogInformation("Starting junk file cleanup for all tenants");
+            _logger.LogInformation("Starting junk-file sweep for all tenants");
 
             var removedCount = 0;
 
@@ -185,8 +190,10 @@ namespace Locus.Storage
                 }
             }
 
-            _statistics.EmptyDirectoriesRemoved += removedCount;
-            _logger.LogInformation("Cleaned up {Count} junk files across all tenants", removedCount);
+            Interlocked.Add(ref _emptyDirectoriesRemoved, removedCount);
+            _logger.LogInformation(
+                "Junk-file sweep completed across all tenants: removed {Count} empty directories",
+                removedCount);
         }
 
         /// <inheritdoc/>
@@ -207,8 +214,8 @@ namespace Locus.Storage
                 spaceFreed += tenantResult.SpaceFreed;
             }
 
-            _statistics.PermanentlyFailedFilesRemoved += removedCount;
-            _statistics.SpaceFreed += spaceFreed;
+            Interlocked.Add(ref _permanentlyFailedFilesRemoved, removedCount);
+            Interlocked.Add(ref _spaceFreed, spaceFreed);
             _logger.LogInformation("Cleaned up {Count} permanently failed files, freed {Size} bytes",
                 removedCount, spaceFreed);
         }
@@ -374,10 +381,51 @@ namespace Locus.Storage
                 _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
             }
 
-            _statistics.OrphanedFilesRemoved += rebuiltCount;
+            Interlocked.Add(ref _orphanedFilesRemoved, rebuiltCount);
             _logger.LogInformation(
                 "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
                 tenant.TenantId, rebuiltCount);
+        }
+
+        /// <inheritdoc/>
+        public async Task CleanupAllOrphanedFilesAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("Starting orphaned file metadata rebuild across all registered volumes");
+
+            var tenantIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var volume in _volumes.Values)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (!_fileSystem.Directory.Exists(volume.MountPath))
+                    continue;
+
+                string[] tenantDirectories;
+                try
+                {
+                    tenantDirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to enumerate tenant directories under volume {VolumeId}", volume.VolumeId);
+                    continue;
+                }
+
+                foreach (var tenantDirectory in tenantDirectories)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var tenantId = _fileSystem.Path.GetFileName(tenantDirectory);
+                    if (!string.IsNullOrWhiteSpace(tenantId))
+                        tenantIds.Add(tenantId);
+                }
+            }
+
+            foreach (var tenantId in tenantIds)
+            {
+                ct.ThrowIfCancellationRequested();
+                await CleanupOrphanedFilesAsync(new CleanupTenantContext(tenantId), ct);
+            }
         }
 
         private string GetOrphanScanKey(string tenantId, string volumeId)
@@ -506,7 +554,7 @@ namespace Locus.Storage
                 resetCount += await ResetTimedOutForTenantAsync(tenantId, cutoffTime, DateTime.UtcNow, ct);
             }
 
-            _statistics.TimedOutFilesReset += resetCount;
+            Interlocked.Add(ref _timedOutFilesReset, resetCount);
             _logger.LogInformation("Reset {Count} timed-out processing files to Pending", resetCount);
         }
 
@@ -545,9 +593,9 @@ namespace Locus.Storage
                 }
             }
 
-            _statistics.TimedOutFilesReset += resetCount;
-            _statistics.PermanentlyFailedFilesRemoved += removedFailed;
-            _statistics.SpaceFreed += spaceFreed;
+            Interlocked.Add(ref _timedOutFilesReset, resetCount);
+            Interlocked.Add(ref _permanentlyFailedFilesRemoved, removedFailed);
+            Interlocked.Add(ref _spaceFreed, spaceFreed);
 
             _logger.LogInformation(
                 "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed removed, {SpaceFreed} bytes freed",
@@ -759,12 +807,12 @@ namespace Locus.Storage
         {
             return Task.FromResult(new CleanupStatistics
             {
-                EmptyDirectoriesRemoved = _statistics.EmptyDirectoriesRemoved,
-                CompletedRecordsRemoved = _statistics.CompletedRecordsRemoved,
-                PermanentlyFailedFilesRemoved = _statistics.PermanentlyFailedFilesRemoved,
-                OrphanedFilesRemoved = _statistics.OrphanedFilesRemoved,
-                TimedOutFilesReset = _statistics.TimedOutFilesReset,
-                SpaceFreed = _statistics.SpaceFreed
+                EmptyDirectoriesRemoved = Volatile.Read(ref _emptyDirectoriesRemoved),
+                CompletedRecordsRemoved = Volatile.Read(ref _completedRecordsRemoved),
+                PermanentlyFailedFilesRemoved = Volatile.Read(ref _permanentlyFailedFilesRemoved),
+                OrphanedFilesRemoved = Volatile.Read(ref _orphanedFilesRemoved),
+                TimedOutFilesReset = Volatile.Read(ref _timedOutFilesReset),
+                SpaceFreed = Interlocked.Read(ref _spaceFreed)
             });
         }
 
@@ -1022,6 +1070,18 @@ namespace Locus.Storage
             {
                 return false;
             }
+        }
+
+        private sealed class CleanupTenantContext : ITenantContext
+        {
+            public CleanupTenantContext(string tenantId)
+            {
+                TenantId = tenantId ?? throw new ArgumentNullException(nameof(tenantId));
+            }
+
+            public string TenantId { get; }
+
+            public TenantStatus Status => TenantStatus.Enabled;
         }
     }
 }

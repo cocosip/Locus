@@ -51,7 +51,11 @@ namespace Locus.Storage
                     // Note: This no longer deletes empty directories, only the junk files within them.
                     await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
-                    // 2-3. Combined single-pass cleanup: timed-out and permanently-failed files.
+                    // 2. Rebuild orphaned files that may have been stranded by write-behind crashes.
+                    if (_options.CleanupOrphanedFiles)
+                        await _cleanupService.CleanupAllOrphanedFilesAsync(stoppingToken);
+
+                    // 3-4. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.
                     // Note: Completed files are deleted immediately on MarkAsCompletedAsync and never accumulate.
                     await _cleanupService.CleanupFilesByStatusAsync(
@@ -59,7 +63,20 @@ namespace Locus.Storage
                         _options.CleanupPermanentlyFailedFiles ? _options.FailedFileRetentionPeriod : null,
                         stoppingToken);
 
-                    // 5. Optimize databases (if enabled and due)
+                    // 5. Remove stale corruption backup files left over from rebuild operations.
+                    if (_options.CleanupInvalidDatabaseBackups)
+                    {
+                        var (filesRemoved, spaceFreed) = await _cleanupService.CleanupInvalidDatabaseFilesAsync(stoppingToken);
+                        if (filesRemoved > 0)
+                        {
+                            _logger.LogInformation(
+                                "Removed {FilesRemoved} stale SQLite corruption backup file(s), freed {SpaceFreedMB:F2} MB",
+                                filesRemoved,
+                                spaceFreed / 1024.0 / 1024.0);
+                        }
+                    }
+
+                    // 6. Optimize databases (if enabled and due)
                     if (_options.OptimizeDatabases && ShouldOptimizeDatabases())
                     {
                         _logger.LogInformation("Starting scheduled database optimization...");
@@ -165,6 +182,18 @@ namespace Locus.Storage
         /// Default: true.
         /// </summary>
         public bool CleanupPermanentlyFailedFiles { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether to rebuild orphaned physical files that exist on disk but have no metadata.
+        /// Default: true.
+        /// </summary>
+        public bool CleanupOrphanedFiles { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether to remove stale SQLite corruption backup files (*.corrupted.*).
+        /// Default: true.
+        /// </summary>
+        public bool CleanupInvalidDatabaseBackups { get; set; } = true;
 
         /// <summary>
         /// Gets or sets the retention period for permanently failed files.

@@ -655,6 +655,52 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupAllOrphanedFilesAsync_RebuildsMetadataAcrossTenants()
+        {
+            var tenant1Path = Path.Combine(_volumePath, "tenant-001");
+            var tenant2Path = Path.Combine(_volumePath, "tenant-002");
+            _fileSystem.Directory.CreateDirectory(tenant1Path);
+            _fileSystem.Directory.CreateDirectory(tenant2Path);
+
+            var tenant1File = Path.Combine(tenant1Path, "alpha.dat");
+            var tenant2File = Path.Combine(tenant2Path, "beta.dat");
+            _fileSystem.File.WriteAllText(tenant1File, "alpha");
+            _fileSystem.File.WriteAllText(tenant2File, "beta");
+
+            await _cleanupService.CleanupAllOrphanedFilesAsync(CancellationToken.None);
+
+            var rebuiltAlpha = await _metadataRepository.GetAsync("tenant-001", "alpha", CancellationToken.None);
+            var rebuiltBeta = await _metadataRepository.GetAsync("tenant-002", "beta", CancellationToken.None);
+
+            Assert.NotNull(rebuiltAlpha);
+            Assert.NotNull(rebuiltBeta);
+
+            var stats = await _cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(2, stats.OrphanedFilesRemoved);
+        }
+
+        [Fact]
+        public async Task CleanupInvalidDatabaseFilesAsync_RemovesCorruptionBackups()
+        {
+            var tenantMetaDir = Path.Combine(_metadataDir, "tenant-001");
+            var tenantQuotaDir = Path.Combine(_quotaDir, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantMetaDir);
+            _fileSystem.Directory.CreateDirectory(tenantQuotaDir);
+
+            var metaBackup = Path.Combine(tenantMetaDir, "metadata.db.corrupted.20260316070000");
+            var quotaBackup = Path.Combine(tenantQuotaDir, "quotas.db.corrupted.20260316070000");
+            _fileSystem.File.WriteAllText(metaBackup, "meta-backup");
+            _fileSystem.File.WriteAllText(quotaBackup, "quota-backup");
+
+            var result = await _cleanupService.CleanupInvalidDatabaseFilesAsync(CancellationToken.None);
+
+            Assert.Equal(2, result.FilesRemoved);
+            Assert.True(result.SpaceFreed > 0);
+            Assert.False(_fileSystem.File.Exists(metaBackup));
+            Assert.False(_fileSystem.File.Exists(quotaBackup));
+        }
+
+        [Fact]
         public async Task CleanupEmptyDirectoriesAsync_RemovesJunkFiles_ButPreservesDirectories()
         {
             // Arrange

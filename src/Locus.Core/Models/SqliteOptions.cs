@@ -63,11 +63,10 @@ namespace Locus.Core.Models
                 throw new ArgumentException("Database path cannot be empty", nameof(databasePath));
 
             // Mode=ReadWriteCreate creates the file if it does not yet exist.
-            // Cache=Private (default) is intentional: each repository holds a single persistent
-            // SqliteConnection per tenant (via Lazy<>). Shared-cache mode is only beneficial when
-            // multiple SqliteConnection objects open the same file concurrently; it adds unnecessary
-            // complexity here and can interfere with WAL-mode locking semantics.
-            return $"Data Source={databasePath};Mode=ReadWriteCreate";
+            // Pooling=False is intentional: repositories keep one long-lived connection per tenant,
+            // so pooling adds little value but makes tenant-scoped maintenance (VACUUM/rebuild/delete)
+            // harder because disposed connections can retain pooled file handles.
+            return $"Data Source={databasePath};Mode=ReadWriteCreate;Pooling=False";
         }
 
         // Whitelists for PRAGMA values that are user-configurable strings.
