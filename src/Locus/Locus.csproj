@@ -42,6 +42,8 @@
   </Target>
 
   <ItemGroup>
+    <!-- Source Link for debugging -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
     <!-- Microsoft Extensions -->
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />

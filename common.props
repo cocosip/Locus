@@ -25,6 +25,10 @@
     <!-- Source Link support for debugging -->
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+
+    <!-- Deterministic builds for reproducibility -->
+    <Deterministic>true</Deterministic>
   </PropertyGroup>
 
   <!-- Include README in package -->
