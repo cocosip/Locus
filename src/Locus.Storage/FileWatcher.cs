@@ -1107,7 +1107,7 @@ namespace Locus.Storage
             var mergedDirectories = existingDirectories.ToList();
             var existingTenantIds = new HashSet<string>(
                 existingDirectories.Select(path => _fileSystem.Path.GetFileName(path)),
-                StringComparer.OrdinalIgnoreCase);
+                _tenantIdComparer);
 
             foreach (var tenantId in tenants)
             {
