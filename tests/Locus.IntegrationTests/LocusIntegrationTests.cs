@@ -163,7 +163,7 @@ namespace Locus.IntegrationTests
                 using var stream1 = await storagePool.ReadFileAsync(tenant!, file1.FileKey, default);
                 // Read and process the stream here if needed
             }
-            await fileScheduler.MarkAsCompletedAsync(file1.FileKey, default);
+            await fileScheduler.MarkAsCompletedAsync(file1.FileKey, file1.ProcessingStartTime!.Value, default);
 
             // Assert - File deleted
             await Assert.ThrowsAsync<FileNotFoundException>(() =>
@@ -172,7 +172,7 @@ namespace Locus.IntegrationTests
             // Act - Get second file and fail it
             var file2 = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);
             Assert.NotNull(file2);
-            await fileScheduler.MarkAsFailedAsync(file2.FileKey, "Test failure", default);
+            await fileScheduler.MarkAsFailedAsync(file2.FileKey, file2.ProcessingStartTime!.Value, "Test failure", default);
 
             // Assert - File goes back to pending
             var file2Status = await fileScheduler.GetFileStatusAsync(file2.FileKey, default);

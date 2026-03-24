@@ -162,10 +162,21 @@ class Program
         // Clean up via MarkAsCompleted (also deletes physical file + metadata)
         WriteInfo("Deleting all test files via MarkAsCompletedAsync ...");
         int deleted = 0;
-        foreach (var k in keys)
+        while (true)
         {
-            try { await pool.MarkAsCompletedAsync(k, default); deleted++; }
-            catch (Exception ex) { WriteWarning($"  Could not delete {k[..16]}...: {ex.Message}"); }
+            var next = await pool.GetNextFileForProcessingAsync(tenant, default);
+            if (next == null)
+                break;
+
+            try
+            {
+                await pool.MarkAsCompletedAsync(next.FileKey, next.ProcessingStartTime!.Value, default);
+                deleted++;
+            }
+            catch (Exception ex)
+            {
+                WriteWarning($"  Could not delete {next.FileKey[..16]}...: {ex.Message}");
+            }
         }
         WriteOk($"Deleted {deleted}/{keys.Count} files.");
         Pause();
@@ -227,8 +238,13 @@ class Program
         }
 
         // Cleanup
-        await pool.MarkAsCompletedAsync(key1, default);
-        await pool.MarkAsCompletedAsync(key2, default);
+        var item1 = await pool.GetNextFileForProcessingAsync(t1, default);
+        if (item1 != null)
+            await pool.MarkAsCompletedAsync(item1.FileKey, item1.ProcessingStartTime!.Value, default);
+
+        var item2 = await pool.GetNextFileForProcessingAsync(t2, default);
+        if (item2 != null)
+            await pool.MarkAsCompletedAsync(item2.FileKey, item2.ProcessingStartTime!.Value, default);
         WriteOk("Test files cleaned up.");
         Pause();
     }
@@ -281,8 +297,14 @@ class Program
         WriteInfo("Tip: To test quota exceeded, set DefaultTenantQuota=3 in appsettings.json and restart.");
 
         // Cleanup
-        foreach (var k in keys)
-            await pool.MarkAsCompletedAsync(k, default);
+        while (true)
+        {
+            var next = await pool.GetNextFileForProcessingAsync(tenant, default);
+            if (next == null)
+                break;
+
+            await pool.MarkAsCompletedAsync(next.FileKey, next.ProcessingStartTime!.Value, default);
+        }
         WriteOk($"Cleaned up {keys.Count} files.");
         Pause();
     }
@@ -334,7 +356,9 @@ class Program
             using var ms = new MemoryStream(Encoding.UTF8.GetBytes("now enabled"));
             var k = await pool.WriteFileAsync(tenant, ms, "test.txt", default);
             WriteOk($"Write succeeded after re-enable. Key = {k[..16]}...");
-            await pool.MarkAsCompletedAsync(k, default);
+            var allocated = await pool.GetNextFileForProcessingAsync(tenant, default);
+            if (allocated != null)
+                await pool.MarkAsCompletedAsync(allocated.FileKey, allocated.ProcessingStartTime!.Value, default);
         }
         catch (Exception ex)
         {
@@ -395,7 +419,7 @@ class Program
                 // Simulate work
                 await Task.Delay(15);
 
-                await pool.MarkAsCompletedAsync(file.FileKey, default);
+                await pool.MarkAsCompletedAsync(file.FileKey, file.ProcessingStartTime!.Value, default);
                 var n = Interlocked.Increment(ref processedCount);
                 System.Console.Write($"\r  Worker {workerId} — processed {n}/{fileCount}    ");
             }
@@ -445,7 +469,7 @@ class Program
             }
 
             WriteInfo($"  Attempt {attempt}: file dequeued — RetryCount={loc.RetryCount}, Status={loc.Status}");
-            await pool.MarkAsFailedAsync(fileKey, $"Simulated failure #{attempt}", default);
+            await pool.MarkAsFailedAsync(fileKey, loc.ProcessingStartTime!.Value, $"Simulated failure #{attempt}", default);
 
             var afterStatus = await pool.GetFileStatusAsync(fileKey, default);
             WriteInfo($"  After MarkAsFailed: status={afterStatus}");

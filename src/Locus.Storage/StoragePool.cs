@@ -380,6 +380,9 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
 
+            // Validate tenant status before exposing metadata.
+            await ValidateTenantAsync(tenant.TenantId, ct);
+
             // Get file metadata
             var metadata = await _metadataRepository.GetAsync(tenant.TenantId, fileKey, ct);
             if (metadata == null)
@@ -409,6 +412,9 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
 
+            // Validate tenant status before exposing physical location.
+            await ValidateTenantAsync(tenant.TenantId, ct);
+
             // Get file metadata
             var metadata = await _metadataRepository.GetAsync(tenant.TenantId, fileKey, ct);
             if (metadata == null)
@@ -430,7 +436,8 @@ namespace Locus.Storage
                 Status = metadata.Status,
                 RetryCount = metadata.RetryCount,
                 LastFailedAt = metadata.LastFailedAt,
-                LastError = metadata.LastError
+                LastError = metadata.LastError,
+                ProcessingStartTime = metadata.ProcessingStartTime
             };
         }
 
@@ -515,7 +522,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsCompletedAsync(string fileKey, CancellationToken ct)
+        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
@@ -531,6 +538,16 @@ namespace Locus.Storage
                 var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
                 if (metadata == null)
                     return; // Already completed by another caller.
+
+                if (metadata.Status != FileProcessingStatus.Processing
+                    || !metadata.ProcessingStartTime.HasValue
+                    || metadata.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                {
+                    throw new FileProcessingLeaseMismatchException(
+                        fileKey,
+                        expectedProcessingStartTimeUtc,
+                        metadata.Status == FileProcessingStatus.Processing ? metadata.ProcessingStartTime : null);
+                }
 
                 var normalizedDirectoryPath = NormalizeDirectoryPathForQuota(metadata.DirectoryPath);
 
@@ -572,7 +589,7 @@ namespace Locus.Storage
                 try
                 {
                     // Delegate physical deletion + metadata removal to file scheduler.
-                    await _fileScheduler.MarkAsCompletedAsync(fileKey, ct);
+                    await _fileScheduler.MarkAsCompletedAsync(fileKey, expectedProcessingStartTimeUtc, ct);
                 }
                 catch
                 {
@@ -619,13 +636,13 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct)
+        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
 
             // Delegate to file scheduler
-            await _fileScheduler.MarkAsFailedAsync(fileKey, errorMessage, ct);
+            await _fileScheduler.MarkAsFailedAsync(fileKey, expectedProcessingStartTimeUtc, errorMessage, ct);
         }
 
         /// <inheritdoc/>

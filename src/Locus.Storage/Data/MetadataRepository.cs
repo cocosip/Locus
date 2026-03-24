@@ -1030,6 +1030,170 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         }
 
         /// <summary>
+        /// Removes a Processing file if it still matches the expected processing lease.
+        /// Returns null when the record was removed or changed concurrently.
+        /// </summary>
+        public async Task<FileMetadata?> TryRemoveProcessingFileAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedProcessingStartTimeUtc,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return null;
+
+                if (current.Status != FileProcessingStatus.Processing
+                    || !current.ProcessingStartTime.HasValue
+                    || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                {
+                    return null;
+                }
+
+                var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
+                    .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
+                if (!removed)
+                    return null;
+
+                _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
+                InvalidatePendingGeneration(tenantId, fileKey);
+                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
+                _logger.LogDebug(
+                    "Conditionally removed processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
+                    fileKey, tenantId, expectedProcessingStartTimeUtc);
+                return current.Clone();
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Updates a Processing file if it still matches the expected processing lease.
+        /// Returns null when the record was removed or changed concurrently.
+        /// </summary>
+        public async Task<FileMetadata?> TryUpdateProcessingFileAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedProcessingStartTimeUtc,
+            Func<FileMetadata, FileMetadata> updateFactory,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            if (updateFactory == null)
+                throw new ArgumentNullException(nameof(updateFactory));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return null;
+
+                if (current.Status != FileProcessingStatus.Processing
+                    || !current.ProcessingStartTime.HasValue
+                    || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                {
+                    return null;
+                }
+
+                var updated = updateFactory(current.Clone());
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return null;
+
+                _fileKeyTenantIndex[fileKey] = tenantId;
+                IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+
+                if (updated.Status == FileProcessingStatus.Pending)
+                {
+                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                    EnqueuePendingCandidate(updated);
+                }
+
+                IndexStatusCandidate(current, updated);
+                EnqueuePersistence(new PersistenceOperation(updated));
+                _logger.LogDebug(
+                    "Conditionally updated processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}, NewStatus: {Status}",
+                    fileKey, tenantId, expectedProcessingStartTimeUtc, updated.Status);
+                return updated.Clone();
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Marks a Pending file as Processing if it still matches the expected pending state.
+        /// Returns null when the record was removed or changed concurrently.
+        /// </summary>
+        public async Task<FileMetadata?> TryMarkPendingFileAsProcessingAsync(
+            string tenantId,
+            string fileKey,
+            DateTime processingStartTimeUtc,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return null;
+
+                if (current.Status != FileProcessingStatus.Pending)
+                    return null;
+
+                var updated = current.Clone();
+                updated.Status = FileProcessingStatus.Processing;
+                updated.ProcessingStartTime = processingStartTimeUtc;
+                updated.AvailableForProcessingAt = null;
+
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return null;
+
+                _fileKeyTenantIndex[fileKey] = tenantId;
+                IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+                _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+                InvalidatePendingGeneration(tenantId, fileKey);
+                IndexStatusCandidate(current, updated);
+                EnqueuePersistence(new PersistenceOperation(updated));
+                _logger.LogDebug(
+                    "Conditionally marked pending metadata as processing for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
+                    fileKey, tenantId, processingStartTimeUtc);
+                return updated.Clone();
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
         /// Returns the IDs of all tenants that currently have an active in-memory cache.
         /// Used by maintenance operations to iterate tenants one at a time instead of
         /// loading all files across all tenants into a single collection.

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -38,16 +39,18 @@ namespace Locus.Core.Abstractions
         /// Marks a file as completed and deletes it from storage.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
+        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsCompletedAsync(string fileKey, CancellationToken ct);
+        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
 
         /// <summary>
         /// Marks a file as failed and returns it to the pool for retry or permanent failure.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
+        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="errorMessage">The error message describing the failure.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct);
+        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
 
         /// <summary>
         /// Resets the processing status of a file to pending.

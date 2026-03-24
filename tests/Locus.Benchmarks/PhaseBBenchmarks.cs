@@ -219,6 +219,7 @@ namespace Locus.Benchmarks
         private string _rootDirectory = string.Empty;
         private string _metadataDirectory = string.Empty;
         private string[] _fileKeys = Array.Empty<string>();
+        private DateTime _processingStartTime;
 
         [Params(64, 256)]
         public int CompletionGuardStripeCount;
@@ -270,8 +271,8 @@ namespace Locus.Benchmarks
             var tenantManager = new Mock<ITenantManager>();
             var scheduler = new Mock<IFileScheduler>();
             scheduler
-                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .Returns(async (string fileKey, CancellationToken token) =>
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
+                .Returns(async (string fileKey, DateTime _, CancellationToken token) =>
                 {
                     var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, token);
                     if (metadata != null)
@@ -287,7 +288,7 @@ namespace Locus.Benchmarks
                 NullLogger<StoragePool>.Instance,
                 CompletionGuardStripeCount);
 
-            var now = DateTime.UtcNow;
+            _processingStartTime = DateTime.UtcNow;
             foreach (var fileKey in _fileKeys)
             {
                 _metadataRepository.AddOrUpdateAsync(new FileMetadata
@@ -298,8 +299,9 @@ namespace Locus.Benchmarks
                     PhysicalPath = $"/bench/{fileKey}.dat",
                     DirectoryPath = "/bench",
                     FileSize = 1024,
-                    Status = FileProcessingStatus.Pending,
-                    CreatedAt = now
+                    Status = FileProcessingStatus.Processing,
+                    CreatedAt = _processingStartTime,
+                    ProcessingStartTime = _processingStartTime
                 }, CancellationToken.None).GetAwaiter().GetResult();
             }
         }
@@ -324,7 +326,7 @@ namespace Locus.Benchmarks
                 tasks[worker] = Task.Run(async () =>
                 {
                     for (var i = start; i < end; i++)
-                        await _storagePool.MarkAsCompletedAsync(_fileKeys[i], CancellationToken.None);
+                        await _storagePool.MarkAsCompletedAsync(_fileKeys[i], _processingStartTime, CancellationToken.None);
                 });
             }
 

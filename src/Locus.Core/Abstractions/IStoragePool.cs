@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -47,6 +48,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file information, or null if not found.</returns>
+        /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
         Task<Models.FileInfo?> GetFileInfoAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
 
         /// <summary>
@@ -57,6 +59,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file location information, or null if not found.</returns>
+        /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
         Task<Models.FileLocation?> GetFileLocationAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
 
         /// <summary>
@@ -91,8 +94,9 @@ namespace Locus.Core.Abstractions
         /// Use this method after successfully processing a file obtained from GetNextFileForProcessingAsync.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
+        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsCompletedAsync(string fileKey, CancellationToken ct);
+        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
 
         /// <summary>
         /// Marks a file as failed processing.
@@ -100,9 +104,10 @@ namespace Locus.Core.Abstractions
         /// If retry count exceeds the maximum, the file is marked as PermanentlyFailed.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
+        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="errorMessage">The error message describing the failure.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct);
+        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
 
         /// <summary>
         /// Gets the current processing status of a file.

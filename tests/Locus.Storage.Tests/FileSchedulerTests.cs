@@ -246,18 +246,20 @@ namespace Locus.Storage.Tests
         public async Task MarkAsCompletedAndDeleteAsync_RemovesMetadata()
         {
             // Arrange
+            var processingStart = DateTime.UtcNow;
             var file = new FileMetadata
             {
                 FileKey = "file-001",
                 TenantId = "tenant-001",
                 PhysicalPath = "/test/file-001.txt",
-                Status = FileProcessingStatus.Processing
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
             // Act
-            await _scheduler.MarkAsCompletedAsync("file-001", CancellationToken.None);
+            await _scheduler.MarkAsCompletedAsync("file-001", processingStart, CancellationToken.None);
 
             // Assert
             var metadata = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
@@ -269,6 +271,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var physicalPath = Path.Combine(_metadataDir, "file-001.txt");
+            var processingStart = DateTime.UtcNow;
 
             // Create physical file
             var directory = Path.GetDirectoryName(physicalPath);
@@ -281,13 +284,14 @@ namespace Locus.Storage.Tests
                 FileKey = "file-001",
                 TenantId = "tenant-001",
                 PhysicalPath = physicalPath,
-                Status = FileProcessingStatus.Processing
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
             // Act
-            await _scheduler.MarkAsCompletedAsync("file-001", CancellationToken.None);
+            await _scheduler.MarkAsCompletedAsync("file-001", processingStart, CancellationToken.None);
 
             // Assert
             Assert.False(_fileSystem.File.Exists(physicalPath));
@@ -298,6 +302,7 @@ namespace Locus.Storage.Tests
         {
             var physicalPath = Path.Combine(_metadataDir, "volume-delete.txt");
             _fileSystem.File.WriteAllText(physicalPath, "test content");
+            var processingStart = DateTime.UtcNow;
 
             var file = new FileMetadata
             {
@@ -305,7 +310,8 @@ namespace Locus.Storage.Tests
                 TenantId = "tenant-001",
                 VolumeId = "vol-001",
                 PhysicalPath = physicalPath,
-                Status = FileProcessingStatus.Processing
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
@@ -323,7 +329,7 @@ namespace Locus.Storage.Tests
             registry.Register(volume.Object);
             var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, volumeRegistry: registry);
 
-            await scheduler.MarkAsCompletedAsync("file-volume-delete", CancellationToken.None);
+            await scheduler.MarkAsCompletedAsync("file-volume-delete", processingStart, CancellationToken.None);
 
             volume.Verify(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()), Times.Once);
             Assert.False(_fileSystem.File.Exists(physicalPath));
@@ -353,7 +359,7 @@ namespace Locus.Storage.Tests
 
             // Act & Assert
             await Assert.ThrowsAsync<IOException>(() =>
-                scheduler.MarkAsCompletedAsync("file-delete-fail", CancellationToken.None));
+                scheduler.MarkAsCompletedAsync("file-delete-fail", file.ProcessingStartTime!.Value, CancellationToken.None));
 
             var updated = await _repository.GetAsync("tenant-001", "file-delete-fail", CancellationToken.None);
             Assert.NotNull(updated);
@@ -368,12 +374,14 @@ namespace Locus.Storage.Tests
         public async Task MarkAsCompletedAsync_FileNotFound_RemovesMetadata()
         {
             // Arrange
+            var processingStart = DateTime.UtcNow;
             var file = new FileMetadata
             {
                 FileKey = "file-delete-missing",
                 TenantId = "tenant-001",
                 PhysicalPath = "/test/file-delete-missing.txt",
-                Status = FileProcessingStatus.Processing
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
@@ -386,7 +394,7 @@ namespace Locus.Storage.Tests
             var scheduler = new FileScheduler(_repository, fsMock.Object, _logger.Object);
 
             // Act
-            await scheduler.MarkAsCompletedAsync("file-delete-missing", CancellationToken.None);
+            await scheduler.MarkAsCompletedAsync("file-delete-missing", processingStart, CancellationToken.None);
 
             // Assert
             var metadata = await _repository.GetAsync("tenant-001", "file-delete-missing", CancellationToken.None);
@@ -394,21 +402,53 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_ThrowsWhenProcessingLeaseChanged()
+        {
+            var originalLease = DateTime.UtcNow.AddMinutes(-2);
+            var replacementLease = DateTime.UtcNow.AddMinutes(-1);
+            var physicalPath = Path.Combine(_metadataDir, "lease-complete.txt");
+            _fileSystem.File.WriteAllText(physicalPath, "test content");
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-lease-complete",
+                TenantId = "tenant-001",
+                PhysicalPath = physicalPath,
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = replacementLease
+            }, CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                _scheduler.MarkAsCompletedAsync("file-lease-complete", originalLease, CancellationToken.None));
+
+            Assert.Equal("file-lease-complete", ex.FileKey);
+            Assert.Equal(replacementLease, ex.ActualProcessingStartTimeUtc);
+            Assert.True(_fileSystem.File.Exists(physicalPath));
+
+            var metadata = await _repository.GetAsync("tenant-001", "file-lease-complete", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Processing, metadata!.Status);
+            Assert.Equal(replacementLease, metadata.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task MarkAsFailedAsync_ReturnsFileToPending()
         {
             // Arrange
+            var processingStart = DateTime.UtcNow;
             var file = new FileMetadata
             {
                 FileKey = "file-001",
                 TenantId = "tenant-001",
                 Status = FileProcessingStatus.Processing,
-                RetryCount = 0
+                RetryCount = 0,
+                ProcessingStartTime = processingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
             // Act
-            await _scheduler.MarkAsFailedAsync("file-001", "Test error", CancellationToken.None);
+            await _scheduler.MarkAsFailedAsync("file-001", processingStart, "Test error", CancellationToken.None);
 
             // Assert
             var metadata = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
@@ -427,19 +467,21 @@ namespace Locus.Storage.Tests
             // Arrange
             var retryPolicy = new FileRetryPolicy { MaxRetryCount = 3 };
             var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, retryPolicy);
+            var processingStart = DateTime.UtcNow;
 
             var file = new FileMetadata
             {
                 FileKey = "file-001",
                 TenantId = "tenant-001",
                 Status = FileProcessingStatus.Processing,
-                RetryCount = 2 // Already failed twice
+                RetryCount = 2, // Already failed twice
+                ProcessingStartTime = processingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
             // Act - third failure should mark as permanently failed
-            await scheduler.MarkAsFailedAsync("file-001", "Final error", CancellationToken.None);
+            await scheduler.MarkAsFailedAsync("file-001", processingStart, "Final error", CancellationToken.None);
 
             // Assert
             var metadata = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
@@ -460,19 +502,21 @@ namespace Locus.Storage.Tests
             };
 
             var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, retryPolicy);
+            var firstProcessingStart = DateTime.UtcNow;
 
             var file = new FileMetadata
             {
                 FileKey = "file-001",
                 TenantId = "tenant-001",
                 Status = FileProcessingStatus.Processing,
-                RetryCount = 0
+                RetryCount = 0,
+                ProcessingStartTime = firstProcessingStart
             };
 
             await _repository.AddOrUpdateAsync(file, CancellationToken.None);
 
             // Act - first failure
-            await scheduler.MarkAsFailedAsync("file-001", "Error 1", CancellationToken.None);
+            await scheduler.MarkAsFailedAsync("file-001", firstProcessingStart, "Error 1", CancellationToken.None);
 
             // Assert - delay should be 5 seconds (5 * 2^0)
             var metadata1 = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
@@ -482,14 +526,44 @@ namespace Locus.Storage.Tests
 
             // Act - second failure
             metadata1.Status = FileProcessingStatus.Processing;
+            var secondProcessingStart = DateTime.UtcNow.AddTicks(1);
+            metadata1.ProcessingStartTime = secondProcessingStart;
             await _repository.AddOrUpdateAsync(metadata1, CancellationToken.None);
-            await scheduler.MarkAsFailedAsync("file-001", "Error 2", CancellationToken.None);
+            await scheduler.MarkAsFailedAsync("file-001", secondProcessingStart, "Error 2", CancellationToken.None);
 
             // Assert - delay should be 10 seconds (5 * 2^1)
             var metadata2 = await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None);
             Assert.NotNull(metadata2);
             var delay2 = metadata2.AvailableForProcessingAt!.Value - DateTime.UtcNow;
             Assert.InRange(delay2.TotalSeconds, 9, 11);
+        }
+
+        [Fact]
+        public async Task MarkAsFailedAsync_ThrowsWhenProcessingLeaseChanged()
+        {
+            var originalLease = DateTime.UtcNow.AddMinutes(-2);
+            var replacementLease = DateTime.UtcNow.AddMinutes(-1);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-lease-fail",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                RetryCount = 0,
+                ProcessingStartTime = replacementLease
+            }, CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                _scheduler.MarkAsFailedAsync("file-lease-fail", originalLease, "stale worker", CancellationToken.None));
+
+            Assert.Equal("file-lease-fail", ex.FileKey);
+            Assert.Equal(replacementLease, ex.ActualProcessingStartTimeUtc);
+
+            var metadata = await _repository.GetAsync("tenant-001", "file-lease-fail", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Processing, metadata!.Status);
+            Assert.Equal(0, metadata.RetryCount);
+            Assert.Equal(replacementLease, metadata.ProcessingStartTime);
         }
 
         [Fact]
@@ -620,6 +694,46 @@ namespace Locus.Storage.Tests
             Assert.NotNull(metadata);
             Assert.Equal(FileProcessingStatus.Failed, metadata!.Status);
             Assert.Null(metadata.ProcessingStartTime);
+        }
+
+        [Fact]
+        public async Task MarkAsProcessingAsync_ConcurrentCalls_OnlyOneSucceeds()
+        {
+            var file = new FileMetadata
+            {
+                FileKey = "file-race",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1)
+            };
+
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var tasks = Enumerable.Range(0, 16)
+                .Select(async _ =>
+                {
+                    try
+                    {
+                        await _scheduler.MarkAsProcessingAsync("file-race", CancellationToken.None);
+                        return (Exception?)null;
+                    }
+                    catch (Exception ex)
+                    {
+                        return ex;
+                    }
+                })
+                .ToArray();
+
+            var results = await Task.WhenAll(tasks);
+
+            Assert.Single(results, result => result == null);
+            foreach (var ex in results.Where(result => result != null))
+                Assert.IsType<FileAlreadyProcessingException>(ex);
+
+            var metadata = await _repository.GetAsync("tenant-001", "file-race", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Processing, metadata!.Status);
+            Assert.NotNull(metadata.ProcessingStartTime);
         }
 
         [Fact]

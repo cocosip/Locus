@@ -61,5 +61,10 @@ namespace Locus.Core.Models
         /// Gets or sets the error message from the last processing failure.
         /// </summary>
         public string? LastError { get; set; }
+
+        /// <summary>
+        /// Gets or sets the timestamp when the current processing lease started.
+        /// </summary>
+        public DateTime? ProcessingStartTime { get; set; }
     }
 }

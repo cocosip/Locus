@@ -409,6 +409,23 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetFileLocationAsync_ThrowsWhenTenantDisabled()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+
+            var disabledTenantContext = new Mock<ITenantContext>();
+            disabledTenantContext.Setup(t => t.TenantId).Returns("tenant-001");
+            disabledTenantContext.Setup(t => t.Status).Returns(TenantStatus.Disabled);
+
+            _tenantManager.Setup(m => m.GetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(disabledTenantContext.Object);
+
+            await Assert.ThrowsAsync<TenantDisabledException>(() =>
+                _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default));
+        }
+
+        [Fact]
         public async Task GetTotalCapacityAsync_ReturnsSumOfAllVolumes()
         {
             // Act
@@ -588,23 +605,47 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetFileInfoAsync_ThrowsWhenTenantDisabled()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+
+            var disabledTenantContext = new Mock<ITenantContext>();
+            disabledTenantContext.Setup(t => t.TenantId).Returns("tenant-001");
+            disabledTenantContext.Setup(t => t.Status).Returns(TenantStatus.Disabled);
+
+            _tenantManager.Setup(m => m.GetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(disabledTenantContext.Object);
+
+            await Assert.ThrowsAsync<TenantDisabledException>(() =>
+                _storagePool.GetFileInfoAsync(_tenant.Object, fileKey, default));
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_ConcurrentDuplicateCalls_DecrementsQuotaOnce()
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("to complete"));
             var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var processingStart = DateTime.UtcNow;
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
 
             _fileScheduler
-                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .Returns(async (string key, CancellationToken token) =>
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
+                .Returns(async (string key, DateTime _, CancellationToken token) =>
                 {
-                    var metadata = await _metadataRepository.GetByFileKeyAsync(key, token);
-                    if (metadata != null)
-                        await _metadataRepository.RemoveAsync(metadata.TenantId, key, token);
+                    var current = await _metadataRepository.GetByFileKeyAsync(key, token);
+                    if (current != null)
+                        await _metadataRepository.RemoveAsync(current.TenantId, key, token);
                 });
 
             var tasks = Enumerable.Range(0, 20)
-                .Select(_ => _storagePool.MarkAsCompletedAsync(fileKey, CancellationToken.None))
+                .Select(_ => _storagePool.MarkAsCompletedAsync(fileKey, processingStart, CancellationToken.None))
                 .ToArray();
 
             // Act
@@ -620,6 +661,46 @@ namespace Locus.Storage.Tests
 
             var metadataAfterCompletion = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.Null(metadataAfterCompletion);
+        }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_WithStaleLease_DoesNotDecrementQuotaOrInvokeScheduler()
+        {
+            // Arrange
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("stale lease"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var activeProcessingStart = DateTime.UtcNow;
+            var staleProcessingStart = activeProcessingStart.AddMinutes(-1);
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = activeProcessingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            // Act
+            var exception = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                _storagePool.MarkAsCompletedAsync(fileKey, staleProcessingStart, CancellationToken.None));
+
+            // Assert
+            Assert.Equal(fileKey, exception.FileKey);
+            Assert.Equal(staleProcessingStart, exception.ExpectedProcessingStartTimeUtc);
+            Assert.Equal(activeProcessingStart, exception.ActualProcessingStartTimeUtc);
+
+            _directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            _tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            _fileScheduler.Verify(
+                m => m.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+
+            var metadataAfterFailure = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadataAfterFailure);
+            Assert.Equal(FileProcessingStatus.Processing, metadataAfterFailure!.Status);
+            Assert.Equal(activeProcessingStart, metadataAfterFailure.ProcessingStartTime);
         }
 
         [Fact]
@@ -644,6 +725,7 @@ namespace Locus.Storage.Tests
             const string tenantId = "tenant-001";
             const string directoryPath = "/compensate";
             const string targetFileKey = "compensate-1";
+            var processingStart = DateTime.UtcNow;
 
             await tenantQuotaManager.SetTenantLimitAsync(tenantId, 2, CancellationToken.None);
             await directoryQuotaManager.SetLimitAsync(tenantId, directoryPath, 2, CancellationToken.None);
@@ -662,7 +744,8 @@ namespace Locus.Storage.Tests
                 DirectoryPath = directoryPath,
                 FileSize = 1,
                 Status = FileProcessingStatus.Processing,
-                CreatedAt = DateTime.UtcNow
+                CreatedAt = DateTime.UtcNow,
+                ProcessingStartTime = processingStart
             }, CancellationToken.None);
 
             await _metadataRepository.AddOrUpdateAsync(new FileMetadata
@@ -678,7 +761,7 @@ namespace Locus.Storage.Tests
             }, CancellationToken.None);
 
             failingScheduler
-                .Setup(s => s.MarkAsCompletedAsync(targetFileKey, It.IsAny<CancellationToken>()))
+                .Setup(s => s.MarkAsCompletedAsync(targetFileKey, processingStart, It.IsAny<CancellationToken>()))
                 .Returns(async () =>
                 {
                     await tenantQuotaManager.SetTenantLimitAsync(tenantId, 1, CancellationToken.None);
@@ -687,7 +770,7 @@ namespace Locus.Storage.Tests
                 });
 
             await Assert.ThrowsAsync<IOException>(() =>
-                storagePool.MarkAsCompletedAsync(targetFileKey, CancellationToken.None));
+                storagePool.MarkAsCompletedAsync(targetFileKey, processingStart, CancellationToken.None));
 
             var tenantCount = await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None);
             var directoryCount = await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None);

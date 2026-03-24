@@ -51,6 +51,15 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 - Expand to related repositories only for integration-relevant work.
 - When using related-project memory, mention the source repository explicitly in your reasoning and outputs.
 
+## Agent Workflow Guardrails
+
+- Keep workflow guidance additive. Preserve the repository-specific architecture and design notes below unless the user explicitly asks to rewrite them.
+- Build context from the current implementation before proposing changes, especially in `src/Locus.Storage`, `src/Locus.MultiTenant`, and `tests/Locus.Storage.Tests`.
+- For review tasks, prioritize concurrency correctness, tenant isolation, quota consistency, cleanup/recovery behavior, and SQLite durability before style or naming feedback.
+- When reporting findings, distinguish confirmed defects from open design questions, and include concrete file paths and line references when possible.
+- Prefer targeted validation commands first (for example a specific test project or test class) before running broad solution-wide test or benchmark commands.
+- If a tool run is interrupted or inconclusive, record that explicitly in the response or handoff instead of implying the check passed.
+
 ## Project Overview
 
 Locus is a file storage pool system targeting .NET netstandard2.0 that provides:

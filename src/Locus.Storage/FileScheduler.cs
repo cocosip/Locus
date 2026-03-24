@@ -82,7 +82,7 @@ namespace Locus.Storage
 
             var metadataList = await _repository.GetNextPendingBatchAsync(tenant.TenantId, batchSize, ct);
 
-            // NOTE: File.Exists is intentionally omitted — same rationale as GetNextFileForProcessingAsync.
+            // NOTE: File.Exists is intentionally omitted - same rationale as GetNextFileForProcessingAsync.
             var locations = metadataList.Select(MapToFileLocation).ToList();
 
             if (locations.Count == 0)
@@ -97,43 +97,54 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
-            var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
-
-            if (metadata == null)
+            const int maxAttempts = 3;
+            for (var attempt = 0; attempt < maxAttempts; attempt++)
             {
+                // Direct cross-tenant lookup - O(tenants) instead of O(total files)
+                var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
+
+                if (metadata == null)
+                    throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
+
+                if (metadata.Status == FileProcessingStatus.Processing)
+                    throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
+
+                if (metadata.Status != FileProcessingStatus.Pending)
+                {
+                    throw new InvalidOperationException(
+                        $"File {fileKey} cannot be marked as processing from status {metadata.Status}. Only Pending files can transition to Processing.");
+                }
+
+                var updated = await _repository.TryMarkPendingFileAsProcessingAsync(
+                    metadata.TenantId,
+                    fileKey,
+                    DateTime.UtcNow,
+                    ct);
+                if (updated != null)
+                {
+                    _logger.LogDebug("Marked file as processing: {FileKey}", fileKey);
+                    return;
+                }
+            }
+
+            var latest = await _repository.GetByFileKeyAsync(fileKey, ct);
+            if (latest == null)
                 throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
-            }
 
-            if (metadata.Status == FileProcessingStatus.Processing)
-            {
+            if (latest.Status == FileProcessingStatus.Processing)
                 throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
-            }
 
-            if (metadata.Status != FileProcessingStatus.Pending)
-            {
-                throw new InvalidOperationException(
-                    $"File {fileKey} cannot be marked as processing from status {metadata.Status}. Only Pending files can transition to Processing.");
-            }
-
-            // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
-            // Mutating it in-place would expose a partial (inconsistent) state to concurrent readers.
-            var updated = metadata.Clone();
-            updated.Status = FileProcessingStatus.Processing;
-            updated.ProcessingStartTime = DateTime.UtcNow;
-
-            await _repository.AddOrUpdateAsync(updated, ct);
-
-            _logger.LogDebug("Marked file as processing: {FileKey}", fileKey);
+            throw new InvalidOperationException(
+                $"File {fileKey} changed state concurrently and is now {latest.Status}.");
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsCompletedAsync(string fileKey, CancellationToken ct)
+        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            // Direct cross-tenant lookup - O(tenants) instead of O(total files)
             var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
@@ -142,24 +153,31 @@ namespace Locus.Storage
                 return;
             }
 
+            var removedMetadata = await _repository.TryRemoveProcessingFileAsync(
+                metadata.TenantId,
+                fileKey,
+                expectedProcessingStartTimeUtc,
+                ct);
+            if (removedMetadata == null)
+                throw CreateLeaseMismatchException(fileKey, expectedProcessingStartTimeUtc, metadata);
+
             // Delete physical file if it exists. If deletion fails for reasons other than
-            // not-found, keep metadata and mark the file PermanentlyFailed so maintenance
-            // cleanup can handle it and quota is not decremented.
+            // not-found, recreate metadata as PermanentlyFailed so maintenance cleanup can handle it.
             Exception? deleteException = null;
-            if (!string.IsNullOrWhiteSpace(metadata.PhysicalPath))
+            if (!string.IsNullOrWhiteSpace(removedMetadata.PhysicalPath))
             {
                 try
                 {
-                    await DeletePhysicalFileAsync(metadata, ct);
-                    _logger.LogDebug("Deleted physical file: {PhysicalPath}", metadata.PhysicalPath);
+                    await DeletePhysicalFileAsync(removedMetadata, ct);
+                    _logger.LogDebug("Deleted physical file: {PhysicalPath}", removedMetadata.PhysicalPath);
                 }
                 catch (Exception ex) when (ex is System.IO.FileNotFoundException || ex is System.IO.DirectoryNotFoundException)
                 {
-                    // File already gone — idempotent, proceed to metadata removal
+                    // File already gone - idempotent, proceed to metadata removal
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to delete physical file: {PhysicalPath}", metadata.PhysicalPath);
+                    _logger.LogError(ex, "Failed to delete physical file: {PhysicalPath}", removedMetadata.PhysicalPath);
                     deleteException = ex;
                 }
             }
@@ -167,7 +185,7 @@ namespace Locus.Storage
             if (deleteException != null)
             {
                 // Clone before mutating so readers never see partial state.
-                var updated = metadata.Clone();
+                var updated = removedMetadata.Clone();
                 updated.Status = FileProcessingStatus.PermanentlyFailed;
                 updated.LastFailedAt = DateTime.UtcNow;
                 updated.ProcessingStartTime = null;
@@ -178,24 +196,21 @@ namespace Locus.Storage
 
                 _logger.LogWarning(
                     "Marked file as PermanentlyFailed because physical delete failed: {FileKey}, Path: {PhysicalPath}",
-                    fileKey, metadata.PhysicalPath);
+                    fileKey, removedMetadata.PhysicalPath);
 
                 throw new IOException($"Failed to delete physical file for completion: {fileKey}", deleteException);
             }
-
-            // Remove metadata (Write-Behind: memory removed immediately, SQLite delete queued)
-            await _repository.RemoveAsync(metadata.TenantId, fileKey, ct);
 
             _logger.LogDebug("Completed and deleted file: {FileKey}", fileKey);
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct)
+        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            // Direct cross-tenant lookup - O(tenants) instead of O(total files)
             var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
@@ -204,36 +219,46 @@ namespace Locus.Storage
                 return;
             }
 
-            // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
-            var updated = metadata.Clone();
-            updated.RetryCount++;
-            updated.LastError = errorMessage;
-            updated.LastFailedAt = DateTime.UtcNow;
-            updated.ProcessingStartTime = null;
+            // Clone before mutating - GetByFileKeyAsync returns a shared cache reference.
+            var updated = await _repository.TryUpdateProcessingFileAsync(
+                metadata.TenantId,
+                fileKey,
+                expectedProcessingStartTimeUtc,
+                current =>
+                {
+                    current.RetryCount++;
+                    current.LastError = errorMessage;
+                    current.LastFailedAt = DateTime.UtcNow;
+                    current.ProcessingStartTime = null;
 
-            if (updated.RetryCount >= _retryPolicy.MaxRetryCount)
+                    if (current.RetryCount >= _retryPolicy.MaxRetryCount)
+                    {
+                        current.Status = FileProcessingStatus.PermanentlyFailed;
+                        current.AvailableForProcessingAt = null;
+                    }
+                    else
+                    {
+                        current.Status = FileProcessingStatus.Pending;
+                        current.AvailableForProcessingAt = DateTime.UtcNow.Add(CalculateRetryDelay(current.RetryCount));
+                    }
+
+                    return current;
+                },
+                ct);
+            if (updated == null)
+                throw CreateLeaseMismatchException(fileKey, expectedProcessingStartTimeUtc, metadata);
+
+            if (updated.Status == FileProcessingStatus.PermanentlyFailed)
             {
-                // Exceeded max retries, mark as permanently failed
-                updated.Status = FileProcessingStatus.PermanentlyFailed;
-                updated.AvailableForProcessingAt = null;
-
                 _logger.LogError("File permanently failed after {RetryCount} retries: {FileKey}, Error: {Error}",
                     updated.RetryCount, fileKey, errorMessage);
             }
             else
             {
-                // Return to pending status for retry
-                updated.Status = FileProcessingStatus.Pending;
-
-                // Calculate retry delay with exponential backoff
-                var delay = CalculateRetryDelay(updated.RetryCount);
-                updated.AvailableForProcessingAt = DateTime.UtcNow.Add(delay);
-
+                var delay = updated.AvailableForProcessingAt!.Value - DateTime.UtcNow;
                 _logger.LogWarning("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
                     updated.RetryCount, _retryPolicy.MaxRetryCount, delay, fileKey, errorMessage);
             }
-
-            await _repository.AddOrUpdateAsync(updated, ct);
         }
 
         /// <inheritdoc/>
@@ -242,7 +267,7 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            // Direct cross-tenant lookup - O(tenants) instead of O(total files)
             var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
@@ -251,7 +276,7 @@ namespace Locus.Storage
                 return;
             }
 
-            // Clone before mutating — GetByFileKeyAsync returns a shared cache reference.
+            // Clone before mutating - GetByFileKeyAsync returns a shared cache reference.
             var updated = metadata.Clone();
             updated.Status = FileProcessingStatus.Pending;
             updated.ProcessingStartTime = null;
@@ -271,7 +296,7 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Direct cross-tenant lookup — O(tenants) instead of O(total files)
+            // Direct cross-tenant lookup - O(tenants) instead of O(total files)
             var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
             if (metadata == null)
@@ -293,7 +318,7 @@ namespace Locus.Storage
             }
 
             // Cap the exponent before computing to prevent double.PositiveInfinity.
-            // 2^62 ≈ 4.6e18 ms — far above any practical MaxRetryDelay, so the clamp below
+            // 2^62 is about 4.6e18 ms - far above any practical MaxRetryDelay, so the clamp below
             // catches it. TimeSpan.FromMilliseconds(Infinity) throws OverflowException, which
             // would escape the caller without this guard.
             const int maxExponent = 62;
@@ -311,8 +336,8 @@ namespace Locus.Storage
             var removedCount = 0;
 
             // Process one tenant at a time to avoid allocating a single list of all files
-            // across every tenant (O(total_files) memory spike → O(max_tenant_files) peak).
-            // EnumerateTenantMetadataRaw returns the live cache values without cloning — we
+            // across every tenant (O(total_files) memory spike -> O(max_tenant_files) peak).
+            // EnumerateTenantMetadataRaw returns the live cache values without cloning - we
             // only read stable fields (PhysicalPath, TenantId, FileKey) so this is safe.
             foreach (var tenantId in _repository.GetActiveTenantIds())
             {
@@ -388,8 +413,22 @@ namespace Locus.Storage
                 Status = metadata.Status,
                 RetryCount = metadata.RetryCount,
                 LastFailedAt = metadata.LastFailedAt,
-                LastError = metadata.LastError
+                LastError = metadata.LastError,
+                ProcessingStartTime = metadata.ProcessingStartTime
             };
+        }
+
+        private static FileProcessingLeaseMismatchException CreateLeaseMismatchException(
+            string fileKey,
+            DateTime expectedProcessingStartTimeUtc,
+            FileMetadata? currentMetadata)
+        {
+            return new FileProcessingLeaseMismatchException(
+                fileKey,
+                expectedProcessingStartTimeUtc,
+                currentMetadata?.Status == FileProcessingStatus.Processing
+                    ? currentMetadata.ProcessingStartTime
+                    : null);
         }
 
         private Task DeletePhysicalFileAsync(FileMetadata metadata, CancellationToken ct)
