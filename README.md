@@ -131,11 +131,11 @@ public interface IStoragePool
     Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(
         ITenantContext tenant, int batchSize, CancellationToken ct);
 
-    // Mark file as completed → deletes file and metadata
-    Task MarkAsCompletedAsync(string fileKey, CancellationToken ct);
+    // Mark file as completed → deletes file and metadata (requires lease token)
+    Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
 
-    // Mark file as failed → returns to queue for retry
-    Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct);
+    // Mark file as failed → returns to queue for retry (requires lease token)
+    Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
 
     // Get current file status
     Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct);
@@ -203,12 +203,16 @@ var tasks = Enumerable.Range(0, 10).Select(async threadId =>
             await ProcessFileAsync(stream);
 
             // Success: mark as completed (deletes file and metadata)
-            await storagePool.MarkAsCompletedAsync(file.FileKey, ct);
+            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
+                ?? throw new InvalidOperationException("Missing processing start time.");
+            await storagePool.MarkAsCompletedAsync(file.FileKey, expectedProcessingStartTimeUtc, ct);
         }
         catch (Exception ex)
         {
             // Failure: return to queue for retry
-            await storagePool.MarkAsFailedAsync(file.FileKey, ex.Message, ct);
+            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
+                ?? throw new InvalidOperationException("Missing processing start time.");
+            await storagePool.MarkAsFailedAsync(file.FileKey, expectedProcessingStartTimeUtc, ex.Message, ct);
             // File will be retried based on retry policy
         }
     }
@@ -237,11 +241,15 @@ while (true)
         {
             using var stream = await storagePool.ReadFileAsync(tenant, file.FileKey, token);
             await ProcessFileAsync(stream);
-            await storagePool.MarkAsCompletedAsync(file.FileKey, token);
+            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
+                ?? throw new InvalidOperationException("Missing processing start time.");
+            await storagePool.MarkAsCompletedAsync(file.FileKey, expectedProcessingStartTimeUtc, token);
         }
         catch (Exception ex)
         {
-            await storagePool.MarkAsFailedAsync(file.FileKey, ex.Message, token);
+            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
+                ?? throw new InvalidOperationException("Missing processing start time.");
+            await storagePool.MarkAsFailedAsync(file.FileKey, expectedProcessingStartTimeUtc, ex.Message, token);
         }
     });
 }

@@ -351,6 +351,51 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetNextPendingFileAsync_PrefetchStaleEntry_IsDiscardedAfterTimeoutReset()
+        {
+            const int fileCount = 4;
+            for (var i = 0; i < fileCount; i++)
+            {
+                var metadata = CreateMetadata($"prefetch-stale-{i:D2}", FileProcessingStatus.Pending);
+                metadata.CreatedAt = DateTime.UtcNow.AddTicks(i);
+                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            }
+
+            var tenantLocks = GetTenantLocks(_repository);
+            var tenantLock = tenantLocks.GetOrAdd(_tenantId, _ => new SemaphoreSlim(1, 1));
+
+            await tenantLock.WaitAsync();
+            var firstTask = _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            Assert.False(firstTask.IsCompleted);
+            tenantLock.Release();
+
+            var first = await firstTask;
+            Assert.NotNull(first);
+            Assert.Equal("prefetch-stale-00", first!.FileKey);
+
+            var staleCandidate = await _repository.GetAsync(_tenantId, "prefetch-stale-01", CancellationToken.None);
+            Assert.NotNull(staleCandidate);
+            Assert.Equal(FileProcessingStatus.Processing, staleCandidate!.Status);
+            Assert.NotNull(staleCandidate.ProcessingStartTime);
+
+            var reset = await _repository.TryResetTimedOutFileAsync(
+                _tenantId,
+                staleCandidate.FileKey,
+                staleCandidate.ProcessingStartTime!.Value,
+                DateTime.UtcNow,
+                CancellationToken.None);
+            Assert.True(reset);
+
+            var allocated = await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            Assert.NotNull(allocated);
+
+            var current = await _repository.GetAsync(_tenantId, allocated!.FileKey, CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Processing, current!.Status);
+            Assert.Equal(allocated.ProcessingStartTime, current.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task GetNextPendingBatchAsync_ConcurrentAllocators_DoNotOverlapFileKeys()
         {
             const int batchSize = 8;

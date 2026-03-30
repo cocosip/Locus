@@ -1979,11 +1979,24 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             if (!_prefetchedPendingByTenant.TryGetValue(tenantId, out var queue))
                 return false;
 
-            if (!queue.TryDequeue(out var item))
+            if (queue.IsEmpty)
                 return false;
 
-            metadata = item;
-            return true;
+            var cache = GetCache(tenantId);
+            while (queue.TryDequeue(out var item))
+            {
+                if (cache.TryGetValue(item.FileKey, out var current)
+                    && current.Status == FileProcessingStatus.Processing
+                    && current.ProcessingStartTime.HasValue
+                    && item.ProcessingStartTime.HasValue
+                    && current.ProcessingStartTime.Value == item.ProcessingStartTime.Value)
+                {
+                    metadata = current;
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void EnqueuePrefetchedPending(string tenantId, FileMetadata metadata)

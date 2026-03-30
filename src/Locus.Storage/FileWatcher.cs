@@ -1279,15 +1279,6 @@ namespace Locus.Storage
                 var fileInfo = _fileSystem.FileInfo.New(filePath);
                 var fileSize = fileInfo.Length;
                 var lastWriteTime = fileInfo.LastWriteTimeUtc;
-                var importFingerprint = CreateImportedFileFingerprint(fileInfo);
-
-                // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
-                if (!TryAcquireImportSlot(filePath, importFingerprint))
-                {
-                    fileResult.FilesSkipped++;
-                    return fileResult;
-                }
-                importSlotTaken = true;
 
                 // Skip empty files (0 bytes)
                 if (fileSize == 0)
@@ -1314,6 +1305,18 @@ namespace Locus.Storage
                     fileResult.FilesSkipped++;
                     return fileResult;
                 }
+
+                // Refresh fingerprint after stability checks so we record the final size/timestamps.
+                fileInfo.Refresh();
+                var importFingerprint = CreateImportedFileFingerprint(fileInfo);
+
+                // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
+                if (!TryAcquireImportSlot(filePath, importFingerprint))
+                {
+                    fileResult.FilesSkipped++;
+                    return fileResult;
+                }
+                importSlotTaken = true;
 
                 var importStream = TryOpenImportStream(filePath);
                 if (importStream == null)

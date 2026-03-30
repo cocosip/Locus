@@ -393,11 +393,11 @@ public interface IFileScheduler
     Task MarkAsProcessingAsync(string fileKey, CancellationToken ct);
 
     // 标记文件处理完成并删除（删除物理文件和元数据）
-    Task MarkAsCompletedAndDeleteAsync(string fileKey, CancellationToken ct);
+    Task MarkAsCompletedAndDeleteAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
 
     // 标记文件处理失败（自动重新放回池子，支持重试）
     // 失败的文件状态变为 Pending，等待下一个线程处理
-    Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct);
+    Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
 
     // 重置处理状态（用于手动重试）
     Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct);
@@ -521,11 +521,13 @@ public class DatabaseOptimizationResult
 
 **失败重试逻辑：**
 ```csharp
-public async Task MarkAsFailedAsync(string fileKey, string errorMessage, CancellationToken ct)
+public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct)
 {
     await using var transaction = await _db.BeginTransactionAsync(ct);
 
     var file = await _db.Files.FindAsync(fileKey);
+    if (file.ProcessingStartTime != expectedProcessingStartTimeUtc)
+        throw new InvalidOperationException("Processing lease mismatch.");
     file.RetryCount++;
     file.LastError = errorMessage;
     file.LastFailedAt = DateTime.UtcNow;
@@ -704,6 +706,8 @@ public async Task ProcessFilesInParallelAsync(ITenantContext tenant, int threadC
 
                     if (fileLocation == null)
                         break; // 没有更多待处理文件
+                    var expectedProcessingStartTimeUtc = fileLocation.ProcessingStartTime
+                        ?? throw new InvalidOperationException("Missing processing start time.");
 
                     // 显示文件信息（包括原始文件名和扩展名）
                     Console.WriteLine($"[Thread {threadId}] Processing file: {fileLocation.FileKey}");
@@ -719,7 +723,7 @@ public async Task ProcessFilesInParallelAsync(ITenantContext tenant, int threadC
                         await ProcessFileContentAsync(stream);
 
                         // 4. 处理成功：删除文件（物理文件 + 元数据）
-                        await fileScheduler.MarkAsCompletedAndDeleteAsync(fileLocation.FileKey, CancellationToken.None);
+                        await fileScheduler.MarkAsCompletedAndDeleteAsync(fileLocation.FileKey, expectedProcessingStartTimeUtc, CancellationToken.None);
 
                         Console.WriteLine($"[Thread {threadId}] Successfully processed and deleted: {fileLocation.FileKey}");
                     }
@@ -727,7 +731,7 @@ public async Task ProcessFilesInParallelAsync(ITenantContext tenant, int threadC
                     {
                         // 5. 处理失败：重新放回池子，等待下一个线程处理
                         // MarkAsFailedAsync 会自动将状态改为 Pending，并增加重试计数
-                        await fileScheduler.MarkAsFailedAsync(fileLocation.FileKey, ex.Message, CancellationToken.None);
+                        await fileScheduler.MarkAsFailedAsync(fileLocation.FileKey, expectedProcessingStartTimeUtc, ex.Message, CancellationToken.None);
 
                         Console.WriteLine($"[Thread {threadId}] Failed to process (will retry): {fileLocation.FileKey}, Error: {ex.Message}");
 
@@ -753,13 +757,15 @@ public async Task ProcessFilesInParallelAsync(ITenantContext tenant, int threadC
 
 ### MarkAsCompletedAndDeleteAsync Implementation
 ```csharp
-public async Task MarkAsCompletedAndDeleteAsync(string fileKey, CancellationToken ct)
+public async Task MarkAsCompletedAndDeleteAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct)
 {
     await using var transaction = await _db.BeginTransactionAsync(ct);
 
     var file = await _db.Files.FindAsync(fileKey);
     if (file == null)
         throw new FileNotFoundException($"File not found: {fileKey}");
+    if (file.ProcessingStartTime != expectedProcessingStartTimeUtc)
+        throw new InvalidOperationException("Processing lease mismatch.");
 
     // 删除物理文件
     var physicalPath = Path.Combine(file.VolumeMount, file.PhysicalPath);
