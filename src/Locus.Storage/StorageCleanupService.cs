@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
 using Microsoft.Extensions.Logging;
@@ -23,6 +24,7 @@ namespace Locus.Storage
         private readonly MetadataRepository _metadataRepository;
         private readonly DirectoryQuotaRepository _quotaRepository;
         private readonly ITenantQuotaManager _tenantQuotaManager;
+        private readonly ITenantManager? _tenantManager;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
@@ -71,11 +73,13 @@ namespace Locus.Storage
             string metadataDirectory,
             string quotaDirectory,
             CleanupOptions? cleanupOptions = null,
-            StorageVolumeRegistry? volumeRegistry = null)
+            StorageVolumeRegistry? volumeRegistry = null,
+            ITenantManager? tenantManager = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
+            _tenantManager = tenantManager;
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
@@ -424,7 +428,42 @@ namespace Locus.Storage
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
-                await CleanupOrphanedFilesAsync(new CleanupTenantContext(tenantId), ct);
+                var tenant = await ResolveCleanupTenantAsync(tenantId, ct);
+                if (tenant == null)
+                    continue;
+
+                await CleanupOrphanedFilesAsync(tenant, ct);
+            }
+        }
+
+        private async Task<ITenantContext?> ResolveCleanupTenantAsync(string tenantId, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                return null;
+
+            if (_tenantManager == null)
+                return new CleanupTenantContext(tenantId);
+
+            try
+            {
+                var tenant = await _tenantManager.GetTenantAsync(tenantId, ct);
+                if (tenant.Status != TenantStatus.Enabled)
+                {
+                    _logger.LogInformation(
+                        "Skipping orphaned-file rebuild for tenant {TenantId} because tenant status is {Status}",
+                        tenantId,
+                        tenant.Status);
+                    return null;
+                }
+
+                return tenant;
+            }
+            catch (TenantNotFoundException)
+            {
+                _logger.LogInformation(
+                    "Skipping orphaned-file rebuild for tenant {TenantId} because tenant metadata was not found",
+                    tenantId);
+                return null;
             }
         }
 
@@ -673,6 +712,8 @@ namespace Locus.Storage
                     break;
                 }
 
+                var removedThisIteration = 0;
+
                 foreach (var metadata in batch)
                 {
                     var physicalFileRemoved = false;
@@ -762,9 +803,18 @@ namespace Locus.Storage
                     }
 
                     removedCount++;
+                    removedThisIteration++;
                 }
 
                 RecordStatusCleanupIteration("failed_cleanup", tenantId, batch.Count, iterationStartedAt);
+
+                if (removedThisIteration == 0)
+                {
+                    _logger.LogWarning(
+                        "Stopping permanently-failed cleanup for tenant {TenantId} because the current batch made no progress",
+                        tenantId);
+                    break;
+                }
 
                 if (batch.Count < _statusCleanupBatchSizePerTenant)
                     break;

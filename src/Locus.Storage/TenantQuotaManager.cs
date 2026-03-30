@@ -89,7 +89,12 @@ namespace Locus.Storage
                 if (currentCount >= globalLimit)
                     throw new TenantQuotaExceededException(tenantId, currentCount, globalLimit);
 
-                await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+                var incremented = await _repository.TryIncrementAsync(tenantId, tenantId, ct);
+                if (!incremented)
+                {
+                    currentCount = await GetFileCountAsync(tenantId, ct);
+                    throw new TenantQuotaExceededException(tenantId, currentCount, globalLimit);
+                }
             }
             finally
             {

@@ -207,6 +207,7 @@ namespace Locus
                 var metadataRepo = sp.GetRequiredService<MetadataRepository>();
                 var quotaRepo = sp.GetRequiredService<DirectoryQuotaRepository>();
                 var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
+                var tenantManager = sp.GetRequiredService<ITenantManager>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
@@ -221,7 +222,8 @@ namespace Locus
                     options.MetadataDirectory,
                     options.QuotaDirectory,
                     options.CleanupOptions,
-                    volumeRegistry);
+                    volumeRegistry,
+                    tenantManager);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 
