@@ -321,7 +321,7 @@ namespace Locus.Benchmarks
         private static async Task<WorkloadResult> RunCurrentAsync(ScenarioContext context)
         {
             var before = await context.CleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
-            await context.CleanupService.CleanupOrphanedFilesAsync(new BenchTenantContext(context.TenantId), CancellationToken.None);
+            await context.CleanupService.RecoverOrphanedFilesAsync(new BenchTenantContext(context.TenantId), CancellationToken.None);
             var after = await context.CleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
 
             var allMetadata = await context.MetadataRepository.GetByTenantAsync(context.TenantId, CancellationToken.None);

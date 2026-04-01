@@ -89,7 +89,7 @@ namespace Locus.Benchmarks
         [Benchmark(Description = "orphan-rebuild current on-demand lookup")]
         public Task Current_OnDemandPathLookup()
         {
-            return _cleanupService.CleanupOrphanedFilesAsync(new BenchTenantContext(_tenantId), CancellationToken.None);
+            return _cleanupService.RecoverOrphanedFilesAsync(new BenchTenantContext(_tenantId), CancellationToken.None);
         }
 
         public void Dispose()

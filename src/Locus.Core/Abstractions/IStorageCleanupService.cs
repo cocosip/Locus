@@ -38,18 +38,19 @@ namespace Locus.Core.Abstractions
         Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct);
 
         /// <summary>
-        /// Cleans up orphaned files (physical files with no metadata) for the specified tenant.
+        /// Recovers orphaned files (physical files with no metadata) for the specified tenant
+        /// by rebuilding their metadata entries and re-queuing them as Pending.
         /// </summary>
         /// <param name="tenant">The tenant context.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task CleanupOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct);
+        Task RecoverOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct);
 
         /// <summary>
-        /// Cleans up orphaned files across all registered storage volumes by discovering tenant
+        /// Recovers orphaned files across all registered storage volumes by discovering tenant
         /// directories under each volume mount path and rebuilding missing metadata entries.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
-        Task CleanupAllOrphanedFilesAsync(CancellationToken ct);
+        Task RecoverAllOrphanedFilesAsync(CancellationToken ct);
 
         /// <summary>
         /// Cleans up files that have been in processing state longer than the timeout threshold.

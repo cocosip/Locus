@@ -225,7 +225,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task CleanupOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct)
+        public async Task RecoverOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -392,7 +392,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task CleanupAllOrphanedFilesAsync(CancellationToken ct)
+        public async Task RecoverAllOrphanedFilesAsync(CancellationToken ct)
         {
             _logger.LogInformation("Starting orphaned file metadata rebuild across all registered volumes");
 
@@ -432,7 +432,7 @@ namespace Locus.Storage
                 if (tenant == null)
                     continue;
 
-                await CleanupOrphanedFilesAsync(tenant, ct);
+                await RecoverOrphanedFilesAsync(tenant, ct);
             }
         }
 

@@ -120,7 +120,9 @@ namespace Locus
                     maxDrainBatchSize: options.MetadataRepository.DrainBatchSize,
                     persistenceQueueSoftMergeThresholdPercent: options.MetadataRepository.SoftMergeThresholdPercent,
                     maxPersistenceQueueSize: options.MetadataRepository.MaxQueueSize,
-                    startupLoadBatchSize: options.MetadataRepository.StartupLoadBatchSize);
+                    startupLoadBatchSize: options.MetadataRepository.StartupLoadBatchSize,
+                    shutdownDrainTimeoutSeconds: options.MetadataRepository.ShutdownDrainTimeoutSeconds,
+                    persistenceIntervalSeconds: options.MetadataRepository.PersistenceIntervalSeconds);
             });
 
             services.AddSingleton(sp =>
@@ -259,6 +261,13 @@ namespace Locus
             {
                 services.AddSingleton(options.CleanupOptions);
                 services.AddHostedService<BackgroundCleanupService>();
+            }
+
+            // Register orphan file recovery service if enabled
+            if (options.EnableOrphanRecovery)
+            {
+                services.AddSingleton(options.OrphanRecoveryOptions);
+                services.AddHostedService<OrphanFileRecoveryService>();
             }
 
             // Register database health check service if enabled

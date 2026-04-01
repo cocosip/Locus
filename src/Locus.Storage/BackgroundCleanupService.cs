@@ -51,9 +51,7 @@ namespace Locus.Storage
                     // Note: This no longer deletes empty directories, only the junk files within them.
                     await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
-                    // 2. Rebuild orphaned files that may have been stranded by write-behind crashes.
-                    if (_options.CleanupOrphanedFiles)
-                        await _cleanupService.CleanupAllOrphanedFilesAsync(stoppingToken);
+                    // 2. Orphan recovery is now handled by OrphanFileRecoveryService (independent BackgroundService).
 
                     // 3-4. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.
@@ -182,12 +180,6 @@ namespace Locus.Storage
         /// Default: true.
         /// </summary>
         public bool CleanupPermanentlyFailedFiles { get; set; } = true;
-
-        /// <summary>
-        /// Gets or sets whether to rebuild orphaned physical files that exist on disk but have no metadata.
-        /// Default: true.
-        /// </summary>
-        public bool CleanupOrphanedFiles { get; set; } = true;
 
         /// <summary>
         /// Gets or sets whether to remove stale SQLite corruption backup files (*.corrupted.*).

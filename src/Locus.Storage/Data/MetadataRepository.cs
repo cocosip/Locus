@@ -24,7 +24,7 @@ namespace Locus.Storage.Data
     /// - AddOrUpdateAsync and RemoveAsync update in-memory cache first, then enqueue SQLite persistence asynchronously.
     /// - If SQLite is unavailable, file writes continue uninterrupted. The physical file on disk is always safe.
     /// - If the process crashes before the background persistence loop flushes to SQLite, the in-memory metadata is lost.
-    /// - On process restart, orphaned physical files (files on disk without metadata) are recovered by StorageCleanupService.CleanupOrphanedFilesAsync.
+    /// - On process restart, orphaned physical files (files on disk without metadata) are recovered by StorageCleanupService.RecoverOrphanedFilesAsync.
     ///
     /// Data Consistency Guarantees:
     /// - Physical files are ALWAYS written synchronously before metadata is updated.
@@ -128,6 +128,8 @@ namespace Locus.Storage.Data
         private readonly int _maxDrainBatchSize;
         private readonly int _persistenceQueueSoftMergeThreshold;
         private readonly int _startupLoadBatchSize;
+        private readonly int _shutdownDrainTimeoutSeconds;
+        private readonly int _persistenceIntervalSeconds;
         private readonly ConcurrentDictionary<string, PersistenceOperation> _coalescedPersistenceOps;
         private int _coalescedLogCounter;
         private int _persistenceChannelDepth;
@@ -420,7 +422,9 @@ namespace Locus.Storage.Data
             int maxDrainBatchSize = DefaultDrainBatchSize,
             int persistenceQueueSoftMergeThresholdPercent = DefaultPersistenceQueueSoftMergeThresholdPercent,
             int maxPersistenceQueueSize = DefaultMaxPersistenceQueueSize,
-            int startupLoadBatchSize = DefaultStartupLoadBatchSize)
+            int startupLoadBatchSize = DefaultStartupLoadBatchSize,
+            int shutdownDrainTimeoutSeconds = DefaultShutdownDrainTimeoutSeconds,
+            int persistenceIntervalSeconds = DefaultPersistenceIntervalSeconds)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -448,6 +452,8 @@ namespace Locus.Storage.Data
             _maxDrainBatchSize = Math.Min(maxDrainBatchSize, _maxPersistenceQueueSize);
             _persistenceQueueSoftMergeThreshold = (int)(_maxPersistenceQueueSize * (persistenceQueueSoftMergeThresholdPercent / 100.0));
             _startupLoadBatchSize = startupLoadBatchSize;
+            _shutdownDrainTimeoutSeconds = shutdownDrainTimeoutSeconds > 0 ? shutdownDrainTimeoutSeconds : DefaultShutdownDrainTimeoutSeconds;
+            _persistenceIntervalSeconds = persistenceIntervalSeconds > 0 ? persistenceIntervalSeconds : DefaultPersistenceIntervalSeconds;
             _activeFiles = new ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>();
             _fileKeyTenantIndex = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
             _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -2470,6 +2476,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         private const int DefaultDrainBatchSize = 2_000;
         private const int DefaultPersistenceQueueSoftMergeThresholdPercent = 90;
         private const int DefaultStartupLoadBatchSize = 2_000;
+        private const int DefaultShutdownDrainTimeoutSeconds = 30;
+        private const int DefaultPersistenceIntervalSeconds = 2;
         private const int PendingSingleAllocatorPrefetchCount = 4;
 
         // Compact pending queues every N drain cycles to reclaim memory from stale entries.
@@ -2592,7 +2600,19 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             }
 
             // Drain any items enqueued before cancellation was observed.
+            var remainingQueued = Volatile.Read(ref _persistenceChannelDepth);
+            var remainingCoalesced = Volatile.Read(ref _coalescedDepth);
+            _logger.LogInformation(
+                "Persistence loop exited, starting final drain (QueueDepth={QueueDepth}, CoalescedDepth={CoalescedDepth})",
+                remainingQueued, remainingCoalesced);
+
             DrainPersistenceQueue();
+
+            var afterQueued = Volatile.Read(ref _persistenceChannelDepth);
+            var afterCoalesced = Volatile.Read(ref _coalescedDepth);
+            _logger.LogInformation(
+                "Final drain completed (QueueDepth={QueueDepth}, CoalescedDepth={CoalescedDepth})",
+                afterQueued, afterCoalesced);
         }
 
         private void LogPerformanceSnapshotIfNeeded(int drainCycles)
@@ -2619,7 +2639,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         {
             // Periodic timeout keeps coalesced-only writes moving even when no new channel items arrive.
             var waitToReadTask = _persistenceReader.WaitToReadAsync(ct).AsTask();
-            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), ct);
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(_persistenceIntervalSeconds), ct);
             var completed = await Task.WhenAny(waitToReadTask, timeoutTask).ConfigureAwait(false);
             if (ct.IsCancellationRequested)
                 throw new OperationCanceledException(ct);
@@ -2942,8 +2962,9 @@ ON CONFLICT(file_key) DO UPDATE SET
 
         /// <summary>
         /// Disposes the repository and closes all SQLite connections.
-        /// Signals the write-behind background task to stop, waits up to 5 seconds
-        /// for it to drain remaining queued writes, then closes all SQLite connections.
+        /// Signals the write-behind background task to stop, waits up to
+        /// <see cref="_shutdownDrainTimeoutSeconds"/> for it to drain remaining
+        /// queued writes, then closes all SQLite connections.
         /// </summary>
         public void Dispose()
         {
@@ -2954,20 +2975,45 @@ ON CONFLICT(file_key) DO UPDATE SET
 
             if (_enableBackgroundPersistence)
             {
-                // 1. Signal the background persistence loop to stop accepting new signals
+                var queueDepthBefore = Volatile.Read(ref _persistenceChannelDepth);
+                var coalescedBefore = Volatile.Read(ref _coalescedDepth);
+                _logger.LogInformation(
+                    "MetadataRepository shutting down: draining persistence queue (QueueDepth={QueueDepth}, CoalescedDepth={CoalescedDepth}, Timeout={TimeoutSeconds}s)",
+                    queueDepthBefore, coalescedBefore, _shutdownDrainTimeoutSeconds);
+
+                // 1. Complete the channel writer so WaitToReadAsync returns false gracefully,
+                // allowing the persistence loop to exit without OperationCanceledException
+                // and proceed to the final DrainPersistenceQueue() call.
+                _persistenceWriter.Complete();
+
+                // 2. Cancel as fallback safety net in case the loop is stuck elsewhere.
                 _persistenceCts.Cancel();
 
-                // 2. Wait for the background task to drain remaining queued items (up to 5 seconds).
+                // 3. Wait for the background task to drain remaining queued items.
                 // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach SQLite.
                 // If SQLite is unavailable or the queue is too large to drain in time, remaining items
-                // are discarded -- physical files are safe on disk and recovered by cleanup service on restart.
+                // are discarded -- physical files are safe on disk and recovered by OrphanFileRecoveryService on restart.
                 try
                 {
-                    _persistenceTask.Wait(TimeSpan.FromSeconds(5));
+                    _persistenceTask.Wait(TimeSpan.FromSeconds(_shutdownDrainTimeoutSeconds));
                 }
                 catch (AggregateException)
                 {
                     // OperationCanceledException wrapped in AggregateException -- expected on cancellation
+                }
+
+                var queueDepthAfter = Volatile.Read(ref _persistenceChannelDepth);
+                var coalescedAfter = Volatile.Read(ref _coalescedDepth);
+                if (queueDepthAfter == 0 && coalescedAfter == 0)
+                {
+                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully — all queued writes persisted to SQLite");
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "MetadataRepository shutdown drain incomplete: {QueueRemaining} queued + {CoalescedRemaining} coalesced operations were NOT persisted. " +
+                        "These files will be recovered as orphans on next startup by OrphanFileRecoveryService",
+                        queueDepthAfter, coalescedAfter);
                 }
             }
 

@@ -519,7 +519,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupOrphanedFilesAsync_RebuildsMetadataForOrphanedFiles()
+        public async Task RecoverOrphanedFilesAsync_RebuildsMetadataForOrphanedFiles()
         {
             // Arrange
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -530,7 +530,7 @@ namespace Locus.Storage.Tests
             // No metadata for this file — it is orphaned (physical file present, no SQLite record)
 
             // Act
-            await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, default);
 
             // Assert — file is NOT deleted; its metadata has been reconstructed instead
             Assert.True(_fileSystem.File.Exists(orphanedFile));
@@ -554,7 +554,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupOrphanedFilesAsync_DoesNotDeleteFilesWithMetadata()
+        public async Task RecoverOrphanedFilesAsync_DoesNotDeleteFilesWithMetadata()
         {
             // Arrange
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -576,14 +576,14 @@ namespace Locus.Storage.Tests
             await _metadataRepository.AddOrUpdateAsync(metadata, default);
 
             // Act
-            await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, default);
 
             // Assert
             Assert.True(_fileSystem.File.Exists(validFile)); // File still exists
         }
 
         [Fact]
-        public async Task CleanupOrphanedFilesAsync_PathComparisonRespectsPlatformCaseSensitivity()
+        public async Task RecoverOrphanedFilesAsync_PathComparisonRespectsPlatformCaseSensitivity()
         {
             // Arrange
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -605,7 +605,7 @@ namespace Locus.Storage.Tests
             await _metadataRepository.AddOrUpdateAsync(metadata, default);
 
             // Act
-            await _cleanupService.CleanupOrphanedFilesAsync(_tenant.Object, default);
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, default);
 
             // Assert
             var after = await _metadataRepository.GetAsync("tenant-001", "CaseFile", default);
@@ -622,7 +622,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupOrphanedFilesAsync_WithSmallLookupCache_RebuildsAllOrphans()
+        public async Task RecoverOrphanedFilesAsync_WithSmallLookupCache_RebuildsAllOrphans()
         {
             var cleanupWithSmallCache = new StorageCleanupService(
                 _metadataRepository,
@@ -663,7 +663,7 @@ namespace Locus.Storage.Tests
                 }
             }
 
-            await cleanupWithSmallCache.CleanupOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+            await cleanupWithSmallCache.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
 
             for (var i = 0; i < 40; i++)
             {
@@ -676,7 +676,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupAllOrphanedFilesAsync_RebuildsMetadataAcrossTenants()
+        public async Task RecoverAllOrphanedFilesAsync_RebuildsMetadataAcrossTenants()
         {
             var tenant1Path = Path.Combine(_volumePath, "tenant-001");
             var tenant2Path = Path.Combine(_volumePath, "tenant-002");
@@ -688,7 +688,7 @@ namespace Locus.Storage.Tests
             _fileSystem.File.WriteAllText(tenant1File, "alpha");
             _fileSystem.File.WriteAllText(tenant2File, "beta");
 
-            await _cleanupService.CleanupAllOrphanedFilesAsync(CancellationToken.None);
+            await _cleanupService.RecoverAllOrphanedFilesAsync(CancellationToken.None);
 
             var rebuiltAlpha = await _metadataRepository.GetAsync("tenant-001", "alpha", CancellationToken.None);
             var rebuiltBeta = await _metadataRepository.GetAsync("tenant-002", "beta", CancellationToken.None);
@@ -701,7 +701,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupAllOrphanedFilesAsync_SkipsDisabledTenants()
+        public async Task RecoverAllOrphanedFilesAsync_SkipsDisabledTenants()
         {
             var enabledTenantPath = Path.Combine(_volumePath, "tenant-001");
             var disabledTenantPath = Path.Combine(_volumePath, "tenant-disabled");
@@ -717,7 +717,7 @@ namespace Locus.Storage.Tests
                 .Setup(m => m.GetTenantAsync("tenant-disabled", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(disabledTenant.Object);
 
-            await _cleanupService.CleanupAllOrphanedFilesAsync(CancellationToken.None);
+            await _cleanupService.RecoverAllOrphanedFilesAsync(CancellationToken.None);
 
             Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "enabled", CancellationToken.None));
             Assert.Null(await _metadataRepository.GetAsync("tenant-disabled", "disabled", CancellationToken.None));

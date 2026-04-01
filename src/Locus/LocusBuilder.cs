@@ -172,6 +172,40 @@ namespace Locus
         }
 
         /// <summary>
+        /// Enables the orphan file recovery service.
+        /// </summary>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder EnableOrphanRecovery()
+        {
+            _options.EnableOrphanRecovery = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Disables the orphan file recovery service.
+        /// </summary>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder DisableOrphanRecovery()
+        {
+            _options.EnableOrphanRecovery = false;
+            return this;
+        }
+
+        /// <summary>
+        /// Configures orphan file recovery options.
+        /// </summary>
+        /// <param name="configure">Configuration action for orphan recovery options.</param>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder WithOrphanRecoveryOptions(Action<Storage.OrphanRecoveryOptions> configure)
+        {
+            if (configure == null)
+                throw new ArgumentNullException(nameof(configure));
+
+            configure(_options.OrphanRecoveryOptions);
+            return this;
+        }
+
+        /// <summary>
         /// Enables the database health check on startup.
         /// </summary>
         /// <returns>The builder for chaining.</returns>

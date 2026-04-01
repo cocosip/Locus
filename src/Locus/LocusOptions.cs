@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Locus.Core.Models;
+using Locus.Storage;
 
 namespace Locus
 {
@@ -47,6 +48,19 @@ namespace Locus
         /// Default: true
         /// </summary>
         public bool EnableBackgroundCleanup { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether to enable the orphan file recovery service.
+        /// When enabled, a background service periodically scans for orphaned physical files
+        /// (files on disk without metadata) and rebuilds their metadata entries.
+        /// Default: true
+        /// </summary>
+        public bool EnableOrphanRecovery { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the orphan file recovery options.
+        /// </summary>
+        public OrphanRecoveryOptions OrphanRecoveryOptions { get; set; } = new OrphanRecoveryOptions();
 
         /// <summary>
         /// Gets or sets whether to enable database health check on startup.

@@ -13,7 +13,7 @@ namespace Locus.Storage.Tests
     public class BackgroundCleanupServiceTests
     {
         [Fact]
-        public async Task ExecuteAsync_RunsOrphanAndInvalidBackupCleanup_WhenEnabled()
+        public async Task ExecuteAsync_RunsCleanupTasks_WhenEnabled()
         {
             var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
             var logger = new Mock<ILogger<BackgroundCleanupService>>();
@@ -21,9 +21,6 @@ namespace Locus.Storage.Tests
 
             cleanupService
                 .Setup(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()))
-                .Returns(Task.CompletedTask);
-            cleanupService
-                .Setup(s => s.CleanupAllOrphanedFilesAsync(It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
             cleanupService
                 .Setup(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()))
@@ -48,7 +45,6 @@ namespace Locus.Storage.Tests
                     OptimizeDatabases = false,
                     CleanupTimedOutFiles = false,
                     CleanupPermanentlyFailedFiles = false,
-                    CleanupOrphanedFiles = true,
                     CleanupInvalidDatabaseBackups = true
                 },
                 logger.Object);
@@ -56,7 +52,6 @@ namespace Locus.Storage.Tests
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.RunAsync(cts.Token));
 
             cleanupService.Verify(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()), Times.Once);
-            cleanupService.Verify(s => s.CleanupAllOrphanedFilesAsync(It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupInvalidDatabaseFilesAsync(It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.GetCleanupStatisticsAsync(It.IsAny<CancellationToken>()), Times.Once);

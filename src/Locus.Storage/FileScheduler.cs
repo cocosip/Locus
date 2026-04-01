@@ -61,7 +61,7 @@ namespace Locus.Storage
                 return null;
 
             // NOTE: File.Exists is intentionally omitted from this hot path.
-            // The cleanup service (CleanupOrphanedFilesAsync) periodically rebuilds metadata
+            // The recovery service (RecoverOrphanedFilesAsync) periodically rebuilds metadata
             // for any orphaned physical files, so the in-memory cache stays consistent.
             // Doing a syscall on every allocation would add latency proportional to inode
             // lookup cost (significant on network volumes) and is not necessary at runtime.
