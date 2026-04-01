@@ -3017,7 +3017,7 @@ ON CONFLICT(file_key) DO UPDATE SET
                 }
             }
 
-            // 3. Close all connections AFTER the drain is complete
+            // 4. Close all connections AFTER the drain is complete
             foreach (var lazyConn in _databases.Values)
             {
                 try
