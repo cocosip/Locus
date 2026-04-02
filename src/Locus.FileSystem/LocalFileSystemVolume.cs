@@ -170,6 +170,9 @@ namespace Locus.FileSystem
         public string MountPath => _mountPath;
 
         /// <inheritdoc/>
+        public int ShardingDepth => _shardingDepth;
+
+        /// <inheritdoc/>
         public long TotalCapacity
         {
             get

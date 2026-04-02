@@ -35,6 +35,12 @@ namespace Locus.Core.Abstractions
         bool IsHealthy { get; }
 
         /// <summary>
+        /// Gets the directory sharding depth used by this volume.
+        /// Shard directories up to this depth should not be deleted by cleanup.
+        /// </summary>
+        int ShardingDepth { get; }
+
+        /// <summary>
         /// Reads a file from the storage volume asynchronously.
         /// </summary>
         /// <param name="path">The relative path of the file to read.</param>

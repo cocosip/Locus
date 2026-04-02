@@ -163,7 +163,8 @@ namespace Locus.Storage
                 if (_fileSystem.Directory.Exists(tenantPath))
                 {
                     // isProtectedRoot=true: never delete the tenant root directory itself.
-                    removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct, isProtectedRoot: true);
+                    // Pass shardingDepth so shard directories are also protected.
+                    removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct, isProtectedRoot: true, shardingDepth: volume.ShardingDepth);
                 }
             }
 
@@ -189,7 +190,8 @@ namespace Locus.Storage
                     foreach (var subdirectory in subdirectories)
                     {
                         // Each subdirectory is a tenant root -- protect it from deletion.
-                        removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true);
+                        // Pass shardingDepth so shard directories are also protected.
+                        removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true, shardingDepth: volume.ShardingDepth);
                     }
                 }
             }
@@ -1046,6 +1048,7 @@ namespace Locus.Storage
             string directoryPath,
             CancellationToken ct,
             bool isProtectedRoot = false,
+            int shardingDepth = 0,
             int depth = 0)
         {
             if (!_fileSystem.Directory.Exists(directoryPath))
@@ -1065,7 +1068,7 @@ namespace Locus.Storage
             var subdirectories = _fileSystem.Directory.GetDirectories(directoryPath);
             foreach (var subdirectory in subdirectories)
             {
-                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false, depth: depth + 1);
+                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false, shardingDepth: shardingDepth, depth: depth + 1);
             }
 
             // 2. Delete junk files in the current directory.
@@ -1088,9 +1091,12 @@ namespace Locus.Storage
                 }
             }
 
-            // 3. Delete the directory itself if it is now empty -- but never delete protected roots
-            //    (volume mount paths, tenant root directories) to avoid recreating them on next write.
-            if (!isProtectedRoot && IsDirectoryEmpty(directoryPath))
+            // 3. Delete the directory itself if it is now empty -- but never delete:
+            //    - protected roots (volume mount paths, tenant root directories)
+            //    - shard directories (depth <= shardingDepth, where depth 0 = tenant root)
+            //    Directory structure: {MountPath}/{TenantId(depth=0)}/{Shard0(depth=1)}/{Shard1(depth=2)}/...
+            var isShardDirectory = depth <= shardingDepth;
+            if (!isProtectedRoot && !isShardDirectory && IsDirectoryEmpty(directoryPath))
             {
                 try
                 {
