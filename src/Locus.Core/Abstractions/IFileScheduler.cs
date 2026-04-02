@@ -17,7 +17,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenant">The tenant context.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file location, or null if no files are available.</returns>
-        Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct);
+        Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default);
 
         /// <summary>
         /// Gets a batch of files for processing in a thread-safe manner.
@@ -26,14 +26,14 @@ namespace Locus.Core.Abstractions
         /// <param name="batchSize">The maximum number of files to retrieve.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>A collection of file locations. May contain fewer files than requested or be empty if no files are available.</returns>
-        Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(ITenantContext tenant, int batchSize, CancellationToken ct);
+        Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(ITenantContext tenant, int batchSize, CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as currently being processed.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsProcessingAsync(string fileKey, CancellationToken ct);
+        Task MarkAsProcessingAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as completed and deletes it from storage.
@@ -41,7 +41,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
+        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as failed and returns it to the pool for retry or permanent failure.
@@ -50,14 +50,14 @@ namespace Locus.Core.Abstractions
         /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="errorMessage">The error message describing the failure.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
+        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default);
 
         /// <summary>
         /// Resets the processing status of a file to pending.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct);
+        Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current processing status of a file.
@@ -65,7 +65,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file processing status.</returns>
-        Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct);
+        Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Cleans up orphaned metadata where physical files no longer exist.
@@ -73,6 +73,6 @@ namespace Locus.Core.Abstractions
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The number of orphaned metadata records removed.</returns>
-        Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct);
+        Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct = default);
     }
 }

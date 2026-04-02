@@ -315,7 +315,7 @@ namespace Locus.Storage
         /// <summary>
         /// Saves the imported files history to persistent storage.
         /// </summary>
-        private async Task SaveImportedFilesHistoryAsync(bool force, CancellationToken ct)
+        private async Task SaveImportedFilesHistoryAsync(bool force, CancellationToken ct = default)
         {
             var lockTaken = false;
             List<ImportedHistoryOperation>? pendingOperations = null;
@@ -375,7 +375,7 @@ namespace Locus.Storage
         private async Task FlushImportedFilesHistoryIfDirtyAsync(
             FileWatcherConfiguration configuration,
             bool force,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (Volatile.Read(ref _importedHistoryDirty) == 0)
                 return;
@@ -558,7 +558,7 @@ namespace Locus.Storage
 
         private async Task<int> AppendImportedHistoryJournalAsync(
             List<ImportedHistoryOperation> operations,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (operations.Count == 0)
                 return 0;
@@ -615,7 +615,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task CompactImportedHistoryAsync(CancellationToken ct)
+        private async Task CompactImportedHistoryAsync(CancellationToken ct = default)
         {
             var checkpointPath = GetImportedHistoryCheckpointPath();
             var tempPath = GetImportedHistoryCheckpointTempPath();
@@ -742,7 +742,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task RegisterWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        public async Task RegisterWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct = default)
         {
             if (configuration == null)
                 throw new ArgumentNullException(nameof(configuration));
@@ -794,7 +794,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task UpdateWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        public async Task UpdateWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct = default)
         {
             var watcherLock = _watcherLocks.GetOrAdd(configuration.WatcherId, _ => new SemaphoreSlim(1, 1));
             await watcherLock.WaitAsync(ct);
@@ -822,7 +822,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task RemoveWatcherAsync(string watcherId, CancellationToken ct)
+        public async Task RemoveWatcherAsync(string watcherId, CancellationToken ct = default)
         {
             var watcherLock = _watcherLocks.GetOrAdd(watcherId, _ => new SemaphoreSlim(1, 1));
             await watcherLock.WaitAsync(ct);
@@ -847,32 +847,32 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task EnableWatcherAsync(string watcherId, CancellationToken ct)
+        public async Task EnableWatcherAsync(string watcherId, CancellationToken ct = default)
         {
             await UpdateWatcherStatusAsync(watcherId, true, ct);
         }
 
         /// <inheritdoc/>
-        public async Task DisableWatcherAsync(string watcherId, CancellationToken ct)
+        public async Task DisableWatcherAsync(string watcherId, CancellationToken ct = default)
         {
             await UpdateWatcherStatusAsync(watcherId, false, ct);
         }
 
         /// <inheritdoc/>
-        public async Task<IEnumerable<FileWatcherConfiguration>> GetWatchersForTenantAsync(string tenantId, CancellationToken ct)
+        public async Task<IEnumerable<FileWatcherConfiguration>> GetWatchersForTenantAsync(string tenantId, CancellationToken ct = default)
         {
             var allWatchers = await GetAllWatchersAsync(ct);
             return allWatchers.Where(w => w.TenantId == tenantId);
         }
 
         /// <inheritdoc/>
-        public async Task<FileWatcherConfiguration?> GetWatcherAsync(string watcherId, CancellationToken ct)
+        public async Task<FileWatcherConfiguration?> GetWatcherAsync(string watcherId, CancellationToken ct = default)
         {
             return await LoadConfigurationAsync(watcherId, ct);
         }
 
         /// <inheritdoc/>
-        public async Task<FileWatcherScanResult> ScanNowAsync(string watcherId, CancellationToken ct)
+        public async Task<FileWatcherScanResult> ScanNowAsync(string watcherId, CancellationToken ct = default)
         {
             // Fast path for BackgroundFileWatcherService: it calls GetAllWatchersAsync first,
             // so we can reuse the same in-memory snapshot and avoid a second file read.
@@ -889,7 +889,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileWatcherScanResult> ScanNowAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        public async Task<FileWatcherScanResult> ScanNowAsync(FileWatcherConfiguration configuration, CancellationToken ct = default)
         {
             if (configuration == null)
                 throw new ArgumentNullException(nameof(configuration));
@@ -928,7 +928,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<IEnumerable<FileWatcherConfiguration>> GetAllWatchersAsync(CancellationToken ct)
+        public async Task<IEnumerable<FileWatcherConfiguration>> GetAllWatchersAsync(CancellationToken ct = default)
         {
             var nowTicks = DateTime.UtcNow.Ticks;
             var cached = _cachedWatchers;
@@ -974,7 +974,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task<FileWatcherScanResult> ScanDirectoryAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        private async Task<FileWatcherScanResult> ScanDirectoryAsync(FileWatcherConfiguration configuration, CancellationToken ct = default)
         {
             var result = new FileWatcherScanResult();
 
@@ -1000,7 +1000,7 @@ namespace Locus.Storage
             return result;
         }
 
-        private async Task ScanSingleTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct)
+        private async Task ScanSingleTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct = default)
         {
             var tenant = await _tenantManager.GetTenantAsync(configuration.TenantId, ct);
 
@@ -1015,7 +1015,7 @@ namespace Locus.Storage
             result.FilesDiscovered += discovered;
         }
 
-        private async Task ScanMultiTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct)
+        private async Task ScanMultiTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct = default)
         {
             var tenantDirectories = _fileSystem.Directory.GetDirectories(configuration.WatchPath);
 
@@ -1099,7 +1099,7 @@ namespace Locus.Storage
         private async Task<string[]> EnsureTenantDirectoriesAsync(
             FileWatcherConfiguration configuration,
             string[] existingDirectories,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             _logger.LogDebug("Auto-creating tenant directories in {WatchPath}", configuration.WatchPath);
 
@@ -1127,7 +1127,7 @@ namespace Locus.Storage
 
         private async Task<string[]> GetTenantsForAutoCreateAsync(
             FileWatcherConfiguration configuration,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             var watcherId = string.IsNullOrWhiteSpace(configuration.WatcherId)
                 ? configuration.WatchPath
@@ -1163,7 +1163,7 @@ namespace Locus.Storage
             ITenantContext tenant,
             IEnumerable<string> files,
             FileWatcherScanResult result,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             // Validate MaxConcurrentImports
             var maxConcurrency = Math.Max(1, configuration.MaxConcurrentImports);
@@ -1265,7 +1265,7 @@ namespace Locus.Storage
             FileWatcherConfiguration configuration,
             ITenantContext tenant,
             string filePath,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             var fileResult = new FileWatcherScanResult();
             var importSlotTaken = false;
@@ -1704,7 +1704,7 @@ namespace Locus.Storage
             return created;
         }
 
-        private Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct)
+        private Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct = default)
         {
             switch (configuration.PostImportAction)
             {
@@ -1755,7 +1755,7 @@ namespace Locus.Storage
             return Task.CompletedTask;
         }
 
-        private async Task UpdateWatcherStatusAsync(string watcherId, bool enabled, CancellationToken ct)
+        private async Task UpdateWatcherStatusAsync(string watcherId, bool enabled, CancellationToken ct = default)
         {
             var watcherLock = _watcherLocks.GetOrAdd(watcherId, _ => new SemaphoreSlim(1, 1));
             await watcherLock.WaitAsync(ct);
@@ -1783,7 +1783,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task<FileWatcherConfiguration?> LoadConfigurationAsync(string watcherId, CancellationToken ct)
+        private async Task<FileWatcherConfiguration?> LoadConfigurationAsync(string watcherId, CancellationToken ct = default)
         {
             var configPath = GetConfigurationPath(watcherId);
 
@@ -1806,7 +1806,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task SaveConfigurationAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        private async Task SaveConfigurationAsync(FileWatcherConfiguration configuration, CancellationToken ct = default)
         {
             var configPath = GetConfigurationPath(configuration.WatcherId);
             var tempPath = configPath + ".tmp." + Guid.NewGuid().ToString("N");
@@ -1938,7 +1938,7 @@ namespace Locus.Storage
             IFileInfo fileInfo,
             TimeSpan fileAge,
             FileWatcherConfiguration configuration,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             try
             {

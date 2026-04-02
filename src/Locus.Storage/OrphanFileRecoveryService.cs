@@ -32,7 +32,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
             _logger.LogInformation("OrphanFileRecoveryService started (InitialDelay={InitialDelay}, RecoveryInterval={RecoveryInterval})",
                 _options.InitialDelay, _options.RecoveryInterval);

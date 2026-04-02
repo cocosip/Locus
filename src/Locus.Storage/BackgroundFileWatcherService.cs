@@ -37,7 +37,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
             _logger.LogInformation("Background File Watcher Service started");
 
@@ -73,7 +73,7 @@ namespace Locus.Storage
             _logger.LogInformation("Background File Watcher Service stopped");
         }
 
-        private async Task<TimeSpan> ScanDueWatchersAsync(FileWatcherOptions options, CancellationToken ct)
+        private async Task<TimeSpan> ScanDueWatchersAsync(FileWatcherOptions options, CancellationToken ct = default)
         {
             var watchers = await _fileWatcher.GetAllWatchersAsync(ct);
             var enabledWatchers = watchers.Where(w => w.Enabled).ToList();
@@ -209,7 +209,7 @@ namespace Locus.Storage
         private async Task ScanWatcherAsync(
             FileWatcherConfiguration watcher,
             FileWatcherOptions options,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             try
             {

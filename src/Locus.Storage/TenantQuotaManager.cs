@@ -14,7 +14,7 @@ namespace Locus.Storage
     /// Supports global default quota and per-tenant specific quotas.
     /// Uses DirectoryQuotaRepository internally (treating tenantId as directoryPath).
     /// </summary>
-    public class TenantQuotaManager : ITenantQuotaManager
+    public class TenantQuotaManager : ITenantQuotaManager, ITenantQuotaCompensationManager
     {
         private const string GLOBAL_QUOTA_KEY = "_GLOBAL_QUOTA_";
         private readonly DirectoryQuotaRepository _repository;
@@ -34,7 +34,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<bool> CanAddFileAsync(string tenantId, CancellationToken ct)
+        public async Task<bool> CanAddFileAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -49,7 +49,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task IncrementFileCountAsync(string tenantId, CancellationToken ct)
+        public async Task IncrementFileCountAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -72,7 +72,7 @@ namespace Locus.Storage
             var globalLimit = await GetGlobalLimitAsync(ct);
             if (globalLimit == 0)
             {
-                // No limit configured â€” use ForceIncrementAsync so the counter always advances
+                // No limit configured â€?use ForceIncrementAsync so the counter always advances
                 // regardless of any MaxCount value that might exist on the quota record.
                 await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
                 _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: unlimited)", tenantId);
@@ -106,7 +106,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task DecrementFileCountAsync(string tenantId, CancellationToken ct)
+        public async Task DecrementFileCountAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -117,7 +117,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<int> GetFileCountAsync(string tenantId, CancellationToken ct)
+        public async Task<int> GetFileCountAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -127,7 +127,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<int> GetEffectiveLimitAsync(string tenantId, CancellationToken ct)
+        public async Task<int> GetEffectiveLimitAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -145,7 +145,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task SetTenantLimitAsync(string tenantId, int maxFiles, CancellationToken ct)
+        public async Task SetTenantLimitAsync(string tenantId, int maxFiles, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -173,7 +173,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task RemoveTenantLimitAsync(string tenantId, CancellationToken ct)
+        public async Task RemoveTenantLimitAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -188,7 +188,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task SetGlobalLimitAsync(int maxFiles, CancellationToken ct)
+        public async Task SetGlobalLimitAsync(int maxFiles, CancellationToken ct = default)
         {
             if (maxFiles < 0)
                 throw new ArgumentException("Max files cannot be negative", nameof(maxFiles));
@@ -196,7 +196,7 @@ namespace Locus.Storage
             var globalQuota = await _repository.GetOrCreateAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
 
             // Build a fresh object to avoid mutating the cached reference.
-            // Do NOT overwrite CurrentCount â€” it tracks real file counts across restarts.
+            // Do NOT overwrite CurrentCount â€?it tracks real file counts across restarts.
             var updated = new DirectoryQuota
             {
                 DirectoryPath = globalQuota.DirectoryPath,
@@ -213,13 +213,14 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<int> GetGlobalLimitAsync(CancellationToken ct)
+        public async Task<int> GetGlobalLimitAsync(CancellationToken ct = default)
         {
             var globalQuota = await _repository.GetAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
             return globalQuota?.MaxCount ?? 0;
         }
 
-        internal async Task CompensateIncrementFileCountAsync(string tenantId, CancellationToken ct)
+        /// <inheritdoc/>
+        public async Task CompensateIncrementFileCountAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));

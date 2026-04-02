@@ -185,7 +185,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct)
+        public async Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -238,7 +238,7 @@ namespace Locus.Storage
 
                 // 8. Capture the bytes that will be written: from current position to end.
                 // Must be read BEFORE WriteAsync because CopyToAsync advances Position to the end.
-                // Using content.Length alone is wrong for streams not at position 0 â€” it would
+                // Using content.Length alone is wrong for streams not at position 0 â€?it would
                 // report the total stream size rather than the bytes actually written.
                 var fileSize = content.CanSeek ? content.Length - content.Position : 0;
                 var contentToWrite = content;
@@ -255,7 +255,7 @@ namespace Locus.Storage
                 if (countingStream != null)
                     fileSize = countingStream.BytesRead;
 
-                // 10. Create file metadata â€” Write-Behind: memory is updated immediately, SQLite write is async.
+                // 10. Create file metadata â€?Write-Behind: memory is updated immediately, SQLite write is async.
                 // AddOrUpdateAsync never throws from the caller's perspective. If SQLite is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
@@ -288,7 +288,7 @@ namespace Locus.Storage
             {
                 // Only roll back the quota when the physical write never reached disk.
                 // If fileWritten==true the file exists on disk; the cleanup service will
-                // recover it as a Pending orphan on restart â€” its quota slot is still needed.
+                // recover it as a Pending orphan on restart â€?its quota slot is still needed.
                 // Guard with !fileWritten so that a future exception after the write
                 // (e.g. in AddOrUpdateAsync) does not incorrectly decrement the quota.
                 if (!fileWritten)
@@ -301,7 +301,7 @@ namespace Locus.Storage
                             await _directoryQuotaManager.DecrementFileCountAsync(
                                 tenant.TenantId,
                                 rollbackDirectoryPath,
-                                CancellationToken.None);
+                                default);
                         }
                         catch (Exception rollbackEx)
                         {
@@ -315,7 +315,7 @@ namespace Locus.Storage
 
                     if (tenantQuotaIncremented)
                     {
-                        await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, CancellationToken.None);
+                        await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, default);
                     }
                 }
 
@@ -339,7 +339,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct)
+        public async Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -372,7 +372,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<Core.Models.FileInfo?> GetFileInfoAsync(ITenantContext tenant, string fileKey, CancellationToken ct)
+        public async Task<Core.Models.FileInfo?> GetFileInfoAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -404,7 +404,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileLocation?> GetFileLocationAsync(ITenantContext tenant, string fileKey, CancellationToken ct)
+        public async Task<FileLocation?> GetFileLocationAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -443,7 +443,7 @@ namespace Locus.Storage
 
 
         /// <inheritdoc/>
-        public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct)
+        public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -459,7 +459,7 @@ namespace Locus.Storage
         public async Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(
             ITenantContext tenant,
             int batchSize,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -476,9 +476,9 @@ namespace Locus.Storage
 
         private async Task CompensateTenantQuotaIncrementAsync(string tenantId)
         {
-            if (_tenantQuotaManager is TenantQuotaManager tenantQuotaManager)
+            if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
             {
-                await tenantQuotaManager.CompensateIncrementFileCountAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
                 return;
             }
 
@@ -487,7 +487,7 @@ namespace Locus.Storage
             // original error or leaves the counter permanently under-counted.
             try
             {
-                await _tenantQuotaManager.IncrementFileCountAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+                await _tenantQuotaManager.IncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
             }
             catch (TenantQuotaExceededException)
             {
@@ -500,9 +500,9 @@ namespace Locus.Storage
 
         private async Task CompensateDirectoryQuotaIncrementAsync(string tenantId, string directoryPath)
         {
-            if (_directoryQuotaManager is DirectoryQuotaManager directoryQuotaManager)
+            if (_directoryQuotaManager is IDirectoryQuotaCompensationManager directoryQuotaCompensationManager)
             {
-                await directoryQuotaManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None).ConfigureAwait(false);
+                await directoryQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
                 return;
             }
 
@@ -510,7 +510,7 @@ namespace Locus.Storage
             // exceptions so the rollback path never throws due to limit enforcement.
             try
             {
-                await _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, CancellationToken.None).ConfigureAwait(false);
+                await _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
             }
             catch (DirectoryQuotaExceededException)
             {
@@ -522,7 +522,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct)
+        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
@@ -534,7 +534,7 @@ namespace Locus.Storage
             await completionGuard.WaitAsync(ct);
             try
             {
-                // Read tenant before delegating â€” scheduler removes metadata record.
+                // Read tenant before delegating â€?scheduler removes metadata record.
                 var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
                 if (metadata == null)
                     return; // Already completed by another caller.
@@ -557,12 +557,12 @@ namespace Locus.Storage
                 await _directoryQuotaManager.DecrementFileCountAsync(
                     metadata.TenantId,
                     normalizedDirectoryPath,
-                    CancellationToken.None);
+                    default);
 
                 var tenantQuotaDecremented = false;
                 try
                 {
-                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
                     tenantQuotaDecremented = true;
                 }
                 catch
@@ -636,7 +636,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct)
+        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
@@ -646,7 +646,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct)
+        public async Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
@@ -656,7 +656,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public Task<long> GetTotalCapacityAsync(CancellationToken ct)
+        public Task<long> GetTotalCapacityAsync(CancellationToken ct = default)
         {
             var totalCapacity = _volumes.Values
                 .Where(v => v.IsHealthy)
@@ -666,7 +666,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public Task<long> GetAvailableSpaceAsync(CancellationToken ct)
+        public Task<long> GetAvailableSpaceAsync(CancellationToken ct = default)
         {
             var availableSpace = _volumes.Values
                 .Where(v => v.IsHealthy)
@@ -679,7 +679,7 @@ namespace Locus.Storage
         /// Validates that a tenant exists and is enabled.
         /// Auto-creation is handled by TenantManager if configured.
         /// </summary>
-        private async Task ValidateTenantAsync(string tenantId, CancellationToken ct)
+        private async Task ValidateTenantAsync(string tenantId, CancellationToken ct = default)
         {
             // Check if tenant exists (auto-creation handled by TenantManager)
             var tenant = await _tenantManager.GetTenantAsync(tenantId, ct);
@@ -737,7 +737,7 @@ namespace Locus.Storage
                 return cached;
 
             // Singleflight: only the CAS winner rebuilds the snapshot.
-            // Concurrent callers return the (slightly stale) cached value â€” acceptable since
+            // Concurrent callers return the (slightly stale) cached value â€?acceptable since
             // the snapshot is refreshed at most every VolumeSnapshotRefreshTicks (1 s) anyway.
             if (Interlocked.CompareExchange(ref _volumeSnapshotRefreshInProgress, 1, 0) != 0)
                 return cached;
@@ -814,12 +814,12 @@ namespace Locus.Storage
                 return read;
             }
 
-            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken = default)
             {
                 return ReadAsyncInternal(buffer, offset, count, cancellationToken);
             }
 
-            private async Task<int> ReadAsyncInternal(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            private async Task<int> ReadAsyncInternal(byte[] buffer, int offset, int count, CancellationToken cancellationToken = default)
             {
                 var read = await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
                 BytesRead += read;

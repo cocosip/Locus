@@ -243,6 +243,50 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupOrphanedMetadataAsync_NormalizesMissingDirectoryPathToRootQuota()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>();
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            var fileKey = "orphan-root-fallback";
+            var physicalPath = Path.Combine(_metadataDir, "missing-root-file.txt");
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(1, removed);
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()),
+                Times.Once);
+            Assert.Null(await _repository.GetAsync("tenant-001", fileKey, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAndDeleteAsync_RemovesMetadata()
         {
             // Arrange

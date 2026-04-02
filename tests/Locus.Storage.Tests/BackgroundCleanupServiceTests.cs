@@ -16,12 +16,16 @@ namespace Locus.Storage.Tests
         public async Task ExecuteAsync_RunsCleanupTasks_WhenEnabled()
         {
             var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
+            var fileScheduler = new Mock<IFileScheduler>(MockBehavior.Strict);
             var logger = new Mock<ILogger<BackgroundCleanupService>>();
             using var cts = new CancellationTokenSource();
 
             cleanupService
                 .Setup(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
+            fileScheduler
+                .Setup(s => s.CleanupOrphanedMetadataAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(0);
             cleanupService
                 .Setup(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
@@ -38,6 +42,7 @@ namespace Locus.Storage.Tests
 
             var service = new TestBackgroundCleanupService(
                 cleanupService.Object,
+                fileScheduler.Object,
                 new CleanupOptions
                 {
                     InitialDelay = TimeSpan.Zero,
@@ -52,6 +57,7 @@ namespace Locus.Storage.Tests
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.RunAsync(cts.Token));
 
             cleanupService.Verify(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()), Times.Once);
+            fileScheduler.Verify(s => s.CleanupOrphanedMetadataAsync(It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupInvalidDatabaseFilesAsync(It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.GetCleanupStatisticsAsync(It.IsAny<CancellationToken>()), Times.Once);
@@ -61,9 +67,10 @@ namespace Locus.Storage.Tests
         {
             public TestBackgroundCleanupService(
                 IStorageCleanupService cleanupService,
+                IFileScheduler fileScheduler,
                 CleanupOptions options,
                 ILogger<BackgroundCleanupService> logger)
-                : base(cleanupService, options, logger)
+                : base(cleanupService, fileScheduler, options, logger)
             {
             }
 

@@ -16,7 +16,7 @@ namespace Locus.Core.Abstractions
         /// </summary>
         /// <param name="fileLocation">The file location metadata.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task AddFileAsync(FileLocation fileLocation, CancellationToken ct);
+        Task AddFileAsync(FileLocation fileLocation, CancellationToken ct = default);
 
         /// <summary>
         /// Gets a file's metadata by its key.
@@ -24,7 +24,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file location, or null if not found.</returns>
-        Task<FileLocation?> GetFileAsync(string fileKey, CancellationToken ct);
+        Task<FileLocation?> GetFileAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Atomically dequeues the next pending file and marks it as processing.
@@ -33,7 +33,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The next pending file, or null if none available.</returns>
-        Task<FileLocation?> DequeueNextPendingFileAsync(string tenantId, CancellationToken ct);
+        Task<FileLocation?> DequeueNextPendingFileAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Updates a file's status.
@@ -41,7 +41,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="status">The new status.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task UpdateFileStatusAsync(string fileKey, FileProcessingStatus status, CancellationToken ct);
+        Task UpdateFileStatusAsync(string fileKey, FileProcessingStatus status, CancellationToken ct = default);
 
         /// <summary>
         /// Updates a file's retry information after a failure.
@@ -50,14 +50,14 @@ namespace Locus.Core.Abstractions
         /// <param name="retryCount">The new retry count.</param>
         /// <param name="lastError">The error message.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task UpdateFileRetryInfoAsync(string fileKey, int retryCount, string lastError, CancellationToken ct);
+        Task UpdateFileRetryInfoAsync(string fileKey, int retryCount, string lastError, CancellationToken ct = default);
 
         /// <summary>
         /// Removes a file from the metadata store.
         /// </summary>
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task RemoveFileAsync(string fileKey, CancellationToken ct);
+        Task RemoveFileAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets all files with a specific status.
@@ -65,7 +65,7 @@ namespace Locus.Core.Abstractions
         /// <param name="status">The file status to filter by.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>A collection of file locations.</returns>
-        Task<IEnumerable<FileLocation>> GetFilesByStatusAsync(FileProcessingStatus status, CancellationToken ct);
+        Task<IEnumerable<FileLocation>> GetFilesByStatusAsync(FileProcessingStatus status, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current file count for a directory.
@@ -73,7 +73,7 @@ namespace Locus.Core.Abstractions
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The current file count.</returns>
-        Task<int> GetDirectoryFileCountAsync(string directoryPath, CancellationToken ct);
+        Task<int> GetDirectoryFileCountAsync(string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Atomically increments the file count for a directory if under quota.
@@ -82,19 +82,19 @@ namespace Locus.Core.Abstractions
         /// <param name="maxFiles">The maximum allowed files.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>True if incremented successfully; false if quota exceeded.</returns>
-        Task<bool> TryIncrementDirectoryFileCountAsync(string directoryPath, int maxFiles, CancellationToken ct);
+        Task<bool> TryIncrementDirectoryFileCountAsync(string directoryPath, int maxFiles, CancellationToken ct = default);
 
         /// <summary>
         /// Atomically decrements the file count for a directory.
         /// </summary>
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task DecrementDirectoryFileCountAsync(string directoryPath, CancellationToken ct);
+        Task DecrementDirectoryFileCountAsync(string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Forces a snapshot of the current in-memory state to disk.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
-        Task FlushAsync(CancellationToken ct);
+        Task FlushAsync(CancellationToken ct = default);
     }
 }

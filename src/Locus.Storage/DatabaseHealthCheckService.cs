@@ -52,7 +52,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task StartAsync(CancellationToken cancellationToken)
+        public async Task StartAsync(CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Starting database health check...");
 
@@ -143,7 +143,7 @@ namespace Locus.Storage
         /// </summary>
         private async Task<(int Attempted, int Failed)> RecoverCorruptedDatabasesAsync(
             DatabaseHealthReport report,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken = default)
         {
             var attempted = 0;
             var failed = 0;
@@ -215,7 +215,7 @@ namespace Locus.Storage
         /// <summary>
         /// Checks all databases with retry mechanism to handle startup timing conflicts.
         /// </summary>
-        private async Task<DatabaseHealthReport> CheckWithRetryAsync(CancellationToken cancellationToken)
+        private async Task<DatabaseHealthReport> CheckWithRetryAsync(CancellationToken cancellationToken = default)
         {
             const int maxRetries = 3;
             const int retryDelayMs = 1000;
@@ -263,7 +263,7 @@ namespace Locus.Storage
         /// Checks for orphaned files (physical files without metadata) in storage volumes.
         /// Uses fast detection: only checks if files exist, does not count all files.
         /// </summary>
-        private Task CheckForOrphanedFilesAsync(CancellationToken ct)
+        private Task CheckForOrphanedFilesAsync(CancellationToken ct = default)
         {
             if (!_volumePaths.Any())
             {
@@ -422,7 +422,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public Task StopAsync(CancellationToken cancellationToken)
+        public Task StopAsync(CancellationToken cancellationToken = default)
         {
             return Task.CompletedTask;
         }

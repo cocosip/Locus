@@ -16,7 +16,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>True if the file can be added, false if quota would be exceeded.</returns>
-        Task<bool> CanAddFileAsync(string tenantId, CancellationToken ct);
+        Task<bool> CanAddFileAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Increments the file count for a tenant.
@@ -25,14 +25,14 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <exception cref="Core.Exceptions.TenantQuotaExceededException">Thrown when quota limit is reached.</exception>
-        Task IncrementFileCountAsync(string tenantId, CancellationToken ct);
+        Task IncrementFileCountAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Decrements the file count for a tenant (called when deleting files).
         /// </summary>
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task DecrementFileCountAsync(string tenantId, CancellationToken ct);
+        Task DecrementFileCountAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current file count for a tenant.
@@ -40,7 +40,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The current number of files for the tenant.</returns>
-        Task<int> GetFileCountAsync(string tenantId, CancellationToken ct);
+        Task<int> GetFileCountAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the effective quota limit for a tenant.
@@ -49,7 +49,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The maximum file count (0 means unlimited).</returns>
-        Task<int> GetEffectiveLimitAsync(string tenantId, CancellationToken ct);
+        Task<int> GetEffectiveLimitAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Sets a tenant-specific quota limit (overrides global quota for this tenant).
@@ -57,28 +57,28 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="maxFiles">The maximum number of files allowed (0 means unlimited).</param>
         /// <param name="ct">Cancellation token.</param>
-        Task SetTenantLimitAsync(string tenantId, int maxFiles, CancellationToken ct);
+        Task SetTenantLimitAsync(string tenantId, int maxFiles, CancellationToken ct = default);
 
         /// <summary>
         /// Removes tenant-specific quota limit (tenant will use global quota).
         /// </summary>
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task RemoveTenantLimitAsync(string tenantId, CancellationToken ct);
+        Task RemoveTenantLimitAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Sets the global default quota limit for all tenants (unless they have specific limits).
         /// </summary>
         /// <param name="maxFiles">The maximum number of files allowed (0 means unlimited).</param>
         /// <param name="ct">Cancellation token.</param>
-        Task SetGlobalLimitAsync(int maxFiles, CancellationToken ct);
+        Task SetGlobalLimitAsync(int maxFiles, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the global default quota limit.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The global maximum file count (0 means unlimited).</returns>
-        Task<int> GetGlobalLimitAsync(CancellationToken ct);
+        Task<int> GetGlobalLimitAsync(CancellationToken ct = default);
     }
 }
 

@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Locus.Storage.Data;
@@ -721,6 +722,88 @@ namespace Locus.Storage.Tests
 
             Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "enabled", CancellationToken.None));
             Assert.Null(await _metadataRepository.GetAsync("tenant-disabled", "disabled", CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_DoesNotPersistMetadata_WhenTenantQuotaCompensationFails()
+        {
+            var quotaFailingManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            quotaFailingManager
+                .Setup(m => m.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new TenantQuotaExceededException("tenant-001", 1, 1));
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                quotaFailingManager.Object,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            var orphanPath = Path.Combine(tenantPath, "quota-fail.dat");
+            _fileSystem.File.WriteAllText(orphanPath, "orphan");
+
+            await cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "quota-fail", CancellationToken.None));
+
+            var directoryQuota = await _quotaRepository.GetAsync("tenant-001", "/", CancellationToken.None);
+            Assert.Null(directoryQuota);
+
+            quotaFailingManager.Verify(
+                m => m.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            quotaFailingManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_UsesTenantQuotaManagerInsteadOfTenantQuotaRepositoryRow()
+        {
+            var customTenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            customTenantQuotaManager
+                .Setup(m => m.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                customTenantQuotaManager.Object,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            var orphanPath = Path.Combine(tenantPath, "custom-manager.dat");
+            _fileSystem.File.WriteAllText(orphanPath, "orphan");
+
+            await cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            var rebuilt = await _metadataRepository.GetAsync("tenant-001", "custom-manager", CancellationToken.None);
+            Assert.NotNull(rebuilt);
+
+            var tenantQuotaRow = await _quotaRepository.GetAsync("tenant-001", "tenant-001", CancellationToken.None);
+            Assert.Null(tenantQuotaRow);
+
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/", CancellationToken.None);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
+            customTenantQuotaManager.Verify(
+                m => m.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            customTenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
         }
 
         [Fact]

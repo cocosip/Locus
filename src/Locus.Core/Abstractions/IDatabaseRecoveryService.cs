@@ -27,7 +27,7 @@ namespace Locus.Core.Abstractions
         Task<DatabaseRebuildResult> RebuildMetadataDatabaseAsync(
             string tenantId,
             IEnumerable<string> volumePaths,
-            CancellationToken ct);
+            CancellationToken ct = default);
 
         /// <summary>
         /// Rebuilds a corrupted quota database for a specific tenant by scanning directories.
@@ -39,13 +39,13 @@ namespace Locus.Core.Abstractions
         Task<DatabaseRebuildResult> RebuildQuotaDatabaseAsync(
             string tenantId,
             IEnumerable<string> volumePaths,
-            CancellationToken ct);
+            CancellationToken ct = default);
 
         /// <summary>
         /// Checks all databases for corruption and returns a health report.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Health report for all databases.</returns>
-        Task<DatabaseHealthReport> CheckAllDatabasesAsync(CancellationToken ct);
+        Task<DatabaseHealthReport> CheckAllDatabasesAsync(CancellationToken ct = default);
     }
 }

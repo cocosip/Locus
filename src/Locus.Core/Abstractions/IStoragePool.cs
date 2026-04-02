@@ -27,7 +27,7 @@ namespace Locus.Core.Abstractions
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
         /// <exception cref="Core.Exceptions.TenantQuotaExceededException">Thrown when tenant file count limit is exceeded.</exception>
         /// <exception cref="Core.Exceptions.InsufficientStorageException">Thrown when no volume has sufficient space.</exception>
-        Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct);
+        Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct = default);
 
         /// <summary>
         /// Reads a file from the storage pool asynchronously using its file key.
@@ -38,7 +38,7 @@ namespace Locus.Core.Abstractions
         /// <returns>A stream containing the file contents.</returns>
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
         /// <exception cref="System.IO.FileNotFoundException">Thrown when the file is not found.</exception>
-        Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
+        Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the file information (metadata) for a given file key.
@@ -49,7 +49,7 @@ namespace Locus.Core.Abstractions
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file information, or null if not found.</returns>
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
-        Task<Models.FileInfo?> GetFileInfoAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
+        Task<Models.FileInfo?> GetFileInfoAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the file location and metadata for a given file key.
@@ -60,7 +60,7 @@ namespace Locus.Core.Abstractions
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file location information, or null if not found.</returns>
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
-        Task<Models.FileLocation?> GetFileLocationAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
+        Task<Models.FileLocation?> GetFileLocationAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the next file for processing in the queue.
@@ -71,7 +71,7 @@ namespace Locus.Core.Abstractions
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The next file available for processing, or null if no files are available.</returns>
         /// <exception cref="Core.Exceptions.TenantDisabledException">Thrown when the tenant is disabled.</exception>
-        Task<Models.FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct);
+        Task<Models.FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default);
 
         /// <summary>
         /// Gets a batch of files for processing in the queue.
@@ -86,7 +86,7 @@ namespace Locus.Core.Abstractions
         Task<System.Collections.Generic.IEnumerable<Models.FileLocation>> GetNextBatchForProcessingAsync(
             ITenantContext tenant,
             int batchSize,
-            CancellationToken ct);
+            CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as successfully processed and deletes it from storage.
@@ -96,7 +96,7 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
+        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as failed processing.
@@ -107,7 +107,7 @@ namespace Locus.Core.Abstractions
         /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
         /// <param name="errorMessage">The error message describing the failure.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
+        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current processing status of a file.
@@ -115,20 +115,20 @@ namespace Locus.Core.Abstractions
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The current status of the file.</returns>
-        Task<Models.FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct);
+        Task<Models.FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the total capacity across all configured storage volumes in bytes.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The total capacity in bytes.</returns>
-        Task<long> GetTotalCapacityAsync(CancellationToken ct);
+        Task<long> GetTotalCapacityAsync(CancellationToken ct = default);
 
         /// <summary>
         /// Gets the total available space across all configured storage volumes in bytes.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The total available space in bytes.</returns>
-        Task<long> GetAvailableSpaceAsync(CancellationToken ct);
+        Task<long> GetAvailableSpaceAsync(CancellationToken ct = default);
     }
 }

@@ -48,7 +48,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileWatcherOptions> GetOptionsAsync(CancellationToken ct)
+        public async Task<FileWatcherOptions> GetOptionsAsync(CancellationToken ct = default)
         {
             // Return cached options if available
             if (_cachedOptions != null)
@@ -76,7 +76,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task UpdateOptionsAsync(FileWatcherOptions options, CancellationToken ct)
+        public async Task UpdateOptionsAsync(FileWatcherOptions options, CancellationToken ct = default)
         {
             if (options == null)
                 throw new ArgumentNullException(nameof(options));
@@ -114,7 +114,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task EnableServiceAsync(CancellationToken ct)
+        public async Task EnableServiceAsync(CancellationToken ct = default)
         {
             var options = await GetOptionsAsync(ct);
             if (options.Enabled)
@@ -129,7 +129,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task DisableServiceAsync(CancellationToken ct)
+        public async Task DisableServiceAsync(CancellationToken ct = default)
         {
             var options = await GetOptionsAsync(ct);
             if (!options.Enabled)
@@ -144,13 +144,13 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<bool> IsServiceEnabledAsync(CancellationToken ct)
+        public async Task<bool> IsServiceEnabledAsync(CancellationToken ct = default)
         {
             var options = await GetOptionsAsync(ct);
             return options.Enabled;
         }
 
-        private async Task<FileWatcherOptions> LoadOptionsAsync(CancellationToken ct)
+        private async Task<FileWatcherOptions> LoadOptionsAsync(CancellationToken ct = default)
         {
             var configPath = GetConfigurationPath();
 
@@ -177,7 +177,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task SaveOptionsAsync(FileWatcherOptions options, CancellationToken ct)
+        private async Task SaveOptionsAsync(FileWatcherOptions options, CancellationToken ct = default)
         {
             var configPath = GetConfigurationPath();
 

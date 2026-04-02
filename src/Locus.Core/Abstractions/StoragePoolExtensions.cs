@@ -28,7 +28,7 @@ namespace Locus.Core.Abstractions
         public static Task<string> WriteFileAsync(
             this IStoragePool storagePool,
             Stream content,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.WriteFileAsync(CreateDefaultTenantContext(), content, null, ct);
         }
@@ -41,7 +41,7 @@ namespace Locus.Core.Abstractions
             this IStoragePool storagePool,
             Stream content,
             string? originalFileName,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.WriteFileAsync(CreateDefaultTenantContext(), content, originalFileName, ct);
         }
@@ -53,7 +53,7 @@ namespace Locus.Core.Abstractions
         public static Task<Stream> ReadFileAsync(
             this IStoragePool storagePool,
             string fileKey,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.ReadFileAsync(CreateDefaultTenantContext(), fileKey, ct);
         }
@@ -65,7 +65,7 @@ namespace Locus.Core.Abstractions
         public static Task<Models.FileInfo?> GetFileInfoAsync(
             this IStoragePool storagePool,
             string fileKey,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.GetFileInfoAsync(CreateDefaultTenantContext(), fileKey, ct);
         }
@@ -77,7 +77,7 @@ namespace Locus.Core.Abstractions
         public static Task<FileLocation?> GetFileLocationAsync(
             this IStoragePool storagePool,
             string fileKey,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.GetFileLocationAsync(CreateDefaultTenantContext(), fileKey, ct);
         }
@@ -88,7 +88,7 @@ namespace Locus.Core.Abstractions
         /// </summary>
         public static Task<FileLocation?> GetNextFileForProcessingAsync(
             this IStoragePool storagePool,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.GetNextFileForProcessingAsync(CreateDefaultTenantContext(), ct);
         }
@@ -100,7 +100,7 @@ namespace Locus.Core.Abstractions
         public static Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(
             this IStoragePool storagePool,
             int batchSize,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             return storagePool.GetNextBatchForProcessingAsync(CreateDefaultTenantContext(), batchSize, ct);
         }

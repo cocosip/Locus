@@ -14,33 +14,33 @@ namespace Locus.Core.Abstractions
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The current options.</returns>
-        Task<FileWatcherOptions> GetOptionsAsync(CancellationToken ct);
+        Task<FileWatcherOptions> GetOptionsAsync(CancellationToken ct = default);
 
         /// <summary>
         /// Updates the file watcher options.
         /// </summary>
         /// <param name="options">The new options.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task UpdateOptionsAsync(FileWatcherOptions options, CancellationToken ct);
+        Task UpdateOptionsAsync(FileWatcherOptions options, CancellationToken ct = default);
 
         /// <summary>
         /// Enables the file watcher service globally.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
-        Task EnableServiceAsync(CancellationToken ct);
+        Task EnableServiceAsync(CancellationToken ct = default);
 
         /// <summary>
         /// Disables the file watcher service globally.
         /// When disabled, all file monitoring will be stopped.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
-        Task DisableServiceAsync(CancellationToken ct);
+        Task DisableServiceAsync(CancellationToken ct = default);
 
         /// <summary>
         /// Checks if the file watcher service is globally enabled.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>True if enabled, false otherwise.</returns>
-        Task<bool> IsServiceEnabledAsync(CancellationToken ct);
+        Task<bool> IsServiceEnabledAsync(CancellationToken ct = default);
     }
 }

@@ -13,6 +13,7 @@ namespace Locus.Storage
     public class BackgroundCleanupService : BackgroundService
     {
         private readonly IStorageCleanupService _cleanupService;
+        private readonly IFileScheduler _fileScheduler;
         private readonly ILogger<BackgroundCleanupService> _logger;
         private readonly CleanupOptions _options;
         // Initialized to UtcNow so the first optimization is deferred by a full
@@ -24,17 +25,19 @@ namespace Locus.Storage
         /// </summary>
         public BackgroundCleanupService(
             IStorageCleanupService cleanupService,
+            IFileScheduler fileScheduler,
             CleanupOptions options,
             ILogger<BackgroundCleanupService> logger)
         {
             _cleanupService = cleanupService ?? throw new ArgumentNullException(nameof(cleanupService));
+            _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _lastDatabaseOptimization = DateTime.UtcNow;
         }
 
         /// <inheritdoc/>
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
             _logger.LogInformation("BackgroundCleanupService started");
 
@@ -51,9 +54,20 @@ namespace Locus.Storage
                     // Note: This no longer deletes empty directories, only the junk files within them.
                     await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
-                    // 2. Orphan recovery is now handled by OrphanFileRecoveryService (independent BackgroundService).
+                    // 2. Remove stale metadata whose physical files are already missing.
+                    // This closes the persistence-loss gap where SQLite still references files that
+                    // no longer exist on disk after an incomplete shutdown or failed delete flush.
+                    var orphanedMetadataRemoved = await _fileScheduler.CleanupOrphanedMetadataAsync(stoppingToken);
+                    if (orphanedMetadataRemoved > 0)
+                    {
+                        _logger.LogInformation(
+                            "Removed {Count} orphaned metadata record(s) whose physical files were missing",
+                            orphanedMetadataRemoved);
+                    }
 
-                    // 3-4. Combined single-pass cleanup: timed-out and permanently-failed files.
+                    // 3. Orphan recovery is now handled by OrphanFileRecoveryService (independent BackgroundService).
+
+                    // 4-5. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.
                     // Note: Completed files are deleted immediately on MarkAsCompletedAsync and never accumulate.
                     await _cleanupService.CleanupFilesByStatusAsync(
@@ -61,7 +75,7 @@ namespace Locus.Storage
                         _options.CleanupPermanentlyFailedFiles ? _options.FailedFileRetentionPeriod : null,
                         stoppingToken);
 
-                    // 5. Remove stale corruption backup files left over from rebuild operations.
+                    // 6. Remove stale corruption backup files left over from rebuild operations.
                     if (_options.CleanupInvalidDatabaseBackups)
                     {
                         var (filesRemoved, spaceFreed) = await _cleanupService.CleanupInvalidDatabaseFilesAsync(stoppingToken);
@@ -74,7 +88,7 @@ namespace Locus.Storage
                         }
                     }
 
-                    // 6. Optimize databases (if enabled and due)
+                    // 7. Optimize databases (if enabled and due)
                     if (_options.OptimizeDatabases && ShouldOptimizeDatabases())
                     {
                         _logger.LogInformation("Starting scheduled database optimization...");

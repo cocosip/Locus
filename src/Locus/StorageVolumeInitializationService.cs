@@ -42,7 +42,7 @@ namespace Locus
         }
 
         /// <inheritdoc/>
-        public async Task StartAsync(CancellationToken cancellationToken)
+        public async Task StartAsync(CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Mounting {Count} storage volume(s)...", _volumeConfigs.Count);
 
@@ -69,7 +69,7 @@ namespace Locus
         }
 
         /// <inheritdoc/>
-        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StopAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         private IStorageVolume CreateVolume(VolumeConfiguration config)
         {

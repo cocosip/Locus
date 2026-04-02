@@ -15,7 +15,7 @@ namespace Locus.Core.Abstractions
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>True if a file can be added; otherwise, false.</returns>
-        Task<bool> CanAddFileAsync(string tenantId, string directoryPath, CancellationToken ct);
+        Task<bool> CanAddFileAsync(string tenantId, string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Increments the file count for the specified directory atomically.
@@ -23,7 +23,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task IncrementFileCountAsync(string tenantId, string directoryPath, CancellationToken ct);
+        Task IncrementFileCountAsync(string tenantId, string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Decrements the file count for the specified directory atomically.
@@ -31,7 +31,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task DecrementFileCountAsync(string tenantId, string directoryPath, CancellationToken ct);
+        Task DecrementFileCountAsync(string tenantId, string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current file count for the specified directory.
@@ -40,7 +40,7 @@ namespace Locus.Core.Abstractions
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The current file count.</returns>
-        Task<int> GetFileCountAsync(string tenantId, string directoryPath, CancellationToken ct);
+        Task<int> GetFileCountAsync(string tenantId, string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the quota limit for the specified directory.
@@ -49,7 +49,7 @@ namespace Locus.Core.Abstractions
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The maximum file count allowed.</returns>
-        Task<int> GetLimitAsync(string tenantId, string directoryPath, CancellationToken ct);
+        Task<int> GetLimitAsync(string tenantId, string directoryPath, CancellationToken ct = default);
 
         /// <summary>
         /// Sets the quota limit for the specified directory.
@@ -58,6 +58,6 @@ namespace Locus.Core.Abstractions
         /// <param name="directoryPath">The directory path.</param>
         /// <param name="maxFiles">The maximum number of files allowed.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task SetLimitAsync(string tenantId, string directoryPath, int maxFiles, CancellationToken ct);
+        Task SetLimitAsync(string tenantId, string directoryPath, int maxFiles, CancellationToken ct = default);
     }
 }

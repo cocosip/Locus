@@ -15,7 +15,7 @@ namespace Locus.Core.Abstractions
         /// <param name="rootConfig">The root configuration.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Number of watchers created or updated.</returns>
-        Task<int> ApplyRootConfigurationAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct);
+        Task<int> ApplyRootConfigurationAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct = default);
 
         /// <summary>
         /// Discovers new tenant directories and creates watchers for them.
@@ -23,19 +23,19 @@ namespace Locus.Core.Abstractions
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Number of new watchers created.</returns>
-        Task<int> DiscoverAndCreateWatchersAsync(CancellationToken ct);
+        Task<int> DiscoverAndCreateWatchersAsync(CancellationToken ct = default);
 
         /// <summary>
         /// Removes all watchers managed by this auto-manager.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
-        Task RemoveAllWatchersAsync(CancellationToken ct);
+        Task RemoveAllWatchersAsync(CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current root configuration.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The root configuration, or null if not set.</returns>
-        Task<FileWatcherRootConfiguration?> GetRootConfigurationAsync(CancellationToken ct);
+        Task<FileWatcherRootConfiguration?> GetRootConfigurationAsync(CancellationToken ct = default);
     }
 }

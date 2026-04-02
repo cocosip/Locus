@@ -46,7 +46,7 @@ namespace Locus.Core.Abstractions
         /// <param name="path">The relative path of the file to read.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>A stream containing the file contents.</returns>
-        Task<Stream> ReadAsync(string path, CancellationToken ct);
+        Task<Stream> ReadAsync(string path, CancellationToken ct = default);
 
         /// <summary>
         /// Writes a file to the storage volume asynchronously.
@@ -54,14 +54,14 @@ namespace Locus.Core.Abstractions
         /// <param name="path">The relative path where the file should be written.</param>
         /// <param name="content">A stream containing the file contents.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task WriteAsync(string path, Stream content, CancellationToken ct);
+        Task WriteAsync(string path, Stream content, CancellationToken ct = default);
 
         /// <summary>
         /// Deletes a file from the storage volume asynchronously.
         /// </summary>
         /// <param name="path">The relative path of the file to delete.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task DeleteAsync(string path, CancellationToken ct);
+        Task DeleteAsync(string path, CancellationToken ct = default);
 
         /// <summary>
         /// Builds the full physical path for a file, applying any volume-specific layout

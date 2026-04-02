@@ -16,35 +16,35 @@ namespace Locus.Core.Abstractions
         /// </summary>
         /// <param name="configuration">The watcher configuration.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task RegisterWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct);
+        Task RegisterWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct = default);
 
         /// <summary>
         /// Updates an existing watcher configuration.
         /// </summary>
         /// <param name="configuration">The updated configuration.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task UpdateWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct);
+        Task UpdateWatcherAsync(FileWatcherConfiguration configuration, CancellationToken ct = default);
 
         /// <summary>
         /// Removes a watcher configuration.
         /// </summary>
         /// <param name="watcherId">The unique watcher identifier.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task RemoveWatcherAsync(string watcherId, CancellationToken ct);
+        Task RemoveWatcherAsync(string watcherId, CancellationToken ct = default);
 
         /// <summary>
         /// Enables a watcher for a specific tenant.
         /// </summary>
         /// <param name="watcherId">The unique watcher identifier.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task EnableWatcherAsync(string watcherId, CancellationToken ct);
+        Task EnableWatcherAsync(string watcherId, CancellationToken ct = default);
 
         /// <summary>
         /// Disables a watcher for a specific tenant.
         /// </summary>
         /// <param name="watcherId">The unique watcher identifier.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task DisableWatcherAsync(string watcherId, CancellationToken ct);
+        Task DisableWatcherAsync(string watcherId, CancellationToken ct = default);
 
         /// <summary>
         /// Gets all watcher configurations for a specific tenant.
@@ -52,7 +52,7 @@ namespace Locus.Core.Abstractions
         /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>A collection of watcher configurations.</returns>
-        Task<IEnumerable<FileWatcherConfiguration>> GetWatchersForTenantAsync(string tenantId, CancellationToken ct);
+        Task<IEnumerable<FileWatcherConfiguration>> GetWatchersForTenantAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
         /// Gets a specific watcher configuration.
@@ -60,7 +60,7 @@ namespace Locus.Core.Abstractions
         /// <param name="watcherId">The unique watcher identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The watcher configuration, or null if not found.</returns>
-        Task<FileWatcherConfiguration?> GetWatcherAsync(string watcherId, CancellationToken ct);
+        Task<FileWatcherConfiguration?> GetWatcherAsync(string watcherId, CancellationToken ct = default);
 
         /// <summary>
         /// Manually triggers an immediate scan of a watcher's directory.
@@ -68,7 +68,7 @@ namespace Locus.Core.Abstractions
         /// <param name="watcherId">The unique watcher identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Statistics about the scan operation.</returns>
-        Task<FileWatcherScanResult> ScanNowAsync(string watcherId, CancellationToken ct);
+        Task<FileWatcherScanResult> ScanNowAsync(string watcherId, CancellationToken ct = default);
 
         /// <summary>
         /// Manually triggers an immediate scan using an already-loaded watcher configuration.
@@ -77,14 +77,14 @@ namespace Locus.Core.Abstractions
         /// <param name="configuration">The watcher configuration snapshot to scan.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Statistics about the scan operation.</returns>
-        Task<FileWatcherScanResult> ScanNowAsync(FileWatcherConfiguration configuration, CancellationToken ct);
+        Task<FileWatcherScanResult> ScanNowAsync(FileWatcherConfiguration configuration, CancellationToken ct = default);
 
         /// <summary>
         /// Gets all registered watcher configurations.
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>A collection of all watcher configurations.</returns>
-        Task<IEnumerable<FileWatcherConfiguration>> GetAllWatchersAsync(CancellationToken ct);
+        Task<IEnumerable<FileWatcherConfiguration>> GetAllWatchersAsync(CancellationToken ct = default);
     }
 
     /// <summary>

@@ -50,7 +50,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct)
+        public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -72,7 +72,7 @@ namespace Locus.Storage
         public async Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(
             ITenantContext tenant,
             int batchSize,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -92,7 +92,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsProcessingAsync(string fileKey, CancellationToken ct)
+        public async Task MarkAsProcessingAsync(string fileKey, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
@@ -139,7 +139,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct)
+        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
@@ -205,7 +205,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct)
+        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
@@ -262,7 +262,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct)
+        public async Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
@@ -291,7 +291,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct)
+        public async Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
@@ -331,7 +331,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct)
+        public async Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct = default)
         {
             var removedCount = 0;
 
@@ -355,14 +355,14 @@ namespace Locus.Storage
                             metadata.FileKey, metadata.PhysicalPath);
 
                         // Decrement quota counters before removing metadata so they stay consistent.
-                        // Use CancellationToken.None for the full cleanup sequence once a candidate
+                        // Use default for the full cleanup sequence once a candidate
                         // orphan has been selected; otherwise a mid-flight cancellation could leave
                         // quotas decremented while the metadata row remains present.
                         if (_tenantQuotaManager != null)
                         {
                             try
                             {
-                                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
                             }
                             catch (Exception ex)
                             {
@@ -370,11 +370,15 @@ namespace Locus.Storage
                             }
                         }
 
-                        if (_directoryQuotaManager != null && !string.IsNullOrWhiteSpace(metadata.DirectoryPath))
+                        if (_directoryQuotaManager != null)
                         {
                             try
                             {
-                                await _directoryQuotaManager.DecrementFileCountAsync(metadata.TenantId, metadata.DirectoryPath, CancellationToken.None);
+                                var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+                                await _directoryQuotaManager.DecrementFileCountAsync(
+                                    metadata.TenantId,
+                                    normalizedDirectoryPath,
+                                    default);
                             }
                             catch (Exception ex)
                             {
@@ -382,7 +386,7 @@ namespace Locus.Storage
                             }
                         }
 
-                        await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, CancellationToken.None);
+                        await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, default);
                         removedCount++;
                     }
                 }
@@ -431,7 +435,7 @@ namespace Locus.Storage
                     : null);
         }
 
-        private Task DeletePhysicalFileAsync(FileMetadata metadata, CancellationToken ct)
+        private Task DeletePhysicalFileAsync(FileMetadata metadata, CancellationToken ct = default)
         {
             if (_volumeRegistry != null
                 && !string.IsNullOrWhiteSpace(metadata.VolumeId)

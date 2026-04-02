@@ -131,7 +131,7 @@ namespace Locus.Storage.Data
         public async Task<DatabaseRebuildResult> RebuildMetadataDatabaseAsync(
             string tenantId,
             IEnumerable<string> volumePaths,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -215,7 +215,7 @@ namespace Locus.Storage.Data
                                 FileExtension = _fileSystem.Path.GetExtension(filePath)
                             };
 
-                            // Use direct write â€” rebuild must be persisted synchronously so the
+                            // Use direct write â€?rebuild must be persisted synchronously so the
                             // new DB file exists and is fully populated when this method returns.
                             await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
                             rebuiltFiles++;
@@ -270,7 +270,7 @@ namespace Locus.Storage.Data
         public async Task<DatabaseRebuildResult> RebuildQuotaDatabaseAsync(
             string tenantId,
             IEnumerable<string> volumePaths,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -389,7 +389,7 @@ namespace Locus.Storage.Data
         /// <summary>
         /// Checks all databases for corruption and returns a health report.
         /// </summary>
-        public async Task<DatabaseHealthReport> CheckAllDatabasesAsync(CancellationToken ct)
+        public async Task<DatabaseHealthReport> CheckAllDatabasesAsync(CancellationToken ct = default)
         {
             var report = new DatabaseHealthReport();
 

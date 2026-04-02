@@ -26,7 +26,7 @@ namespace Locus
             _options = options ?? throw new ArgumentNullException(nameof(options));
         }
 
-        public async Task StartAsync(CancellationToken cancellationToken)
+        public async Task StartAsync(CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Initializing file watchers...");
 
@@ -85,7 +85,7 @@ namespace Locus
             }
         }
 
-        public Task StopAsync(CancellationToken cancellationToken)
+        public Task StopAsync(CancellationToken cancellationToken = default)
         {
             return Task.CompletedTask;
         }

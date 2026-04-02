@@ -345,7 +345,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// <summary>
         /// Acquires tenant lock unless current async flow already owns a rebuild lock for this tenant.
         /// </summary>
-        private async Task<SemaphoreSlim?> AcquireTenantLockIfNeededAsync(string tenantId, CancellationToken ct)
+        private async Task<SemaphoreSlim?> AcquireTenantLockIfNeededAsync(string tenantId, CancellationToken ct = default)
         {
             if (_tenantLockBypass.Value != null && _tenantLockBypass.Value.Contains(tenantId))
                 return null;
@@ -880,7 +880,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// Gets or creates a directory quota.
         /// Returns a snapshot with the live current count from the atomic state.
         /// </summary>
-        public async Task<DirectoryQuota> GetOrCreateAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public async Task<DirectoryQuota> GetOrCreateAsync(string tenantId, string directoryPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -906,7 +906,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// No lock needed: GetDatabase uses LazyThreadSafetyMode.ExecutionAndPublication
         /// and _quotaCache is a ConcurrentDictionary (lock-free reads).
         /// </summary>
-        public Task<DirectoryQuota?> GetAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task<DirectoryQuota?> GetAsync(string tenantId, string directoryPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -926,7 +926,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// Persists to SQLite immediately and syncs the atomic state so the hot path
         /// picks up the new limit without waiting for the next flush.
         /// </summary>
-        public async Task UpdateAsync(string tenantId, DirectoryQuota quota, CancellationToken ct)
+        public async Task UpdateAsync(string tenantId, DirectoryQuota quota, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -967,7 +967,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// Intended for maintenance workflows (e.g. database rebuild) where a deterministic count
         /// must take effect before returning.
         /// </summary>
-        public async Task SetCurrentCountAsync(string tenantId, string directoryPath, int count, CancellationToken ct)
+        public async Task SetCurrentCountAsync(string tenantId, string directoryPath, int count, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -993,7 +993,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// Sets the current count without acquiring tenant lock.
         /// Callers must already hold the tenant lock for this tenant.
         /// </summary>
-        internal Task SetCurrentCountForRebuildAsync(string tenantId, string directoryPath, int count, CancellationToken ct)
+        internal Task SetCurrentCountForRebuildAsync(string tenantId, string directoryPath, int count, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1041,7 +1041,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// SQLite is updated asynchronously by the Write-Behind timer.
         /// Returns false if the increment would exceed the configured maximum count.
         /// </summary>
-        public Task<bool> TryIncrementAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task<bool> TryIncrementAsync(string tenantId, string directoryPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1051,7 +1051,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
 
             var state = GetOrCreateAtomicState(tenantId, directoryPath);
 
-            // Fast-path: no limit configured or quota disabled â€” always allow.
+            // Fast-path: no limit configured or quota disabled â€?always allow.
             if (!state.Enabled || state.MaxCount == 0)
             {
                 Interlocked.Increment(ref state.Count);
@@ -1097,7 +1097,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// Lock-free hot path: uses CAS on the atomic counter.
         /// SQLite is updated asynchronously by the Write-Behind timer.
         /// </summary>
-        public Task DecrementAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task DecrementAsync(string tenantId, string directoryPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1143,7 +1143,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// Lock-free hot path: uses Interlocked.Increment on the atomic counter.
         /// SQLite is updated asynchronously by the Write-Behind timer.
         /// </summary>
-        public Task ForceIncrementAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public Task ForceIncrementAsync(string tenantId, string directoryPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1169,7 +1169,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// No lock needed: GetDatabase uses LazyThreadSafetyMode.ExecutionAndPublication
         /// and _quotaCache is a ConcurrentDictionary (lock-free reads).
         /// </summary>
-        public Task<IEnumerable<DirectoryQuota>> GetAllAsync(string tenantId, CancellationToken ct)
+        public Task<IEnumerable<DirectoryQuota>> GetAllAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1188,7 +1188,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// <summary>
         /// Removes a directory quota.
         /// </summary>
-        public async Task<bool> RemoveAsync(string tenantId, string directoryPath, CancellationToken ct)
+        public async Task<bool> RemoveAsync(string tenantId, string directoryPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1233,7 +1233,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// <summary>
         /// Optimizes a specific tenant's quota database via SQLite VACUUM to reclaim space.
         /// </summary>
-        public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
+        public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             var dbPath = GetDatabasePath(tenantId);
@@ -1304,7 +1304,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// <summary>
         /// Gets all tenant IDs that have quota databases.
         /// </summary>
-        public Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
+        public Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct = default)
         {
             if (!_fileSystem.Directory.Exists(_quotaDirectory))
                 return Task.FromResult<IEnumerable<string>>(Array.Empty<string>());
@@ -1365,7 +1365,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// A handle whose <see cref="DatabaseRebuildLockHandle.BackupPath"/> is the path to the
         /// corrupted database backup, or <c>null</c> if no database file existed.
         /// </returns>
-        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
+        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));

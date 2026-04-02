@@ -60,7 +60,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<int> ApplyRootConfigurationAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct)
+        public async Task<int> ApplyRootConfigurationAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct = default)
         {
             if (rootConfig == null)
                 throw new ArgumentNullException(nameof(rootConfig));
@@ -100,7 +100,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<int> DiscoverAndCreateWatchersAsync(CancellationToken ct)
+        public async Task<int> DiscoverAndCreateWatchersAsync(CancellationToken ct = default)
         {
             await _lock.WaitAsync(ct);
             try
@@ -133,7 +133,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task RemoveAllWatchersAsync(CancellationToken ct)
+        public async Task RemoveAllWatchersAsync(CancellationToken ct = default)
         {
             await _lock.WaitAsync(ct);
             try
@@ -170,7 +170,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileWatcherRootConfiguration?> GetRootConfigurationAsync(CancellationToken ct)
+        public async Task<FileWatcherRootConfiguration?> GetRootConfigurationAsync(CancellationToken ct = default)
         {
             if (_currentRootConfig != null)
             {
@@ -189,7 +189,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task<int> CreateMultiTenantWatchersAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct)
+        private async Task<int> CreateMultiTenantWatchersAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct = default)
         {
             // Single watcher in multi-tenant mode
             var watcherId = GenerateWatcherId("multi-tenant", rootConfig.RootPath);
@@ -233,7 +233,7 @@ namespace Locus.Storage
             return 1;
         }
 
-        private async Task<int> CreateSingleTenantWatcherAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct)
+        private async Task<int> CreateSingleTenantWatcherAsync(FileWatcherRootConfiguration rootConfig, CancellationToken ct = default)
         {
             // In single-tenant mode, monitor only the root directory
             // The tenant ID should be provided separately or default to "default"
@@ -300,7 +300,7 @@ namespace Locus.Storage
             return $"auto-{mode}-{hash}";
         }
 
-        private async Task SaveRootConfigurationAsync(FileWatcherRootConfiguration config, CancellationToken ct)
+        private async Task SaveRootConfigurationAsync(FileWatcherRootConfiguration config, CancellationToken ct = default)
         {
             var configPath = GetRootConfigurationPath();
 
@@ -310,7 +310,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task<FileWatcherRootConfiguration?> LoadRootConfigurationAsync(CancellationToken ct)
+        private async Task<FileWatcherRootConfiguration?> LoadRootConfigurationAsync(CancellationToken ct = default)
         {
             var configPath = GetRootConfigurationPath();
 

@@ -1,4 +1,4 @@
-ï»¿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -775,7 +775,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// For maintenance operations (database rebuild) that require immediate SQLite persistence,
         /// use <see cref="AddOrUpdateDirectAsync"/> instead.
         /// </remarks>
-        public Task AddOrUpdateAsync(FileMetadata metadata, CancellationToken ct)
+        public Task AddOrUpdateAsync(FileMetadata metadata, CancellationToken ct = default)
         {
             if (_disposed)
                 throw new ObjectDisposedException(nameof(MetadataRepository));
@@ -806,7 +806,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// Bypasses the Write-Behind queue -- use only for maintenance operations such as
         /// database rebuild where the caller needs the data persisted before returning.
         /// </summary>
-        internal Task AddOrUpdateDirectAsync(FileMetadata metadata, CancellationToken ct)
+        internal Task AddOrUpdateDirectAsync(FileMetadata metadata, CancellationToken ct = default)
         {
             if (metadata == null)
                 throw new ArgumentNullException(nameof(metadata));
@@ -875,7 +875,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// Gets file metadata by file key.
         /// All queries hit memory first (microseconds).
         /// </summary>
-        public Task<FileMetadata?> GetAsync(string tenantId, string fileKey, CancellationToken ct)
+        public Task<FileMetadata?> GetAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -892,7 +892,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// Removes file metadata by file key.
         /// Used when file processing is completed successfully.
         /// </summary>
-        public Task<bool> RemoveAsync(string tenantId, string fileKey, CancellationToken ct)
+        public Task<bool> RemoveAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
             if (_disposed)
                 throw new ObjectDisposedException(nameof(MetadataRepository));
@@ -940,7 +940,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string fileKey,
             DateTime expectedProcessingStartTimeUtc,
             DateTime availableForProcessingAtUtc,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -991,7 +991,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string tenantId,
             string fileKey,
             DateTime expectedLastFailedAtUtc,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1043,7 +1043,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string tenantId,
             string fileKey,
             DateTime expectedProcessingStartTimeUtc,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1095,7 +1095,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string fileKey,
             DateTime expectedProcessingStartTimeUtc,
             Func<FileMetadata, FileMetadata> updateFactory,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1155,7 +1155,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string tenantId,
             string fileKey,
             DateTime processingStartTimeUtc,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1209,7 +1209,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <summary>
         /// Gets all file metadata for a specific tenant.
         /// </summary>
-        public Task<IEnumerable<FileMetadata>> GetByTenantAsync(string tenantId, CancellationToken ct)
+        public Task<IEnumerable<FileMetadata>> GetByTenantAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1222,7 +1222,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <summary>
         /// Returns a point-in-time reference snapshot of all metadata for a tenant without
         /// deep-cloning each entry.  Callers MUST NOT mutate the returned objects.
-        /// This is O(N) reference copy vs the O(N Ã— clone_cost) of <see cref="GetByTenantAsync"/>
+        /// This is O(N) reference copy vs the O(N ¡Á clone_cost) of <see cref="GetByTenantAsync"/>
         /// and is intended for read-only, best-effort scans such as orphan cleanup.
         /// </summary>
         internal FileMetadata[] SnapshotTenantMetadataRaw(string tenantId)
@@ -1239,7 +1239,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// Checks whether a metadata record exists for the specified physical path.
         /// Path comparison follows platform-specific case sensitivity.
         /// </summary>
-        public Task<bool> ExistsByPhysicalPathAsync(string tenantId, string physicalPath, CancellationToken ct)
+        public Task<bool> ExistsByPhysicalPathAsync(string tenantId, string physicalPath, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1258,7 +1258,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         internal Task<bool> ExistsByNormalizedPhysicalPathAsync(
             string tenantId,
             string normalizedPhysicalPath,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1297,7 +1297,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string tenantId,
             DateTime cutoffUtc,
             int limit,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1325,7 +1325,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             string tenantId,
             DateTime cutoffUtc,
             int limit,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1349,7 +1349,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <summary>
         /// Gets all file metadata with a specific status.
         /// </summary>
-        public Task<IEnumerable<FileMetadata>> GetByStatusAsync(FileProcessingStatus status, CancellationToken ct)
+        public Task<IEnumerable<FileMetadata>> GetByStatusAsync(FileProcessingStatus status, CancellationToken ct = default)
         {
             var results = new List<FileMetadata>();
 
@@ -1704,7 +1704,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// are validated and discarded on dequeue. Delayed-retry files are held in a separate
         /// delayed queue and promoted to ready when they become due.
         /// </summary>
-        public async Task<FileMetadata?> GetNextPendingFileAsync(string tenantId, CancellationToken ct)
+        public async Task<FileMetadata?> GetNextPendingFileAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -1845,7 +1845,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         public async Task<IEnumerable<FileMetadata>> GetNextPendingBatchAsync(
             string tenantId,
             int batchSize,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -2023,7 +2023,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <see cref="StorageCleanupService"/> after its own timed-out-file scan.
         /// </remarks>
         [Obsolete("Use TryResetTimedOutFileAsync for per-file timeout resets. This bulk method is not called by production code.")]
-        public Task<int> ResetTimedOutFilesAsync(TimeSpan timeout, CancellationToken ct)
+        public Task<int> ResetTimedOutFilesAsync(TimeSpan timeout, CancellationToken ct = default)
         {
             var cutoffTime = DateTime.UtcNow - timeout;
             var count = 0;
@@ -2076,7 +2076,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// Finds file metadata by fileKey using a global O(1) index.
         /// Falls back to a tenant scan only to self-heal stale index entries.
         /// </summary>
-        public Task<FileMetadata?> GetByFileKeyAsync(string fileKey, CancellationToken ct)
+        public Task<FileMetadata?> GetByFileKeyAsync(string fileKey, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
@@ -2105,7 +2105,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <summary>
         /// Gets all file metadata (for maintenance operations).
         /// </summary>
-        public Task<IEnumerable<FileMetadata>> GetAllAsync(CancellationToken ct)
+        public Task<IEnumerable<FileMetadata>> GetAllAsync(CancellationToken ct = default)
         {
             var results = new List<FileMetadata>();
 
@@ -2125,7 +2125,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <param name="tenantId">The tenant ID whose database should be optimized.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Tuple of (size before, size after) in bytes.</returns>
-        public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct)
+        public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
@@ -2187,7 +2187,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <summary>
         /// Gets all tenant IDs that have metadata databases.
         /// </summary>
-        public async Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct)
+        public async Task<IEnumerable<string>> GetAllTenantIdsAsync(CancellationToken ct = default)
         {
             // Include in-memory tenants first so cleanup can process recent writes that have not
             // been flushed to disk yet by the write-behind persistence loop.
@@ -2280,8 +2280,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             // This method is only called from within the Lazy<SqliteConnection> factory in GetDatabase,
             // which holds the Lazy.ExecutionAndPublication lock for this tenant.
             // If we try to acquire GetDatabaseLock we risk a deadlock:
-            //   Thread A: inside Lazy factory (holds Lazy lock) â†’ wants GetDatabaseLock
-            //   Thread B: inside AddOrUpdateDirectAsync (holds GetDatabaseLock) â†’ waits on Lazy.Value
+            //   Thread A: inside Lazy factory (holds Lazy lock) ¡ú wants GetDatabaseLock
+            //   Thread B: inside AddOrUpdateDirectAsync (holds GetDatabaseLock) ¡ú waits on Lazy.Value
             // The Lazy lock already serializes all concurrent callers for this tenantId, so all
             // ConcurrentDictionary updates and file operations below are safe without an extra lock.
             {
@@ -2371,7 +2371,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// A handle whose <see cref="DatabaseRebuildLockHandle.BackupPath"/> is the path to the
         /// corrupted database backup, or <c>null</c> if no database file existed.
         /// </returns>
-        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct)
+        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -2561,7 +2561,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         // grouping operations by tenant so each tenant gets a single SQLite transaction
         // instead of one transaction per operation. This dramatically reduces SQLite overhead
         // under burst writes (e.g. 1000 concurrent file writes -> 1 transaction per tenant).
-        private async Task RunPersistenceLoopAsync(CancellationToken ct)
+        private async Task RunPersistenceLoopAsync(CancellationToken ct = default)
         {
             int drainCycles = 0;
             while (true)
@@ -2635,7 +2635,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 Interlocked.Read(ref _statusIndexStaleSkips));
         }
 
-        private async Task WaitForPersistenceWorkAsync(CancellationToken ct)
+        private async Task WaitForPersistenceWorkAsync(CancellationToken ct = default)
         {
             // Periodic timeout keeps coalesced-only writes moving even when no new channel items arrive.
             var waitToReadTask = _persistenceReader.WaitToReadAsync(ct).AsTask();
@@ -3006,7 +3006,7 @@ ON CONFLICT(file_key) DO UPDATE SET
                 var coalescedAfter = Volatile.Read(ref _coalescedDepth);
                 if (queueDepthAfter == 0 && coalescedAfter == 0)
                 {
-                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully â€” all queued writes persisted to SQLite");
+                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully ¡ª all queued writes persisted to SQLite");
                 }
                 else
                 {

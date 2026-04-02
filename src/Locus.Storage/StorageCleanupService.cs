@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -139,7 +139,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task CleanupEmptyDirectoriesAsync(ITenantContext tenant, CancellationToken ct)
+        public async Task CleanupEmptyDirectoriesAsync(ITenantContext tenant, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -148,7 +148,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task CleanupEmptyDirectoriesAsync(string tenantId, CancellationToken ct)
+        public async Task CleanupEmptyDirectoriesAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
@@ -176,7 +176,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task CleanupAllEmptyDirectoriesAsync(CancellationToken ct)
+        public async Task CleanupAllEmptyDirectoriesAsync(CancellationToken ct = default)
         {
             _logger.LogInformation("Starting junk-file sweep for all tenants");
 
@@ -203,7 +203,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct)
+        public async Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct = default)
         {
             _logger.LogInformation("Starting cleanup of permanently failed files older than {TimeSpan}", olderThan);
 
@@ -227,7 +227,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task RecoverOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct)
+        public async Task RecoverOrphanedFilesAsync(ITenantContext tenant, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -322,10 +322,30 @@ namespace Locus.Storage
                                         continue;
                                     }
 
-                                    // AddOrUpdateDirectAsync writes immediately to SQLite (not write-behind)
-                                    // so the record survives even if the process crashes right after this call.
-                                    await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
-                                    await CompensateRebuiltFileQuotaAsync(metadata, CancellationToken.None);
+                                    var tenantQuotaCompensated = false;
+                                    var directoryQuotaCompensated = false;
+                                    try
+                                    {
+                                        await CompensateRebuiltTenantQuotaAsync(metadata.TenantId, default);
+                                        tenantQuotaCompensated = true;
+
+                                        var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+                                        await _quotaRepository.ForceIncrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                                        directoryQuotaCompensated = true;
+
+                                        // Persist rebuilt metadata only after quota compensation succeeds so we never
+                                        // re-queue a file whose quota counters still under-report real usage.
+                                        await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+                                    }
+                                    catch
+                                    {
+                                        await RollbackRebuiltFileQuotaCompensationAsync(
+                                            metadata,
+                                            tenantQuotaCompensated,
+                                            directoryQuotaCompensated);
+                                        throw;
+                                    }
+
                                     if (normalizedPhysical != null && existenceCache != null)
                                     {
                                         if (existenceCache.Count < _orphanRebuildLookupCacheSize
@@ -394,7 +414,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task RecoverAllOrphanedFilesAsync(CancellationToken ct)
+        public async Task RecoverAllOrphanedFilesAsync(CancellationToken ct = default)
         {
             _logger.LogInformation("Starting orphaned file metadata rebuild across all registered volumes");
 
@@ -438,7 +458,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task<ITenantContext?> ResolveCleanupTenantAsync(string tenantId, CancellationToken ct)
+        private async Task<ITenantContext?> ResolveCleanupTenantAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 return null;
@@ -561,27 +581,63 @@ namespace Locus.Storage
             };
         }
 
-        private async Task CompensateRebuiltFileQuotaAsync(FileMetadata metadata, CancellationToken ct)
+        private async Task CompensateRebuiltTenantQuotaAsync(string tenantId, CancellationToken ct = default)
         {
-            if (metadata == null)
-                throw new ArgumentNullException(nameof(metadata));
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            if (string.IsNullOrWhiteSpace(metadata.TenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
+            if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
+            {
+                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, ct);
+                return;
+            }
 
+            await _tenantQuotaManager.IncrementFileCountAsync(tenantId, ct);
+        }
+
+        private async Task RollbackRebuiltFileQuotaCompensationAsync(
+            FileMetadata metadata,
+            bool tenantQuotaCompensated,
+            bool directoryQuotaCompensated)
+        {
             var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
 
-            // Orphan rebuild restores files that already exist physically, so quota counters must
-            // reflect reality even if the current configured limit would reject a normal increment.
-            // Use ForceIncrementAsync (unconditional atomic increment) to avoid the TOCTOU race
-            // in the old GetOrCreateAsync + SetCurrentCountAsync(count+1) pattern: concurrent writers
-            // or decrements occurring between the read and the write would be silently lost.
-            await _quotaRepository.ForceIncrementAsync(metadata.TenantId, metadata.TenantId, ct);
-            await _quotaRepository.ForceIncrementAsync(metadata.TenantId, normalizedDirectoryPath, ct);
+            if (directoryQuotaCompensated)
+            {
+                try
+                {
+                    await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback directory quota compensation for orphaned file rebuild. Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                        metadata.TenantId,
+                        normalizedDirectoryPath,
+                        metadata.FileKey);
+                }
+            }
+
+            if (tenantQuotaCompensated)
+            {
+                try
+                {
+                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback tenant quota compensation for orphaned file rebuild. Tenant={TenantId}, FileKey={FileKey}",
+                        metadata.TenantId,
+                        metadata.FileKey);
+                }
+            }
         }
 
         /// <inheritdoc/>
-        public async Task CleanupTimedOutProcessingFilesAsync(TimeSpan timeout, CancellationToken ct)
+        public async Task CleanupTimedOutProcessingFilesAsync(TimeSpan timeout, CancellationToken ct = default)
         {
             _logger.LogInformation("Starting cleanup of timed-out processing files (timeout: {Timeout})", timeout);
 
@@ -603,7 +659,7 @@ namespace Locus.Storage
         public async Task CleanupFilesByStatusAsync(
             TimeSpan? processingTimeout,
             TimeSpan? failedRetentionPeriod,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             if (processingTimeout == null && failedRetentionPeriod == null)
                 return;
@@ -647,7 +703,7 @@ namespace Locus.Storage
             string tenantId,
             DateTime timeoutCutoffUtc,
             DateTime nowUtc,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             int resetCount = 0;
 
@@ -695,7 +751,7 @@ namespace Locus.Storage
         private async Task<(int RemovedCount, long SpaceFreed)> CleanupPermanentlyFailedForTenantAsync(
             string tenantId,
             DateTime failedCutoffUtc,
-            CancellationToken ct)
+            CancellationToken ct = default)
         {
             int removedCount = 0;
             long spaceFreed = 0;
@@ -782,7 +838,7 @@ namespace Locus.Storage
                     // cleanup loop and leave subsequent permanently-failed files unprocessed.
                     try
                     {
-                        await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, CancellationToken.None);
+                        await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
                     }
                     catch (Exception ex)
                     {
@@ -794,7 +850,7 @@ namespace Locus.Storage
 
                     try
                     {
-                        await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, CancellationToken.None);
+                        await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
                     }
                     catch (Exception ex)
                     {
@@ -855,7 +911,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public Task<CleanupStatistics> GetCleanupStatisticsAsync(CancellationToken ct)
+        public Task<CleanupStatistics> GetCleanupStatisticsAsync(CancellationToken ct = default)
         {
             return Task.FromResult(new CleanupStatistics
             {
@@ -869,7 +925,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<DatabaseOptimizationResult> OptimizeDatabasesAsync(CancellationToken ct)
+        public async Task<DatabaseOptimizationResult> OptimizeDatabasesAsync(CancellationToken ct = default)
         {
             _logger.LogWarning("Starting database optimization. This operation can be time-consuming for large databases.");
             _logger.LogWarning("Tenant operations will be BLOCKED during optimization. Run during low-activity periods.");
@@ -968,7 +1024,7 @@ namespace Locus.Storage
         /// </summary>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Number of backup files removed and space freed in bytes.</returns>
-        public Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct)
+        public Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct = default)
         {
             _logger.LogInformation("Starting cleanup of SQLite corruption backup files...");
 
@@ -988,7 +1044,7 @@ namespace Locus.Storage
         /// Cleans up SQLite corruption backup files (*.corrupted.*) inside each tenant subdirectory.
         /// Each tenant directory lives under <paramref name="rootDirectory"/>/{tenantId}/.
         /// </summary>
-        private (int FilesRemoved, long SpaceFreed) CleanupCorruptedDatabaseBackups(string rootDirectory, CancellationToken ct)
+        private (int FilesRemoved, long SpaceFreed) CleanupCorruptedDatabaseBackups(string rootDirectory, CancellationToken ct = default)
         {
             var filesRemoved = 0;
             long spaceFreed = 0;
@@ -1141,5 +1197,3 @@ namespace Locus.Storage
         }
     }
 }
-
-
