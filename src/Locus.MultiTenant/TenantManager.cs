@@ -1,4 +1,4 @@
-using System;
+ï»¿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -26,7 +26,7 @@ namespace Locus.MultiTenant
         private readonly TimeSpan _cacheExpiration;
         private readonly bool _autoCreateTenants;
 
-        // Cache: TenantId â†?(TenantContext, ExpirationTime)
+        // Cache: TenantId ï¿½?(TenantContext, ExpirationTime)
         private readonly ConcurrentDictionary<string, (ITenantContext Context, DateTime ExpiresAt)> _cache;
 
         // Locks for file operations per tenant
@@ -80,13 +80,13 @@ namespace Locus.MultiTenant
                 throw new ArgumentException("Tenant ID cannot be null or whitespace.", nameof(tenantId));
 
             // Fast path: cache hit (no lock required).
-            // No debug log here â€?this is the hot path called on every file operation
+            // No debug log here ï¿½?this is the hot path called on every file operation
             // and logging on each cache hit generates excessive noise at high throughput.
             if (_cache.TryGetValue(tenantId, out var cached) && DateTime.UtcNow < cached.ExpiresAt)
                 return cached.Context;
 
             // Slow path: cache miss or expiry.
-            // Acquire per-tenant lock so only one thread reads the file â€?all other concurrent
+            // Acquire per-tenant lock so only one thread reads the file ï¿½?all other concurrent
             // callers for the same tenantId wait here and then get the freshly cached value.
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             await tenantLock.WaitAsync(ct);
@@ -236,7 +236,7 @@ namespace Locus.MultiTenant
                     ct.ThrowIfCancellationRequested();
                     try
                     {
-                        // Read the JSON file directly â€?bypasses GetTenantAsync's per-tenant lock
+                        // Read the JSON file directly ï¿½?bypasses GetTenantAsync's per-tenant lock
                         // and avoids N sequential lock acquisitions for large tenant counts.
                         TenantMetadata? metadata;
                         using (var stream = _fileSystem.File.OpenRead(filePath))
@@ -252,6 +252,10 @@ namespace Locus.MultiTenant
 
                         // Populate cache so subsequent GetTenantAsync calls are served from memory.
                         _cache[metadata.TenantId] = (context, DateTime.UtcNow.Add(_cacheExpiration));
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception ex)
                     {

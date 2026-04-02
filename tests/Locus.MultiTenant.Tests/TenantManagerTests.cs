@@ -1,4 +1,5 @@
 using System;
+using System.IO.Abstractions;
 using System.IO.Abstractions.TestingHelpers;
 using System.Threading;
 using System.Threading.Tasks;
@@ -6,6 +7,7 @@ using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.MultiTenant;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Xunit;
 
 namespace Locus.MultiTenant.Tests
@@ -179,6 +181,36 @@ namespace Locus.MultiTenant.Tests
         }
 
         [Fact]
+        public async Task GetAllTenantsAsync_PropagatesCancellation()
+        {
+            var metadataRoot = ".locus/tenants";
+            var metadataPath = ".locus/tenants/tenant-001.json";
+            var cts = new CancellationTokenSource();
+            var directory = new Mock<IDirectory>();
+            directory.Setup(d => d.Exists(metadataRoot)).Returns(true);
+            directory.Setup(d => d.GetFiles(metadataRoot, "*.json")).Returns(new[] { metadataPath });
+
+            var file = new Mock<IFile>();
+            file.Setup(f => f.OpenRead(metadataPath))
+                .Returns(() =>
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException(cts.Token);
+                });
+
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.SetupGet(fs => fs.Directory).Returns(directory.Object);
+            fileSystem.SetupGet(fs => fs.File).Returns(file.Object);
+
+            var tenantManager = new TenantManager(
+                fileSystem.Object,
+                NullLogger<TenantManager>.Instance,
+                metadataRoot);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => tenantManager.GetAllTenantsAsync(cts.Token));
+        }
+
+        [Fact]
         public async Task GetTenantAsync_UsesCaching_ForRepeatedCalls()
         {
             // Arrange
@@ -234,5 +266,6 @@ namespace Locus.MultiTenant.Tests
             var tenant2 = await _tenantManager.GetTenantAsync(tenantId, CancellationToken.None);
             Assert.Equal(TenantStatus.Disabled, tenant2.Status);
         }
+
     }
 }

@@ -352,7 +352,7 @@ namespace Locus.Storage
                                     var directoryQuotaCompensated = false;
                                     try
                                     {
-                                        await CompensateRebuiltTenantQuotaAsync(metadata.TenantId, default);
+                                        await CompensateTenantQuotaIncrementAsync(metadata.TenantId, default);
                                         tenantQuotaCompensated = true;
 
                                         var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
@@ -634,7 +634,7 @@ namespace Locus.Storage
             };
         }
 
-        private async Task CompensateRebuiltTenantQuotaAsync(string tenantId, CancellationToken ct = default)
+        private async Task CompensateTenantQuotaIncrementAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -827,52 +827,7 @@ namespace Locus.Storage
 
                 foreach (var metadata in batch)
                 {
-                    var physicalFileRemoved = false;
-                    if (_volumes.TryGetValue(metadata.VolumeId, out var volume))
-                    {
-                        try
-                        {
-                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
-                            {
-                                await volume.DeleteAsync(metadata.PhysicalPath, ct);
-                                physicalFileRemoved = !_fileSystem.File.Exists(metadata.PhysicalPath);
-                                if (physicalFileRemoved)
-                                    spaceFreed += metadata.FileSize;
-                            }
-                            else
-                            {
-                                physicalFileRemoved = true;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to delete physical file {PhysicalPath}", metadata.PhysicalPath);
-                        }
-                    }
-                    else if (!_fileSystem.File.Exists(metadata.PhysicalPath))
-                    {
-                        physicalFileRemoved = true;
-                    }
-                    else
-                    {
-                        _logger.LogWarning(
-                            "Skipping permanently failed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
-                            metadata.VolumeId,
-                            metadata.PhysicalPath);
-                    }
-
-                    if (!physicalFileRemoved)
-                        continue;
-
                     if (!metadata.LastFailedAt.HasValue)
-                        continue;
-
-                    var removed = await _metadataRepository.TryRemovePermanentlyFailedFileAsync(
-                        metadata.TenantId,
-                        metadata.FileKey,
-                        metadata.LastFailedAt.Value,
-                        ct);
-                    if (!removed)
                         continue;
 
                     var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
@@ -884,33 +839,76 @@ namespace Locus.Storage
                             metadata.FileKey);
                     }
 
-                    // Decrement quotas in independent try-catch blocks.
-                    // Metadata and physical file are already removed at this point; if a quota
-                    // decrement fails the file is permanently gone but the counter is not updated.
-                    // We log a warning and continue rather than re-throwing, which would halt the
-                    // cleanup loop and leave subsequent permanently-failed files unprocessed.
+                    var physicalFileExists = _fileSystem.File.Exists(metadata.PhysicalPath);
+                    var hasVolume = _volumes.TryGetValue(metadata.VolumeId, out var volume);
+                    if (physicalFileExists && !hasVolume)
+                    {
+                        _logger.LogWarning(
+                            "Skipping permanently failed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
+                            metadata.VolumeId,
+                            metadata.PhysicalPath);
+                        continue;
+                    }
+
+                    var directoryQuotaDecremented = false;
+                    var tenantQuotaDecremented = false;
+                    var metadataRemoved = false;
                     try
                     {
                         await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex,
-                            "Failed to decrement directory quota after removing permanently-failed file. " +
-                            "Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
-                            metadata.TenantId, normalizedDirectoryPath, metadata.FileKey);
-                    }
+                        directoryQuotaDecremented = true;
 
-                    try
-                    {
                         await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                        tenantQuotaDecremented = true;
+
+                        metadataRemoved = await _metadataRepository.TryRemovePermanentlyFailedFileAsync(
+                            metadata.TenantId,
+                            metadata.FileKey,
+                            metadata.LastFailedAt.Value,
+                            ct);
+                        if (!metadataRemoved)
+                        {
+                            await RollbackPermanentlyFailedCleanupAsync(
+                                metadata,
+                                normalizedDirectoryPath,
+                                metadataRemoved: false,
+                                tenantQuotaDecremented,
+                                directoryQuotaDecremented);
+                            continue;
+                        }
+
+                        if (physicalFileExists)
+                        {
+                            try
+                            {
+                                await volume!.DeleteAsync(metadata.PhysicalPath, ct);
+                            }
+                            catch (Exception ex) when (!_fileSystem.File.Exists(metadata.PhysicalPath))
+                            {
+                                _logger.LogDebug(
+                                    ex,
+                                    "DeleteAsync threw after removing permanently-failed file {PhysicalPath}",
+                                    metadata.PhysicalPath);
+                            }
+
+                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                                throw new IOException($"Failed to delete physical file {metadata.PhysicalPath}");
+
+                            spaceFreed += metadata.FileSize;
+                        }
                     }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex,
-                            "Failed to decrement tenant quota after removing permanently-failed file. " +
-                            "Tenant={TenantId}, FileKey={FileKey}",
-                            metadata.TenantId, metadata.FileKey);
+                            "Failed to cleanup permanently-failed file. Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                            metadata.TenantId, normalizedDirectoryPath, metadata.FileKey);
+                        await RollbackPermanentlyFailedCleanupAsync(
+                            metadata,
+                            normalizedDirectoryPath,
+                            metadataRemoved,
+                            tenantQuotaDecremented,
+                            directoryQuotaDecremented);
+                        continue;
                     }
 
                     removedCount++;
@@ -932,6 +930,63 @@ namespace Locus.Storage
             }
 
             return (removedCount, spaceFreed);
+        }
+
+        private async Task RollbackPermanentlyFailedCleanupAsync(
+            FileMetadata metadata,
+            string normalizedDirectoryPath,
+            bool metadataRemoved,
+            bool tenantQuotaDecremented,
+            bool directoryQuotaDecremented)
+        {
+            if (directoryQuotaDecremented)
+            {
+                try
+                {
+                    await _quotaRepository.ForceIncrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Failed to restore directory quota after permanently-failed cleanup rollback. Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                        metadata.TenantId,
+                        normalizedDirectoryPath,
+                        metadata.FileKey);
+                }
+            }
+
+            if (tenantQuotaDecremented)
+            {
+                try
+                {
+                    await CompensateTenantQuotaIncrementAsync(metadata.TenantId, default);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Failed to restore tenant quota after permanently-failed cleanup rollback. Tenant={TenantId}, FileKey={FileKey}",
+                        metadata.TenantId,
+                        metadata.FileKey);
+                }
+            }
+
+            if (metadataRemoved)
+            {
+                try
+                {
+                    await _metadataRepository.AddOrUpdateDirectAsync(metadata, default);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Failed to restore metadata after permanently-failed cleanup rollback. Tenant={TenantId}, FileKey={FileKey}",
+                        metadata.TenantId,
+                        metadata.FileKey);
+                }
+            }
         }
 
         private void RecordStatusCleanupIteration(

@@ -1,4 +1,4 @@
-using System;
+ï»¿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -1200,6 +1200,65 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         }
 
         /// <summary>
+        /// Resets a non-processing file back to Pending atomically under the tenant lock.
+        /// Returns the current Processing snapshot unchanged when the file is still leased.
+        /// Returns null when the record was removed concurrently.
+        /// </summary>
+        public async Task<FileMetadata?> TryResetFileToPendingAsync(
+            string tenantId,
+            string fileKey,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return null;
+
+                if (current.Status == FileProcessingStatus.Processing)
+                    return current.Clone();
+
+                var updated = current.Clone();
+                updated.Status = FileProcessingStatus.Pending;
+                updated.ProcessingStartTime = null;
+                updated.AvailableForProcessingAt = null;
+                updated.RetryCount = 0;
+                updated.LastError = null;
+                updated.LastFailedAt = null;
+
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return null;
+
+                _fileKeyTenantIndex[fileKey] = tenantId;
+                IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+
+                if (current.Status != FileProcessingStatus.Pending)
+                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+
+                InvalidatePendingGeneration(tenantId, fileKey);
+                EnqueuePendingCandidate(updated);
+                IndexStatusCandidate(current, updated);
+                EnqueuePersistence(new PersistenceOperation(updated));
+                _logger.LogDebug(
+                    "Conditionally reset file metadata to pending for file: {FileKey}, Tenant: {TenantId}, PreviousStatus: {PreviousStatus}",
+                    fileKey, tenantId, current.Status);
+                return updated.Clone();
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
         /// Returns the IDs of all tenants that currently have an active in-memory cache.
         /// Used by maintenance operations to iterate tenants one at a time instead of
         /// loading all files across all tenants into a single collection.
@@ -1222,7 +1281,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         /// <summary>
         /// Returns a point-in-time reference snapshot of all metadata for a tenant without
         /// deep-cloning each entry.  Callers MUST NOT mutate the returned objects.
-        /// This is O(N) reference copy vs the O(N ¡Á clone_cost) of <see cref="GetByTenantAsync"/>
+        /// This is O(N) reference copy vs the O(N ï¿½ï¿½ clone_cost) of <see cref="GetByTenantAsync"/>
         /// and is intended for read-only, best-effort scans such as orphan cleanup.
         /// </summary>
         internal FileMetadata[] SnapshotTenantMetadataRaw(string tenantId)
@@ -2280,8 +2339,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             // This method is only called from within the Lazy<SqliteConnection> factory in GetDatabase,
             // which holds the Lazy.ExecutionAndPublication lock for this tenant.
             // If we try to acquire GetDatabaseLock we risk a deadlock:
-            //   Thread A: inside Lazy factory (holds Lazy lock) ¡ú wants GetDatabaseLock
-            //   Thread B: inside AddOrUpdateDirectAsync (holds GetDatabaseLock) ¡ú waits on Lazy.Value
+            //   Thread A: inside Lazy factory (holds Lazy lock) ï¿½ï¿½ wants GetDatabaseLock
+            //   Thread B: inside AddOrUpdateDirectAsync (holds GetDatabaseLock) ï¿½ï¿½ waits on Lazy.Value
             // The Lazy lock already serializes all concurrent callers for this tenantId, so all
             // ConcurrentDictionary updates and file operations below are safe without an extra lock.
             {
@@ -3006,7 +3065,7 @@ ON CONFLICT(file_key) DO UPDATE SET
                 var coalescedAfter = Volatile.Read(ref _coalescedDepth);
                 if (queueDepthAfter == 0 && coalescedAfter == 0)
                 {
-                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully ¡ª all queued writes persisted to SQLite");
+                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully ï¿½ï¿½ all queued writes persisted to SQLite");
                 }
                 else
                 {

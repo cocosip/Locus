@@ -120,6 +120,6 @@ namespace Locus.Core.Abstractions
         /// <summary>
         /// Gets or sets any error messages encountered during scanning.
         /// </summary>
-        public List<string> Errors { get; set; } = new List<string>();
+        public List<string> Errors { get; set; } = [];
     }
 }

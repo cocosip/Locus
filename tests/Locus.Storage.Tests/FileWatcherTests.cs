@@ -567,6 +567,46 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_SkipsDisabledSingleTenant()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            _fileSystem.File.WriteAllText(filePath, "content1");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-1));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Disabled);
+
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            var config = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+
+            var result = await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            Assert.Equal(0, result.FilesDiscovered);
+            Assert.Equal(0, result.FilesImported);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
         public async Task ScanNowAsync_SkipsYoungFiles()
         {
             // Arrange

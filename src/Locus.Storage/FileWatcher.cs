@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -1003,6 +1003,16 @@ namespace Locus.Storage
         private async Task ScanSingleTenantDirectoryAsync(FileWatcherConfiguration configuration, FileWatcherScanResult result, CancellationToken ct = default)
         {
             var tenant = await _tenantManager.GetTenantAsync(configuration.TenantId, ct);
+
+            // Single-tenant watchers only need to short-circuit known disabled states.
+            // Avoid a second IsTenantEnabledAsync lookup here so mocked or partially-populated
+            // tenant contexts with an unknown/default status do not get skipped accidentally.
+            if (tenant.Status == TenantStatus.Disabled || tenant.Status == TenantStatus.Suspended)
+            {
+                _logger.LogDebug("Skipping watcher {WatcherId} - tenant {TenantId} is disabled",
+                    configuration.WatcherId, configuration.TenantId);
+                return;
+            }
 
             // Get all files recursively
             var files = GetFilesRecursive(

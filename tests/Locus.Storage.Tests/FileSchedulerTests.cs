@@ -642,6 +642,32 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ResetProcessingStatusAsync_ThrowsWhenFileIsStillProcessing()
+        {
+            var leaseStart = DateTime.UtcNow.AddMinutes(-1);
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-processing",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                RetryCount = 2,
+                LastError = "still running",
+                LastFailedAt = DateTime.UtcNow.AddMinutes(-2),
+                ProcessingStartTime = leaseStart
+            }, CancellationToken.None);
+
+            await Assert.ThrowsAsync<FileAlreadyProcessingException>(() =>
+                _scheduler.ResetProcessingStatusAsync("file-processing", CancellationToken.None));
+
+            var metadata = await _repository.GetAsync("tenant-001", "file-processing", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Processing, metadata!.Status);
+            Assert.Equal(2, metadata.RetryCount);
+            Assert.Equal("still running", metadata.LastError);
+            Assert.Equal(leaseStart, metadata.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task GetFileStatusAsync_ReturnsCorrectStatus()
         {
             // Arrange

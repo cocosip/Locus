@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
@@ -267,27 +267,41 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Direct cross-tenant lookup - O(tenants) instead of O(total files)
-            var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
+            const int maxAttempts = 3;
+            for (var attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                // Direct cross-tenant lookup - O(tenants) instead of O(total files)
+                var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
 
-            if (metadata == null)
+                if (metadata == null)
+                {
+                    _logger.LogWarning("Attempted to reset non-existent file: {FileKey}", fileKey);
+                    return;
+                }
+
+                var updated = await _repository.TryResetFileToPendingAsync(metadata.TenantId, fileKey, ct);
+                if (updated == null)
+                    continue;
+
+                if (updated.Status == FileProcessingStatus.Processing)
+                    throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
+
+                _logger.LogInformation("Reset processing status for file: {FileKey}", fileKey);
+                return;
+            }
+
+            var latest = await _repository.GetByFileKeyAsync(fileKey, ct);
+            if (latest == null)
             {
                 _logger.LogWarning("Attempted to reset non-existent file: {FileKey}", fileKey);
                 return;
             }
 
-            // Clone before mutating - GetByFileKeyAsync returns a shared cache reference.
-            var updated = metadata.Clone();
-            updated.Status = FileProcessingStatus.Pending;
-            updated.ProcessingStartTime = null;
-            updated.AvailableForProcessingAt = null;
-            updated.RetryCount = 0;
-            updated.LastError = null;
-            updated.LastFailedAt = null;
+            if (latest.Status == FileProcessingStatus.Processing)
+                throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
 
-            await _repository.AddOrUpdateAsync(updated, ct);
-
-            _logger.LogInformation("Reset processing status for file: {FileKey}", fileKey);
+            throw new InvalidOperationException(
+                $"File {fileKey} changed state concurrently and is now {latest.Status}.");
         }
 
         /// <inheritdoc/>

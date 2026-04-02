@@ -409,7 +409,61 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupPermanentlyFailedFilesAsync_DoesNotDecrementQuota_WhenMetadataWasRemovedConcurrently()
+        public async Task CleanupPermanentlyFailedFilesAsync_KeepsState_WhenTenantQuotaDecrementFails()
+        {
+            var physicalPath = Path.Combine(_volumePath, "failed-tenant-quota.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+
+            var failedMetadata = new FileMetadata
+            {
+                FileKey = "file-tenant-quota",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 14,
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-10),
+                CreatedAt = DateTime.UtcNow.AddDays(-10)
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
+
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("quota db busy"));
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                tenantQuotaManager.Object,
+                _fileSystem,
+                new Mock<ILogger<StorageCleanupService>>().Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "file-tenant-quota", default);
+            Assert.NotNull(metadata);
+            Assert.True(_fileSystem.File.Exists(physicalPath));
+
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(default);
+            Assert.Equal(0, stats.PermanentlyFailedFilesRemoved);
+
+            _volume.Verify(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_StillSucceeds_WhenDeleteCallbackAlsoRemovesMetadata()
         {
             var physicalPath = Path.Combine(_volumePath, "failed-concurrent-remove.dat");
             _fileSystem.File.WriteAllText(physicalPath, "failed content");
@@ -444,13 +498,13 @@ namespace Locus.Storage.Tests
             await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
 
             var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
-            Assert.Equal(1, directoryQuota.CurrentCount);
+            Assert.Equal(0, directoryQuota.CurrentCount);
 
             var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", default);
-            Assert.Equal(1, tenantCount);
+            Assert.Equal(0, tenantCount);
 
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
-            Assert.Equal(0, stats.PermanentlyFailedFilesRemoved);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
         }
 
         [Fact]
