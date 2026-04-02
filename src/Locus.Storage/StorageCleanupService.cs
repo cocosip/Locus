@@ -274,7 +274,8 @@ namespace Locus.Storage
                             var resumeAfterPath = directoryScanState.ResumeAfterPath;
                             var directoryFullyScanned = true;
 
-                            var fileEntries = EnumerateSortedOrphanScanEntries(directory);
+                            var fileEntries = directoryScanState.SortedEntries ?? EnumerateSortedOrphanScanEntries(directory);
+                            directoryScanState.SortedEntries = fileEntries;
                             var resumeIndex = FindOrphanScanStartIndex(fileEntries, resumeAfterPath);
 
                             for (var fileIndex = resumeIndex; fileIndex < fileEntries.Count; fileIndex++)
@@ -558,6 +559,7 @@ namespace Locus.Storage
         private sealed class OrphanDirectoryScanState
         {
             public string? ResumeAfterPath { get; set; }
+            public List<OrphanFileScanEntry>? SortedEntries { get; set; }
         }
 
         /// <summary>
