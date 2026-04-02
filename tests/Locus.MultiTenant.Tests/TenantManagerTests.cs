@@ -188,7 +188,7 @@ namespace Locus.MultiTenant.Tests
             var cts = new CancellationTokenSource();
             var directory = new Mock<IDirectory>();
             directory.Setup(d => d.Exists(metadataRoot)).Returns(true);
-            directory.Setup(d => d.GetFiles(metadataRoot, "*.json")).Returns(new[] { metadataPath });
+            directory.Setup(d => d.EnumerateFiles(metadataRoot, "*.json")).Returns(new[] { metadataPath });
 
             var file = new Mock<IFile>();
             file.Setup(f => f.OpenRead(metadataPath))

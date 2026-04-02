@@ -446,6 +446,26 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CapacityQueries_ReuseCachedSnapshotWithinRefreshWindow()
+        {
+            _volume1.Invocations.Clear();
+            _volume2.Invocations.Clear();
+
+            var total1 = await _storagePool.GetTotalCapacityAsync(default);
+            var total2 = await _storagePool.GetTotalCapacityAsync(default);
+            var available1 = await _storagePool.GetAvailableSpaceAsync(default);
+            var available2 = await _storagePool.GetAvailableSpaceAsync(default);
+
+            Assert.Equal(2000000000L, total1);
+            Assert.Equal(total1, total2);
+            Assert.Equal(1100000000L, available1);
+            Assert.Equal(available1, available2);
+
+            _volume1.VerifyGet(v => v.IsHealthy, Times.AtMost(1));
+            _volume2.VerifyGet(v => v.IsHealthy, Times.AtMost(1));
+        }
+
+        [Fact]
         public async Task WriteFileAsync_DistributesFilesAcrossVolumes()
         {
             // This test verifies that files are written to volumes

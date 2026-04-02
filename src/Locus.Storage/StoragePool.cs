@@ -38,6 +38,10 @@ namespace Locus.Storage
         // Singleflight guard: only the CAS winner rebuilds the snapshot; losers reuse the stale cache.
         private int _volumeSnapshotRefreshInProgress;
         private static readonly long VolumeSnapshotRefreshTicks = Stopwatch.Frequency; // 1 second
+        private static readonly long CapacitySnapshotRefreshTicks = Stopwatch.Frequency; // 1 second
+        private long _lastCapacitySnapshotTicks;
+        private long _cachedTotalCapacity;
+        private long _cachedAvailableCapacity;
 
         // Serialize completion for the same file key to keep quota decrement idempotent.
         private readonly SemaphoreSlim[] _completionGuards;
@@ -179,6 +183,7 @@ namespace Locus.Storage
 
             _cachedWritableVolumes = Array.Empty<IStorageVolume>();
             Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
+            Interlocked.Exchange(ref _lastCapacitySnapshotTicks, 0);
 
             _logger.LogInformation("Mounted volume {VolumeId} at {MountPath} (healthy checks: {HealthyAttempts}/{MaxAttempts})",
                 volume.VolumeId, volume.MountPath, healthyAttempts, maxHealthCheckAttempts);
@@ -238,7 +243,7 @@ namespace Locus.Storage
 
                 // 8. Capture the bytes that will be written: from current position to end.
                 // Must be read BEFORE WriteAsync because CopyToAsync advances Position to the end.
-                // Using content.Length alone is wrong for streams not at position 0 â€?it would
+                // Using content.Length alone is wrong for streams not at position 0 ï¿½?it would
                 // report the total stream size rather than the bytes actually written.
                 var fileSize = content.CanSeek ? content.Length - content.Position : 0;
                 var contentToWrite = content;
@@ -255,7 +260,7 @@ namespace Locus.Storage
                 if (countingStream != null)
                     fileSize = countingStream.BytesRead;
 
-                // 10. Create file metadata â€?Write-Behind: memory is updated immediately, SQLite write is async.
+                // 10. Create file metadata ï¿½?Write-Behind: memory is updated immediately, SQLite write is async.
                 // AddOrUpdateAsync never throws from the caller's perspective. If SQLite is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
@@ -288,7 +293,7 @@ namespace Locus.Storage
             {
                 // Only roll back the quota when the physical write never reached disk.
                 // If fileWritten==true the file exists on disk; the cleanup service will
-                // recover it as a Pending orphan on restart â€?its quota slot is still needed.
+                // recover it as a Pending orphan on restart ï¿½?its quota slot is still needed.
                 // Guard with !fileWritten so that a future exception after the write
                 // (e.g. in AddOrUpdateAsync) does not incorrectly decrement the quota.
                 if (!fileWritten)
@@ -534,7 +539,7 @@ namespace Locus.Storage
             await completionGuard.WaitAsync(ct);
             try
             {
-                // Read tenant before delegating â€?scheduler removes metadata record.
+                // Read tenant before delegating ï¿½?scheduler removes metadata record.
                 var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
                 if (metadata == null)
                     return; // Already completed by another caller.
@@ -658,21 +663,15 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public Task<long> GetTotalCapacityAsync(CancellationToken ct = default)
         {
-            var totalCapacity = _volumes.Values
-                .Where(v => v.IsHealthy)
-                .Sum(v => v.TotalCapacity);
-
-            return Task.FromResult(totalCapacity);
+            RefreshCapacitySnapshotIfNeeded(Stopwatch.GetTimestamp());
+            return Task.FromResult(Volatile.Read(ref _cachedTotalCapacity));
         }
 
         /// <inheritdoc/>
         public Task<long> GetAvailableSpaceAsync(CancellationToken ct = default)
         {
-            var availableSpace = _volumes.Values
-                .Where(v => v.IsHealthy)
-                .Sum(v => v.AvailableSpace);
-
-            return Task.FromResult(availableSpace);
+            RefreshCapacitySnapshotIfNeeded(Stopwatch.GetTimestamp());
+            return Task.FromResult(Volatile.Read(ref _cachedAvailableCapacity));
         }
 
         /// <summary>
@@ -689,6 +688,29 @@ namespace Locus.Storage
             {
                 throw new TenantDisabledException(tenantId);
             }
+        }
+
+        private void RefreshCapacitySnapshotIfNeeded(long nowTicks)
+        {
+            var lastRefresh = Interlocked.Read(ref _lastCapacitySnapshotTicks);
+            if (lastRefresh != 0 && (nowTicks - lastRefresh) < CapacitySnapshotRefreshTicks)
+                return;
+
+            var totalCapacity = 0L;
+            var availableCapacity = 0L;
+
+            foreach (var volume in _volumes.Values)
+            {
+                if (!volume.IsHealthy)
+                    continue;
+
+                totalCapacity += volume.TotalCapacity;
+                availableCapacity += volume.AvailableSpace;
+            }
+
+            Volatile.Write(ref _cachedTotalCapacity, totalCapacity);
+            Volatile.Write(ref _cachedAvailableCapacity, availableCapacity);
+            Interlocked.Exchange(ref _lastCapacitySnapshotTicks, nowTicks);
         }
 
         /// <summary>
@@ -737,7 +759,7 @@ namespace Locus.Storage
                 return cached;
 
             // Singleflight: only the CAS winner rebuilds the snapshot.
-            // Concurrent callers return the (slightly stale) cached value â€?acceptable since
+            // Concurrent callers return the (slightly stale) cached value ï¿½?acceptable since
             // the snapshot is refreshed at most every VolumeSnapshotRefreshTicks (1 s) anyway.
             if (Interlocked.CompareExchange(ref _volumeSnapshotRefreshInProgress, 1, 0) != 0)
                 return cached;

@@ -347,4 +347,182 @@ namespace Locus.Benchmarks
             }
         }
     }
+
+    [MemoryDiagnoser]
+    [SimpleJob(warmupCount: 1, iterationCount: 3)]
+    public class OrphanRebuildBudgetBenchmarks : IDisposable
+    {
+        private readonly string _tenantId = "phaseb-orphan-budget";
+
+        private IFileSystem _fileSystem = null!;
+        private MetadataRepository _metadataRepository = null!;
+        private DirectoryQuotaRepository _quotaRepository = null!;
+        private StorageCleanupService _singlePassCleanupService = null!;
+        private StorageCleanupService _budgetedCleanupService = null!;
+        private string _rootDirectory = string.Empty;
+        private string _singlePassMetadataDirectory = string.Empty;
+        private string _singlePassQuotaDirectory = string.Empty;
+        private string _singlePassVolumeDirectory = string.Empty;
+        private string _budgetedMetadataDirectory = string.Empty;
+        private string _budgetedQuotaDirectory = string.Empty;
+        private string _budgetedVolumeDirectory = string.Empty;
+
+        [Params(4_096)]
+        public int FileCount;
+
+        [Params(128)]
+        public int MaxOrphanFilesPerRun;
+
+        [GlobalSetup]
+        public void GlobalSetup()
+        {
+            _fileSystem = new System.IO.Abstractions.FileSystem();
+            _rootDirectory = Path.Combine(Path.GetTempPath(), $"locus-bench-phaseb-orphan-budget-{Guid.NewGuid():N}");
+            _singlePassMetadataDirectory = Path.Combine(_rootDirectory, "single-metadata");
+            _singlePassQuotaDirectory = Path.Combine(_rootDirectory, "single-quota");
+            _singlePassVolumeDirectory = Path.Combine(_rootDirectory, "single-volume");
+            _budgetedMetadataDirectory = Path.Combine(_rootDirectory, "budgeted-metadata");
+            _budgetedQuotaDirectory = Path.Combine(_rootDirectory, "budgeted-quota");
+            _budgetedVolumeDirectory = Path.Combine(_rootDirectory, "budgeted-volume");
+            _fileSystem.Directory.CreateDirectory(_rootDirectory);
+        }
+
+        [IterationSetup(Target = nameof(Current_SinglePassFullBudget))]
+        public void IterationSetupSinglePass()
+        {
+            PrepareDataset(
+                _singlePassMetadataDirectory,
+                _singlePassQuotaDirectory,
+                _singlePassVolumeDirectory,
+                out _metadataRepository,
+                out _quotaRepository,
+                out _singlePassCleanupService,
+                int.MaxValue);
+        }
+
+        [IterationSetup(Target = nameof(Current_BudgetedResumeUntilComplete))]
+        public void IterationSetupBudgeted()
+        {
+            PrepareDataset(
+                _budgetedMetadataDirectory,
+                _budgetedQuotaDirectory,
+                _budgetedVolumeDirectory,
+                out _metadataRepository,
+                out _quotaRepository,
+                out _budgetedCleanupService,
+                MaxOrphanFilesPerRun);
+        }
+
+        [Benchmark(Baseline = true, Description = "orphan-rebuild single-pass full budget")]
+        public async Task Current_SinglePassFullBudget()
+        {
+            await _singlePassCleanupService.RecoverOrphanedFilesAsync(new BenchTenantContext(_tenantId), CancellationToken.None);
+
+            var stats = await _singlePassCleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            if (stats.OrphanedFilesRecovered != FileCount)
+                throw new InvalidOperationException($"Expected {FileCount} rebuilt files, actual {stats.OrphanedFilesRecovered}.");
+        }
+
+        [Benchmark(Description = "orphan-rebuild budgeted resume until complete")]
+        public async Task Current_BudgetedResumeUntilComplete()
+        {
+            while (true)
+            {
+                await _budgetedCleanupService.RecoverOrphanedFilesAsync(new BenchTenantContext(_tenantId), CancellationToken.None);
+                var stats = await _budgetedCleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+                if (stats.OrphanedFilesRecovered >= FileCount)
+                    break;
+            }
+        }
+
+        public void Dispose()
+        {
+            _metadataRepository?.Dispose();
+            _quotaRepository?.Dispose();
+            try
+            {
+                if (_fileSystem.Directory.Exists(_rootDirectory))
+                    _fileSystem.Directory.Delete(_rootDirectory, recursive: true);
+            }
+            catch
+            {
+                // Ignore benchmark cleanup failures.
+            }
+        }
+
+        private void PrepareDataset(
+            string metadataDirectory,
+            string quotaDirectory,
+            string volumeDirectory,
+            out MetadataRepository metadataRepository,
+            out DirectoryQuotaRepository quotaRepository,
+            out StorageCleanupService cleanupService,
+            int maxOrphanFilesPerRun)
+        {
+            if (_fileSystem.Directory.Exists(metadataDirectory))
+                _fileSystem.Directory.Delete(metadataDirectory, recursive: true);
+            if (_fileSystem.Directory.Exists(quotaDirectory))
+                _fileSystem.Directory.Delete(quotaDirectory, recursive: true);
+            if (_fileSystem.Directory.Exists(volumeDirectory))
+                _fileSystem.Directory.Delete(volumeDirectory, recursive: true);
+
+            _fileSystem.Directory.CreateDirectory(metadataDirectory);
+            _fileSystem.Directory.CreateDirectory(quotaDirectory);
+            _fileSystem.Directory.CreateDirectory(volumeDirectory);
+
+            metadataRepository = new MetadataRepository(
+                _fileSystem,
+                NullLogger<MetadataRepository>.Instance,
+                metadataDirectory,
+                enableBackgroundPersistence: false);
+            quotaRepository = new DirectoryQuotaRepository(
+                _fileSystem,
+                NullLogger<DirectoryQuotaRepository>.Instance,
+                quotaDirectory);
+            var tenantQuotaManager = new TenantQuotaManager(
+                quotaRepository,
+                NullLogger<TenantQuotaManager>.Instance);
+
+            cleanupService = new StorageCleanupService(
+                metadataRepository,
+                quotaRepository,
+                tenantQuotaManager,
+                _fileSystem,
+                NullLogger<StorageCleanupService>.Instance,
+                metadataDirectory,
+                quotaDirectory,
+                new CleanupOptions
+                {
+                    MaxOrphanFilesPerRun = maxOrphanFilesPerRun,
+                    OrphanRebuildLookupCacheSize = 8192
+                });
+
+            var volume = new Mock<IStorageVolume>();
+            volume.Setup(v => v.VolumeId).Returns("vol-001");
+            volume.Setup(v => v.MountPath).Returns(volumeDirectory);
+            cleanupService.RegisterVolume(volume.Object);
+
+            var tenantPath = Path.Combine(volumeDirectory, _tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+
+            for (var i = 0; i < FileCount; i++)
+            {
+                var fileKey = $"orphan-{i:D6}";
+                var path = Path.Combine(tenantPath, $"{fileKey}.dat");
+                _fileSystem.File.WriteAllText(path, "benchmark");
+            }
+        }
+
+        private sealed class BenchTenantContext : ITenantContext
+        {
+            public BenchTenantContext(string tenantId)
+            {
+                TenantId = tenantId;
+            }
+
+            public string TenantId { get; }
+
+            public TenantStatus Status => TenantStatus.Enabled;
+        }
+    }
 }

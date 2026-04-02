@@ -331,7 +331,7 @@ namespace Locus.Benchmarks
 
             return new WorkloadResult(
                 knownHits,
-                rebuiltCount: Math.Max(0, after.OrphanedFilesRemoved - before.OrphanedFilesRemoved));
+                rebuiltCount: Math.Max(0, after.OrphanedFilesRecovered - before.OrphanedFilesRecovered));
         }
 
         private static string GetPhysicalPath(ScenarioContext context, int index)

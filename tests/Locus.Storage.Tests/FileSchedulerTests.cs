@@ -807,6 +807,29 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsFailedAsync_ResolvesTenantByFileKeyAcrossTenants()
+        {
+            var processingStart = DateTime.UtcNow;
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "cross-tenant-file",
+                TenantId = "tenant-002",
+                Status = FileProcessingStatus.Processing,
+                RetryCount = 0,
+                ProcessingStartTime = processingStart
+            }, CancellationToken.None);
+
+            await _scheduler.MarkAsFailedAsync("cross-tenant-file", processingStart, "cross-tenant failure", CancellationToken.None);
+
+            var metadata = await _repository.GetAsync("tenant-002", "cross-tenant-file", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Pending, metadata!.Status);
+            Assert.Equal(1, metadata.RetryCount);
+            Assert.Equal("cross-tenant failure", metadata.LastError);
+        }
+
+        [Fact]
         public async Task GetFileStatusAsync_ThrowsWhenFileNotFound()
         {
             // Act & Assert
@@ -1042,6 +1065,60 @@ namespace Locus.Storage.Tests
             directoryQuotaManager.Verify(
                 m => m.DecrementFileCountAsync(coldTenantId, "/", It.IsAny<CancellationToken>()),
                 Times.Once);
+        }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_RemovesAllRowsSharingMissingPhysicalPath()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            var sharedMissingPath = Path.Combine(_metadataDir, "shared-missing-file.dat");
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "dup-file-001",
+                TenantId = "tenant-001",
+                PhysicalPath = sharedMissingPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "dup-file-002",
+                TenantId = "tenant-001",
+                PhysicalPath = sharedMissingPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Failed,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object);
+
+            var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(2, removedCount);
+            Assert.Null(await _repository.GetAsync("tenant-001", "dup-file-001", CancellationToken.None));
+            Assert.Null(await _repository.GetAsync("tenant-001", "dup-file-002", CancellationToken.None));
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Exactly(2));
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()),
+                Times.Exactly(2));
         }
     }
 }

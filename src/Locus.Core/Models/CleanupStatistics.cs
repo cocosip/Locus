@@ -26,6 +26,11 @@ namespace Locus.Core.Models
         public int OrphanedFilesRemoved { get; set; }
 
         /// <summary>
+        /// Gets or sets the number of orphaned files whose metadata was rebuilt.
+        /// </summary>
+        public int OrphanedFilesRecovered { get; set; }
+
+        /// <summary>
         /// Gets or sets the number of timed-out files reset to pending status.
         /// </summary>
         public int TimedOutFilesReset { get; set; }

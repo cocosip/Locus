@@ -63,6 +63,9 @@ namespace Locus.Storage.Data
 
         // Global fileKey -> tenantId index for O(1) cross-tenant lookup by file key.
         private readonly ConcurrentDictionary<string, string> _fileKeyTenantIndex;
+        private volatile string[] _cachedTenantDirectoryIds = Array.Empty<string>();
+        private long _cachedTenantDirectoryIdsTicks;
+        private static readonly long TenantDirectoryCacheTicks = Stopwatch.Frequency;
         private readonly StringComparer _pathComparer;
 
         // Per-tenant normalized physical path -> file key index for O(1) orphan-rebuild path checks.
@@ -2140,25 +2143,42 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            if (_fileKeyTenantIndex.TryGetValue(fileKey, out var tenantId)
+            if (TryResolveTenantIdByFileKey(fileKey, out var tenantId)
                 && _activeFiles.TryGetValue(tenantId, out var indexedTenantFiles)
                 && indexedTenantFiles.TryGetValue(fileKey, out var indexedMetadata))
             {
                 return Task.FromResult<FileMetadata?>(indexedMetadata.Clone());
             }
 
+            return Task.FromResult<FileMetadata?>(null);
+        }
+
+        internal bool TryResolveTenantIdByFileKey(string fileKey, out string tenantId)
+        {
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            if (_fileKeyTenantIndex.TryGetValue(fileKey, out tenantId)
+                && _activeFiles.TryGetValue(tenantId, out var indexedTenantFiles)
+                && indexedTenantFiles.ContainsKey(fileKey))
+            {
+                return true;
+            }
+
             // Fallback: recover from stale/missing index entries (rare, e.g. after crash recovery).
             foreach (var tenantEntry in _activeFiles)
             {
-                if (!tenantEntry.Value.TryGetValue(fileKey, out var metadata))
+                if (!tenantEntry.Value.ContainsKey(fileKey))
                     continue;
 
-                _fileKeyTenantIndex[fileKey] = tenantEntry.Key;
-                return Task.FromResult<FileMetadata?>(metadata.Clone());
+                tenantId = tenantEntry.Key;
+                _fileKeyTenantIndex[fileKey] = tenantId;
+                return true;
             }
 
             _fileKeyTenantIndex.TryRemove(fileKey, out _);
-            return Task.FromResult<FileMetadata?>(null);
+            tenantId = null!;
+            return false;
         }
 
         /// <summary>
@@ -2252,19 +2272,33 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             // been flushed to disk yet by the write-behind persistence loop.
             var tenantIds = new HashSet<string>(_activeFiles.Keys, StringComparer.Ordinal);
 
-            if (_fileSystem.Directory.Exists(_metadataDirectory))
+            foreach (var tenantId in GetTenantDirectoryIdsSnapshot())
             {
-                // Each tenant database lives in its own subdirectory: {metadataDirectory}/{tenantId}/metadata.db
-                // Enumerate subdirectories to discover tenant IDs without any filename filtering.
-                var tenantDirs = _fileSystem.Directory.GetDirectories(_metadataDirectory);
-                foreach (var dir in tenantDirs)
-                {
-                    var tid = _fileSystem.Path.GetFileName(dir);
-                    if (!string.IsNullOrWhiteSpace(tid))
-                        tenantIds.Add(tid);
-                }
+                if (!string.IsNullOrWhiteSpace(tenantId))
+                    tenantIds.Add(tenantId);
             }
 
+            return tenantIds;
+        }
+
+        private string[] GetTenantDirectoryIdsSnapshot()
+        {
+            if (!_fileSystem.Directory.Exists(_metadataDirectory))
+                return Array.Empty<string>();
+
+            var now = Stopwatch.GetTimestamp();
+            var lastRefresh = Interlocked.Read(ref _cachedTenantDirectoryIdsTicks);
+            if (lastRefresh != 0 && (now - lastRefresh) < TenantDirectoryCacheTicks)
+                return _cachedTenantDirectoryIds;
+
+            var tenantDirs = _fileSystem.Directory.GetDirectories(_metadataDirectory);
+            var tenantIds = tenantDirs
+                .Select(dir => _fileSystem.Path.GetFileName(dir))
+                .Where(tid => !string.IsNullOrWhiteSpace(tid))
+                .ToArray()!;
+
+            _cachedTenantDirectoryIds = tenantIds;
+            Interlocked.Exchange(ref _cachedTenantDirectoryIdsTicks, now);
             return tenantIds;
         }
 

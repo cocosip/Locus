@@ -90,8 +90,33 @@ namespace Locus.Storage.Tests
 
             await manager.SetGlobalLimitAsync(2, CancellationToken.None);
 
-            Assert.False(new FileInfo(dbPath).IsReadOnly);
+            Assert.False(new System.IO.FileInfo(dbPath).IsReadOnly);
             Assert.Equal(2, await manager.GetGlobalLimitAsync(CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task RemoveTenantLimitAsync_DisablesTenantSpecificQuotaRecord()
+        {
+            const string tenantId = "tenant-limit-disabled";
+
+            await _manager.SetTenantLimitAsync(tenantId, 5, CancellationToken.None);
+            await _manager.RemoveTenantLimitAsync(tenantId, CancellationToken.None);
+
+            var quota = await _repository.GetAsync(tenantId, tenantId, CancellationToken.None);
+            Assert.NotNull(quota);
+            Assert.Equal(0, quota!.MaxCount);
+            Assert.False(quota.Enabled);
+        }
+
+        [Fact]
+        public async Task SetGlobalLimitAsync_WithZero_DisablesGlobalQuotaRecord()
+        {
+            await _manager.SetGlobalLimitAsync(0, CancellationToken.None);
+
+            var quota = await _repository.GetAsync("_GLOBAL_QUOTA_", "_GLOBAL_QUOTA_", CancellationToken.None);
+            Assert.NotNull(quota);
+            Assert.Equal(0, quota!.MaxCount);
+            Assert.False(quota.Enabled);
         }
 
         public void Dispose()

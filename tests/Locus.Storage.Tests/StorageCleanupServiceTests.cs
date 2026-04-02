@@ -605,7 +605,8 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, directoryQuota.CurrentCount);
 
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
-            Assert.Equal(1, stats.OrphanedFilesRemoved); // counter reused for "rebuilt" count
+            Assert.Equal(0, stats.OrphanedFilesRemoved);
+            Assert.Equal(1, stats.OrphanedFilesRecovered);
         }
 
         [Fact]
@@ -727,7 +728,7 @@ namespace Locus.Storage.Tests
             }
 
             var stats = await cleanupWithSmallCache.GetCleanupStatisticsAsync(CancellationToken.None);
-            Assert.Equal(20, stats.OrphanedFilesRemoved);
+            Assert.Equal(20, stats.OrphanedFilesRecovered);
         }
 
         [Fact]
@@ -771,7 +772,7 @@ namespace Locus.Storage.Tests
             Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "budget-004", CancellationToken.None));
 
             var stats = await cleanupWithSmallBudget.GetCleanupStatisticsAsync(CancellationToken.None);
-            Assert.Equal(5, stats.OrphanedFilesRemoved);
+            Assert.Equal(5, stats.OrphanedFilesRecovered);
         }
 
         [Fact]
@@ -796,7 +797,7 @@ namespace Locus.Storage.Tests
             Assert.NotNull(rebuiltBeta);
 
             var stats = await _cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
-            Assert.Equal(2, stats.OrphanedFilesRemoved);
+            Assert.Equal(2, stats.OrphanedFilesRecovered);
         }
 
         [Fact]

@@ -72,7 +72,7 @@ namespace Locus.Storage
             var globalLimit = await GetGlobalLimitAsync(ct);
             if (globalLimit == 0)
             {
-                // No limit configured â€?use ForceIncrementAsync so the counter always advances
+                // No limit configured ï¿½?use ForceIncrementAsync so the counter always advances
                 // regardless of any MaxCount value that might exist on the quota record.
                 await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
                 _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: unlimited)", tenantId);
@@ -162,7 +162,7 @@ namespace Locus.Storage
                 DirectoryPath = snapshot.DirectoryPath,
                 CurrentCount = snapshot.CurrentCount,
                 MaxCount = maxFiles,
-                Enabled = true,
+                Enabled = maxFiles > 0,
                 CreatedAt = snapshot.CreatedAt,
                 LastUpdated = snapshot.LastUpdated
             };
@@ -181,8 +181,17 @@ namespace Locus.Storage
             var quota = await _repository.GetAsync(tenantId, tenantId, ct);
             if (quota != null)
             {
-                quota.MaxCount = 0;
-                await _repository.UpdateAsync(tenantId, quota, ct);
+                var updated = new DirectoryQuota
+                {
+                    DirectoryPath = quota.DirectoryPath,
+                    CurrentCount = quota.CurrentCount,
+                    MaxCount = 0,
+                    Enabled = false,
+                    CreatedAt = quota.CreatedAt,
+                    LastUpdated = quota.LastUpdated
+                };
+
+                await _repository.UpdateAsync(tenantId, updated, ct);
                 _logger.LogInformation("Removed tenant-specific quota for {TenantId}, will use global quota", tenantId);
             }
         }
@@ -196,13 +205,13 @@ namespace Locus.Storage
             var globalQuota = await _repository.GetOrCreateAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
 
             // Build a fresh object to avoid mutating the cached reference.
-            // Do NOT overwrite CurrentCount â€?it tracks real file counts across restarts.
+            // Do NOT overwrite CurrentCount ï¿½?it tracks real file counts across restarts.
             var updated = new DirectoryQuota
             {
                 DirectoryPath = globalQuota.DirectoryPath,
                 CurrentCount = globalQuota.CurrentCount,
                 MaxCount = maxFiles,
-                Enabled = true,
+                Enabled = maxFiles > 0,
                 CreatedAt = globalQuota.CreatedAt,
                 LastUpdated = globalQuota.LastUpdated
             };

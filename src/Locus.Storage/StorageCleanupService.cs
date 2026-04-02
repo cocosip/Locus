@@ -48,6 +48,7 @@ namespace Locus.Storage
         private int _completedRecordsRemoved;
         private int _permanentlyFailedFilesRemoved;
         private int _orphanedFilesRemoved;
+        private int _orphanedFilesRecovered;
         private int _timedOutFilesReset;
         private long _spaceFreed;
         
@@ -188,8 +189,7 @@ namespace Locus.Storage
             {
                 if (_fileSystem.Directory.Exists(volume.MountPath))
                 {
-                    var subdirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
-                    foreach (var subdirectory in subdirectories)
+                    foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(volume.MountPath))
                     {
                         // Each subdirectory is a tenant root -- protect it from deletion.
                         // Pass shardingDepth so shard directories are also protected.
@@ -213,7 +213,7 @@ namespace Locus.Storage
             var removedCount = 0;
             long spaceFreed = 0;
 
-            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            var tenantIds = await GetMetadataTenantIdsSnapshotAsync(ct);
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
@@ -246,6 +246,7 @@ namespace Locus.Storage
 
                 var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
                 var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
+                var knownPhysicalPaths = BuildKnownPhysicalPathSet(tenant.TenantId);
                 var existenceCache = _orphanRebuildLookupCacheSize > 0
                     ? new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer)
                     : null;
@@ -273,20 +274,12 @@ namespace Locus.Storage
                             var resumeAfterPath = directoryScanState.ResumeAfterPath;
                             var directoryFullyScanned = true;
 
-                            foreach (var fileEntry in _fileSystem.Directory
-                                .EnumerateFiles(directory)
-                                .Select(physicalPath => new
-                                {
-                                    PhysicalPath = physicalPath,
-                                    NormalizedPath = NormalizePath(physicalPath) ?? physicalPath
-                                })
-                                .OrderBy(entry => entry.NormalizedPath, _pathComparer))
+                            var fileEntries = EnumerateSortedOrphanScanEntries(directory);
+                            var resumeIndex = FindOrphanScanStartIndex(fileEntries, resumeAfterPath);
+
+                            for (var fileIndex = resumeIndex; fileIndex < fileEntries.Count; fileIndex++)
                             {
-                                if (!string.IsNullOrWhiteSpace(resumeAfterPath)
-                                    && _pathComparer.Compare(fileEntry.NormalizedPath, resumeAfterPath) <= 0)
-                                {
-                                    continue;
-                                }
+                                var fileEntry = fileEntries[fileIndex];
 
                                 ct.ThrowIfCancellationRequested();
                                 scannedThisRun++;
@@ -305,10 +298,7 @@ namespace Locus.Storage
                                     }
                                     else
                                     {
-                                        metadataExists = await _metadataRepository.ExistsByNormalizedPhysicalPathAsync(
-                                            tenant.TenantId,
-                                            normalizedPhysical,
-                                            ct);
+                                        metadataExists = knownPhysicalPaths.Contains(normalizedPhysical);
 
                                         if (existenceCache != null
                                             && existenceCache.Count < _orphanRebuildLookupCacheSize)
@@ -381,6 +371,9 @@ namespace Locus.Storage
                                         }
                                     }
 
+                                    if (normalizedPhysical != null)
+                                        knownPhysicalPaths.Add(normalizedPhysical);
+
                                     rebuiltCount++;
                                     _logger.LogInformation(
                                         "Rebuilt metadata and compensated quota for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
@@ -438,7 +431,7 @@ namespace Locus.Storage
                 _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
             }
 
-            Interlocked.Add(ref _orphanedFilesRemoved, rebuiltCount);
+            Interlocked.Add(ref _orphanedFilesRecovered, rebuiltCount);
             _logger.LogInformation(
                 "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
                 tenant.TenantId, rebuiltCount);
@@ -457,24 +450,21 @@ namespace Locus.Storage
                 if (!_fileSystem.Directory.Exists(volume.MountPath))
                     continue;
 
-                string[] tenantDirectories;
                 try
                 {
-                    tenantDirectories = _fileSystem.Directory.GetDirectories(volume.MountPath);
+                    foreach (var tenantDirectory in _fileSystem.Directory.EnumerateDirectories(volume.MountPath))
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        var tenantId = _fileSystem.Path.GetFileName(tenantDirectory);
+                        if (!string.IsNullOrWhiteSpace(tenantId))
+                            tenantIds.Add(tenantId);
+                    }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to enumerate tenant directories under volume {VolumeId}", volume.VolumeId);
                     continue;
-                }
-
-                foreach (var tenantDirectory in tenantDirectories)
-                {
-                    ct.ThrowIfCancellationRequested();
-
-                    var tenantId = _fileSystem.Path.GetFileName(tenantDirectory);
-                    if (!string.IsNullOrWhiteSpace(tenantId))
-                        tenantIds.Add(tenantId);
                 }
             }
 
@@ -696,7 +686,7 @@ namespace Locus.Storage
 
             var cutoffTime = DateTime.UtcNow - timeout;
             var resetCount = 0;
-            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            var tenantIds = await GetMetadataTenantIdsSnapshotAsync(ct);
 
             foreach (var tenantId in tenantIds)
             {
@@ -728,7 +718,7 @@ namespace Locus.Storage
             int resetCount = 0, removedFailed = 0;
             long spaceFreed = 0;
 
-            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            var tenantIds = await GetMetadataTenantIdsSnapshotAsync(ct);
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
@@ -808,6 +798,7 @@ namespace Locus.Storage
         {
             int removedCount = 0;
             long spaceFreed = 0;
+            var physicalPathExistsCache = new Dictionary<string, bool>(_pathComparer);
 
             while (true)
             {
@@ -839,7 +830,7 @@ namespace Locus.Storage
                             metadata.FileKey);
                     }
 
-                    var physicalFileExists = _fileSystem.File.Exists(metadata.PhysicalPath);
+                    var physicalFileExists = GetCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache);
                     var hasVolume = _volumes.TryGetValue(metadata.VolumeId, out var volume);
                     if (physicalFileExists && !hasVolume)
                     {
@@ -882,8 +873,9 @@ namespace Locus.Storage
                             try
                             {
                                 await volume!.DeleteAsync(metadata.PhysicalPath, ct);
+                                physicalPathExistsCache[metadata.PhysicalPath] = false;
                             }
-                            catch (Exception ex) when (!_fileSystem.File.Exists(metadata.PhysicalPath))
+                            catch (Exception ex) when (!RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
                             {
                                 _logger.LogDebug(
                                     ex,
@@ -891,7 +883,7 @@ namespace Locus.Storage
                                     metadata.PhysicalPath);
                             }
 
-                            if (_fileSystem.File.Exists(metadata.PhysicalPath))
+                            if (RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
                                 throw new IOException($"Failed to delete physical file {metadata.PhysicalPath}");
 
                             spaceFreed += metadata.FileSize;
@@ -930,6 +922,23 @@ namespace Locus.Storage
             }
 
             return (removedCount, spaceFreed);
+        }
+
+        private bool GetCachedPhysicalFileExists(string physicalPath, IDictionary<string, bool> cache)
+        {
+            if (cache.TryGetValue(physicalPath, out var exists))
+                return exists;
+
+            exists = _fileSystem.File.Exists(physicalPath);
+            cache[physicalPath] = exists;
+            return exists;
+        }
+
+        private bool RefreshCachedPhysicalFileExists(string physicalPath, IDictionary<string, bool> cache)
+        {
+            var exists = _fileSystem.File.Exists(physicalPath);
+            cache[physicalPath] = exists;
+            return exists;
         }
 
         private async Task RollbackPermanentlyFailedCleanupAsync(
@@ -1027,6 +1036,7 @@ namespace Locus.Storage
                 CompletedRecordsRemoved = Volatile.Read(ref _completedRecordsRemoved),
                 PermanentlyFailedFilesRemoved = Volatile.Read(ref _permanentlyFailedFilesRemoved),
                 OrphanedFilesRemoved = Volatile.Read(ref _orphanedFilesRemoved),
+                OrphanedFilesRecovered = Volatile.Read(ref _orphanedFilesRecovered),
                 TimedOutFilesReset = Volatile.Read(ref _timedOutFilesReset),
                 SpaceFreed = Interlocked.Read(ref _spaceFreed)
             });
@@ -1048,7 +1058,7 @@ namespace Locus.Storage
             };
 
             // Get all tenant IDs from metadata databases
-            var metadataTenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            var metadataTenantIds = await GetMetadataTenantIdsSnapshotAsync(ct);
 
             // Optimize metadata databases (per-tenant, thread-safe)
             var metadataProcessed = 0;
@@ -1082,7 +1092,7 @@ namespace Locus.Storage
             }
 
             // Get all tenant IDs from quota databases
-            var quotaTenantIds = await _quotaRepository.GetAllTenantIdsAsync(ct);
+            var quotaTenantIds = await GetQuotaTenantIdsSnapshotAsync(ct);
 
             // Optimize quota databases (per-tenant, thread-safe)
             var quotaProcessed = 0;
@@ -1161,13 +1171,11 @@ namespace Locus.Storage
                 return (0, 0);
 
             // Each tenant has its own subdirectory; scan all of them.
-            var tenantDirs = _fileSystem.Directory.GetDirectories(rootDirectory);
-            foreach (var tenantDir in tenantDirs)
+            foreach (var tenantDir in _fileSystem.Directory.EnumerateDirectories(rootDirectory))
             {
                 ct.ThrowIfCancellationRequested();
 
-                var allFiles = _fileSystem.Directory.GetFiles(tenantDir);
-                foreach (var filePath in allFiles)
+                foreach (var filePath in _fileSystem.Directory.EnumerateFiles(tenantDir))
                 {
                     ct.ThrowIfCancellationRequested();
 
@@ -1229,15 +1237,13 @@ namespace Locus.Storage
             var removedCount = 0;
 
             // 1. Process subdirectories first (bottom-up so parents can be emptied).
-            var subdirectories = _fileSystem.Directory.GetDirectories(directoryPath);
-            foreach (var subdirectory in subdirectories)
+            foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(directoryPath))
             {
                 removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false, shardingDepth: shardingDepth, depth: depth + 1);
             }
 
             // 2. Delete junk files in the current directory.
-            var files = _fileSystem.Directory.GetFiles(directoryPath);
-            foreach (var file in files)
+            foreach (var file in _fileSystem.Directory.EnumerateFiles(directoryPath))
             {
                 ct.ThrowIfCancellationRequested();
                 var fileName = _fileSystem.Path.GetFileName(file);
@@ -1284,12 +1290,87 @@ namespace Locus.Storage
         {
             try
             {
-                return !_fileSystem.Directory.GetFileSystemEntries(directoryPath).Any();
+                return !_fileSystem.Directory.EnumerateFileSystemEntries(directoryPath).Any();
             }
             catch
             {
                 return false;
             }
+        }
+
+        private async Task<string[]> GetMetadataTenantIdsSnapshotAsync(CancellationToken ct)
+        {
+            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            return tenantIds
+                .Where(tenantId => !string.IsNullOrWhiteSpace(tenantId))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        private async Task<string[]> GetQuotaTenantIdsSnapshotAsync(CancellationToken ct)
+        {
+            var tenantIds = await _quotaRepository.GetAllTenantIdsAsync(ct);
+            return tenantIds
+                .Where(tenantId => !string.IsNullOrWhiteSpace(tenantId))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        private List<OrphanFileScanEntry> EnumerateSortedOrphanScanEntries(string directory)
+        {
+            var entries = new List<OrphanFileScanEntry>();
+
+            foreach (var physicalPath in _fileSystem.Directory.EnumerateFiles(directory))
+            {
+                entries.Add(new OrphanFileScanEntry(
+                    physicalPath,
+                    NormalizePath(physicalPath) ?? physicalPath));
+            }
+
+            entries.Sort((left, right) => _pathComparer.Compare(left.NormalizedPath, right.NormalizedPath));
+
+            return entries;
+        }
+
+        private int FindOrphanScanStartIndex(IReadOnlyList<OrphanFileScanEntry> entries, string? resumeAfterPath)
+        {
+            if (string.IsNullOrWhiteSpace(resumeAfterPath) || entries.Count == 0)
+                return 0;
+
+            var low = 0;
+            var high = entries.Count;
+
+            while (low < high)
+            {
+                var mid = low + ((high - low) / 2);
+                var comparison = _pathComparer.Compare(entries[mid].NormalizedPath, resumeAfterPath);
+
+                if (comparison <= 0)
+                {
+                    low = mid + 1;
+                }
+                else
+                {
+                    high = mid;
+                }
+            }
+
+            return low;
+        }
+
+        private HashSet<string> BuildKnownPhysicalPathSet(string tenantId)
+        {
+            var metadataEntries = _metadataRepository.SnapshotTenantMetadataRaw(tenantId);
+            var knownPaths = new HashSet<string>(_pathComparer);
+
+            foreach (var metadata in metadataEntries)
+            {
+                var normalizedPath = NormalizePath(metadata.PhysicalPath);
+                if (normalizedPath != null)
+                    knownPaths.Add(normalizedPath);
+            }
+
+            return knownPaths;
         }
 
         private sealed class CleanupTenantContext : ITenantContext
@@ -1302,6 +1383,19 @@ namespace Locus.Storage
             public string TenantId { get; }
 
             public TenantStatus Status => TenantStatus.Enabled;
+        }
+
+        private readonly struct OrphanFileScanEntry
+        {
+            public OrphanFileScanEntry(string physicalPath, string normalizedPath)
+            {
+                PhysicalPath = physicalPath;
+                NormalizedPath = normalizedPath;
+            }
+
+            public string PhysicalPath { get; }
+
+            public string NormalizedPath { get; }
         }
     }
 }

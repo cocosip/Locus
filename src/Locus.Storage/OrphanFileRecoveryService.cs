@@ -46,17 +46,17 @@ namespace Locus.Storage
                 try
                 {
                     var statsBefore = await _cleanupService.GetCleanupStatisticsAsync(stoppingToken);
-                    var countBefore = statsBefore.OrphanedFilesRemoved;
+                    var countBefore = statsBefore.OrphanedFilesRecovered;
 
                     _logger.LogInformation("Starting orphaned file recovery scan");
 
                     await _cleanupService.RecoverAllOrphanedFilesAsync(stoppingToken);
 
                     var statsAfter = await _cleanupService.GetCleanupStatisticsAsync(stoppingToken);
-                    var recovered = statsAfter.OrphanedFilesRemoved - countBefore;
+                    var recovered = statsAfter.OrphanedFilesRecovered - countBefore;
                     _logger.LogInformation(
                         "Orphaned file recovery completed: {OrphanedFilesRecovered} file(s) recovered this run, {TotalRecovered} total since startup",
-                        recovered, statsAfter.OrphanedFilesRemoved);
+                        recovered, statsAfter.OrphanedFilesRecovered);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {

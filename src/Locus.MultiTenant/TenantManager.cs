@@ -228,10 +228,9 @@ namespace Locus.MultiTenant
                 if (cachedSnapshot != null && DateTime.UtcNow < cachedSnapshot.ExpiresAtUtc)
                     return cachedSnapshot.Tenants;
 
-                var metadataFiles = _fileSystem.Directory.GetFiles(_metadataRoot, "*.json");
-                var tenants = new List<ITenantContext>(metadataFiles.Length);
+                var tenants = new List<ITenantContext>();
 
-                foreach (var filePath in metadataFiles)
+                foreach (var filePath in _fileSystem.Directory.EnumerateFiles(_metadataRoot, "*.json"))
                 {
                     ct.ThrowIfCancellationRequested();
                     try

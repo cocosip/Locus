@@ -181,6 +181,38 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetAllTenantIdsAsync_RefreshesDirectorySnapshotAfterCacheWindow()
+        {
+            const string tenantA = "tenant-cache-a";
+            const string tenantB = "tenant-cache-b";
+
+            _fileSystem.Directory.CreateDirectory(Path.Combine(_metadataDir, tenantA));
+            var first = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
+            Assert.Contains(tenantA, first);
+
+            _fileSystem.Directory.CreateDirectory(Path.Combine(_metadataDir, tenantB));
+            await Task.Delay(1100);
+
+            var second = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
+            Assert.Contains(tenantB, second);
+        }
+
+        [Fact]
+        public async Task GetAllTenantIdsAsync_IncludesInMemoryTenantWithinDirectoryCacheWindow()
+        {
+            const string memoryTenant = "tenant-hot-memory";
+
+            var first = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
+            Assert.DoesNotContain(memoryTenant, first);
+
+            var activeFiles = GetActiveFiles(_repository);
+            activeFiles.TryAdd(memoryTenant, new ConcurrentDictionary<string, FileMetadata>());
+
+            var second = (await _repository.GetAllTenantIdsAsync(CancellationToken.None)).ToList();
+            Assert.Contains(memoryTenant, second);
+        }
+
+        [Fact]
         public async Task GetByFileKeyAsync_ReturnsMetadataAcrossTenants()
         {
             await _repository.AddOrUpdateAsync(CreateMetadata("file-tenant-1", FileProcessingStatus.Pending, "tenant-001"), CancellationToken.None);

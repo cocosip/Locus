@@ -125,13 +125,15 @@ namespace Locus.Storage
                         "FailedFiles={FailedFiles}, " +
                         "TimedOut={TimedOut}, " +
                         "CompletedRecords={CompletedRecords}, " +
-                        "OrphanedFiles={OrphanedFiles}, " +
+                        "OrphanedFilesRemoved={OrphanedFilesRemoved}, " +
+                        "OrphanedFilesRecovered={OrphanedFilesRecovered}, " +
                         "SpaceFreed={SpaceFreedMB} MB",
                         stats.EmptyDirectoriesRemoved,
                         stats.PermanentlyFailedFilesRemoved,
                         stats.TimedOutFilesReset,
                         stats.CompletedRecordsRemoved,
                         stats.OrphanedFilesRemoved,
+                        stats.OrphanedFilesRecovered,
                         stats.SpaceFreed / 1024 / 1024);
                 }
                 catch (Exception ex)
