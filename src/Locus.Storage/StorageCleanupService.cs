@@ -40,6 +40,7 @@ namespace Locus.Storage
         private readonly StringComparison _pathComparison;
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _orphanScanLocks;
+        private readonly ConcurrentDictionary<string, OrphanDirectoryScanState> _orphanDirectoryScanStates;
         private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
         private long _statusCleanupIterationCount;
         private long _statusCleanupIterationStopwatchTicks;
@@ -86,6 +87,7 @@ namespace Locus.Storage
             _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
             _orphanScanQueues = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
             _orphanScanLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _orphanDirectoryScanStates = new ConcurrentDictionary<string, OrphanDirectoryScanState>();
             _orphanScanLastRunUtc = new ConcurrentDictionary<string, DateTime>();
 
             if (string.IsNullOrWhiteSpace(metadataDirectory))
@@ -260,16 +262,39 @@ namespace Locus.Storage
                         ct.ThrowIfCancellationRequested();
 
                         if (!_fileSystem.Directory.Exists(directory))
+                        {
+                            ClearOrphanDirectoryScanState(scanKey, directory);
                             continue;
+                        }
 
                         try
                         {
-                            foreach (var physicalPath in _fileSystem.Directory.EnumerateFiles(directory))
+                            var directoryScanState = GetOrphanDirectoryScanState(scanKey, directory);
+                            var resumeAfterPath = directoryScanState.ResumeAfterPath;
+                            var directoryFullyScanned = true;
+
+                            foreach (var fileEntry in _fileSystem.Directory
+                                .EnumerateFiles(directory)
+                                .Select(physicalPath => new
+                                {
+                                    PhysicalPath = physicalPath,
+                                    NormalizedPath = NormalizePath(physicalPath) ?? physicalPath
+                                })
+                                .OrderBy(entry => entry.NormalizedPath, _pathComparer))
                             {
+                                if (!string.IsNullOrWhiteSpace(resumeAfterPath)
+                                    && _pathComparer.Compare(fileEntry.NormalizedPath, resumeAfterPath) <= 0)
+                                {
+                                    continue;
+                                }
+
                                 ct.ThrowIfCancellationRequested();
                                 scannedThisRun++;
 
-                                var normalizedPhysical = NormalizePath(physicalPath);
+                                directoryScanState.ResumeAfterPath = fileEntry.NormalizedPath;
+
+                                var physicalPath = fileEntry.PhysicalPath;
+                                var normalizedPhysical = fileEntry.NormalizedPath;
                                 var metadataExists = false;
                                 if (normalizedPhysical != null)
                                 {
@@ -297,6 +322,7 @@ namespace Locus.Storage
                                 {
                                     if (scannedThisRun >= _maxOrphanFilesPerRun)
                                     {
+                                        directoryFullyScanned = false;
                                         scanQueue.Enqueue(directory);
                                         budgetReached = true;
                                         break;
@@ -367,14 +393,19 @@ namespace Locus.Storage
 
                                 if (scannedThisRun >= _maxOrphanFilesPerRun)
                                 {
+                                    directoryFullyScanned = false;
                                     scanQueue.Enqueue(directory);
                                     budgetReached = true;
                                     break;
                                 }
                             }
+
+                            if (directoryFullyScanned)
+                                ClearOrphanDirectoryScanState(scanKey, directory);
                         }
                         catch (Exception ex)
                         {
+                            ClearOrphanDirectoryScanState(scanKey, directory);
                             _logger.LogWarning(ex, "Failed to enumerate files in directory {DirectoryPath}", directory);
                         }
 
@@ -494,12 +525,29 @@ namespace Locus.Storage
             return $"{tenantId}\u001F{volumeId}";
         }
 
+        private string GetOrphanDirectoryScanStateKey(string scanKey, string directoryPath)
+        {
+            return $"{scanKey}\u001F{NormalizePath(directoryPath) ?? directoryPath}";
+        }
+
         private ConcurrentQueue<string> GetOrphanScanQueue(string scanKey, string tenantPath)
         {
             var queue = _orphanScanQueues.GetOrAdd(scanKey, _ => new ConcurrentQueue<string>());
             if (queue.IsEmpty)
                 queue.Enqueue(tenantPath);
             return queue;
+        }
+
+        private OrphanDirectoryScanState GetOrphanDirectoryScanState(string scanKey, string directoryPath)
+        {
+            return _orphanDirectoryScanStates.GetOrAdd(
+                GetOrphanDirectoryScanStateKey(scanKey, directoryPath),
+                _ => new OrphanDirectoryScanState());
+        }
+
+        private void ClearOrphanDirectoryScanState(string scanKey, string directoryPath)
+        {
+            _orphanDirectoryScanStates.TryRemove(GetOrphanDirectoryScanStateKey(scanKey, directoryPath), out _);
         }
 
         private string? NormalizePath(string? path)
@@ -515,6 +563,11 @@ namespace Locus.Storage
             {
                 return path;
             }
+        }
+
+        private sealed class OrphanDirectoryScanState
+        {
+            public string? ResumeAfterPath { get; set; }
         }
 
         /// <summary>

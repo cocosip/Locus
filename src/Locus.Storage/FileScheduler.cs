@@ -334,12 +334,15 @@ namespace Locus.Storage
         public async Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct = default)
         {
             var removedCount = 0;
+            var tenantIds = await _repository.GetAllTenantIdsAsync(ct).ConfigureAwait(false);
 
             // Process one tenant at a time to avoid allocating a single list of all files
             // across every tenant (O(total_files) memory spike -> O(max_tenant_files) peak).
             // EnumerateTenantMetadataRaw returns the live cache values without cloning - we
             // only read stable fields (PhysicalPath, TenantId, FileKey) so this is safe.
-            foreach (var tenantId in _repository.GetActiveTenantIds())
+            // Use all known tenant IDs, not only hot in-memory tenants, so cold SQLite-only
+            // tenants also have stale metadata reconciled before they are leased again.
+            foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
 

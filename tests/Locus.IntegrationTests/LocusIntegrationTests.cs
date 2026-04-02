@@ -207,6 +207,40 @@ namespace Locus.IntegrationTests
         }
 
         [Fact]
+        public async Task FileSchedulerCleanup_ReconcilesQuotaCountersThroughRegisteredManagers()
+        {
+            var tenantManager = _serviceProvider.GetRequiredService<ITenantManager>();
+            var storagePool = _serviceProvider.GetRequiredService<IStoragePool>();
+            var fileScheduler = _serviceProvider.GetRequiredService<IFileScheduler>();
+            var tenantQuotaManager = _serviceProvider.GetRequiredService<ITenantQuotaManager>();
+            var directoryQuotaManager = _serviceProvider.GetRequiredService<IDirectoryQuotaManager>();
+
+            await tenantManager.CreateTenantAsync("tenant-006", default);
+            var tenant = await tenantManager.GetTenantAsync("tenant-006", default);
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("quota cleanup"));
+            var fileKey = await storagePool.WriteFileAsync(tenant!, content, null, default);
+            var location = await storagePool.GetFileLocationAsync(tenant!, fileKey, default);
+
+            Assert.NotNull(location);
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync("tenant-006", default));
+            Assert.Equal(
+                1,
+                await directoryQuotaManager.GetFileCountAsync("tenant-006", location!.DirectoryPath, default));
+
+            File.Delete(location.PhysicalPath);
+
+            var removedCount = await fileScheduler.CleanupOrphanedMetadataAsync(default);
+
+            Assert.Equal(1, removedCount);
+            Assert.Null(await storagePool.GetFileLocationAsync(tenant!, fileKey, default));
+            Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync("tenant-006", default));
+            Assert.Equal(
+                0,
+                await directoryQuotaManager.GetFileCountAsync("tenant-006", location.DirectoryPath, default));
+        }
+
+        [Fact]
         public async Task CleanupService_CleansTimedOutFiles()
         {
             // Arrange

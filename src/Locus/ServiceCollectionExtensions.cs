@@ -173,7 +173,16 @@ namespace Locus
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<FileScheduler>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
-                return new FileScheduler(repository, fileSystem, logger, options.RetryPolicy, volumeRegistry);
+                var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
+                var directoryQuotaManager = sp.GetRequiredService<IDirectoryQuotaManager>();
+                return new FileScheduler(
+                    repository,
+                    fileSystem,
+                    logger,
+                    options.RetryPolicy,
+                    volumeRegistry,
+                    tenantQuotaManager,
+                    directoryQuotaManager);
             });
 
             // Register StoragePool as its concrete type so StorageVolumeInitializationService

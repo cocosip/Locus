@@ -677,6 +677,50 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RecoverOrphanedFilesAsync_WithSmallRunBudget_ContinuesScanningLargeDirectoryAcrossRuns()
+        {
+            var cleanupWithSmallBudget = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new CleanupOptions
+                {
+                    MaxOrphanFilesPerRun = 2
+                },
+                tenantManager: _tenantManager.Object);
+            cleanupWithSmallBudget.RegisterVolume(_volume.Object);
+
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+
+            for (var i = 0; i < 5; i++)
+            {
+                var filePath = Path.Combine(tenantPath, $"budget-{i:D3}.dat");
+                _fileSystem.File.WriteAllText(filePath, $"content-{i}");
+            }
+
+            await cleanupWithSmallBudget.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "budget-000", CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "budget-001", CancellationToken.None));
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "budget-004", CancellationToken.None));
+
+            await cleanupWithSmallBudget.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "budget-002", CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "budget-003", CancellationToken.None));
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "budget-004", CancellationToken.None));
+
+            await cleanupWithSmallBudget.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "budget-004", CancellationToken.None));
+
+            var stats = await cleanupWithSmallBudget.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(5, stats.OrphanedFilesRemoved);
+        }
+
+        [Fact]
         public async Task RecoverAllOrphanedFilesAsync_RebuildsMetadataAcrossTenants()
         {
             var tenant1Path = Path.Combine(_volumePath, "tenant-001");

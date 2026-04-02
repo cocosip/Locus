@@ -954,5 +954,68 @@ namespace Locus.Storage.Tests
             Assert.Equal(0, removedCount);
             Assert.NotNull(await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None));
         }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_RemovesMissingRowsForColdTenantsLoadedFromDisk()
+        {
+            var coldTenantId = $"tenant-cold-{Guid.NewGuid():N}";
+
+            using (var seedRepository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await seedRepository.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = "cold-file",
+                    TenantId = coldTenantId,
+                    VolumeId = "vol-001",
+                    PhysicalPath = Path.Combine(_metadataDir, "missing-cold-file.dat"),
+                    DirectoryPath = "/",
+                    Status = FileProcessingStatus.Pending,
+                    CreatedAt = DateTime.UtcNow
+                }, CancellationToken.None);
+            }
+
+            await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
+
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync(coldTenantId, It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync(coldTenantId, "/", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            using (var reopenedRepository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                var scheduler = new FileScheduler(
+                    reopenedRepository,
+                    _fileSystem,
+                    _logger.Object,
+                    tenantQuotaManager: tenantQuotaManager.Object,
+                    directoryQuotaManager: directoryQuotaManager.Object);
+
+                var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+                Assert.Equal(1, removedCount);
+                Assert.Null(await reopenedRepository.GetAsync(coldTenantId, "cold-file", CancellationToken.None));
+            }
+
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(coldTenantId, It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(coldTenantId, "/", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
     }
 }
