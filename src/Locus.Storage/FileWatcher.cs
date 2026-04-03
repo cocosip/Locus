@@ -1156,6 +1156,7 @@ namespace Locus.Storage
 
             var allTenants = await _tenantManager.GetAllTenantsAsync(ct);
             var tenantIds = allTenants
+                .Where(tenant => tenant.Status == TenantStatus.Enabled)
                 .Select(tenant => tenant.TenantId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
                 .Distinct(_tenantIdComparer)

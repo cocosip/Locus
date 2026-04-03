@@ -1055,6 +1055,70 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_ContinuesPastMoreThanDeferredSkipLimit()
+        {
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new CleanupOptions
+                {
+                    CleanupBatchSizePerTenant = 1
+                },
+                tenantManager: _tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var sharedBlockedPhysicalPath = Path.Combine(_volumePath, "failed-blocked-many.dat");
+            var removablePhysicalPath = Path.Combine(_volumePath, "failed-removable-after-many.dat");
+            _fileSystem.File.WriteAllText(sharedBlockedPhysicalPath, "failed content");
+            _fileSystem.File.WriteAllText(removablePhysicalPath, "failed content");
+
+            for (var i = 0; i <= 500; i++)
+            {
+                await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = $"failed-blocked-{i:D3}",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-missing",
+                    PhysicalPath = sharedBlockedPhysicalPath,
+                    DirectoryPath = "/failed",
+                    FileSize = 12,
+                    CreatedAt = DateTime.UtcNow.AddDays(-20).AddMinutes(i),
+                    Status = FileProcessingStatus.PermanentlyFailed,
+                    LastFailedAt = DateTime.UtcNow.AddDays(-15).AddMinutes(i)
+                }, CancellationToken.None);
+            }
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "failed-removable-after-many",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = removablePhysicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddDays(-5),
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-8)
+            }, CancellationToken.None);
+
+            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), CancellationToken.None);
+
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "failed-blocked-000", CancellationToken.None));
+            Assert.True(_fileSystem.File.Exists(sharedBlockedPhysicalPath));
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "failed-removable-after-many", CancellationToken.None));
+            Assert.False(_fileSystem.File.Exists(removablePhysicalPath));
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
+        }
+
+        [Fact]
         public async Task CleanupInvalidDatabaseFilesAsync_RemovesCorruptionBackups()
         {
             var tenantMetaDir = Path.Combine(_metadataDir, "tenant-001");

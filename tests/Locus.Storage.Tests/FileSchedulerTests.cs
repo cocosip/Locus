@@ -287,6 +287,42 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupOrphanedMetadataAsync_SkipsRowsWhenVolumeIsUnavailableAndPhysicalPathStillExists()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            var volumeRegistry = new StorageVolumeRegistry();
+            var fileKey = "orphan-volume-unavailable";
+            var physicalPath = Path.Combine(_metadataDir, "still-there.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "content");
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                VolumeId = "vol-missing",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                volumeRegistry: volumeRegistry,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(0, removed);
+            Assert.NotNull(await _repository.GetAsync("tenant-001", fileKey, CancellationToken.None));
+            Assert.True(_fileSystem.File.Exists(physicalPath));
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAndDeleteAsync_RemovesMetadata()
         {
             // Arrange

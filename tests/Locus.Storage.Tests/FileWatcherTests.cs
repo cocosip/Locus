@@ -499,6 +499,53 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_MultiTenantAutoCreate_SkipsDisabledAndSuspendedTenants()
+        {
+            var watchPath = @"C:\watch-auto-create-filtered";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var enabledTenant = new Mock<ITenantContext>();
+            enabledTenant.Setup(t => t.TenantId).Returns("tenant-enabled");
+            enabledTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+
+            var disabledTenant = new Mock<ITenantContext>();
+            disabledTenant.Setup(t => t.TenantId).Returns("tenant-disabled");
+            disabledTenant.Setup(t => t.Status).Returns(TenantStatus.Disabled);
+
+            var suspendedTenant = new Mock<ITenantContext>();
+            suspendedTenant.Setup(t => t.TenantId).Returns("tenant-suspended");
+            suspendedTenant.Setup(t => t.Status).Returns(TenantStatus.Suspended);
+
+            _tenantManager.Setup(m => m.GetAllTenantsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    enabledTenant.Object,
+                    disabledTenant.Object,
+                    suspendedTenant.Object
+                });
+
+            _tenantManager.Setup(m => m.GetTenantAsync("tenant-enabled", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(enabledTenant.Object);
+
+            var config = new FileWatcherConfiguration
+            {
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = true,
+                AutoCreateTenantDirectories = true,
+                AutoCreateTenantDirectoriesCacheTtl = TimeSpan.Zero,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+            await _fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            Assert.True(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-enabled")));
+            Assert.False(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-disabled")));
+            Assert.False(_fileSystem.Directory.Exists(Path.Combine(watchPath, "tenant-suspended")));
+        }
+
+        [Fact]
         public async Task ScanNowAsync_SkipsDisabledTenants()
         {
             // Arrange

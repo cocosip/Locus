@@ -1635,6 +1635,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         // Stale entries that are not processed this cycle will be retried on the next cleanup run.
         private const int MaxStatusIndexStaleSkipsPerCall = 500;
         private const int MaxStatusIndexDeferredSkipsPerCall = 500;
+        private const int MaxStatusIndexCandidatesPerCall = 5_000;
 
         private IReadOnlyList<FileMetadata> GetStatusBatchFromIndex(
             string tenantId,
@@ -1656,6 +1657,10 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             var selectedKeys = new HashSet<string>(StringComparer.Ordinal);
             var staleSkips = 0;
             var deferredSkips = 0;
+            var examined = 0;
+            var maxCandidates = Math.Max(
+                MaxStatusIndexCandidatesPerCall,
+                limit + (excludedFileKeys?.Count ?? 0) + 64);
 
             // First lock section: dequeue candidates and validate them.
             // Valid entries (added to results) are collected in restoreEntries so they can be
@@ -1665,9 +1670,11 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             {
                 while (results.Count < limit
                     && staleSkips < MaxStatusIndexStaleSkipsPerCall
-                    && deferredSkips < MaxStatusIndexDeferredSkipsPerCall
+                    && examined < maxCandidates
                     && index.TryPeek(out var peek))
                 {
+                    examined++;
+
                     if (peek.TimestampUtc >= cutoffUtc)
                         break;
 
@@ -1709,6 +1716,13 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     {
                         deferredSkips++;
                         restoreEntries.Add(candidate);
+
+                        if (deferredSkips >= MaxStatusIndexDeferredSkipsPerCall
+                            && results.Count > 0)
+                        {
+                            break;
+                        }
+
                         continue;
                     }
 

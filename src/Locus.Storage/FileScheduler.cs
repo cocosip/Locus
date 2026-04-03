@@ -356,22 +356,26 @@ namespace Locus.Storage
                     if (string.IsNullOrWhiteSpace(metadata.PhysicalPath))
                         continue;
 
-                    if (!physicalPathExistsCache.TryGetValue(metadata.PhysicalPath, out var physicalFileExists))
-                    {
-                        physicalFileExists = _fileSystem.File.Exists(metadata.PhysicalPath);
-                        physicalPathExistsCache[metadata.PhysicalPath] = physicalFileExists;
-                    }
+                    if (!TryConfirmPhysicalFileMissing(metadata, physicalPathExistsCache, out var physicalFileMissing))
+                        continue;
 
-                    // Check if physical file exists
-                    if (!physicalFileExists)
+                    if (physicalFileMissing)
                     {
                         _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
                             metadata.FileKey, metadata.PhysicalPath);
 
-                        // Decrement quota counters before removing metadata so they stay consistent.
-                        // Use default for the full cleanup sequence once a candidate
-                        // orphan has been selected; otherwise a mid-flight cancellation could leave
-                        // quotas decremented while the metadata row remains present.
+                        // Use default for the full cleanup sequence once a candidate orphan has
+                        // been selected; otherwise a mid-flight cancellation could leave cleanup
+                        // work half-applied.
+                        var removed = await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, default);
+                        if (!removed)
+                        {
+                            _logger.LogDebug(
+                                "Skipped orphaned metadata cleanup for {FileKey} because the metadata row changed concurrently",
+                                metadata.FileKey);
+                            continue;
+                        }
+
                         if (_tenantQuotaManager != null)
                         {
                             try
@@ -400,7 +404,6 @@ namespace Locus.Storage
                             }
                         }
 
-                        await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, default);
                         removedCount++;
                     }
                 }
@@ -412,6 +415,80 @@ namespace Locus.Storage
             }
 
             return removedCount;
+        }
+
+        private bool TryConfirmPhysicalFileMissing(
+            FileMetadata metadata,
+            IDictionary<string, bool> physicalPathExistsCache,
+            out bool physicalFileMissing)
+        {
+            physicalFileMissing = false;
+
+            if (physicalPathExistsCache.TryGetValue(metadata.PhysicalPath, out var physicalFileExists))
+            {
+                physicalFileMissing = !physicalFileExists;
+                return true;
+            }
+
+            physicalFileExists = _fileSystem.File.Exists(metadata.PhysicalPath);
+            if (physicalFileExists)
+            {
+                physicalPathExistsCache[metadata.PhysicalPath] = true;
+                return true;
+            }
+
+            if (_volumeRegistry != null
+                && !string.IsNullOrWhiteSpace(metadata.VolumeId)
+                && !_volumeRegistry.TryGetVolume(metadata.VolumeId, out _))
+            {
+                _logger.LogWarning(
+                    "Skipping orphaned metadata cleanup because volume {VolumeId} is unavailable for file {FileKey}",
+                    metadata.VolumeId,
+                    metadata.FileKey);
+                return false;
+            }
+
+            try
+            {
+                using (var stream = _fileSystem.File.Open(
+                    metadata.PhysicalPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                }
+
+                physicalPathExistsCache[metadata.PhysicalPath] = true;
+                return true;
+            }
+            catch (System.IO.FileNotFoundException)
+            {
+                physicalPathExistsCache[metadata.PhysicalPath] = false;
+                physicalFileMissing = true;
+                return true;
+            }
+            catch (System.IO.DirectoryNotFoundException)
+            {
+                physicalPathExistsCache[metadata.PhysicalPath] = false;
+                physicalFileMissing = true;
+                return true;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Skipping orphaned metadata cleanup because physical-path access could not be verified for {FileKey}",
+                    metadata.FileKey);
+                return false;
+            }
+            catch (IOException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Skipping orphaned metadata cleanup because physical-path access could not be verified for {FileKey}",
+                    metadata.FileKey);
+                return false;
+            }
         }
 
         /// <summary>
