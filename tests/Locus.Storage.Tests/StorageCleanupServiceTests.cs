@@ -60,6 +60,9 @@ namespace Locus.Storage.Tests
                 .Setup(m => m.GetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(defaultTenant.Object);
             _tenantManager
+                .Setup(m => m.TryGetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(defaultTenant.Object);
+            _tenantManager
                 .Setup(m => m.GetTenantAsync(It.Is<string>(s => s != "tenant-001"), It.IsAny<CancellationToken>()))
                 .Returns<string, CancellationToken>((tenantId, _) =>
                 {
@@ -67,6 +70,15 @@ namespace Locus.Storage.Tests
                     tenant.Setup(t => t.TenantId).Returns(tenantId);
                     tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
                     return Task.FromResult<ITenantContext>(tenant.Object);
+                });
+            _tenantManager
+                .Setup(m => m.TryGetTenantAsync(It.Is<string>(s => s != "tenant-001"), It.IsAny<CancellationToken>()))
+                .Returns<string, CancellationToken>((tenantId, _) =>
+                {
+                    var tenant = new Mock<ITenantContext>();
+                    tenant.Setup(t => t.TenantId).Returns(tenantId);
+                    tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+                    return Task.FromResult<ITenantContext?>(tenant.Object);
                 });
 
             // Setup cleanup service
@@ -105,6 +117,9 @@ namespace Locus.Storage.Tests
             _tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
             _tenantManager
                 .Setup(m => m.GetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(_tenant.Object);
+            _tenantManager
+                .Setup(m => m.TryGetTenantAsync("tenant-001", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(_tenant.Object);
         }
 
@@ -814,13 +829,86 @@ namespace Locus.Storage.Tests
             disabledTenant.Setup(t => t.TenantId).Returns("tenant-disabled");
             disabledTenant.Setup(t => t.Status).Returns(TenantStatus.Disabled);
             _tenantManager
-                .Setup(m => m.GetTenantAsync("tenant-disabled", It.IsAny<CancellationToken>()))
+                .Setup(m => m.TryGetTenantAsync("tenant-disabled", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(disabledTenant.Object);
 
             await _cleanupService.RecoverAllOrphanedFilesAsync(CancellationToken.None);
 
             Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "enabled", CancellationToken.None));
             Assert.Null(await _metadataRepository.GetAsync("tenant-disabled", "disabled", CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task RecoverAllOrphanedFilesAsync_DoesNotAutoCreateTenantMetadataFromStrayDirectories()
+        {
+            var tenantManager = new Mock<ITenantManager>(MockBehavior.Strict);
+            tenantManager
+                .Setup(m => m.TryGetTenantAsync("tenant-stray", It.IsAny<CancellationToken>()))
+                .ReturnsAsync((ITenantContext?)null);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var strayTenantPath = Path.Combine(_volumePath, "tenant-stray");
+            _fileSystem.Directory.CreateDirectory(strayTenantPath);
+            _fileSystem.File.WriteAllText(Path.Combine(strayTenantPath, "stray.dat"), "stray");
+
+            await cleanupService.RecoverAllOrphanedFilesAsync(CancellationToken.None);
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-stray", "stray", CancellationToken.None));
+            tenantManager.Verify(
+                m => m.TryGetTenantAsync("tenant-stray", It.IsAny<CancellationToken>()),
+                Times.AtLeastOnce);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_ReconcilesQuotaDown_WhenQuotaOvercountsLiveFiles()
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+
+            await ((ITenantQuotaReconciliationManager)_tenantQuotaManager)
+                .SetFileCountAsync("tenant-001", 1, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync("tenant-001", "/stale", 1, CancellationToken.None);
+
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/stale", CancellationToken.None)).CurrentCount);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_ReconcilesQuotaUp_WhenMetadataStillOwnsTheFile()
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            var physicalPath = Path.Combine(tenantPath, "kept.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "kept");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "kept",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/",
+                FileSize = 4,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+                Status = FileProcessingStatus.Pending
+            }, CancellationToken.None);
+
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/", CancellationToken.None)).CurrentCount);
         }
 
         [Fact]
@@ -906,7 +994,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task CleanupPermanentlyFailedFilesAsync_StopsWhenBatchMakesNoProgress()
+        public async Task CleanupPermanentlyFailedFilesAsync_SkipsBlockedBatchAndContinuesToLaterRecords()
         {
             var cleanupService = new StorageCleanupService(
                 _metadataRepository,
@@ -921,16 +1009,19 @@ namespace Locus.Storage.Tests
                     CleanupBatchSizePerTenant = 1
                 },
                 tenantManager: _tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
 
-            var physicalPath = Path.Combine(_volumePath, "failed-stuck.dat");
-            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+            var blockedPhysicalPath = Path.Combine(_volumePath, "failed-stuck.dat");
+            var removablePhysicalPath = Path.Combine(_volumePath, "failed-removable.dat");
+            _fileSystem.File.WriteAllText(blockedPhysicalPath, "failed content");
+            _fileSystem.File.WriteAllText(removablePhysicalPath, "failed content");
 
             await _metadataRepository.AddOrUpdateAsync(new FileMetadata
             {
                 FileKey = "failed-stuck",
                 TenantId = "tenant-001",
                 VolumeId = "vol-missing",
-                PhysicalPath = physicalPath,
+                PhysicalPath = blockedPhysicalPath,
                 DirectoryPath = "/failed",
                 FileSize = 12,
                 CreatedAt = DateTime.UtcNow.AddDays(-10),
@@ -938,12 +1029,29 @@ namespace Locus.Storage.Tests
                 LastFailedAt = DateTime.UtcNow.AddDays(-8)
             }, CancellationToken.None);
 
-            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
-            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), cts.Token);
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "failed-removable",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = removablePhysicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddDays(-9),
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-7).AddHours(-1)
+            }, CancellationToken.None);
 
-            var metadata = await _metadataRepository.GetAsync("tenant-001", "failed-stuck", CancellationToken.None);
-            Assert.NotNull(metadata);
-            Assert.True(_fileSystem.File.Exists(physicalPath));
+            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), CancellationToken.None);
+
+            Assert.NotNull(await _metadataRepository.GetAsync("tenant-001", "failed-stuck", CancellationToken.None));
+            Assert.True(_fileSystem.File.Exists(blockedPhysicalPath));
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "failed-removable", CancellationToken.None));
+            Assert.False(_fileSystem.File.Exists(removablePhysicalPath));
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
         }
 
         [Fact]

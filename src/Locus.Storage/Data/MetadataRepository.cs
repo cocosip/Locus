@@ -1389,6 +1389,20 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             int limit,
             CancellationToken ct = default)
         {
+            return GetPermanentlyFailedOlderThanAsync(tenantId, cutoffUtc, limit, excludedFileKeys: null, ct);
+        }
+
+        /// <summary>
+        /// Gets a bounded batch of files in PermanentlyFailed status whose last failure is older than the cutoff.
+        /// Excluded keys are deferred to later iterations so maintenance scans can progress past blocked records.
+        /// </summary>
+        public Task<IReadOnlyList<FileMetadata>> GetPermanentlyFailedOlderThanAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            ISet<string>? excludedFileKeys = null,
+            CancellationToken ct = default)
+        {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
@@ -1403,7 +1417,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 FileProcessingStatus.PermanentlyFailed,
                 _permanentlyFailedByLastFailedAt,
                 _permanentlyFailedByLastFailedAtLocks,
-                metadata => metadata.LastFailedAt);
+                metadata => metadata.LastFailedAt,
+                excludedFileKeys);
 
             return Task.FromResult(results);
         }
@@ -1619,6 +1634,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         // (e.g. files that were deleted between index insertion and cleanup scan).
         // Stale entries that are not processed this cycle will be retried on the next cleanup run.
         private const int MaxStatusIndexStaleSkipsPerCall = 500;
+        private const int MaxStatusIndexDeferredSkipsPerCall = 500;
 
         private IReadOnlyList<FileMetadata> GetStatusBatchFromIndex(
             string tenantId,
@@ -1627,7 +1643,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             FileProcessingStatus expectedStatus,
             ConcurrentDictionary<string, StatusTimestampIndex> indexMap,
             ConcurrentDictionary<string, object> lockMap,
-            Func<FileMetadata, DateTime?> timestampSelector)
+            Func<FileMetadata, DateTime?> timestampSelector,
+            ISet<string>? excludedFileKeys = null)
         {
             if (!indexMap.TryGetValue(tenantId, out var index) || index.Count == 0)
                 return Array.Empty<FileMetadata>();
@@ -1638,6 +1655,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             var restoreEntries = new List<StatusTimestampEntry>(limit);
             var selectedKeys = new HashSet<string>(StringComparer.Ordinal);
             var staleSkips = 0;
+            var deferredSkips = 0;
 
             // First lock section: dequeue candidates and validate them.
             // Valid entries (added to results) are collected in restoreEntries so they can be
@@ -1647,6 +1665,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             {
                 while (results.Count < limit
                     && staleSkips < MaxStatusIndexStaleSkipsPerCall
+                    && deferredSkips < MaxStatusIndexDeferredSkipsPerCall
                     && index.TryPeek(out var peek))
                 {
                     if (peek.TimestampUtc >= cutoffUtc)
@@ -1683,6 +1702,13 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     if (!selectedKeys.Add(candidate.FileKey))
                     {
                         staleSkips++;
+                        continue;
+                    }
+
+                    if (excludedFileKeys != null && excludedFileKeys.Contains(candidate.FileKey))
+                    {
+                        deferredSkips++;
+                        restoreEntries.Add(candidate);
                         continue;
                     }
 

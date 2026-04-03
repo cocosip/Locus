@@ -77,6 +77,30 @@ namespace Locus.MultiTenant.Tests
         }
 
         [Fact]
+        public async Task TryGetTenantAsync_ReturnsNull_WhenTenantNotFound()
+        {
+            var tenant = await _tenantManager.TryGetTenantAsync("nonexistent-tenant", CancellationToken.None);
+
+            Assert.Null(tenant);
+        }
+
+        [Fact]
+        public async Task TryGetTenantAsync_DoesNotAutoCreate_WhenAutoCreateEnabled()
+        {
+            var fileSystem = new MockFileSystem();
+            var tenantManager = new TenantManager(
+                fileSystem,
+                NullLogger<TenantManager>.Instance,
+                ".locus/tenants",
+                autoCreateTenants: true);
+
+            var tenant = await tenantManager.TryGetTenantAsync("tenant-auto-skip", CancellationToken.None);
+
+            Assert.Null(tenant);
+            Assert.False(fileSystem.File.Exists(".locus/tenants/tenant-auto-skip.json"));
+        }
+
+        [Fact]
         public async Task IsTenantEnabledAsync_ReturnsTrue_WhenTenantIsEnabled()
         {
             // Arrange

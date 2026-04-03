@@ -432,6 +432,7 @@ namespace Locus.Storage
                 _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
             }
 
+            await ReconcileQuotaCountsAsync(tenant.TenantId, ct);
             Interlocked.Add(ref _orphanedFilesRecovered, rebuiltCount);
             _logger.LogInformation(
                 "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
@@ -478,6 +479,27 @@ namespace Locus.Storage
 
                 await RecoverOrphanedFilesAsync(tenant, ct);
             }
+
+            var reconcileTenantIds = new HashSet<string>(
+                await GetMetadataTenantIdsSnapshotAsync(ct),
+                StringComparer.Ordinal);
+
+            if (_tenantManager != null)
+            {
+                foreach (var quotaTenantId in await GetQuotaTenantIdsSnapshotAsync(ct))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var tenant = await _tenantManager.TryGetTenantAsync(quotaTenantId, ct);
+                    if (tenant != null)
+                        reconcileTenantIds.Add(quotaTenantId);
+                }
+            }
+
+            foreach (var tenantId in reconcileTenantIds)
+            {
+                ct.ThrowIfCancellationRequested();
+                await ReconcileQuotaCountsAsync(tenantId, ct);
+            }
         }
 
         private async Task<ITenantContext?> ResolveCleanupTenantAsync(string tenantId, CancellationToken ct = default)
@@ -488,27 +510,25 @@ namespace Locus.Storage
             if (_tenantManager == null)
                 return new CleanupTenantContext(tenantId);
 
-            try
-            {
-                var tenant = await _tenantManager.GetTenantAsync(tenantId, ct);
-                if (tenant.Status != TenantStatus.Enabled)
-                {
-                    _logger.LogInformation(
-                        "Skipping orphaned-file rebuild for tenant {TenantId} because tenant status is {Status}",
-                        tenantId,
-                        tenant.Status);
-                    return null;
-                }
-
-                return tenant;
-            }
-            catch (TenantNotFoundException)
+            var tenant = await _tenantManager.TryGetTenantAsync(tenantId, ct);
+            if (tenant == null)
             {
                 _logger.LogInformation(
                     "Skipping orphaned-file rebuild for tenant {TenantId} because tenant metadata was not found",
                     tenantId);
                 return null;
             }
+
+            if (tenant.Status != TenantStatus.Enabled)
+            {
+                _logger.LogInformation(
+                    "Skipping orphaned-file rebuild for tenant {TenantId} because tenant status is {Status}",
+                    tenantId,
+                    tenant.Status);
+                return null;
+            }
+
+            return tenant;
         }
 
         private string GetOrphanScanKey(string tenantId, string volumeId)
@@ -681,6 +701,41 @@ namespace Locus.Storage
             }
         }
 
+        private async Task ReconcileQuotaCountsAsync(string tenantId, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            var metadataEntries = (await _metadataRepository.GetByTenantAsync(tenantId, ct)).ToArray();
+            var expectedTenantCount = metadataEntries.Length;
+            var expectedDirectoryCounts = metadataEntries
+                .GroupBy(
+                    metadata => DirectoryPathNormalizer.Normalize(metadata.DirectoryPath),
+                    StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+
+            var knownDirectoryPaths = new HashSet<string>(
+                (await _quotaRepository.GetAllAsync(tenantId, ct))
+                    .Select(quota => quota.DirectoryPath)
+                    .Where(directoryPath => !string.IsNullOrWhiteSpace(directoryPath)
+                        && !string.Equals(directoryPath, tenantId, StringComparison.Ordinal)),
+                StringComparer.Ordinal);
+
+            foreach (var directoryPath in expectedDirectoryCounts.Keys)
+                knownDirectoryPaths.Add(directoryPath);
+
+            foreach (var directoryPath in knownDirectoryPaths)
+            {
+                var expectedDirectoryCount = expectedDirectoryCounts.TryGetValue(directoryPath, out var count)
+                    ? count
+                    : 0;
+                await _quotaRepository.SetCurrentCountAsync(tenantId, directoryPath, expectedDirectoryCount, ct);
+            }
+
+            if (_tenantQuotaManager is ITenantQuotaReconciliationManager tenantQuotaReconciliationManager)
+                await tenantQuotaReconciliationManager.SetFileCountAsync(tenantId, expectedTenantCount, ct);
+        }
+
         /// <inheritdoc/>
         public async Task CleanupTimedOutProcessingFilesAsync(TimeSpan timeout, CancellationToken ct = default)
         {
@@ -801,6 +856,7 @@ namespace Locus.Storage
             int removedCount = 0;
             long spaceFreed = 0;
             var physicalPathExistsCache = new Dictionary<string, bool>(_pathComparer);
+            var blockedFileKeys = new HashSet<string>(StringComparer.Ordinal);
 
             while (true)
             {
@@ -809,6 +865,7 @@ namespace Locus.Storage
                     tenantId,
                     failedCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
+                    blockedFileKeys,
                     ct);
                 if (batch.Count == 0)
                 {
@@ -821,7 +878,10 @@ namespace Locus.Storage
                 foreach (var metadata in batch)
                 {
                     if (!metadata.LastFailedAt.HasValue)
+                    {
+                        blockedFileKeys.Add(metadata.FileKey);
                         continue;
+                    }
 
                     var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
                     if (string.IsNullOrWhiteSpace(metadata.DirectoryPath))
@@ -840,6 +900,7 @@ namespace Locus.Storage
                             "Skipping permanently failed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
                             metadata.VolumeId,
                             metadata.PhysicalPath);
+                        blockedFileKeys.Add(metadata.FileKey);
                         continue;
                     }
 
@@ -861,6 +922,7 @@ namespace Locus.Storage
                             ct);
                         if (!metadataRemoved)
                         {
+                            blockedFileKeys.Add(metadata.FileKey);
                             await RollbackPermanentlyFailedCleanupAsync(
                                 metadata,
                                 normalizedDirectoryPath,
@@ -896,6 +958,7 @@ namespace Locus.Storage
                         _logger.LogWarning(ex,
                             "Failed to cleanup permanently-failed file. Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
                             metadata.TenantId, normalizedDirectoryPath, metadata.FileKey);
+                        blockedFileKeys.Add(metadata.FileKey);
                         await RollbackPermanentlyFailedCleanupAsync(
                             metadata,
                             normalizedDirectoryPath,
@@ -910,14 +973,6 @@ namespace Locus.Storage
                 }
 
                 RecordStatusCleanupIteration("failed_cleanup", tenantId, batch.Count, iterationStartedAt);
-
-                if (removedThisIteration == 0)
-                {
-                    _logger.LogWarning(
-                        "Stopping permanently-failed cleanup for tenant {TenantId} because the current batch made no progress",
-                        tenantId);
-                    break;
-                }
 
                 if (batch.Count < _statusCleanupBatchSizePerTenant)
                     break;

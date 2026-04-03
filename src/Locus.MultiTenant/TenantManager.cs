@@ -76,6 +76,18 @@ namespace Locus.MultiTenant
         /// <inheritdoc/>
         public async Task<ITenantContext> GetTenantAsync(string tenantId, CancellationToken ct = default)
         {
+            var tenant = await GetTenantInternalAsync(tenantId, allowAutoCreate: true, ct);
+            return tenant ?? throw new TenantNotFoundException(tenantId);
+        }
+
+        /// <inheritdoc/>
+        public Task<ITenantContext?> TryGetTenantAsync(string tenantId, CancellationToken ct = default)
+        {
+            return GetTenantInternalAsync(tenantId, allowAutoCreate: false, ct);
+        }
+
+        private async Task<ITenantContext?> GetTenantInternalAsync(string tenantId, bool allowAutoCreate, CancellationToken ct)
+        {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("Tenant ID cannot be null or whitespace.", nameof(tenantId));
 
@@ -103,7 +115,7 @@ namespace Locus.MultiTenant
                 var metadata = await LoadTenantMetadataAsync(tenantId, ct);
                 if (metadata == null)
                 {
-                    if (_autoCreateTenants)
+                    if (allowAutoCreate && _autoCreateTenants)
                     {
                         _logger.LogInformation("Auto-creating tenant: {TenantId}", tenantId);
                         await CreateTenantInternalAsync(tenantId, ct);
@@ -114,7 +126,7 @@ namespace Locus.MultiTenant
                     }
                     else
                     {
-                        throw new TenantNotFoundException(tenantId);
+                        return null;
                     }
                 }
 

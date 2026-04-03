@@ -18,6 +18,14 @@ namespace Locus.Core.Abstractions
         Task<ITenantContext> GetTenantAsync(string tenantId, CancellationToken ct = default);
 
         /// <summary>
+        /// Tries to get the tenant context for the specified tenant ID without auto-creating it.
+        /// </summary>
+        /// <param name="tenantId">The unique tenant identifier.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>The tenant context if it exists; otherwise, null.</returns>
+        Task<ITenantContext?> TryGetTenantAsync(string tenantId, CancellationToken ct = default);
+
+        /// <summary>
         /// Checks whether a tenant is enabled and can perform operations.
         /// </summary>
         /// <param name="tenantId">The unique tenant identifier.</param>

@@ -14,7 +14,7 @@ namespace Locus.Storage
     /// Supports global default quota and per-tenant specific quotas.
     /// Uses DirectoryQuotaRepository internally (treating tenantId as directoryPath).
     /// </summary>
-    public class TenantQuotaManager : ITenantQuotaManager, ITenantQuotaCompensationManager
+    public class TenantQuotaManager : ITenantQuotaManager, ITenantQuotaCompensationManager, ITenantQuotaReconciliationManager
     {
         private const string GLOBAL_QUOTA_KEY = "_GLOBAL_QUOTA_";
         private readonly DirectoryQuotaRepository _repository;
@@ -241,6 +241,20 @@ namespace Locus.Storage
             await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
 
             _logger.LogDebug("Compensated file count for tenant {TenantId}", tenantId);
+        }
+
+        /// <inheritdoc/>
+        public async Task SetFileCountAsync(string tenantId, int count, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (count < 0)
+                throw new ArgumentException("Count cannot be negative", nameof(count));
+
+            await _repository.SetCurrentCountAsync(tenantId, tenantId, count, ct);
+
+            _logger.LogDebug("Reconciled file count for tenant {TenantId}: {Count}", tenantId, count);
         }
     }
 }
