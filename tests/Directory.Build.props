@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <!-- Disable Microsoft.CodeCoverage referenced path maps for test projects.
+         On the current Windows environment these generated mapping files fail
+         with MSB3491 and prevent local test builds from running. -->
+    <DisableMsCoverageReferencedPathMaps>true</DisableMsCoverageReferencedPathMaps>
+
+  </PropertyGroup>
+</Project>

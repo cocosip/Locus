@@ -1,0 +1,6 @@
+<Project>
+  <!-- Override coverlet source-root mapping generation for test projects.
+       This avoids MSB3491 on the current Windows environment while keeping
+       the collector package reference intact. -->
+  <Target Name="ReferencedPathMaps" />
+</Project>

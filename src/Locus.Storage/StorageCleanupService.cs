@@ -432,11 +432,19 @@ namespace Locus.Storage
                 _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
             }
 
-            await ReconcileQuotaCountsAsync(tenant.TenantId, ct);
             Interlocked.Add(ref _orphanedFilesRecovered, rebuiltCount);
-            _logger.LogInformation(
-                "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
-                tenant.TenantId, rebuiltCount);
+
+            if (rebuiltCount > 0)
+            {
+                await PruneZeroCountUnlimitedQuotaEntriesAsync(tenant.TenantId, ct);
+                _logger.LogInformation(
+                    "Orphaned file rebuild complete for tenant {TenantId}: {Count} file(s) re-queued as Pending",
+                    tenant.TenantId, rebuiltCount);
+            }
+            else
+            {
+                _logger.LogDebug("No orphaned files found for tenant {TenantId}", tenant.TenantId);
+            }
         }
 
         /// <inheritdoc/>
@@ -478,27 +486,6 @@ namespace Locus.Storage
                     continue;
 
                 await RecoverOrphanedFilesAsync(tenant, ct);
-            }
-
-            var reconcileTenantIds = new HashSet<string>(
-                await GetMetadataTenantIdsSnapshotAsync(ct),
-                StringComparer.Ordinal);
-
-            if (_tenantManager != null)
-            {
-                foreach (var quotaTenantId in await GetQuotaTenantIdsSnapshotAsync(ct))
-                {
-                    ct.ThrowIfCancellationRequested();
-                    var tenant = await _tenantManager.TryGetTenantAsync(quotaTenantId, ct);
-                    if (tenant != null)
-                        reconcileTenantIds.Add(quotaTenantId);
-                }
-            }
-
-            foreach (var tenantId in reconcileTenantIds)
-            {
-                ct.ThrowIfCancellationRequested();
-                await ReconcileQuotaCountsAsync(tenantId, ct);
             }
         }
 
@@ -701,7 +688,8 @@ namespace Locus.Storage
             }
         }
 
-        private async Task ReconcileQuotaCountsAsync(string tenantId, CancellationToken ct = default)
+        /// <inheritdoc/>
+        public async Task ReconcileQuotaCountsAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -714,12 +702,12 @@ namespace Locus.Storage
                     StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
 
-            var knownDirectoryPaths = new HashSet<string>(
-                (await _quotaRepository.GetAllAsync(tenantId, ct))
-                    .Select(quota => quota.DirectoryPath)
-                    .Where(directoryPath => !string.IsNullOrWhiteSpace(directoryPath)
-                        && !string.Equals(directoryPath, tenantId, StringComparison.Ordinal)),
-                StringComparer.Ordinal);
+            var existingDirectoryQuotas = (await _quotaRepository.GetAllAsync(tenantId, ct))
+                .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
+                    && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
+                .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
+
+            var knownDirectoryPaths = new HashSet<string>(existingDirectoryQuotas.Keys, StringComparer.Ordinal);
 
             foreach (var directoryPath in expectedDirectoryCounts.Keys)
                 knownDirectoryPaths.Add(directoryPath);
@@ -729,11 +717,74 @@ namespace Locus.Storage
                 var expectedDirectoryCount = expectedDirectoryCounts.TryGetValue(directoryPath, out var count)
                     ? count
                     : 0;
+
+                if (expectedDirectoryCount == 0
+                    && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
+                    && !HasExplicitQuotaLimit(existingQuota))
+                {
+                    await _quotaRepository.RemoveAsync(tenantId, directoryPath, ct);
+                    continue;
+                }
+
                 await _quotaRepository.SetCurrentCountAsync(tenantId, directoryPath, expectedDirectoryCount, ct);
             }
 
             if (_tenantQuotaManager is ITenantQuotaReconciliationManager tenantQuotaReconciliationManager)
                 await tenantQuotaReconciliationManager.SetFileCountAsync(tenantId, expectedTenantCount, ct);
+        }
+
+        /// <inheritdoc/>
+        public async Task ReconcileAllQuotaCountsAsync(CancellationToken ct = default)
+        {
+            var reconcileTenantIds = new HashSet<string>(
+                await GetMetadataTenantIdsSnapshotAsync(ct),
+                StringComparer.Ordinal);
+
+            if (_tenantManager != null)
+            {
+                foreach (var quotaTenantId in await GetQuotaTenantIdsSnapshotAsync(ct))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var tenant = await _tenantManager.TryGetTenantAsync(quotaTenantId, ct);
+                    if (tenant != null)
+                        reconcileTenantIds.Add(quotaTenantId);
+                }
+            }
+
+            foreach (var tenantId in reconcileTenantIds)
+            {
+                ct.ThrowIfCancellationRequested();
+                await ReconcileQuotaCountsAsync(tenantId, ct);
+            }
+        }
+
+        private async Task PruneZeroCountUnlimitedQuotaEntriesAsync(string tenantId, CancellationToken ct = default)
+        {
+            var quotas = (await _quotaRepository.GetAllAsync(tenantId, ct)).ToArray();
+
+            foreach (var quota in quotas)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (string.IsNullOrWhiteSpace(quota.DirectoryPath))
+                    continue;
+
+                if (quota.CurrentCount != 0)
+                    continue;
+
+                if (HasExplicitQuotaLimit(quota))
+                    continue;
+
+                await _quotaRepository.RemoveAsync(tenantId, quota.DirectoryPath, ct);
+            }
+        }
+
+        private static bool HasExplicitQuotaLimit(DirectoryQuota quota)
+        {
+            if (quota == null)
+                throw new ArgumentNullException(nameof(quota));
+
+            return quota.MaxCount > 0;
         }
 
         /// <inheritdoc/>

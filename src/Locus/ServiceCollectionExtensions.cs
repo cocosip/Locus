@@ -279,6 +279,13 @@ namespace Locus
                 services.AddHostedService<OrphanFileRecoveryService>();
             }
 
+            // Register quota reconciliation maintenance service if enabled
+            if (options.EnableQuotaReconciliation)
+            {
+                services.AddSingleton(options.QuotaReconciliationOptions);
+                services.AddHostedService<QuotaReconciliationService>();
+            }
+
             // Register database health check service if enabled
             if (options.EnableDatabaseHealthCheck)
             {

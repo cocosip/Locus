@@ -53,6 +53,21 @@ namespace Locus.Core.Abstractions
         Task RecoverAllOrphanedFilesAsync(CancellationToken ct = default);
 
         /// <summary>
+        /// Reconciles quota counters for a single tenant by recomputing counts from metadata.
+        /// This is a maintenance action and is not intended for the regular startup path.
+        /// </summary>
+        /// <param name="tenantId">The unique tenant identifier.</param>
+        /// <param name="ct">Cancellation token.</param>
+        Task ReconcileQuotaCountsAsync(string tenantId, CancellationToken ct = default);
+
+        /// <summary>
+        /// Reconciles quota counters across all known tenants by recomputing counts from metadata.
+        /// This is a maintenance action and is not intended for the regular startup path.
+        /// </summary>
+        /// <param name="ct">Cancellation token.</param>
+        Task ReconcileAllQuotaCountsAsync(CancellationToken ct = default);
+
+        /// <summary>
         /// Cleans up files that have been in processing state longer than the timeout threshold.
         /// </summary>
         /// <param name="timeout">The processing timeout threshold.</param>

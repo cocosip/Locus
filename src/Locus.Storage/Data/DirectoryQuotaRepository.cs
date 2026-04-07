@@ -1029,10 +1029,6 @@ ON CONFLICT(directory_path) DO UPDATE SET
             state.MaxCount = snapshot.MaxCount;
             state.Enabled = snapshot.Enabled;
             state.Dirty = false;
-
-            _logger.LogDebug(
-                "Set current count for directory {DirectoryPath}, Tenant: {TenantId}: {CurrentCount}/{MaxCount}",
-                directoryPath, tenantId, count, state.MaxCount);
         }
 
         /// <summary>
@@ -1051,7 +1047,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
 
             var state = GetOrCreateAtomicState(tenantId, directoryPath);
 
-            // Fast-path: no limit configured or quota disabled â€?always allow.
+            // Fast-path: no limit configured or quota disabled; always allow.
             if (!state.Enabled || state.MaxCount == 0)
             {
                 Interlocked.Increment(ref state.Count);

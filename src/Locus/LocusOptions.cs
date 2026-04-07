@@ -63,6 +63,19 @@ namespace Locus
         public OrphanRecoveryOptions OrphanRecoveryOptions { get; set; } = new OrphanRecoveryOptions();
 
         /// <summary>
+        /// Gets or sets whether to enable the quota reconciliation maintenance service.
+        /// This service recomputes quota counters from metadata snapshots and should remain disabled
+        /// during normal runtime unless quota drift repair is explicitly required.
+        /// Default: false
+        /// </summary>
+        public bool EnableQuotaReconciliation { get; set; }
+
+        /// <summary>
+        /// Gets or sets the quota reconciliation maintenance options.
+        /// </summary>
+        public QuotaReconciliationOptions QuotaReconciliationOptions { get; set; } = new QuotaReconciliationOptions();
+
+        /// <summary>
         /// Gets or sets whether to enable database health check on startup.
         /// When enabled, all databases will be checked for corruption on application startup.
         /// Corrupted databases will be logged with instructions for recovery.

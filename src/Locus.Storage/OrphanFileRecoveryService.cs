@@ -34,12 +34,20 @@ namespace Locus.Storage
         /// <inheritdoc/>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
-            _logger.LogInformation("OrphanFileRecoveryService started (InitialDelay={InitialDelay}, RecoveryInterval={RecoveryInterval})",
-                _options.InitialDelay, _options.RecoveryInterval);
+            _logger.LogInformation(
+                "OrphanFileRecoveryService started (RunOnStartup={RunOnStartup}, InitialDelay={InitialDelay}, RecoveryInterval={RecoveryInterval})",
+                _options.RunOnStartup,
+                _options.InitialDelay,
+                _options.RecoveryInterval);
 
-            // Short initial delay to allow volumes to mount
-            if (_options.InitialDelay > TimeSpan.Zero)
-                await Task.Delay(_options.InitialDelay, stoppingToken);
+            var delayBeforeFirstRun = _options.RunOnStartup
+                ? _options.InitialDelay
+                : _options.RecoveryInterval;
+
+            if (delayBeforeFirstRun > TimeSpan.Zero)
+            {
+                await Task.Delay(delayBeforeFirstRun, stoppingToken);
+            }
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -86,8 +94,14 @@ namespace Locus.Storage
         public TimeSpan RecoveryInterval { get; set; } = TimeSpan.FromMinutes(30);
 
         /// <summary>
+        /// Gets or sets a value indicating whether the first recovery scan should run shortly after startup.
+        /// Default: false.
+        /// </summary>
+        public bool RunOnStartup { get; set; }
+
+        /// <summary>
         /// Gets or sets the initial delay before the first recovery scan.
-        /// Allows time for storage volumes to mount before scanning.
+        /// Applies only when <see cref="RunOnStartup"/> is enabled and allows time for storage volumes to mount.
         /// Default: 10 seconds.
         /// </summary>
         public TimeSpan InitialDelay { get; set; } = TimeSpan.FromSeconds(10);

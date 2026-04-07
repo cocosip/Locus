@@ -870,7 +870,20 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task RecoverOrphanedFilesAsync_ReconcilesQuotaDown_WhenQuotaOvercountsLiveFiles()
+        public async Task RecoverAllOrphanedFilesAsync_DoesNotReconcileQuotaOnlyTenantsWithoutOrphans()
+        {
+            await ((ITenantQuotaReconciliationManager)_tenantQuotaManager)
+                .SetFileCountAsync("tenant-quota-only", 2, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync("tenant-quota-only", "/stale", 2, CancellationToken.None);
+
+            await _cleanupService.RecoverAllOrphanedFilesAsync(CancellationToken.None);
+
+            Assert.Equal(2, await _tenantQuotaManager.GetFileCountAsync("tenant-quota-only", CancellationToken.None));
+            Assert.Equal(2, (await _quotaRepository.GetAsync("tenant-quota-only", "/stale", CancellationToken.None))?.CurrentCount);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_DoesNotReconcileQuota_WhenNoOrphansFound()
         {
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
             _fileSystem.Directory.CreateDirectory(tenantPath);
@@ -881,12 +894,48 @@ namespace Locus.Storage.Tests
 
             await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
 
-            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
-            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/stale", CancellationToken.None)).CurrentCount);
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(1, (await _quotaRepository.GetAsync("tenant-001", "/stale", CancellationToken.None))?.CurrentCount);
         }
 
         [Fact]
-        public async Task RecoverOrphanedFilesAsync_ReconcilesQuotaUp_WhenMetadataStillOwnsTheFile()
+        public async Task ReconcileQuotaCountsAsync_PrunesUnlimitedZeroCountRowsAndResetsTenantCount()
+        {
+            await ((ITenantQuotaReconciliationManager)_tenantQuotaManager)
+                .SetFileCountAsync("tenant-001", 1, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync("tenant-001", "/stale", 1, CancellationToken.None);
+
+            await _cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
+
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Null(await _quotaRepository.GetAsync("tenant-001", "/stale", CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task ReconcileQuotaCountsAsync_KeepsExplicitLimitRowsAtZero()
+        {
+            var existing = await _quotaRepository.GetOrCreateAsync("tenant-001", "/limited", CancellationToken.None);
+            await _quotaRepository.UpdateAsync("tenant-001", new DirectoryQuota
+            {
+                DirectoryPath = "/limited",
+                CurrentCount = 0,
+                MaxCount = 5,
+                Enabled = true,
+                CreatedAt = existing.CreatedAt,
+                LastUpdated = existing.LastUpdated,
+            }, CancellationToken.None);
+
+            await _cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
+
+            var limitedQuota = await _quotaRepository.GetAsync("tenant-001", "/limited", CancellationToken.None);
+            Assert.NotNull(limitedQuota);
+            Assert.Equal(0, limitedQuota.CurrentCount);
+            Assert.Equal(5, limitedQuota.MaxCount);
+            Assert.True(limitedQuota.Enabled);
+        }
+
+        [Fact]
+        public async Task ReconcileQuotaCountsAsync_ReconcilesQuotaUp_WhenMetadataStillOwnsTheFile()
         {
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
             _fileSystem.Directory.CreateDirectory(tenantPath);
@@ -905,7 +954,7 @@ namespace Locus.Storage.Tests
                 Status = FileProcessingStatus.Pending
             }, CancellationToken.None);
 
-            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+            await _cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
 
             Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
             Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/", CancellationToken.None)).CurrentCount);
