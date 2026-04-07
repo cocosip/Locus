@@ -165,9 +165,17 @@ namespace Locus.IntegrationTests
             }
             await fileScheduler.MarkAsCompletedAsync(file1.Lease!, default);
 
-            // Assert - File deleted
-            await Assert.ThrowsAsync<FileNotFoundException>(() =>
-                storagePool.ReadFileAsync(tenant!, file1.FileKey, default));
+            // Assert - File is marked completed and physical content is still readable.
+            // Physical deletion is now handled asynchronously by background cleanup/reaper.
+            var file1Status = await fileScheduler.GetFileStatusAsync(tenant!.TenantId, file1.FileKey, default);
+            Assert.Equal(FileProcessingStatus.Completed, file1Status);
+
+            using (var completedStream = await storagePool.ReadFileAsync(tenant!, file1.FileKey, default))
+            using (var completedReader = new StreamReader(completedStream))
+            {
+                var completedContent = await completedReader.ReadToEndAsync();
+                Assert.Equal("File 1", completedContent);
+            }
 
             // Act - Get second file and fail it
             var file2 = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);

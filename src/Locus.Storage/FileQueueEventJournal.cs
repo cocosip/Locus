@@ -69,6 +69,7 @@ namespace Locus.Storage
             await appendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                var state = LoadJournalState(record.TenantId);
                 var tenantDirectory = GetTenantDirectory(record.TenantId);
                 if (!_fileSystem.Directory.Exists(tenantDirectory))
                     _fileSystem.Directory.CreateDirectory(tenantDirectory);
@@ -81,10 +82,12 @@ namespace Locus.Storage
                 {
                     await stream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
                     await stream.FlushAsync(ct).ConfigureAwait(false);
+
+                    // Use the actual physical file length after the append so logical tail offset
+                    // stays consistent even when queue.state.json does not exist yet.
+                    state.TailOffset = state.BaseOffset + stream.Length;
                 }
 
-                var state = LoadJournalState(record.TenantId);
-                state.TailOffset += bytes.Length;
                 SaveJournalState(record.TenantId, state);
             }
             finally

@@ -18,7 +18,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
-    public class StoragePoolTests : IDisposable, IAsyncLifetime
+    public class StoragePoolTests : IAsyncLifetime
     {
         private readonly IFileSystem _fileSystem;
         private readonly MetadataRepository _metadataRepository;
@@ -51,10 +51,18 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(_quotaPath);
 
             var metadataRepoLogger = new Mock<ILogger<MetadataRepository>>();
-            _metadataRepository = new MetadataRepository(_fileSystem, metadataRepoLogger.Object, _metadataPath);
+            _metadataRepository = new MetadataRepository(
+                _fileSystem,
+                metadataRepoLogger.Object,
+                _metadataPath,
+                enableBackgroundPersistence: false);
 
             var quotaRepoLogger = new Mock<ILogger<DirectoryQuotaRepository>>();
-            _quotaRepository = new DirectoryQuotaRepository(_fileSystem, quotaRepoLogger.Object, _quotaPath);
+            _quotaRepository = new DirectoryQuotaRepository(
+                _fileSystem,
+                quotaRepoLogger.Object,
+                _quotaPath,
+                enableBackgroundFlush: false);
 
             // Setup tenant quota manager mock
             _tenantQuotaManager = new Mock<ITenantQuotaManager>();
@@ -219,20 +227,13 @@ namespace Locus.Storage.Tests
             // Clear SQLite connection pool to release file handles
             SqliteConnection.ClearAllPools();
 
-            // Give the background persistence loop time to flush pending operations
-            await Task.Delay(100);
-
             // Cleanup temporary test directories
             // Delete volume paths first (actual data), then metadata and quota paths
             CleanupTestDirectory(_volume1Path);
             CleanupTestDirectory(_volume2Path);
             CleanupTestDirectory(_metadataPath);
             CleanupTestDirectory(_quotaPath);
-        }
-
-        public void Dispose()
-        {
-            DisposeAsync().GetAwaiter().GetResult();
+            await Task.CompletedTask;
         }
 
         private void CleanupTestDirectory(string path)

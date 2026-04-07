@@ -27,6 +27,9 @@ namespace Locus.Storage.Tests
                 .Setup(s => s.CleanupOrphanedMetadataAsync(It.IsAny<CancellationToken>()))
                 .ReturnsAsync(0);
             cleanupService
+                .Setup(s => s.CleanupCompletedFilesAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            cleanupService
                 .Setup(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
             cleanupService
@@ -54,10 +57,11 @@ namespace Locus.Storage.Tests
                 },
                 logger.Object);
 
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.RunAsync(cts.Token));
+            await service.RunAsync(cts.Token);
 
             cleanupService.Verify(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()), Times.Once);
             fileScheduler.Verify(s => s.CleanupOrphanedMetadataAsync(It.IsAny<CancellationToken>()), Times.Once);
+            cleanupService.Verify(s => s.CleanupCompletedFilesAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupInvalidDatabaseFilesAsync(It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.GetCleanupStatisticsAsync(It.IsAny<CancellationToken>()), Times.Once);

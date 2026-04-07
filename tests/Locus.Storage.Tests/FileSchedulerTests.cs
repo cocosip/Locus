@@ -36,7 +36,11 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(_metadataDir);
 
             var repoLogger = new Mock<ILogger<MetadataRepository>>();
-            _repository = new MetadataRepository(_fileSystem, repoLogger.Object, _metadataDir);
+            _repository = new MetadataRepository(
+                _fileSystem,
+                repoLogger.Object,
+                _metadataDir,
+                enableBackgroundPersistence: false);
 
             _logger = new Mock<ILogger<FileScheduler>>();
             _scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object);

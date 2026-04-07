@@ -143,13 +143,24 @@ namespace Locus.Storage
                         stats.OrphanedFilesRecovered,
                         stats.SpaceFreed / 1024 / 1024);
                 }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error during scheduled cleanup");
                 }
 
                 // Wait for next cleanup interval
-                await Task.Delay(_options.CleanupInterval, stoppingToken);
+                try
+                {
+                    await Task.Delay(_options.CleanupInterval, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
 
             _logger.LogInformation("BackgroundCleanupService stopped");

@@ -295,6 +295,7 @@ namespace Locus.Storage.Data
             };
 
             _logger.LogWarning("Starting THREAD-SAFE quota database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
+            var rebuiltFromMetadata = false;
 
             try
             {
@@ -313,55 +314,74 @@ namespace Locus.Storage.Data
                 }
 
                 if (await TryRebuildQuotaFromMetadataAsync(tenantId, volumePaths, result, ct).ConfigureAwait(false))
-                    return result;
-
-                // Step 2: Scan directories and rebuild quotas
-                var directoryCounts = new Dictionary<string, int>();
-
-                foreach (var volumePath in volumePaths)
                 {
-                    var tenantPath = _fileSystem.Path.Combine(volumePath, tenantId);
-                    if (!_fileSystem.Directory.Exists(tenantPath))
-                        continue;
-
-                    ScanDirectoryRecursive(tenantPath, tenantPath, directoryCounts);
+                    rebuiltFromMetadata = true;
                 }
-
-                // Rebuild quota records
-                var rebuiltQuotas = 0;
-                foreach (var kvp in directoryCounts)
+                else
                 {
-                    ct.ThrowIfCancellationRequested();
+                    // Step 2: Scan directories and rebuild quotas
+                    var directoryCounts = new Dictionary<string, int>();
 
-                    try
+                    foreach (var volumePath in volumePaths)
                     {
-                        // BeginDatabaseRebuildAsync already holds the tenant lock (via the handle).
-                        // Use the rebuild-specific path to avoid re-acquiring the same lock and deadlocking.
-                        await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, kvp.Key, kvp.Value, ct);
-                        rebuiltQuotas++;
+                        var tenantPath = _fileSystem.Path.Combine(volumePath, tenantId);
+                        if (!_fileSystem.Directory.Exists(tenantPath))
+                            continue;
 
-                        _logger.LogDebug("Rebuilt quota for directory: {DirectoryPath}, Count: {Count}",
-                            kvp.Key, kvp.Value);
+                        ScanDirectoryRecursive(tenantPath, tenantPath, directoryCounts);
                     }
-                    catch (Exception ex)
+
+                    // Rebuild quota records
+                    var rebuiltQuotas = 0;
+                    foreach (var kvp in directoryCounts)
                     {
-                        result.Errors.Add($"Failed to rebuild quota for {kvp.Key}: {ex.Message}");
-                        _logger.LogWarning(ex, "Failed to rebuild quota for directory {DirectoryPath}", kvp.Key);
+                        ct.ThrowIfCancellationRequested();
+
+                        try
+                        {
+                            // BeginDatabaseRebuildAsync already holds the tenant lock (via the handle).
+                            // Use the rebuild-specific path to avoid re-acquiring the same lock and deadlocking.
+                            await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, kvp.Key, kvp.Value, ct);
+                            rebuiltQuotas++;
+
+                            _logger.LogDebug("Rebuilt quota for directory: {DirectoryPath}, Count: {Count}",
+                                kvp.Key, kvp.Value);
+                        }
+                        catch (Exception ex)
+                        {
+                            result.Errors.Add($"Failed to rebuild quota for {kvp.Key}: {ex.Message}");
+                            _logger.LogWarning(ex, "Failed to rebuild quota for directory {DirectoryPath}", kvp.Key);
+                        }
                     }
+
+                    result.RecordsRebuilt = rebuiltQuotas;
+                    result.Success = true;
+
+                    _logger.LogInformation(
+                        "Quota database rebuild completed for tenant {TenantId}. Rebuilt {Count} records",
+                        tenantId, rebuiltQuotas);
                 }
-
-                result.RecordsRebuilt = rebuiltQuotas;
-                result.Success = true;
-
-                _logger.LogInformation(
-                    "Quota database rebuild completed for tenant {TenantId}. Rebuilt {Count} records",
-                    tenantId, rebuiltQuotas);
             }
             catch (Exception ex)
             {
                 result.Success = false;
                 result.Errors.Add($"Rebuild failed: {ex.Message}");
                 _logger.LogError(ex, "Failed to rebuild quota database for tenant {TenantId}", tenantId);
+            }
+
+            if (rebuiltFromMetadata && _storageCleanupService != null)
+            {
+                try
+                {
+                    await _storageCleanupService.ReconcileQuotaCountsAsync(tenantId, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Post-rebuild quota reconciliation callback failed for tenant {TenantId} after metadata-based recovery",
+                        tenantId);
+                }
             }
 
             return result;
@@ -561,9 +581,6 @@ namespace Locus.Storage.Data
             DatabaseRebuildResult result,
             CancellationToken ct)
         {
-            if (_storageCleanupService == null)
-                return false;
-
             try
             {
                 var metadataCount = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
@@ -603,7 +620,45 @@ namespace Locus.Storage.Data
                     return true;
                 }
 
-                await _storageCleanupService.ReconcileQuotaCountsAsync(tenantId, ct).ConfigureAwait(false);
+                var expectedDirectoryCounts = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false))
+                    .GroupBy(
+                        metadata => DirectoryPathNormalizer.Normalize(metadata.DirectoryPath),
+                        StringComparer.Ordinal)
+                    .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+
+                var existingDirectoryQuotas = (await _quotaRepository.GetAllAsync(tenantId, ct).ConfigureAwait(false))
+                    .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
+                        && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
+                    .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
+
+                var knownDirectoryPaths = new HashSet<string>(existingDirectoryQuotas.Keys, StringComparer.Ordinal);
+                foreach (var directoryPath in expectedDirectoryCounts.Keys)
+                    knownDirectoryPaths.Add(directoryPath);
+
+                foreach (var directoryPath in knownDirectoryPaths)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var expectedDirectoryCount = expectedDirectoryCounts.TryGetValue(directoryPath, out var count)
+                        ? count
+                        : 0;
+
+                    if (expectedDirectoryCount == 0
+                        && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
+                        && !HasExplicitQuotaLimit(existingQuota))
+                    {
+                        await _quotaRepository.RemoveAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    await _quotaRepository.SetCurrentCountForRebuildAsync(
+                        tenantId,
+                        directoryPath,
+                        expectedDirectoryCount,
+                        ct).ConfigureAwait(false);
+                }
+
+                await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, tenantId, metadataCount, ct).ConfigureAwait(false);
                 result.RecordsRebuilt = (await _quotaRepository.GetAllAsync(tenantId, ct).ConfigureAwait(false)).Count();
                 result.Success = true;
                 _logger.LogInformation(
@@ -622,6 +677,14 @@ namespace Locus.Storage.Data
                 result.Errors.Add($"Metadata-based quota recovery failed: {ex.Message}");
                 return false;
             }
+        }
+
+        private static bool HasExplicitQuotaLimit(DirectoryQuota quota)
+        {
+            if (quota == null)
+                throw new ArgumentNullException(nameof(quota));
+
+            return quota.MaxCount > 0;
         }
 
         private bool HasAnyPhysicalFilesForTenant(string tenantId, IEnumerable<string> volumePaths)

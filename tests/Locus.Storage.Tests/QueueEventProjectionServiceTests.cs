@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
@@ -17,6 +18,7 @@ namespace Locus.Storage.Tests
     public class QueueEventProjectionServiceTests : IDisposable
     {
         private readonly IFileSystem _fileSystem;
+        private readonly List<IDisposable> _trackedDisposables;
         private readonly string _rootDirectory;
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
@@ -28,6 +30,7 @@ namespace Locus.Storage.Tests
         public QueueEventProjectionServiceTests()
         {
             _fileSystem = new System.IO.Abstractions.FileSystem();
+            _trackedDisposables = new List<IDisposable>();
             _rootDirectory = Path.Combine(Path.GetTempPath(), $"locus-test-projector-{Guid.NewGuid():N}");
             _metadataDirectory = Path.Combine(_rootDirectory, "metadata");
             _quotaDirectory = Path.Combine(_rootDirectory, "quota");
@@ -42,11 +45,13 @@ namespace Locus.Storage.Tests
             _metadataRepository = new MetadataRepository(
                 _fileSystem,
                 new Mock<ILogger<MetadataRepository>>().Object,
-                _metadataDirectory);
+                _metadataDirectory,
+                enableBackgroundPersistence: false);
             _quotaRepository = new DirectoryQuotaRepository(
                 _fileSystem,
                 new Mock<ILogger<DirectoryQuotaRepository>>().Object,
-                _quotaDirectory);
+                _quotaDirectory,
+                enableBackgroundFlush: false);
         }
 
         [Fact]
@@ -81,7 +86,7 @@ namespace Locus.Storage.Tests
                 FileExtension = ".dcm"
             }, CancellationToken.None);
 
-            var service = new QueueEventProjectionService(
+            var service = TrackDisposable(new QueueEventProjectionService(
                 journal,
                 _metadataRepository,
                 tenantQuotaManager,
@@ -98,7 +103,7 @@ namespace Locus.Storage.Tests
                     IdleCycleDelay = TimeSpan.FromMilliseconds(10),
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
-                new Mock<ILogger<QueueEventProjectionService>>().Object);
+                new Mock<ILogger<QueueEventProjectionService>>().Object));
 
             await service.StartAsync(CancellationToken.None);
             try
@@ -812,7 +817,7 @@ namespace Locus.Storage.Tests
             await _quotaRepository.SetCurrentCountAsync(tenantId, directoryPath, 3, CancellationToken.None);
             await _quotaRepository.SetCurrentCountAsync(tenantId, staleDirectoryPath, 2, CancellationToken.None);
 
-            var service = new QueueEventProjectionService(
+            var service = TrackDisposable(new QueueEventProjectionService(
                 journal,
                 _metadataRepository,
                 tenantQuotaManager,
@@ -830,7 +835,7 @@ namespace Locus.Storage.Tests
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
                 new Mock<ILogger<QueueEventProjectionService>>().Object,
-                cleanupService);
+                cleanupService));
 
             var state = await service.RebuildTenantAsync(tenantId, CancellationToken.None);
 
@@ -872,7 +877,7 @@ namespace Locus.Storage.Tests
                 FileExtension = ".dcm"
             }, CancellationToken.None);
 
-            var service = new QueueEventProjectionService(
+            var service = TrackDisposable(new QueueEventProjectionService(
                 journal,
                 _metadataRepository,
                 tenantQuotaManager,
@@ -890,7 +895,7 @@ namespace Locus.Storage.Tests
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
                 new Mock<ILogger<QueueEventProjectionService>>().Object,
-                cleanupService);
+                cleanupService));
 
             var snapshotState = await service.SnapshotTenantAsync(tenantId, CancellationToken.None);
 
@@ -942,7 +947,7 @@ namespace Locus.Storage.Tests
                 Status = FileProcessingStatus.Pending
             }, CancellationToken.None);
 
-            var service = new QueueEventProjectionService(
+            var service = TrackDisposable(new QueueEventProjectionService(
                 journal,
                 _metadataRepository,
                 tenantQuotaManager,
@@ -962,7 +967,7 @@ namespace Locus.Storage.Tests
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
                 new Mock<ILogger<QueueEventProjectionService>>().Object,
-                cleanupService);
+                cleanupService));
 
             var replayState = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
             var baseOffset = await journal.GetBaseOffsetAsync(tenantId, CancellationToken.None);
@@ -995,6 +1000,17 @@ namespace Locus.Storage.Tests
 
         public void Dispose()
         {
+            foreach (var disposable in _trackedDisposables)
+            {
+                try
+                {
+                    disposable.Dispose();
+                }
+                catch
+                {
+                }
+            }
+
             _metadataRepository.Dispose();
             _quotaRepository.Dispose();
             SqliteConnection.ClearAllPools();
@@ -1069,7 +1085,7 @@ namespace Locus.Storage.Tests
             TenantQuotaManager tenantQuotaManager,
             DirectoryQuotaManager directoryQuotaManager)
         {
-            return new QueueEventProjectionService(
+            return TrackDisposable(new QueueEventProjectionService(
                 journal,
                 _metadataRepository,
                 tenantQuotaManager,
@@ -1086,7 +1102,14 @@ namespace Locus.Storage.Tests
                     IdleCycleDelay = TimeSpan.FromMilliseconds(10),
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
-                new Mock<ILogger<QueueEventProjectionService>>().Object);
+                new Mock<ILogger<QueueEventProjectionService>>().Object));
+        }
+
+        private T TrackDisposable<T>(T disposable)
+            where T : IDisposable
+        {
+            _trackedDisposables.Add(disposable);
+            return disposable;
         }
     }
 }

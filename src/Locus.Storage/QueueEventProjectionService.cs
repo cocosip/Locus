@@ -126,11 +126,14 @@ namespace Locus.Storage
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                while (await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false))
+                var cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
+                long? advancedCursorOffset;
+                while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
                 {
+                    cursorOffset = advancedCursorOffset.Value;
                 }
 
-                return await BuildTenantStateAsync(tenantId, ct).ConfigureAwait(false);
+                return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
             }
             finally
             {
@@ -171,8 +174,10 @@ namespace Locus.Storage
                 var cursorOffset = await NormalizeCursorOffsetAsync(tenantId, restoredCursorOffset ?? 0, ct).ConfigureAwait(false);
                 await SaveCursorAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
 
-                while (await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false))
+                long? advancedCursorOffset;
+                while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
                 {
+                    cursorOffset = advancedCursorOffset.Value;
                 }
 
                 if (_storageCleanupService != null)
@@ -190,7 +195,7 @@ namespace Locus.Storage
                     }
                 }
 
-                return await BuildTenantStateAsync(tenantId, ct).ConfigureAwait(false);
+                return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
             }
             finally
             {
@@ -206,7 +211,7 @@ namespace Locus.Storage
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                return await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false);
+                return (await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue;
             }
             finally
             {
@@ -214,7 +219,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task<bool> ProjectTenantCoreAsync(string tenantId, CancellationToken ct)
+        private async Task<long?> ProjectTenantCoreAsync(string tenantId, CancellationToken ct)
         {
             var offset = await LoadCursorAsync(tenantId, ct).ConfigureAwait(false);
             var batch = await _journal.ReadBatchAsync(tenantId, offset, _options.MaxRecordsPerTenantPerCycle, ct).ConfigureAwait(false);
@@ -223,10 +228,10 @@ namespace Locus.Storage
                 if (batch.NextOffset > offset)
                 {
                     await SaveCursorAsync(tenantId, batch.NextOffset, ct).ConfigureAwait(false);
-                    return true;
+                    return batch.NextOffset;
                 }
 
-                return false;
+                return null;
             }
 
             foreach (var record in batch.Records)
@@ -245,7 +250,7 @@ namespace Locus.Storage
             }
 
             await SaveCursorAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
-            return true;
+            return cursorOffset;
         }
 
         private async Task ProjectRecordAsync(QueueEventRecord record, CancellationToken ct)
@@ -277,7 +282,7 @@ namespace Locus.Storage
 
         private async Task ProjectAcceptedAsync(QueueEventRecord record, CancellationToken ct)
         {
-            var existing = await _metadataRepository.GetByFileKeyAsync(record.FileKey, ct).ConfigureAwait(false);
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing != null)
                 return;
 
@@ -287,7 +292,7 @@ namespace Locus.Storage
         private async Task ProjectProcessingStartedAsync(QueueEventRecord record, CancellationToken ct)
         {
             var eventProcessingStart = record.ProcessingStartTimeUtc ?? record.OccurredAtUtc;
-            var existing = await _metadataRepository.GetByFileKeyAsync(record.FileKey, ct).ConfigureAwait(false);
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing == null)
             {
                 existing = await EnsureMetadataExistsAsync(record, FileProcessingStatus.Processing, ct).ConfigureAwait(false);
@@ -312,7 +317,7 @@ namespace Locus.Storage
         private async Task ProjectProcessingFailedAsync(QueueEventRecord record, CancellationToken ct)
         {
             var status = record.Status ?? FileProcessingStatus.Pending;
-            var existing = await _metadataRepository.GetByFileKeyAsync(record.FileKey, ct).ConfigureAwait(false);
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing == null)
             {
                 existing = await EnsureMetadataExistsAsync(record, status, ct).ConfigureAwait(false);
@@ -340,7 +345,7 @@ namespace Locus.Storage
 
         private async Task ProjectProcessingCompletedAsync(QueueEventRecord record, CancellationToken ct)
         {
-            var existing = await _metadataRepository.GetByFileKeyAsync(record.FileKey, ct).ConfigureAwait(false);
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing == null)
             {
                 existing = await EnsureMetadataExistsAsync(record, FileProcessingStatus.Completed, ct).ConfigureAwait(false);
@@ -364,7 +369,7 @@ namespace Locus.Storage
 
         private async Task ProjectDeleteRequestedAsync(QueueEventRecord record, CancellationToken ct)
         {
-            var existing = await _metadataRepository.GetByFileKeyAsync(record.FileKey, ct).ConfigureAwait(false);
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing == null)
             {
                 await EnsureMetadataExistsAsync(record, FileProcessingStatus.Completed, ct).ConfigureAwait(false);
@@ -393,7 +398,7 @@ namespace Locus.Storage
 
         private async Task ProjectDeleteSucceededAsync(QueueEventRecord record, CancellationToken ct)
         {
-            var existing = await _metadataRepository.GetByFileKeyAsync(record.FileKey, ct).ConfigureAwait(false);
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing == null)
                 return;
 
@@ -507,6 +512,11 @@ namespace Locus.Storage
                 OriginalFileName = record.OriginalFileName,
                 FileExtension = record.FileExtension,
             };
+        }
+
+        private Task<FileMetadata?> GetExistingMetadataAsync(QueueEventRecord record, CancellationToken ct)
+        {
+            return _metadataRepository.GetAsync(record.TenantId, record.FileKey, ct);
         }
 
         private bool ShouldSkipStartedProjection(FileMetadata existing, DateTime eventProcessingStart)
@@ -697,6 +707,12 @@ namespace Locus.Storage
         private async Task<QueueProjectionTenantState> BuildTenantStateAsync(string tenantId, CancellationToken ct)
         {
             var cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
+            return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+        }
+
+        private async Task<QueueProjectionTenantState> BuildTenantStateAsync(string tenantId, long cursorOffset, CancellationToken ct)
+        {
+            cursorOffset = await NormalizeCursorOffsetAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
             var journalSizeBytes = await _journal.GetTailOffsetAsync(tenantId, ct).ConfigureAwait(false);
             var snapshot = await LoadSnapshotAsync(tenantId, ct).ConfigureAwait(false);
             return new QueueProjectionTenantState

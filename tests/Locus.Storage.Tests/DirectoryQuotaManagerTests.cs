@@ -37,7 +37,11 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(_quotaDir);
 
             var repoLogger = new Mock<ILogger<DirectoryQuotaRepository>>();
-            _repository = new DirectoryQuotaRepository(_fileSystem, repoLogger.Object, _quotaDir);
+            _repository = new DirectoryQuotaRepository(
+                _fileSystem,
+                repoLogger.Object,
+                _quotaDir,
+                enableBackgroundFlush: false);
 
             _logger = new Mock<ILogger<DirectoryQuotaManager>>();
             _quotaManager = new DirectoryQuotaManager(_repository, _logger.Object);
