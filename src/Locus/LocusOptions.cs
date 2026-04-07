@@ -53,9 +53,9 @@ namespace Locus
         /// Gets or sets whether to enable the orphan file recovery service.
         /// When enabled, a background service periodically scans for orphaned physical files
         /// (files on disk without metadata) and rebuilds their metadata entries.
-        /// Default: true
+        /// Default: false
         /// </summary>
-        public bool EnableOrphanRecovery { get; set; } = true;
+        public bool EnableOrphanRecovery { get; set; } = false;
 
         /// <summary>
         /// Gets or sets the orphan file recovery options.
@@ -224,9 +224,9 @@ namespace Locus
 
         /// <summary>
         /// Gets or sets whether each write should force a flush to disk.
-        /// Default: false.
+        /// Default: true.
         /// </summary>
-        public bool ForceFlushAfterWrite { get; set; } = false;
+        public bool ForceFlushAfterWrite { get; set; } = true;
 
         /// <summary>
         /// Validates the volume configuration.

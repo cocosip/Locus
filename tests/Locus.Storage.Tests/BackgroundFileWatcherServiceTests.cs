@@ -39,7 +39,7 @@ namespace Locus.Storage.Tests
             {
                 WatcherId = "slow",
                 Enabled = true,
-                PollingInterval = TimeSpan.FromMilliseconds(500),
+                PollingInterval = TimeSpan.FromSeconds(1),
                 WatchPath = "/watch/slow"
             };
 
@@ -53,7 +53,10 @@ namespace Locus.Storage.Tests
                     TimeSpan.FromSeconds(2),
                     "Timed out waiting for initial watcher scan.");
 
-                await Task.Delay(TimeSpan.FromMilliseconds(260));
+                await WaitUntilAsync(
+                    () => GetCount(scanCounts, "fast") >= 4,
+                    TimeSpan.FromMilliseconds(700),
+                    "Timed out waiting for fast watcher to scan repeatedly.");
             }
             finally
             {

@@ -74,7 +74,7 @@ namespace Locus.FileSystem
         /// <param name="copyBufferSize">Pooled copy buffer size in bytes. Default 80 KB.</param>
         /// <param name="forceFlushAfterWrite">
         /// Whether to force <see cref="Stream.FlushAsync(CancellationToken)"/> after each write.
-        /// Default: false.
+        /// Default: true.
         /// </param>
         /// <param name="knownDirectoryCacheMaxEntries">
         /// Maximum number of cached directory entries before trimming. Default 50,000.
@@ -88,7 +88,7 @@ namespace Locus.FileSystem
             TimeSpan healthCheckCacheDuration = default,
             int writeBufferSize = DefaultWriteBufferSize,
             int copyBufferSize = DefaultCopyBufferSize,
-            bool forceFlushAfterWrite = false,
+            bool forceFlushAfterWrite = true,
             int knownDirectoryCacheMaxEntries = DefaultKnownDirectoryCacheMaxEntries)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -689,3 +689,4 @@ namespace Locus.FileSystem
         }
     }
 }
+

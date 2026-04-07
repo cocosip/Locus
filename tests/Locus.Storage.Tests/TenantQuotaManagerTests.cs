@@ -120,6 +120,68 @@ namespace Locus.Storage.Tests
             Assert.False(quota.Enabled);
         }
 
+        [Fact]
+        public async Task ApplyAcceptedProjectionAsync_ConsumesReservationAndKeepsTotalStable()
+        {
+            const string tenantId = "tenant-projection-accepted";
+
+            await _manager.SetTenantLimitAsync(tenantId, 2, CancellationToken.None);
+            await _manager.IncrementFileCountAsync(tenantId, CancellationToken.None);
+
+            var consumedReservation = await _manager.ApplyAcceptedProjectionAsync(tenantId, CancellationToken.None);
+            var count = await _manager.GetFileCountAsync(tenantId, CancellationToken.None);
+
+            Assert.True(consumedReservation);
+            Assert.Equal(1, count);
+            Assert.Equal(1, (await _repository.GetAsync(tenantId, tenantId, CancellationToken.None))!.CurrentCount);
+        }
+
+        [Fact]
+        public async Task ApplyDeleteSucceededProjectionAsync_DecrementsProjectedCountWithoutTouchingReservations()
+        {
+            const string tenantId = "tenant-projection-delete";
+
+            await _manager.ApplyAcceptedProjectionAsync(tenantId, CancellationToken.None);
+            await _manager.IncrementFileCountAsync(tenantId, CancellationToken.None);
+
+            await _manager.ApplyDeleteSucceededProjectionAsync(tenantId, CancellationToken.None);
+
+            var count = await _manager.GetFileCountAsync(tenantId, CancellationToken.None);
+            Assert.Equal(1, count);
+            Assert.Equal(0, (await _repository.GetAsync(tenantId, tenantId, CancellationToken.None))!.CurrentCount);
+        }
+
+        [Fact]
+        public async Task SetGlobalLimitAsync_UsesQuotaProjectionStoreWhenProvided()
+        {
+            var existing = new DirectoryQuota
+            {
+                DirectoryPath = "_GLOBAL_QUOTA_",
+                CurrentCount = 0,
+                MaxCount = 1,
+                Enabled = true,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+                LastUpdated = DateTime.UtcNow.AddMinutes(-1)
+            };
+
+            var quotaStore = new Mock<IQuotaProjectionStore>(MockBehavior.Strict);
+            quotaStore
+                .Setup(store => store.GetOrCreateQuotaAsync("_GLOBAL_QUOTA_", "_GLOBAL_QUOTA_", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(existing);
+            quotaStore
+                .Setup(store => store.UpdateQuotaAsync(
+                    "_GLOBAL_QUOTA_",
+                    It.Is<DirectoryQuota>(quota => quota.DirectoryPath == "_GLOBAL_QUOTA_" && quota.MaxCount == 7 && quota.Enabled),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var manager = new TenantQuotaManager(quotaStore.Object, new Mock<ILogger<TenantQuotaManager>>().Object);
+
+            await manager.SetGlobalLimitAsync(7, CancellationToken.None);
+
+            quotaStore.VerifyAll();
+        }
+
         public void Dispose()
         {
             _repository.Dispose();

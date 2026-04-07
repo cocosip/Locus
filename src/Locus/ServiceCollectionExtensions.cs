@@ -126,6 +126,42 @@ namespace Locus
                     persistenceIntervalSeconds: options.MetadataRepository.PersistenceIntervalSeconds);
             });
 
+            services.AddSingleton<IQueueProjectionStore>(sp =>
+            {
+                var repository = sp.GetRequiredService<MetadataRepository>();
+                return new MetadataRepositoryQueueProjectionStore(repository);
+            });
+
+            services.AddSingleton<IQueueProjectionWriteStore>(sp =>
+            {
+                var repository = sp.GetRequiredService<MetadataRepository>();
+                return new MetadataRepositoryQueueProjectionWriteStore(repository);
+            });
+
+            services.AddSingleton<IQueueProjectionCleanupStore>(sp =>
+            {
+                var repository = sp.GetRequiredService<MetadataRepository>();
+                return new MetadataRepositoryQueueProjectionCleanupStore(repository);
+            });
+
+            services.AddSingleton<IMetadataProjectionMaintenanceStore>(sp =>
+            {
+                var repository = sp.GetRequiredService<MetadataRepository>();
+                return new MetadataRepositoryProjectionMaintenanceStore(repository);
+            });
+
+            services.AddSingleton<IQuotaProjectionStore>(sp =>
+            {
+                var repository = sp.GetRequiredService<DirectoryQuotaRepository>();
+                return new DirectoryQuotaRepositoryProjectionStore(repository);
+            });
+
+            services.AddSingleton<IQuotaProjectionMaintenanceStore>(sp =>
+            {
+                var repository = sp.GetRequiredService<DirectoryQuotaRepository>();
+                return new DirectoryQuotaRepositoryProjectionMaintenanceStore(repository);
+            });
+
             services.AddSingleton(sp =>
             {
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
@@ -141,21 +177,21 @@ namespace Locus
                 return new TenantManager(fileSystem, logger, options.MetadataDirectory, autoCreateTenants: options.AutoCreateTenants);
             });
 
-            // Register directory quota manager
-            services.AddSingleton<IDirectoryQuotaManager>(sp =>
+            services.AddSingleton<DirectoryQuotaManager>(sp =>
             {
-                var repository = sp.GetRequiredService<DirectoryQuotaRepository>();
+                var quotaStore = sp.GetRequiredService<IQuotaProjectionStore>();
                 var logger = sp.GetRequiredService<ILogger<DirectoryQuotaManager>>();
-                return new DirectoryQuotaManager(repository, logger);
+                return new DirectoryQuotaManager(quotaStore, logger);
             });
+            services.AddSingleton<IDirectoryQuotaManager>(sp => sp.GetRequiredService<DirectoryQuotaManager>());
 
-            // Register tenant quota manager
-            services.AddSingleton<ITenantQuotaManager>(sp =>
+            services.AddSingleton<TenantQuotaManager>(sp =>
             {
-                var repository = sp.GetRequiredService<DirectoryQuotaRepository>();
+                var quotaStore = sp.GetRequiredService<IQuotaProjectionStore>();
                 var logger = sp.GetRequiredService<ILogger<TenantQuotaManager>>();
-                return new TenantQuotaManager(repository, logger);
+                return new TenantQuotaManager(quotaStore, logger);
             });
+            services.AddSingleton<ITenantQuotaManager>(sp => sp.GetRequiredService<TenantQuotaManager>());
 
             // Register file watcher
             services.AddSingleton<IFileWatcher>(sp =>
@@ -170,20 +206,22 @@ namespace Locus
             // Register file scheduler
             services.AddSingleton<IFileScheduler>(sp =>
             {
-                var repository = sp.GetRequiredService<MetadataRepository>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<FileScheduler>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
                 var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
                 var directoryQuotaManager = sp.GetRequiredService<IDirectoryQuotaManager>();
+                var queueEventJournal = sp.GetService<IQueueEventJournal>();
+                var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
                 return new FileScheduler(
-                    repository,
+                    projectionStore,
                     fileSystem,
                     logger,
                     options.RetryPolicy,
                     volumeRegistry,
                     tenantQuotaManager,
-                    directoryQuotaManager);
+                    directoryQuotaManager,
+                    queueEventJournal);
             });
 
             // Register StoragePool as its concrete type so StorageVolumeInitializationService
@@ -198,6 +236,8 @@ namespace Locus
                 var logger = sp.GetRequiredService<ILogger<StoragePool>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
                 var queueEventJournal = sp.GetService<IQueueEventJournal>();
+                var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
+                var projectionWriteStore = sp.GetRequiredService<IQueueProjectionWriteStore>();
 
                 // Volumes are NOT mounted here. StorageVolumeInitializationService mounts
                 // them asynchronously in StartAsync, before requests are accepted.
@@ -210,7 +250,9 @@ namespace Locus
                     logger,
                     options.StoragePool.CompletionGuardStripeCount,
                     volumeRegistry,
-                    queueEventJournal);
+                    queueEventJournal,
+                    projectionStore,
+                    projectionWriteStore);
             });
             services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 
@@ -222,6 +264,11 @@ namespace Locus
                 var quotaRepo = sp.GetRequiredService<DirectoryQuotaRepository>();
                 var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
                 var tenantManager = sp.GetRequiredService<ITenantManager>();
+                var directoryQuotaManager = sp.GetRequiredService<IDirectoryQuotaManager>();
+                var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
+                var projectionCleanupStore = sp.GetRequiredService<IQueueProjectionCleanupStore>();
+                var metadataMaintenanceStore = sp.GetRequiredService<IMetadataProjectionMaintenanceStore>();
+                var quotaMaintenanceStore = sp.GetRequiredService<IQuotaProjectionMaintenanceStore>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
@@ -239,7 +286,12 @@ namespace Locus
                     options.CleanupOptions,
                     volumeRegistry,
                     tenantManager,
-                    queueEventJournal);
+                    queueEventJournal,
+                    directoryQuotaManager,
+                    projectionStore,
+                    projectionCleanupStore,
+                    metadataMaintenanceStore,
+                    quotaMaintenanceStore);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 
@@ -261,6 +313,9 @@ namespace Locus
                 var logger = sp.GetRequiredService<ILogger<Locus.Storage.Data.DatabaseRecoveryService>>();
                 var queueProjectionMaintenanceService = sp.GetService<IQueueProjectionMaintenanceService>();
                 var storageCleanupService = sp.GetService<IStorageCleanupService>();
+                var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
+                var metadataMaintenanceStore = sp.GetRequiredService<IMetadataProjectionMaintenanceStore>();
+                var quotaMaintenanceStore = sp.GetRequiredService<IQuotaProjectionMaintenanceStore>();
 
                 return new Locus.Storage.Data.DatabaseRecoveryService(
                     metadataRepo,
@@ -271,7 +326,10 @@ namespace Locus
                     options.QuotaDirectory,
                     options.Volumes.ToDictionary(v => v.MountPath, v => v.VolumeId, StringComparer.OrdinalIgnoreCase),
                     queueProjectionMaintenanceService,
-                    storageCleanupService);
+                    storageCleanupService,
+                    projectionStore,
+                    metadataMaintenanceStore,
+                    quotaMaintenanceStore);
             });
 
             if (options.QueueEventJournal.Enabled)
@@ -293,6 +351,7 @@ namespace Locus
                     var fileSystem = sp.GetRequiredService<IFileSystem>();
                     var logger = sp.GetRequiredService<ILogger<QueueEventProjectionService>>();
                     var storageCleanupService = sp.GetRequiredService<IStorageCleanupService>();
+                    var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
 
                     return new QueueEventProjectionService(
                         journal,
@@ -302,7 +361,8 @@ namespace Locus
                         fileSystem,
                         options.QueueEventJournal,
                         logger,
-                        storageCleanupService);
+                        storageCleanupService,
+                        projectionStore);
                 });
                 services.AddSingleton<IQueueProjectionMaintenanceService>(sp => sp.GetRequiredService<QueueEventProjectionService>());
 

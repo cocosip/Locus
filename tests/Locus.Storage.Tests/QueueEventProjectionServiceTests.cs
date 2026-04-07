@@ -5,6 +5,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 using Locus.Core.Models;
 using Locus.Storage;
 using Locus.Storage.Data;
@@ -131,6 +132,63 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, tenantCount);
             Assert.Equal(1, directoryCount);
             Assert.True(_fileSystem.File.Exists(cursorPath));
+        }
+
+        [Fact]
+        public async Task ReplayTenantAsync_AcceptedEventOnExistingPendingProjection_SettlesQuotaAndMarksMetadata()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-existing-accepted";
+            const string fileKey = "file-existing-accepted";
+            const string directoryPath = "/logical/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "file-existing-accepted.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3 });
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+                Status = FileProcessingStatus.Pending,
+                Metadata = new Dictionary<string, string>
+                {
+                    ["queue.accepted_projection_applied"] = bool.FalseString
+                }
+            }, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending
+            }, CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            var rebuilt = await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None);
+
+            Assert.NotNull(rebuilt);
+            Assert.True(rebuilt!.Metadata!.TryGetValue("queue.accepted_projection_applied", out var acceptedApplied));
+            Assert.Equal(bool.TrueString, acceptedApplied);
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
         }
 
         [Fact]
@@ -775,7 +833,7 @@ namespace Locus.Storage.Tests
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
             var directoryQuotaManager = CreateDirectoryQuotaManager();
-            var cleanupService = CreateCleanupService(tenantQuotaManager);
+            var cleanupService = CreateCleanupService(tenantQuotaManager, directoryQuotaManager);
             var journal = CreateJournal();
 
             const string tenantId = "tenant-008";
@@ -852,7 +910,7 @@ namespace Locus.Storage.Tests
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
             var directoryQuotaManager = CreateDirectoryQuotaManager();
-            var cleanupService = CreateCleanupService(tenantQuotaManager);
+            var cleanupService = CreateCleanupService(tenantQuotaManager, directoryQuotaManager);
             var journal = CreateJournal();
 
             const string tenantId = "tenant-009";
@@ -919,11 +977,72 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task SnapshotTenantAsync_UsesProjectionStoreAsSnapshotSource()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+
+            const string tenantId = "tenant-snapshot-projection-store";
+            const string fileKey = "file-snapshot-projection-store";
+            const string directoryPath = "/projection";
+            var createdAt = DateTime.UtcNow.AddMinutes(-2);
+
+            projectionStore
+                .Setup(store => store.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        VolumeId = "vol-001",
+                        PhysicalPath = Path.Combine(_volumeDirectory, tenantId, "projection", "file.dcm"),
+                        DirectoryPath = directoryPath,
+                        FileSize = 12,
+                        CreatedAt = createdAt,
+                        Status = FileProcessingStatus.Pending,
+                        OriginalFileName = "file.dcm",
+                        FileExtension = ".dcm"
+                    }
+                });
+
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal,
+                metadataRepository: null,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                projectionStore: projectionStore.Object));
+
+            var state = await service.SnapshotTenantAsync(tenantId, CancellationToken.None);
+            var snapshotPath = Path.Combine(_queueDirectory, tenantId, "projection.snapshot.json");
+
+            Assert.True(state.HasSnapshot);
+            Assert.Equal(1, state.SnapshotFileCount);
+            Assert.True(_fileSystem.File.Exists(snapshotPath));
+            projectionStore.Verify(store => store.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task ReplayTenantAsync_WithSnapshotAndCompaction_AllowsRebuildFromCompactedJournal()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
             var directoryQuotaManager = CreateDirectoryQuotaManager();
-            var cleanupService = CreateCleanupService(tenantQuotaManager);
+            var cleanupService = CreateCleanupService(tenantQuotaManager, directoryQuotaManager);
             var journal = CreateJournal();
 
             const string tenantId = "tenant-010";
@@ -1053,7 +1172,7 @@ namespace Locus.Storage.Tests
                 new Mock<ILogger<DirectoryQuotaManager>>().Object);
         }
 
-        private StorageCleanupService CreateCleanupService(TenantQuotaManager tenantQuotaManager)
+        private StorageCleanupService CreateCleanupService(TenantQuotaManager tenantQuotaManager, DirectoryQuotaManager directoryQuotaManager)
         {
             return new StorageCleanupService(
                 _metadataRepository,
@@ -1062,7 +1181,8 @@ namespace Locus.Storage.Tests
                 _fileSystem,
                 new Mock<ILogger<StorageCleanupService>>().Object,
                 _metadataDirectory,
-                _quotaDirectory);
+                _quotaDirectory,
+                directoryQuotaManager: directoryQuotaManager);
         }
 
         private FileQueueEventJournal CreateJournal()

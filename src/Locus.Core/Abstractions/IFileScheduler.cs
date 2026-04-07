@@ -76,4 +76,16 @@ namespace Locus.Core.Abstractions
         /// <returns>The number of orphaned metadata records removed.</returns>
         Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct = default);
     }
+
+    /// <summary>
+    /// Indicates that an <see cref="IFileScheduler"/> instance durably persists queue events
+    /// before applying in-memory or projected status transitions.
+    /// </summary>
+    public interface IQueueEventManagedFileScheduler
+    {
+        /// <summary>
+        /// Gets a value indicating whether this scheduler instance currently owns queue-event persistence.
+        /// </summary>
+        bool HandlesQueueJournal { get; }
+    }
 }

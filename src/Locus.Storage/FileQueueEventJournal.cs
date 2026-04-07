@@ -54,29 +54,55 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
+        public Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
         {
             if (record == null)
                 throw new ArgumentNullException(nameof(record));
 
-            if (string.IsNullOrWhiteSpace(record.TenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(record));
+            return AppendBatchAsync(new[] { record }, ct);
+        }
 
-            if (string.IsNullOrWhiteSpace(record.FileKey))
-                throw new ArgumentException("FileKey cannot be empty", nameof(record));
+        /// <inheritdoc/>
+        public async Task AppendBatchAsync(IReadOnlyList<QueueEventRecord> records, CancellationToken ct = default)
+        {
+            if (records == null)
+                throw new ArgumentNullException(nameof(records));
 
-            var appendLock = _appendLocks.GetOrAdd(record.TenantId, _ => new SemaphoreSlim(1, 1));
+            if (records.Count == 0)
+                return;
+
+            var tenantId = records[0]?.TenantId;
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(records));
+
+            for (var i = 0; i < records.Count; i++)
+            {
+                var record = records[i] ?? throw new ArgumentException("Queue event record cannot be null.", nameof(records));
+                if (string.IsNullOrWhiteSpace(record.TenantId))
+                    throw new ArgumentException("TenantId cannot be empty", nameof(records));
+
+                if (string.IsNullOrWhiteSpace(record.FileKey))
+                    throw new ArgumentException("FileKey cannot be empty", nameof(records));
+
+                if (!string.Equals(record.TenantId, tenantId, StringComparison.Ordinal))
+                    throw new ArgumentException("All queue event records in a batch must belong to the same tenant.", nameof(records));
+            }
+
+            var appendLock = _appendLocks.GetOrAdd(tenantId!, _ => new SemaphoreSlim(1, 1));
             await appendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var state = LoadJournalState(record.TenantId);
-                var tenantDirectory = GetTenantDirectory(record.TenantId);
+                var state = LoadJournalState(tenantId!);
+                var tenantDirectory = GetTenantDirectory(tenantId!);
                 if (!_fileSystem.Directory.Exists(tenantDirectory))
                     _fileSystem.Directory.CreateDirectory(tenantDirectory);
 
-                var path = GetJournalPath(record.TenantId);
-                var payload = JsonSerializer.Serialize(record, JsonOptions) + "\n";
-                var bytes = Utf8NoBom.GetBytes(payload);
+                var path = GetJournalPath(tenantId!);
+                var payloadBuilder = new StringBuilder();
+                for (var i = 0; i < records.Count; i++)
+                    payloadBuilder.Append(JsonSerializer.Serialize(records[i], JsonOptions)).Append('\n');
+
+                var bytes = Utf8NoBom.GetBytes(payloadBuilder.ToString());
 
                 using (var stream = _fileSystem.File.Open(path, FileMode.Append, FileAccess.Write, FileShare.Read))
                 {
@@ -88,7 +114,7 @@ namespace Locus.Storage
                     state.TailOffset = state.BaseOffset + stream.Length;
                 }
 
-                SaveJournalState(record.TenantId, state);
+                SaveJournalState(tenantId!, state);
             }
             finally
             {

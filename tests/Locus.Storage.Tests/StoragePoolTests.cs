@@ -307,6 +307,41 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task WriteFileAsync_WithLogicalDirectory_PersistsLogicalDirectoryIntoMetadataAndJournal()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("logical-dir"));
+
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "scan.dcm", "/incoming/studies", default);
+
+            var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
+
+            Assert.NotNull(location);
+            Assert.Equal("/incoming/studies", location!.DirectoryPath);
+
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.Accepted
+                        && record.FileKey == fileKey
+                        && record.DirectoryPath == "/incoming/studies"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_WithoutLogicalDirectory_UsesRootDirectory()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("root-dir"));
+
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "scan.dcm", default);
+
+            var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
+
+            Assert.NotNull(location);
+            Assert.Equal("/", location!.DirectoryPath);
+        }
+
+        [Fact]
         public async Task GetNextFileForProcessingAsync_AppendsProcessingStartedQueueEvent()
         {
             var processingStartTime = DateTime.UtcNow;
@@ -487,6 +522,83 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.Null(location);
+        }
+
+        [Fact]
+        public async Task GetFileLocationAsync_UsesProjectionStoreWhenProvided()
+        {
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedFileAsync("tenant-001", "projection-location", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new FileMetadata
+                {
+                    FileKey = "projection-location",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-001",
+                    PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "projection-location.dcm"),
+                    DirectoryPath = "/projection",
+                    FileSize = 64,
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+                    Status = FileProcessingStatus.Pending
+                });
+
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                projectionStore: projectionStore.Object);
+            await storagePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+
+            var location = await storagePool.GetFileLocationAsync(_tenant.Object, "projection-location", CancellationToken.None);
+
+            Assert.NotNull(location);
+            Assert.Equal("/projection", location!.DirectoryPath);
+            projectionStore.VerifyAll();
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_UsesProjectionWriteStoreWhenProvided()
+        {
+            var captured = default(FileMetadata);
+            var projectionWriteStore = new Mock<IQueueProjectionWriteStore>(MockBehavior.Strict);
+            projectionWriteStore
+                .Setup(store => store.QueueProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+                .Callback<FileMetadata, CancellationToken>((metadata, _) => captured = metadata)
+                .Returns(Task.CompletedTask);
+
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                queueEventJournal: _queueEventJournal.Object,
+                projectionWriteStore: projectionWriteStore.Object);
+
+            await storagePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("write-store"));
+
+            var fileKey = await storagePool.WriteFileAsync(_tenant.Object, content, "write-store.dcm", CancellationToken.None);
+
+            Assert.NotNull(captured);
+            Assert.Equal(fileKey, captured!.FileKey);
+            Assert.Equal("tenant-001", captured.TenantId);
+            Assert.Equal("/", captured.DirectoryPath);
+            Assert.Equal(FileProcessingStatus.Pending, captured.Status);
+
+            projectionWriteStore.Verify(
+                store => store.QueueProjectedFileAsync(
+                    It.Is<FileMetadata>(metadata =>
+                        metadata.FileKey == fileKey
+                        && metadata.TenantId == "tenant-001"
+                        && metadata.DirectoryPath == "/"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
         }
 
         [Fact]
@@ -955,6 +1067,83 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_UsesProjectionStoreForLeaseValidationAndEventPayload()
+        {
+            var processingStart = DateTime.UtcNow.AddMinutes(-2);
+            var completedAt = DateTime.UtcNow.AddMinutes(-1);
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .SetupSequence(store => store.GetProjectedFileAsync("tenant-001", "projection-complete", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new FileMetadata
+                {
+                    FileKey = "projection-complete",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-001",
+                    PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "projection-complete.dcm"),
+                    DirectoryPath = "/projection",
+                    FileSize = 8,
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-3),
+                    Status = FileProcessingStatus.Processing,
+                    ProcessingStartTime = processingStart
+                })
+                .ReturnsAsync(new FileMetadata
+                {
+                    FileKey = "projection-complete",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-001",
+                    PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "projection-complete.dcm"),
+                    DirectoryPath = "/projection",
+                    FileSize = 8,
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-3),
+                    Status = FileProcessingStatus.Completed,
+                    CompletedAt = completedAt
+                });
+
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                queueEventJournal: _queueEventJournal.Object,
+                projectionStore: projectionStore.Object);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == "projection-complete"
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            _queueEventJournal.Invocations.Clear();
+
+            await storagePool.MarkAsCompletedAsync(
+                CreateLease("tenant-001", "projection-complete", processingStart),
+                CancellationToken.None);
+
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.ProcessingCompleted
+                        && record.FileKey == "projection-complete"
+                        && record.DirectoryPath == "/projection"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.DeleteRequested
+                        && record.FileKey == "projection-complete"
+                        && record.DirectoryPath == "/projection"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+            projectionStore.VerifyAll();
+        }
+
+        [Fact]
         public async Task MarkAsFailedAsync_AppendsProcessingFailedQueueEvent()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("failed-event"));
@@ -1007,6 +1196,69 @@ namespace Locus.Storage.Tests
                         && record.AvailableForProcessingAtUtc == retryAt),
                     It.IsAny<CancellationToken>()),
                 Times.Once);
+        }
+
+        [Fact]
+        public async Task MarkAsFailedAsync_UsesProjectionStoreForQueueEventPayload()
+        {
+            var processingStart = DateTime.UtcNow.AddMinutes(-2);
+            var retryAt = DateTime.UtcNow.AddMinutes(1);
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedFileAsync("tenant-001", "projection-failed", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new FileMetadata
+                {
+                    FileKey = "projection-failed",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-001",
+                    PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "projection-failed.dcm"),
+                    DirectoryPath = "/projection",
+                    FileSize = 8,
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-3),
+                    Status = FileProcessingStatus.Pending,
+                    RetryCount = 1,
+                    LastError = "decode failed",
+                    LastFailedAt = DateTime.UtcNow,
+                    AvailableForProcessingAt = retryAt
+                });
+
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                queueEventJournal: _queueEventJournal.Object,
+                projectionStore: projectionStore.Object);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsFailedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == "projection-failed"
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    "decode failed",
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            _queueEventJournal.Invocations.Clear();
+
+            await storagePool.MarkAsFailedAsync(
+                CreateLease("tenant-001", "projection-failed", processingStart),
+                "decode failed",
+                CancellationToken.None);
+
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.ProcessingFailed
+                        && record.FileKey == "projection-failed"
+                        && record.DirectoryPath == "/projection"
+                        && record.AvailableForProcessingAtUtc == retryAt),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+            projectionStore.VerifyAll();
         }
 
         [Fact]

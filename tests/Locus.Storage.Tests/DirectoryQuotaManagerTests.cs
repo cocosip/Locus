@@ -242,6 +242,42 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task SetLimitAsync_UsesQuotaProjectionStoreWhenProvided()
+        {
+            var directoryPath = "/projection/dir";
+            var snapshot = new DirectoryQuota
+            {
+                DirectoryPath = directoryPath,
+                CurrentCount = 2,
+                MaxCount = 3,
+                Enabled = true,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+                LastUpdated = DateTime.UtcNow.AddMinutes(-1)
+            };
+
+            var quotaStore = new Mock<IQuotaProjectionStore>(MockBehavior.Strict);
+            quotaStore
+                .Setup(store => store.GetOrCreateQuotaAsync(TenantId, directoryPath, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(snapshot);
+            quotaStore
+                .Setup(store => store.UpdateQuotaAsync(
+                    TenantId,
+                    It.Is<DirectoryQuota>(quota =>
+                        quota.DirectoryPath == directoryPath
+                        && quota.CurrentCount == 2
+                        && quota.MaxCount == 9
+                        && quota.Enabled),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var manager = new DirectoryQuotaManager(quotaStore.Object, _logger.Object);
+
+            await manager.SetLimitAsync(TenantId, directoryPath, 9, CancellationToken.None);
+
+            quotaStore.VerifyAll();
+        }
+
+        [Fact]
         public async Task ConcurrentIncrements_AllSucceedBelowLimit()
         {
             // Arrange
@@ -412,6 +448,42 @@ namespace Locus.Storage.Tests
                 if (_fileSystem.Directory.Exists(isolatedQuotaDir))
                     _fileSystem.Directory.Delete(isolatedQuotaDir, recursive: true);
             }
+        }
+
+        [Fact]
+        public async Task ApplyAcceptedProjectionAsync_ConsumesReservationAndKeepsLogicalDirectoryTotalStable()
+        {
+            const string directoryPath = "/logical/accepted";
+
+            await _quotaManager.SetLimitAsync(TenantId, directoryPath, 2, CancellationToken.None);
+            await _quotaManager.IncrementFileCountAsync(TenantId, directoryPath, CancellationToken.None);
+
+            var consumedReservation = await _quotaManager.ApplyAcceptedProjectionAsync(TenantId, directoryPath, CancellationToken.None);
+            var count = await _quotaManager.GetFileCountAsync(TenantId, directoryPath, CancellationToken.None);
+            var quota = await _repository.GetAsync(TenantId, directoryPath, CancellationToken.None);
+
+            Assert.True(consumedReservation);
+            Assert.Equal(1, count);
+            Assert.NotNull(quota);
+            Assert.Equal(1, quota!.CurrentCount);
+        }
+
+        [Fact]
+        public async Task ApplyDeleteSucceededProjectionAsync_DecrementsProjectedCountWithoutTouchingReservations()
+        {
+            const string directoryPath = "/logical/delete";
+
+            await _quotaManager.ApplyAcceptedProjectionAsync(TenantId, directoryPath, CancellationToken.None);
+            await _quotaManager.IncrementFileCountAsync(TenantId, directoryPath, CancellationToken.None);
+
+            await _quotaManager.ApplyDeleteSucceededProjectionAsync(TenantId, directoryPath, CancellationToken.None);
+
+            var count = await _quotaManager.GetFileCountAsync(TenantId, directoryPath, CancellationToken.None);
+            var quota = await _repository.GetAsync(TenantId, directoryPath, CancellationToken.None);
+
+            Assert.Equal(1, count);
+            Assert.NotNull(quota);
+            Assert.Equal(0, quota!.CurrentCount);
         }
 
         private static void InvokeFlushDirtyCounters(DirectoryQuotaRepository repository)

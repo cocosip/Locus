@@ -130,6 +130,118 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetNextFileForProcessingAsync_UsesProjectionStoreWhenProvided()
+        {
+            var processingStart = DateTime.UtcNow;
+            var projected = new FileMetadata
+            {
+                FileKey = "projected-file-001",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                CreatedAt = processingStart.AddMinutes(-1),
+                ProcessingStartTime = processingStart,
+                PhysicalPath = "/projected/file-001.dat",
+                DirectoryPath = "/logical/inbox"
+            };
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(m => m.LeaseNextPendingFileAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(projected);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                projectionStore: projectionStore.Object);
+
+            var location = await scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.NotNull(location);
+            Assert.Equal("projected-file-001", location!.FileKey);
+            Assert.Equal("/logical/inbox", location.DirectoryPath);
+            Assert.NotNull(location.Lease);
+            Assert.Equal(processingStart, location.Lease!.ProcessingStartTimeUtc);
+            projectionStore.Verify(
+                m => m.LeaseNextPendingFileAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_UsesProjectionStoreWhenProvided()
+        {
+            var missingPath = Path.Combine(_metadataDir, "projection-missing-file.dat");
+            var projected = new FileMetadata
+            {
+                FileKey = "projection-orphan",
+                TenantId = "tenant-001",
+                PhysicalPath = missingPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(m => m.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { "tenant-001" });
+            projectionStore
+                .Setup(m => m.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { projected });
+            projectionStore
+                .Setup(m => m.RemoveProjectedFileAsync("tenant-001", "projection-orphan", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            var scheduler = new FileScheduler(
+                projectionStore.Object,
+                _fileSystem,
+                _logger.Object);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(1, removed);
+            projectionStore.Verify(
+                m => m.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()),
+                Times.Once);
+            projectionStore.Verify(
+                m => m.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            projectionStore.Verify(
+                m => m.RemoveProjectedFileAsync("tenant-001", "projection-orphan", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task GetNextFileForProcessingAsync_WhenJournalAppendFails_RollsBackToPending()
+        {
+            var metadata = new FileMetadata
+            {
+                FileKey = "file-journal-start",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+            };
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var journal = new Mock<IQueueEventJournal>();
+            journal
+                .Setup(m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record => record.EventType == QueueEventType.ProcessingStarted),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("journal append failed"));
+
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, queueEventJournal: journal.Object);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None));
+
+            var current = await _repository.GetAsync("tenant-001", "file-journal-start", CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Pending, current!.Status);
+            Assert.Null(current.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task GetNextFileForProcessingAsync_SkipsProcessingFiles()
         {
             // Arrange
@@ -459,6 +571,46 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenJournalBatchAppendFails_LeavesFileProcessing()
+        {
+            var processingStart = DateTime.UtcNow;
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-journal-complete",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-2),
+                PhysicalPath = Path.Combine(_metadataDir, "file-journal-complete.dcm"),
+                DirectoryPath = "/incoming",
+                VolumeId = "vol-001",
+            }, CancellationToken.None);
+
+            var journal = new Mock<IQueueEventJournal>();
+            journal
+                .Setup(m => m.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.ProcessingCompleted
+                        && records[1].EventType == QueueEventType.DeleteRequested),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("journal batch append failed"));
+
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, queueEventJournal: journal.Object);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                scheduler.MarkAsCompletedAsync(
+                    CreateLease("tenant-001", "file-journal-complete", processingStart),
+                    CancellationToken.None));
+
+            var current = await _repository.GetAsync("tenant-001", "file-journal-complete", CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Processing, current!.Status);
+            Assert.Equal(processingStart, current.ProcessingStartTime);
+            Assert.Null(current.CompletedAt);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_FileAlreadyCompleted_KeepsCompletedState()
         {
             var processingStart = DateTime.UtcNow;
@@ -571,6 +723,46 @@ namespace Locus.Storage.Tests
             Assert.Equal(FileProcessingStatus.PermanentlyFailed, metadata.Status);
             Assert.Equal(3, metadata.RetryCount);
             Assert.Null(metadata.AvailableForProcessingAt);
+        }
+
+        [Fact]
+        public async Task MarkAsFailedAsync_WhenJournalAppendFails_LeavesFileProcessing()
+        {
+            var processingStart = DateTime.UtcNow;
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-journal-fail",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart,
+                RetryCount = 0,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-2),
+                PhysicalPath = Path.Combine(_metadataDir, "file-journal-fail.dcm"),
+                DirectoryPath = "/incoming",
+                VolumeId = "vol-001",
+            }, CancellationToken.None);
+
+            var journal = new Mock<IQueueEventJournal>();
+            journal
+                .Setup(m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record => record.EventType == QueueEventType.ProcessingFailed),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("journal append failed"));
+
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, queueEventJournal: journal.Object);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                scheduler.MarkAsFailedAsync(
+                    CreateLease("tenant-001", "file-journal-fail", processingStart),
+                    "decode failed",
+                    CancellationToken.None));
+
+            var current = await _repository.GetAsync("tenant-001", "file-journal-fail", CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Processing, current!.Status);
+            Assert.Equal(processingStart, current.ProcessingStartTime);
+            Assert.Equal(0, current.RetryCount);
+            Assert.Null(current.LastFailedAt);
         }
 
         [Fact]

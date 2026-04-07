@@ -16,6 +16,11 @@ namespace Locus.Core.Abstractions
         Task AppendAsync(QueueEventRecord record, CancellationToken ct = default);
 
         /// <summary>
+        /// Appends multiple queue event records atomically to the same tenant journal.
+        /// </summary>
+        Task AppendBatchAsync(IReadOnlyList<QueueEventRecord> records, CancellationToken ct = default);
+
+        /// <summary>
         /// Reads a bounded batch of queue event records from a tenant journal, starting at a byte offset.
         /// </summary>
         Task<QueueEventReadBatch> ReadBatchAsync(

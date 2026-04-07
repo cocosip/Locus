@@ -1,0 +1,54 @@
+using System;
+using System.Collections.Generic;
+using Locus.Storage.Data;
+
+namespace Locus.Storage
+{
+    /// <summary>
+    /// Stores durable projection flags inside FileMetadata.Metadata.
+    /// </summary>
+    internal static class QueueProjectionMetadataState
+    {
+        private const string AcceptedProjectionAppliedKey = "queue.accepted_projection_applied";
+
+        public static bool IsAcceptedProjectionApplied(FileMetadata metadata)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (metadata.Metadata == null)
+                return false;
+
+            return metadata.Metadata.TryGetValue(AcceptedProjectionAppliedKey, out var value)
+                && string.Equals(value, bool.TrueString, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static void MarkAcceptedProjectionPending(FileMetadata metadata)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            GetWritableMetadata(metadata)[AcceptedProjectionAppliedKey] = bool.FalseString;
+        }
+
+        public static void MarkAcceptedProjectionApplied(FileMetadata metadata)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            GetWritableMetadata(metadata)[AcceptedProjectionAppliedKey] = bool.TrueString;
+        }
+
+        private static IDictionary<string, string> GetWritableMetadata(FileMetadata metadata)
+        {
+            if (metadata.Metadata == null)
+            {
+                metadata.Metadata = new Dictionary<string, string>(StringComparer.Ordinal);
+                return metadata.Metadata;
+            }
+
+            metadata.Metadata = new Dictionary<string, string>(metadata.Metadata, StringComparer.Ordinal);
+            return metadata.Metadata;
+        }
+    }
+}

@@ -10,16 +10,26 @@ using Microsoft.Extensions.Logging;
 namespace Locus.Storage
 {
     /// <summary>
-    /// Manages file count quotas for tenants.
-    /// Supports global default quota and per-tenant specific quotas.
-    /// Uses DirectoryQuotaRepository internally (treating tenantId as directoryPath).
+    /// Manages tenant-level quota reservations and projected counts.
     /// </summary>
-    public class TenantQuotaManager : ITenantQuotaManager, ITenantQuotaCompensationManager, ITenantQuotaReconciliationManager
+    public class TenantQuotaManager : ITenantQuotaManager, ITenantQuotaCompensationManager, ITenantQuotaProjectionManager, ITenantQuotaReconciliationManager
     {
         private const string GLOBAL_QUOTA_KEY = "_GLOBAL_QUOTA_";
-        private readonly DirectoryQuotaRepository _repository;
+        private readonly IQuotaProjectionStore _quotaStore;
         private readonly ILogger<TenantQuotaManager> _logger;
-        private readonly ConcurrentDictionary<string, SemaphoreSlim> _globalQuotaLocks;
+        private readonly ConcurrentDictionary<string, TenantQuotaState> _states;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TenantQuotaManager"/> class.
+        /// </summary>
+        public TenantQuotaManager(
+            IQuotaProjectionStore quotaStore,
+            ILogger<TenantQuotaManager> logger)
+        {
+            _quotaStore = quotaStore ?? throw new ArgumentNullException(nameof(quotaStore));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _states = new ConcurrentDictionary<string, TenantQuotaState>(StringComparer.Ordinal);
+        }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="TenantQuotaManager"/> class.
@@ -27,136 +37,130 @@ namespace Locus.Storage
         public TenantQuotaManager(
             DirectoryQuotaRepository repository,
             ILogger<TenantQuotaManager> logger)
+            : this(
+                new DirectoryQuotaRepositoryProjectionStore(repository ?? throw new ArgumentNullException(nameof(repository))),
+                logger)
         {
-            _repository = repository ?? throw new ArgumentNullException(nameof(repository));
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _globalQuotaLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
         }
 
         /// <inheritdoc/>
         public async Task<bool> CanAddFileAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
-            var effectiveLimit = await GetEffectiveLimitAsync(tenantId, ct);
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                var effectiveLimit = await GetEffectiveLimitCoreAsync(tenantId, ct).ConfigureAwait(false);
+                if (effectiveLimit == 0)
+                    return true;
 
-            if (effectiveLimit == 0)
-                return true;
-
-            var currentCount = await GetFileCountAsync(tenantId, ct);
-            return currentCount < effectiveLimit;
+                return state.ProjectedCount + state.ReservationCount < effectiveLimit;
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
         }
 
         /// <inheritdoc/>
         public async Task IncrementFileCountAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
-            var tenantQuota = await _repository.GetAsync(tenantId, tenantId, ct);
-            if (tenantQuota != null && tenantQuota.MaxCount > 0)
-            {
-                var success = await _repository.TryIncrementAsync(tenantId, tenantId, ct);
-                if (!success)
-                {
-                    var currentCount = await GetFileCountAsync(tenantId, ct);
-                    throw new TenantQuotaExceededException(tenantId, currentCount, tenantQuota.MaxCount);
-                }
-
-                _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: {EffectiveLimit})",
-                    tenantId, tenantQuota.MaxCount);
-                return;
-            }
-
-            var globalLimit = await GetGlobalLimitAsync(ct);
-            if (globalLimit == 0)
-            {
-                // No limit configured �?use ForceIncrementAsync so the counter always advances
-                // regardless of any MaxCount value that might exist on the quota record.
-                await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
-                _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: unlimited)", tenantId);
-                return;
-            }
-
-            // Global quota is shared configuration. Keep it out of tenant-specific quota records
-            // so later global limit changes still affect tenants that do not have explicit overrides.
-            var gate = _globalQuotaLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
-            await gate.WaitAsync(ct);
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
             try
             {
-                var currentCount = await GetFileCountAsync(tenantId, ct);
-                if (currentCount >= globalLimit)
-                    throw new TenantQuotaExceededException(tenantId, currentCount, globalLimit);
+                var effectiveLimit = await GetEffectiveLimitCoreAsync(tenantId, ct).ConfigureAwait(false);
+                var currentTotal = state.ProjectedCount + state.ReservationCount;
+                if (effectiveLimit > 0 && currentTotal >= effectiveLimit)
+                    throw new TenantQuotaExceededException(tenantId, currentTotal, effectiveLimit);
 
-                var incremented = await _repository.TryIncrementAsync(tenantId, tenantId, ct);
-                if (!incremented)
-                {
-                    currentCount = await GetFileCountAsync(tenantId, ct);
-                    throw new TenantQuotaExceededException(tenantId, currentCount, globalLimit);
-                }
+                state.ReservationCount++;
+                _logger.LogDebug(
+                    "Reserved tenant quota for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}, limit={EffectiveLimit}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount,
+                    effectiveLimit);
             }
             finally
             {
-                gate.Release();
+                state.Gate.Release();
             }
-
-            _logger.LogDebug("Incremented file count for tenant {TenantId} (limit: {EffectiveLimit})",
-                tenantId, globalLimit);
         }
 
         /// <inheritdoc/>
         public async Task DecrementFileCountAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
-            await _repository.DecrementAsync(tenantId, tenantId, ct);
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                if (state.ReservationCount > 0)
+                {
+                    state.ReservationCount--;
+                    _logger.LogDebug(
+                        "Released tenant quota reservation for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}",
+                        tenantId,
+                        state.ProjectedCount,
+                        state.ReservationCount);
+                    return;
+                }
 
-            _logger.LogDebug("Decremented file count for tenant {TenantId}", tenantId);
+                if (state.ProjectedCount == 0)
+                {
+                    _logger.LogDebug("Tenant quota decrement ignored because projected count is already zero: {TenantId}", tenantId);
+                    return;
+                }
+
+                state.ProjectedCount--;
+                await PersistProjectedCountAsync(tenantId, state.ProjectedCount, ct).ConfigureAwait(false);
+                _logger.LogDebug(
+                    "Decremented projected tenant quota for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount);
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
         }
 
         /// <inheritdoc/>
         public async Task<int> GetFileCountAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
-            var quota = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
-            return quota.CurrentCount;
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                return state.ProjectedCount + state.ReservationCount;
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
         }
 
         /// <inheritdoc/>
         public async Task<int> GetEffectiveLimitAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
-
-            var tenantQuota = await _repository.GetAsync(tenantId, tenantId, ct);
-            if (tenantQuota != null && tenantQuota.MaxCount > 0)
-            {
-                _logger.LogDebug("Using tenant-specific quota for {TenantId}: {MaxCount}", tenantId, tenantQuota.MaxCount);
-                return tenantQuota.MaxCount;
-            }
-
-            var globalLimit = await GetGlobalLimitAsync(ct);
-            _logger.LogDebug("Using global quota for {TenantId}: {MaxCount}", tenantId, globalLimit);
-            return globalLimit;
+            ValidateTenantId(tenantId);
+            return await GetEffectiveLimitCoreAsync(tenantId, ct).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
         public async Task SetTenantLimitAsync(string tenantId, int maxFiles, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
             if (maxFiles < 0)
                 throw new ArgumentException("Max files cannot be negative", nameof(maxFiles));
 
-            var snapshot = await _repository.GetOrCreateAsync(tenantId, tenantId, ct);
-
-            // Build a fresh object instead of mutating the returned reference so we never
-            // accidentally overwrite the live CurrentCount with a stale or zero value.
+            var snapshot = await _quotaStore.GetOrCreateQuotaAsync(tenantId, tenantId, ct).ConfigureAwait(false);
             var updated = new DirectoryQuota
             {
                 DirectoryPath = snapshot.DirectoryPath,
@@ -167,7 +171,7 @@ namespace Locus.Storage
                 LastUpdated = snapshot.LastUpdated
             };
 
-            await _repository.UpdateAsync(tenantId, updated, ct);
+            await _quotaStore.UpdateQuotaAsync(tenantId, updated, ct).ConfigureAwait(false);
 
             _logger.LogInformation("Set tenant-specific quota for {TenantId}: {MaxFiles} files", tenantId, maxFiles);
         }
@@ -175,25 +179,24 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task RemoveTenantLimitAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
-            var quota = await _repository.GetAsync(tenantId, tenantId, ct);
-            if (quota != null)
+            var quota = await _quotaStore.GetQuotaAsync(tenantId, tenantId, ct).ConfigureAwait(false);
+            if (quota == null)
+                return;
+
+            var updated = new DirectoryQuota
             {
-                var updated = new DirectoryQuota
-                {
-                    DirectoryPath = quota.DirectoryPath,
-                    CurrentCount = quota.CurrentCount,
-                    MaxCount = 0,
-                    Enabled = false,
-                    CreatedAt = quota.CreatedAt,
-                    LastUpdated = quota.LastUpdated
-                };
+                DirectoryPath = quota.DirectoryPath,
+                CurrentCount = quota.CurrentCount,
+                MaxCount = 0,
+                Enabled = false,
+                CreatedAt = quota.CreatedAt,
+                LastUpdated = quota.LastUpdated
+            };
 
-                await _repository.UpdateAsync(tenantId, updated, ct);
-                _logger.LogInformation("Removed tenant-specific quota for {TenantId}, will use global quota", tenantId);
-            }
+            await _quotaStore.UpdateQuotaAsync(tenantId, updated, ct).ConfigureAwait(false);
+            _logger.LogInformation("Removed tenant-specific quota for {TenantId}, will use global quota", tenantId);
         }
 
         /// <inheritdoc/>
@@ -202,10 +205,7 @@ namespace Locus.Storage
             if (maxFiles < 0)
                 throw new ArgumentException("Max files cannot be negative", nameof(maxFiles));
 
-            var globalQuota = await _repository.GetOrCreateAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
-
-            // Build a fresh object to avoid mutating the cached reference.
-            // Do NOT overwrite CurrentCount �?it tracks real file counts across restarts.
+            var globalQuota = await _quotaStore.GetOrCreateQuotaAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct).ConfigureAwait(false);
             var updated = new DirectoryQuota
             {
                 DirectoryPath = globalQuota.DirectoryPath,
@@ -216,45 +216,218 @@ namespace Locus.Storage
                 LastUpdated = globalQuota.LastUpdated
             };
 
-            await _repository.UpdateAsync(GLOBAL_QUOTA_KEY, updated, ct);
-
+            await _quotaStore.UpdateQuotaAsync(GLOBAL_QUOTA_KEY, updated, ct).ConfigureAwait(false);
             _logger.LogInformation("Set global quota limit: {MaxFiles} files (0 = unlimited)", maxFiles);
         }
 
         /// <inheritdoc/>
         public async Task<int> GetGlobalLimitAsync(CancellationToken ct = default)
         {
-            var globalQuota = await _repository.GetAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct);
+            var globalQuota = await _quotaStore.GetQuotaAsync(GLOBAL_QUOTA_KEY, GLOBAL_QUOTA_KEY, ct).ConfigureAwait(false);
             return globalQuota?.MaxCount ?? 0;
         }
 
         /// <inheritdoc/>
         public async Task CompensateIncrementFileCountAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            _ = await ApplyAcceptedProjectionAsync(tenantId, ct).ConfigureAwait(false);
+        }
 
-            // Use ForceIncrementAsync (unconditional atomic increment) rather than
-            // GetOrCreateAsync + SetCurrentCountAsync to avoid the TOCTOU race where a
-            // concurrent writer could read the same stale CurrentCount and both add 1,
-            // or a concurrent decrement could be lost.
-            await _repository.ForceIncrementAsync(tenantId, tenantId, ct);
+        /// <inheritdoc/>
+        public async Task<bool> ApplyAcceptedProjectionAsync(string tenantId, CancellationToken ct = default)
+        {
+            ValidateTenantId(tenantId);
 
-            _logger.LogDebug("Compensated file count for tenant {TenantId}", tenantId);
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                var consumedReservation = false;
+                if (state.ReservationCount > 0)
+                {
+                    state.ReservationCount--;
+                    consumedReservation = true;
+                }
+
+                state.ProjectedCount++;
+                await PersistProjectedCountAsync(tenantId, state.ProjectedCount, ct).ConfigureAwait(false);
+
+                _logger.LogDebug(
+                    "Applied Accepted tenant projection for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}, consumedReservation={ConsumedReservation}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount,
+                    consumedReservation);
+
+                return consumedReservation;
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task RollbackAcceptedProjectionAsync(string tenantId, bool restoreReservation, CancellationToken ct = default)
+        {
+            ValidateTenantId(tenantId);
+
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                if (state.ProjectedCount > 0)
+                {
+                    state.ProjectedCount--;
+                    await PersistProjectedCountAsync(tenantId, state.ProjectedCount, ct).ConfigureAwait(false);
+                }
+
+                if (restoreReservation)
+                    state.ReservationCount++;
+
+                _logger.LogDebug(
+                    "Rolled back Accepted tenant projection for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}, restoredReservation={RestoreReservation}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount,
+                    restoreReservation);
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task ApplyDeleteSucceededProjectionAsync(string tenantId, CancellationToken ct = default)
+        {
+            ValidateTenantId(tenantId);
+
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                if (state.ProjectedCount == 0)
+                {
+                    _logger.LogDebug("DeleteSucceeded tenant projection ignored because projected count is already zero: {TenantId}", tenantId);
+                    return;
+                }
+
+                state.ProjectedCount--;
+                await PersistProjectedCountAsync(tenantId, state.ProjectedCount, ct).ConfigureAwait(false);
+                _logger.LogDebug(
+                    "Applied DeleteSucceeded tenant projection for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount);
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task RollbackDeleteSucceededProjectionAsync(string tenantId, CancellationToken ct = default)
+        {
+            ValidateTenantId(tenantId);
+
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                state.ProjectedCount++;
+                await PersistProjectedCountAsync(tenantId, state.ProjectedCount, ct).ConfigureAwait(false);
+                _logger.LogDebug(
+                    "Rolled back DeleteSucceeded tenant projection for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount);
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
         }
 
         /// <inheritdoc/>
         public async Task SetFileCountAsync(string tenantId, int count, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            ValidateTenantId(tenantId);
 
             if (count < 0)
                 throw new ArgumentException("Count cannot be negative", nameof(count));
 
-            await _repository.SetCurrentCountAsync(tenantId, tenantId, count, ct);
+            var state = await EnterStateAsync(tenantId, ct).ConfigureAwait(false);
+            try
+            {
+                state.ProjectedCount = count;
+                await PersistProjectedCountAsync(tenantId, state.ProjectedCount, ct).ConfigureAwait(false);
+                _logger.LogDebug(
+                    "Reconciled tenant quota for {TenantId}: projected={ProjectedCount}, reservations={ReservationCount}",
+                    tenantId,
+                    state.ProjectedCount,
+                    state.ReservationCount);
+            }
+            finally
+            {
+                state.Gate.Release();
+            }
+        }
 
-            _logger.LogDebug("Reconciled file count for tenant {TenantId}: {Count}", tenantId, count);
+        private async Task<int> GetEffectiveLimitCoreAsync(string tenantId, CancellationToken ct)
+        {
+            var tenantQuota = await _quotaStore.GetQuotaAsync(tenantId, tenantId, ct).ConfigureAwait(false);
+            if (tenantQuota != null && tenantQuota.MaxCount > 0)
+            {
+                _logger.LogDebug("Using tenant-specific quota for {TenantId}: {MaxCount}", tenantId, tenantQuota.MaxCount);
+                return tenantQuota.MaxCount;
+            }
+
+            var globalLimit = await GetGlobalLimitAsync(ct).ConfigureAwait(false);
+            _logger.LogDebug("Using global quota for {TenantId}: {MaxCount}", tenantId, globalLimit);
+            return globalLimit;
+        }
+
+        private async Task PersistProjectedCountAsync(string tenantId, int projectedCount, CancellationToken ct)
+        {
+            await _quotaStore.SetProjectedCountAsync(tenantId, tenantId, projectedCount, ct).ConfigureAwait(false);
+        }
+
+        private async Task<TenantQuotaState> EnterStateAsync(string tenantId, CancellationToken ct)
+        {
+            var state = _states.GetOrAdd(tenantId, _ => new TenantQuotaState());
+            await state.Gate.WaitAsync(ct).ConfigureAwait(false);
+
+            try
+            {
+                if (!state.Initialized)
+                {
+                    var snapshot = await _quotaStore.GetOrCreateQuotaAsync(tenantId, tenantId, ct).ConfigureAwait(false);
+                    state.ProjectedCount = snapshot.CurrentCount;
+                    state.Initialized = true;
+                }
+
+                return state;
+            }
+            catch
+            {
+                state.Gate.Release();
+                throw;
+            }
+        }
+
+        private static void ValidateTenantId(string tenantId)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+        }
+
+        private sealed class TenantQuotaState
+        {
+            public SemaphoreSlim Gate { get; } = new SemaphoreSlim(1, 1);
+
+            public int ProjectedCount { get; set; }
+
+            public int ReservationCount { get; set; }
+
+            public bool Initialized { get; set; }
         }
     }
 }

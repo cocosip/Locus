@@ -127,7 +127,9 @@ namespace Locus.Storage.Data
                 AvailableForProcessingAt = AvailableForProcessingAt,
                 OriginalFileName = OriginalFileName,
                 FileExtension = FileExtension,
-                Metadata = Metadata
+                Metadata = Metadata != null
+                    ? new System.Collections.Generic.Dictionary<string, string>(Metadata)
+                    : null
             };
         }
     }

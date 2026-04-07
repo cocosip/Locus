@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -22,7 +23,8 @@ namespace Locus.Storage.Tests
         private readonly IFileSystem _fileSystem;
         private readonly MetadataRepository _metadataRepository;
         private readonly DirectoryQuotaRepository _quotaRepository;
-        private readonly ITenantQuotaManager _tenantQuotaManager;
+        private readonly TenantQuotaManager _tenantQuotaManager;
+        private readonly DirectoryQuotaManager _directoryQuotaManager;
         private readonly Mock<ITenantManager> _tenantManager;
         private readonly Mock<ILogger<StorageCleanupService>> _logger;
         private readonly StorageCleanupService _cleanupService;
@@ -60,6 +62,9 @@ namespace Locus.Storage.Tests
             _tenantQuotaManager = new TenantQuotaManager(
                 _quotaRepository,
                 new Mock<ILogger<TenantQuotaManager>>().Object);
+            _directoryQuotaManager = new DirectoryQuotaManager(
+                _quotaRepository,
+                new Mock<ILogger<DirectoryQuotaManager>>().Object);
             _tenantManager = new Mock<ITenantManager>();
             var defaultTenant = new Mock<ITenantContext>();
             defaultTenant.Setup(t => t.TenantId).Returns("tenant-001");
@@ -99,7 +104,8 @@ namespace Locus.Storage.Tests
                 _logger.Object,
                 _metadataDir,
                 _quotaDir,
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager);
 
             // Setup mock volume
             _volumePath = Path.Combine(Path.GetTempPath(), $"locus-test-cleanup-vol-{testId}");
@@ -153,6 +159,12 @@ namespace Locus.Storage.Tests
             {
                 // Ignore cleanup errors in tests
             }
+        }
+
+        private async Task SeedProjectedCountsAsync(string tenantId, string directoryPath)
+        {
+            await _tenantQuotaManager.ApplyAcceptedProjectionAsync(tenantId, CancellationToken.None);
+            await _directoryQuotaManager.ApplyAcceptedProjectionAsync(tenantId, directoryPath, CancellationToken.None);
         }
 
         [Fact]
@@ -315,8 +327,7 @@ namespace Locus.Storage.Tests
             };
 
             await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
 
             // Act
             await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
@@ -379,8 +390,7 @@ namespace Locus.Storage.Tests
             };
 
             await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/", default);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/", default);
+            await SeedProjectedCountsAsync("tenant-001", "/");
 
             await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
 
@@ -411,9 +421,7 @@ namespace Locus.Storage.Tests
             };
 
             await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
-            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", default);
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
 
             _volume.Setup(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()))
                 .ThrowsAsync(new IOException("file is locked"));
@@ -451,8 +459,7 @@ namespace Locus.Storage.Tests
             };
 
             await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
 
             var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
             tenantQuotaManager
@@ -505,9 +512,7 @@ namespace Locus.Storage.Tests
             };
 
             await _metadataRepository.AddOrUpdateAsync(failedMetadata, default);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/failed", default);
-            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", default);
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
 
             _volume.Setup(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()))
                 .Returns(async (string path, CancellationToken token) =>
@@ -969,6 +974,102 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReconcileQuotaCountsAsync_UsesProjectionStoreWhenProvided()
+        {
+            var physicalPath = Path.Combine(_volumePath, "tenant-001", "projection-owned.dat");
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        FileKey = "projection-owned",
+                        TenantId = "tenant-001",
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalPath,
+                        DirectoryPath = "/projection",
+                        FileSize = 4,
+                        CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+                        Status = FileProcessingStatus.Pending
+                    }
+                });
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager,
+                projectionStore: projectionStore.Object);
+
+            await cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
+
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/projection", CancellationToken.None)).CurrentCount);
+            projectionStore.Verify(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()), Times.Once);
+            projectionStore.VerifyAll();
+        }
+
+        [Fact]
+        public async Task ReconcileQuotaCountsAsync_UsesQuotaMaintenanceStoreWhenDirectoryManagerMissing()
+        {
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        FileKey = "quota-maint-file",
+                        TenantId = "tenant-001",
+                        VolumeId = "vol-001",
+                        PhysicalPath = Path.Combine(_volumePath, "tenant-001", "quota-maint-file.dat"),
+                        DirectoryPath = "/projection-maint",
+                        FileSize = 4,
+                        CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+                        Status = FileProcessingStatus.Pending
+                    }
+                });
+
+            var quotaMaintenanceStore = new Mock<IQuotaProjectionMaintenanceStore>(MockBehavior.Strict);
+            quotaMaintenanceStore
+                .Setup(store => store.GetQuotaRowsAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<DirectoryQuota>());
+            quotaMaintenanceStore
+                .Setup(store => store.SetProjectedCountAsync("tenant-001", "/projection-maint", 1, It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: null,
+                projectionStore: projectionStore.Object,
+                quotaMaintenanceStore: quotaMaintenanceStore.Object);
+
+            await cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
+
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            quotaMaintenanceStore.Verify(
+                store => store.GetQuotaRowsAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            quotaMaintenanceStore.Verify(
+                store => store.SetProjectedCountAsync("tenant-001", "/projection-maint", 1, It.IsAny<CancellationToken>()),
+                Times.Once);
+            quotaMaintenanceStore.VerifyAll();
+        }
+
+        [Fact]
         public async Task RecoverOrphanedFilesAsync_DoesNotPersistMetadata_WhenTenantQuotaCompensationFails()
         {
             var quotaFailingManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
@@ -1048,6 +1149,101 @@ namespace Locus.Storage.Tests
             customTenantQuotaManager.Verify(
                 m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
                 Times.Never);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_UsesProjectionStoreWhenProvided()
+        {
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            FileMetadata? capturedMetadata = null;
+
+            projectionStore
+                .Setup(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projectionStore
+                .Setup(store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+                .Callback<FileMetadata, CancellationToken>((metadata, _) => capturedMetadata = metadata.Clone())
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager,
+                projectionStore: projectionStore.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            var orphanPath = Path.Combine(tenantPath, "projection-store.dat");
+            _fileSystem.File.WriteAllText(orphanPath, "orphan");
+
+            await cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.NotNull(capturedMetadata);
+            Assert.Equal("tenant-001", capturedMetadata!.TenantId);
+            Assert.Equal(orphanPath, capturedMetadata.PhysicalPath);
+            Assert.Equal(FileProcessingStatus.Pending, capturedMetadata.Status);
+            Assert.NotNull(capturedMetadata.Metadata);
+            Assert.True(capturedMetadata.Metadata!.TryGetValue("queue.accepted_projection_applied", out var acceptedApplied));
+            Assert.Equal(bool.TrueString, acceptedApplied);
+
+            projectionStore.Verify(
+                store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            projectionStore.Verify(
+                store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_DoesNotRebuild_WhenProjectionStoreAlreadyKnowsPhysicalPath()
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            var knownPath = Path.Combine(tenantPath, "known-by-projection.dat");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            _fileSystem.File.WriteAllText(knownPath, "known");
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        FileKey = "known-by-projection",
+                        TenantId = "tenant-001",
+                        VolumeId = "vol-001",
+                        PhysicalPath = knownPath,
+                        DirectoryPath = "/",
+                        Status = FileProcessingStatus.Pending,
+                        CreatedAt = DateTime.UtcNow
+                    }
+                });
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager,
+                projectionStore: projectionStore.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "known-by-projection", CancellationToken.None));
+            projectionStore.Verify(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()), Times.Once);
+            projectionStore.VerifyNoOtherCalls();
         }
 
         [Fact]
@@ -1239,9 +1435,7 @@ namespace Locus.Storage.Tests
                 CompletedAt = DateTime.UtcNow.AddMinutes(-5)
             }, CancellationToken.None);
 
-            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", CancellationToken.None);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/done", CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/done");
 
             await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
             await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
@@ -1295,9 +1489,7 @@ namespace Locus.Storage.Tests
                 CompletedAt = DateTime.UtcNow.AddMinutes(-5)
             }, CancellationToken.None);
 
-            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", CancellationToken.None);
-            await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None);
-            await _quotaRepository.TryIncrementAsync("tenant-001", "/done", CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/done");
 
             await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
 
@@ -1308,6 +1500,85 @@ namespace Locus.Storage.Tests
 
             var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
             Assert.Equal(1, stats.CompletedRecordsRemoved);
+        }
+
+        [Fact]
+        public async Task CleanupCompletedFilesAsync_UsesProjectionCleanupStoreWhenProvided()
+        {
+            var completedAt = DateTime.UtcNow.AddMinutes(-5);
+            var physicalPath = Path.Combine(_volumePath, "completed-projection-store.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+
+            var metadata = new FileMetadata
+            {
+                FileKey = "completed-projection-store",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = completedAt
+            };
+
+            var projectionCleanupStore = new Mock<IQueueProjectionCleanupStore>(MockBehavior.Strict);
+            projectionCleanupStore
+                .SetupSequence(store => store.GetCompletedFilesOlderThanAsync(
+                    "tenant-001",
+                    It.IsAny<DateTime>(),
+                    It.IsAny<int>(),
+                    It.IsAny<ISet<string>?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { metadata })
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projectionCleanupStore
+                .Setup(store => store.TryRemoveCompletedFileAsync(
+                    "tenant-001",
+                    "completed-projection-store",
+                    completedAt,
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager,
+                projectionCleanupStore: projectionCleanupStore.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "tenant-seed",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumePath, "tenant-seed.dat"),
+                DirectoryPath = "/seed",
+                FileSize = 1,
+                CreatedAt = DateTime.UtcNow,
+                Status = FileProcessingStatus.Pending
+            }, CancellationToken.None);
+
+            await SeedProjectedCountsAsync("tenant-001", "/done");
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None)).CurrentCount);
+
+            projectionCleanupStore.Verify(store => store.TryRemoveCompletedFileAsync(
+                "tenant-001",
+                "completed-projection-store",
+                completedAt,
+                It.IsAny<CancellationToken>()), Times.Once);
+            projectionCleanupStore.VerifyAll();
         }
 
         [Fact]

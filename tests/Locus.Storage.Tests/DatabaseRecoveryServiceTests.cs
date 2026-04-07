@@ -17,6 +17,15 @@ namespace Locus.Storage.Tests
 {
     public class DatabaseRecoveryServiceTests : IDisposable
     {
+        private sealed class TestDatabaseRebuildLockHandle : IDatabaseRebuildLockHandle
+        {
+            public string? BackupPath { get; set; }
+
+            public void Dispose()
+            {
+            }
+        }
+
         private readonly IFileSystem _fileSystem;
         private readonly MetadataRepository _metadataRepository;
         private readonly DirectoryQuotaRepository _quotaRepository;
@@ -312,6 +321,67 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildMetadataDatabaseAsync_UsesProjectionStoreForQueueRecoveryCountsWhenProvided()
+        {
+            var tenantId = $"tenant-rebuild-journal-projection-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var physicalFile = Path.Combine(_volumePath, tenantId, "projection-file.dcm");
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalFile)!);
+            _fileSystem.File.WriteAllText(physicalFile, "content");
+
+            var projectionMaintenance = new Mock<IQueueProjectionMaintenanceService>(MockBehavior.Strict);
+            projectionMaintenance
+                .Setup(x => x.RebuildTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new QueueProjectionTenantState
+                {
+                    TenantId = tenantId,
+                    CursorOffset = 256,
+                    JournalSizeBytes = 256,
+                    LagBytes = 0,
+                    HasSnapshot = true,
+                    SnapshotCursorOffset = 256,
+                    SnapshotFileCount = 1
+                });
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(x => x.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        FileKey = "projection-file",
+                        TenantId = tenantId,
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalFile,
+                        DirectoryPath = "/logical/recovered",
+                        FileSize = 7,
+                        Status = FileProcessingStatus.Pending,
+                        CreatedAt = DateTime.UtcNow
+                    }
+                });
+
+            var recoveryService = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                queueProjectionMaintenanceService: projectionMaintenance.Object,
+                projectionStore: projectionStore.Object);
+
+            var result = await recoveryService.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+            Assert.Equal(1, result.RecordsRebuilt);
+            projectionMaintenance.Verify(x => x.RebuildTenantAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+            projectionStore.Verify(x => x.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task RebuildMetadataDatabaseAsync_UsesStableFileKeyAndConfiguredVolumeId()
         {
             // Arrange
@@ -418,6 +488,28 @@ namespace Locus.Storage.Tests
 
             var metadata = (await _metadataRepository.GetByTenantAsync(tenantId, default)).Single();
             Assert.Equal("/", metadata.DirectoryPath);
+        }
+
+        [Fact]
+        public async Task RebuildMetadataDatabaseAsync_PhysicalScanUsesRootLogicalDirectoryForNestedFiles()
+        {
+            var tenantId = $"tenant-nested-dir-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var nestedPath = Path.Combine(_volumePath, tenantId, "incoming", "studies");
+            _fileSystem.Directory.CreateDirectory(nestedPath);
+            _fileSystem.File.WriteAllText(Path.Combine(nestedPath, "study-001.dcm"), "content");
+
+            var result = await _recoveryService.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+
+            var metadata = (await _metadataRepository.GetByTenantAsync(tenantId, default)).Single();
+            Assert.Equal("/", metadata.DirectoryPath);
+            Assert.NotNull(metadata.Metadata);
+            Assert.True(metadata.Metadata!.TryGetValue("queue.accepted_projection_applied", out var acceptedApplied));
+            Assert.Equal(bool.TrueString, acceptedApplied);
         }
 
         [Fact]
@@ -538,11 +630,17 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.True(result.Success);
-            Assert.True(result.RecordsRebuilt >= 2);
+            Assert.Equal(2, result.RecordsRebuilt);
             Assert.NotNull(result.BackupPath);
 
             // Verify new database file exists
             Assert.True(_fileSystem.File.Exists(dbPath));
+
+            var quotas = (await _quotaRepository.GetAllAsync(tenantId, default)).ToArray();
+            Assert.Contains(quotas, q => q.DirectoryPath == "/" && q.CurrentCount == 3);
+            Assert.Contains(quotas, q => q.DirectoryPath == tenantId && q.CurrentCount == 3);
+            Assert.DoesNotContain(quotas, q => q.DirectoryPath == "/documents");
+            Assert.DoesNotContain(quotas, q => q.DirectoryPath == "/images");
         }
 
         [Fact]
@@ -607,6 +705,121 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildQuotaDatabaseAsync_UsesProjectionStoreMetadataWhenProvided()
+        {
+            var tenantId = $"tenant-rebuild-quota-projection-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(x => x.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        FileKey = "quota-projection-file",
+                        TenantId = tenantId,
+                        VolumeId = "vol-001",
+                        PhysicalPath = Path.Combine(_volumePath, tenantId, "docs", "quota-projection-file.dcm"),
+                        DirectoryPath = "/logical/inbox",
+                        FileSize = 11,
+                        Status = FileProcessingStatus.Pending,
+                        CreatedAt = DateTime.UtcNow
+                    }
+                });
+
+            var recoveryService = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                projectionStore: projectionStore.Object);
+
+            var result = await recoveryService.RebuildQuotaDatabaseAsync(
+                tenantId,
+                Array.Empty<string>(),
+                default);
+
+            Assert.True(result.Success);
+            Assert.True(result.RecordsRebuilt >= 2);
+            projectionStore.Verify(x => x.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+
+            var quotas = (await _quotaRepository.GetAllAsync(tenantId, default)).ToArray();
+            Assert.Contains(quotas, q => q.DirectoryPath == "/logical/inbox" && q.CurrentCount == 1);
+            Assert.Contains(quotas, q => q.DirectoryPath == tenantId && q.CurrentCount == 1);
+        }
+
+        [Fact]
+        public async Task RebuildQuotaDatabaseAsync_UsesQuotaMaintenanceStoreWhenProvided()
+        {
+            var tenantId = $"tenant-rebuild-quota-maint-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(x => x.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[]
+                {
+                    new FileMetadata
+                    {
+                        FileKey = "quota-maint-file",
+                        TenantId = tenantId,
+                        VolumeId = "vol-001",
+                        PhysicalPath = Path.Combine(_volumePath, tenantId, "docs", "quota-maint-file.dcm"),
+                        DirectoryPath = "/logical/inbox",
+                        FileSize = 11,
+                        Status = FileProcessingStatus.Pending,
+                        CreatedAt = DateTime.UtcNow
+                    }
+                });
+
+            var quotaMaintenanceStore = new Mock<IQuotaProjectionMaintenanceStore>(MockBehavior.Strict);
+            quotaMaintenanceStore
+                .Setup(store => store.BeginDatabaseRebuildAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new TestDatabaseRebuildLockHandle());
+            quotaMaintenanceStore
+                .SetupSequence(store => store.GetQuotaRowsAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<DirectoryQuota>())
+                .ReturnsAsync(new[]
+                {
+                    new DirectoryQuota { DirectoryPath = "/logical/inbox", CurrentCount = 1, MaxCount = 0, Enabled = false },
+                    new DirectoryQuota { DirectoryPath = tenantId, CurrentCount = 1, MaxCount = 0, Enabled = false }
+                });
+            quotaMaintenanceStore
+                .Setup(store => store.SetProjectedCountForRebuildAsync(tenantId, "/logical/inbox", 1, It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            quotaMaintenanceStore
+                .Setup(store => store.SetProjectedCountForRebuildAsync(tenantId, tenantId, 1, It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var recoveryService = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                projectionStore: projectionStore.Object,
+                quotaMaintenanceStore: quotaMaintenanceStore.Object);
+
+            var result = await recoveryService.RebuildQuotaDatabaseAsync(
+                tenantId,
+                Array.Empty<string>(),
+                default);
+
+            Assert.True(result.Success);
+            Assert.Equal(2, result.RecordsRebuilt);
+            quotaMaintenanceStore.Verify(
+                store => store.BeginDatabaseRebuildAsync(tenantId, It.IsAny<CancellationToken>()),
+                Times.Once);
+            quotaMaintenanceStore.Verify(
+                store => store.SetProjectedCountForRebuildAsync(tenantId, "/logical/inbox", 1, It.IsAny<CancellationToken>()),
+                Times.Once);
+            quotaMaintenanceStore.Verify(
+                store => store.SetProjectedCountForRebuildAsync(tenantId, tenantId, 1, It.IsAny<CancellationToken>()),
+                Times.Once);
+            quotaMaintenanceStore.VerifyAll();
+        }
+
+        [Fact]
         public async Task RebuildQuotaDatabaseAsync_SynchronizesAtomicCounterState()
         {
             // Arrange
@@ -635,14 +848,14 @@ namespace Locus.Storage.Tests
 
             await _recoveryService.RebuildQuotaDatabaseAsync(tenantId, new[] { _volumePath }, default);
 
-            // Set limit equal to rebuilt count; a further increment must be rejected.
-            var quota = await _quotaRepository.GetOrCreateAsync(tenantId, "/documents", default);
+            // Set limit equal to rebuilt logical-root count; a further increment must be rejected.
+            var quota = await _quotaRepository.GetOrCreateAsync(tenantId, "/", default);
             quota.MaxCount = 2;
             quota.Enabled = true;
             await _quotaRepository.UpdateAsync(tenantId, quota, default);
 
             // Act
-            var incremented = await _quotaRepository.TryIncrementAsync(tenantId, "/documents", default);
+            var incremented = await _quotaRepository.TryIncrementAsync(tenantId, "/", default);
 
             // Assert
             Assert.False(incremented);

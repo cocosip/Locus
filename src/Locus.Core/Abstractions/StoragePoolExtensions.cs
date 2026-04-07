@@ -47,6 +47,21 @@ namespace Locus.Core.Abstractions
         }
 
         /// <summary>
+        /// Writes a file without specifying a tenant (uses default tenant) with original file name
+        /// and logical directory path.
+        /// For single-tenant scenarios only.
+        /// </summary>
+        public static Task<string> WriteFileAsync(
+            this IStoragePool storagePool,
+            Stream content,
+            string? originalFileName,
+            string? logicalDirectoryPath,
+            CancellationToken ct = default)
+        {
+            return storagePool.WriteFileAsync(CreateDefaultTenantContext(), content, originalFileName, logicalDirectoryPath, ct);
+        }
+
+        /// <summary>
         /// Reads a file without specifying a tenant (uses default tenant).
         /// For single-tenant scenarios only.
         /// </summary>

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
@@ -18,19 +19,45 @@ namespace Locus.Storage
     /// File scheduler that manages concurrent file processing with retry logic.
     /// Ensures that different threads receive different files.
     /// </summary>
-    public class FileScheduler : IFileScheduler
+    public class FileScheduler : IFileScheduler, IQueueEventManagedFileScheduler
     {
         private static readonly StringComparer PhysicalPathComparer =
             RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
-        private readonly MetadataRepository _repository;
+        private readonly IQueueProjectionStore _projectionStore;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<FileScheduler> _logger;
         private readonly FileRetryPolicy _retryPolicy;
         private readonly StorageVolumeRegistry? _volumeRegistry;
         private readonly ITenantQuotaManager? _tenantQuotaManager;
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
+        private readonly IQueueEventJournal? _queueEventJournal;
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _transitionGuards;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="FileScheduler"/> class.
+        /// </summary>
+        public FileScheduler(
+            IQueueProjectionStore projectionStore,
+            IFileSystem fileSystem,
+            ILogger<FileScheduler> logger,
+            FileRetryPolicy? retryPolicy = null,
+            StorageVolumeRegistry? volumeRegistry = null,
+            ITenantQuotaManager? tenantQuotaManager = null,
+            IDirectoryQuotaManager? directoryQuotaManager = null,
+            IQueueEventJournal? queueEventJournal = null)
+        {
+            _projectionStore = projectionStore ?? throw new ArgumentNullException(nameof(projectionStore));
+            _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _retryPolicy = retryPolicy ?? new FileRetryPolicy();
+            _volumeRegistry = volumeRegistry;
+            _tenantQuotaManager = tenantQuotaManager;
+            _directoryQuotaManager = directoryQuotaManager;
+            _queueEventJournal = queueEventJournal;
+            _transitionGuards = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+        }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FileScheduler"/> class.
@@ -42,16 +69,23 @@ namespace Locus.Storage
             FileRetryPolicy? retryPolicy = null,
             StorageVolumeRegistry? volumeRegistry = null,
             ITenantQuotaManager? tenantQuotaManager = null,
-            IDirectoryQuotaManager? directoryQuotaManager = null)
+            IDirectoryQuotaManager? directoryQuotaManager = null,
+            IQueueEventJournal? queueEventJournal = null,
+            IQueueProjectionStore? projectionStore = null)
+            : this(
+                projectionStore ?? new MetadataRepositoryQueueProjectionStore(repository ?? throw new ArgumentNullException(nameof(repository))),
+                fileSystem,
+                logger,
+                retryPolicy,
+                volumeRegistry,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                queueEventJournal)
         {
-            _repository = repository ?? throw new ArgumentNullException(nameof(repository));
-            _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _retryPolicy = retryPolicy ?? new FileRetryPolicy();
-            _volumeRegistry = volumeRegistry;
-            _tenantQuotaManager = tenantQuotaManager;
-            _directoryQuotaManager = directoryQuotaManager;
         }
+
+        /// <inheritdoc/>
+        public bool HandlesQueueJournal => _queueEventJournal != null;
 
         /// <inheritdoc/>
         public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default)
@@ -59,10 +93,23 @@ namespace Locus.Storage
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
 
-            var metadata = await _repository.GetNextPendingFileAsync(tenant.TenantId, ct);
+            var metadata = await _projectionStore.LeaseNextPendingFileAsync(tenant.TenantId, ct).ConfigureAwait(false);
 
             if (metadata == null)
                 return null;
+
+            if (_queueEventJournal != null)
+            {
+                try
+                {
+                    await _queueEventJournal.AppendAsync(CreateProcessingStartedEvent(metadata), ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await TryRollbackLeasedFilesAsync(new[] { metadata }).ConfigureAwait(false);
+                    throw;
+                }
+            }
 
             // NOTE: File.Exists is intentionally omitted from this hot path.
             // The recovery service (RecoverOrphanedFilesAsync) periodically rebuilds metadata
@@ -84,7 +131,23 @@ namespace Locus.Storage
             if (batchSize <= 0)
                 throw new ArgumentException("Batch size must be greater than zero", nameof(batchSize));
 
-            var metadataList = await _repository.GetNextPendingBatchAsync(tenant.TenantId, batchSize, ct);
+            var metadataList = (await _projectionStore.LeaseNextPendingBatchAsync(tenant.TenantId, batchSize, ct).ConfigureAwait(false)).ToList();
+
+            if (_queueEventJournal != null && metadataList.Count > 0)
+            {
+                try
+                {
+                    await _queueEventJournal.AppendBatchAsync(
+                        metadataList.Select(CreateProcessingStartedEvent).ToArray(),
+                        ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await TryRollbackLeasedFilesAsync(
+                        metadataList).ConfigureAwait(false);
+                    throw;
+                }
+            }
 
             // NOTE: File.Exists is intentionally omitted - same rationale as GetNextFileForProcessingAsync.
             var locations = metadataList.Select(MapToFileLocation).ToList();
@@ -107,11 +170,11 @@ namespace Locus.Storage
             const int maxAttempts = 3;
             for (var attempt = 0; attempt < maxAttempts; attempt++)
             {
-                var updated = await _repository.TryMarkPendingFileAsProcessingAsync(
+                var updated = await _projectionStore.TryMarkProjectedPendingFileAsProcessingAsync(
                     tenantId,
                     fileKey,
                     DateTime.UtcNow,
-                    ct);
+                    ct).ConfigureAwait(false);
                 if (updated != null)
                 {
                     _logger.LogDebug("Marked file as processing: {FileKey}", fileKey);
@@ -119,7 +182,7 @@ namespace Locus.Storage
                 }
             }
 
-            var latest = await _repository.GetAsync(tenantId, fileKey, ct);
+            var latest = await _projectionStore.GetProjectedFileAsync(tenantId, fileKey, ct).ConfigureAwait(false);
             if (latest == null)
                 throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
 
@@ -135,34 +198,78 @@ namespace Locus.Storage
         {
             ValidateLease(lease);
 
-            var completedAtUtc = DateTime.UtcNow;
-            var updated = await _repository.TryUpdateProcessingFileAsync(
-                lease.TenantId,
-                lease.FileKey,
-                lease.ProcessingStartTimeUtc,
-                current =>
-                {
-                    current.Status = FileProcessingStatus.Completed;
-                    current.ProcessingStartTime = null;
-                    current.CompletedAt = completedAtUtc;
-                    current.DeleteSucceededAt = null;
-                    current.AvailableForProcessingAt = null;
-                    current.LastError = null;
-                    return current;
-                },
-                ct);
-            if (updated != null)
+            SemaphoreSlim? transitionGuard = null;
+            if (_queueEventJournal != null)
             {
-                _logger.LogDebug("Marked file as completed: {FileKey}", lease.FileKey);
-                return;
+                transitionGuard = GetTransitionGuard(lease.FileKey);
+                await transitionGuard.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    var current = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                    if (current == null)
+                        return;
+
+                    if (current.Status == FileProcessingStatus.Completed)
+                        return;
+
+                    if (current.Status != FileProcessingStatus.Processing
+                        || !current.ProcessingStartTime.HasValue
+                        || current.ProcessingStartTime.Value != lease.ProcessingStartTimeUtc)
+                    {
+                        throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, current);
+                    }
+
+                    var completedAtUtc = DateTime.UtcNow;
+                    await _queueEventJournal.AppendBatchAsync(
+                        new[]
+                        {
+                            CreateProcessingCompletedEvent(current, lease.ProcessingStartTimeUtc, completedAtUtc),
+                            CreateDeleteRequestedEvent(current, completedAtUtc),
+                        },
+                        ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    transitionGuard.Release();
+                    throw;
+                }
             }
 
-            var metadata = await _repository.GetAsync(lease.TenantId, lease.FileKey, ct);
-            if (metadata?.Status == FileProcessingStatus.Completed)
-                return;
+            try
+            {
+                var completedAtUtc = DateTime.UtcNow;
+                var updated = await _projectionStore.TryUpdateProjectedProcessingFileAsync(
+                    lease.TenantId,
+                    lease.FileKey,
+                    lease.ProcessingStartTimeUtc,
+                    current =>
+                    {
+                        current.Status = FileProcessingStatus.Completed;
+                        current.ProcessingStartTime = null;
+                        current.CompletedAt = completedAtUtc;
+                        current.DeleteSucceededAt = null;
+                        current.AvailableForProcessingAt = null;
+                        current.LastError = null;
+                        return current;
+                    },
+                    ct).ConfigureAwait(false);
+                if (updated != null)
+                {
+                    _logger.LogDebug("Marked file as completed: {FileKey}", lease.FileKey);
+                    return;
+                }
 
-            if (updated == null)
-                throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
+                var metadata = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                if (metadata?.Status == FileProcessingStatus.Completed)
+                    return;
+
+                if (updated == null)
+                    throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
+            }
+            finally
+            {
+                transitionGuard?.Release();
+            }
         }
 
         /// <inheritdoc/>
@@ -170,48 +277,85 @@ namespace Locus.Storage
         {
             ValidateLease(lease);
 
-            var updated = await _repository.TryUpdateProcessingFileAsync(
-                lease.TenantId,
-                lease.FileKey,
-                lease.ProcessingStartTimeUtc,
-                current =>
+            SemaphoreSlim? transitionGuard = null;
+            if (_queueEventJournal != null)
+            {
+                transitionGuard = GetTransitionGuard(lease.FileKey);
+                await transitionGuard.WaitAsync(ct).ConfigureAwait(false);
+                try
                 {
-                    current.RetryCount++;
-                    current.LastError = errorMessage;
-                    current.LastFailedAt = DateTime.UtcNow;
-                    current.ProcessingStartTime = null;
-                    current.DeleteSucceededAt = null;
+                    var current = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                    if (current == null)
+                        throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, null);
 
-                    if (current.RetryCount >= _retryPolicy.MaxRetryCount)
+                    if (current.Status != FileProcessingStatus.Processing
+                        || !current.ProcessingStartTime.HasValue
+                        || current.ProcessingStartTime.Value != lease.ProcessingStartTimeUtc)
                     {
-                        current.Status = FileProcessingStatus.PermanentlyFailed;
-                        current.AvailableForProcessingAt = null;
-                    }
-                    else
-                    {
-                        current.Status = FileProcessingStatus.Pending;
-                        current.AvailableForProcessingAt = DateTime.UtcNow.Add(CalculateRetryDelay(current.RetryCount));
+                        throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, current);
                     }
 
-                    return current;
-                },
-                ct);
-            var metadata = updated == null
-                ? await _repository.GetAsync(lease.TenantId, lease.FileKey, ct)
-                : null;
-            if (updated == null)
-                throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
-
-            if (updated.Status == FileProcessingStatus.PermanentlyFailed)
-            {
-                _logger.LogError("File permanently failed after {RetryCount} retries: {FileKey}, Error: {Error}",
-                    updated.RetryCount, lease.FileKey, errorMessage);
+                    var projected = BuildFailedMetadata(current, errorMessage);
+                    await _queueEventJournal.AppendAsync(
+                        CreateProcessingFailedEvent(projected, errorMessage, lease.ProcessingStartTimeUtc),
+                        ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    transitionGuard.Release();
+                    throw;
+                }
             }
-            else
+
+            try
             {
-                var delay = updated.AvailableForProcessingAt!.Value - DateTime.UtcNow;
-                _logger.LogWarning("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
-                    updated.RetryCount, _retryPolicy.MaxRetryCount, delay, lease.FileKey, errorMessage);
+                var updated = await _projectionStore.TryUpdateProjectedProcessingFileAsync(
+                    lease.TenantId,
+                    lease.FileKey,
+                    lease.ProcessingStartTimeUtc,
+                    current =>
+                    {
+                        current.RetryCount++;
+                        current.LastError = errorMessage;
+                        current.LastFailedAt = DateTime.UtcNow;
+                        current.ProcessingStartTime = null;
+                        current.DeleteSucceededAt = null;
+
+                        if (current.RetryCount >= _retryPolicy.MaxRetryCount)
+                        {
+                            current.Status = FileProcessingStatus.PermanentlyFailed;
+                            current.AvailableForProcessingAt = null;
+                        }
+                        else
+                        {
+                            current.Status = FileProcessingStatus.Pending;
+                            current.AvailableForProcessingAt = DateTime.UtcNow.Add(CalculateRetryDelay(current.RetryCount));
+                        }
+
+                        return current;
+                    },
+                    ct).ConfigureAwait(false);
+                var metadata = updated == null
+                    ? await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false)
+                    : null;
+                if (updated == null)
+                    throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
+
+                if (updated.Status == FileProcessingStatus.PermanentlyFailed)
+                {
+                    _logger.LogError("File permanently failed after {RetryCount} retries: {FileKey}, Error: {Error}",
+                        updated.RetryCount, lease.FileKey, errorMessage);
+                }
+                else
+                {
+                    var delay = updated.AvailableForProcessingAt!.Value - DateTime.UtcNow;
+                    _logger.LogWarning("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
+                        updated.RetryCount, _retryPolicy.MaxRetryCount, delay, lease.FileKey, errorMessage);
+                }
+            }
+            finally
+            {
+                transitionGuard?.Release();
             }
         }
 
@@ -227,7 +371,7 @@ namespace Locus.Storage
             const int maxAttempts = 3;
             for (var attempt = 0; attempt < maxAttempts; attempt++)
             {
-                var updated = await _repository.TryResetFileToPendingAsync(tenantId, fileKey, ct);
+                var updated = await _projectionStore.TryResetProjectedFileToPendingAsync(tenantId, fileKey, ct).ConfigureAwait(false);
                 if (updated == null)
                     continue;
 
@@ -238,7 +382,7 @@ namespace Locus.Storage
                 return;
             }
 
-            var latest = await _repository.GetAsync(tenantId, fileKey, ct);
+            var latest = await _projectionStore.GetProjectedFileAsync(tenantId, fileKey, ct).ConfigureAwait(false);
             if (latest == null)
             {
                 _logger.LogWarning("Attempted to reset non-existent file: {FileKey}", fileKey);
@@ -261,7 +405,7 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            var metadata = await _repository.GetAsync(tenantId, fileKey, ct);
+            var metadata = await _projectionStore.GetProjectedFileAsync(tenantId, fileKey, ct).ConfigureAwait(false);
 
             if (metadata == null)
             {
@@ -294,23 +438,172 @@ namespace Locus.Storage
             return TimeSpan.FromMilliseconds(Math.Min(delayMs, maxMs));
         }
 
+        private SemaphoreSlim GetTransitionGuard(string fileKey)
+        {
+            return _transitionGuards.GetOrAdd(fileKey, _ => new SemaphoreSlim(1, 1));
+        }
+
+        private async Task TryRollbackLeasedFilesAsync(IEnumerable<FileMetadata> leasedFiles)
+        {
+            foreach (var leasedFile in leasedFiles
+                .Where(file => file.ProcessingStartTime.HasValue)
+                .GroupBy(file => file.FileKey, StringComparer.Ordinal)
+                .Select(group => group.First()))
+            {
+                try
+                {
+                    await _projectionStore.TryUpdateProjectedProcessingFileAsync(
+                        leasedFile.TenantId,
+                        leasedFile.FileKey,
+                        leasedFile.ProcessingStartTime!.Value,
+                        current =>
+                        {
+                            current.Status = FileProcessingStatus.Pending;
+                            current.ProcessingStartTime = null;
+                            current.AvailableForProcessingAt = null;
+                            return current;
+                        },
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback leased file after queue journal append failure: Tenant={TenantId}, FileKey={FileKey}",
+                        leasedFile.TenantId,
+                        leasedFile.FileKey);
+                }
+            }
+        }
+
+        private FileMetadata BuildFailedMetadata(FileMetadata current, string errorMessage)
+        {
+            var updated = current.Clone();
+            updated.RetryCount++;
+            updated.LastError = errorMessage;
+            updated.LastFailedAt = DateTime.UtcNow;
+            updated.ProcessingStartTime = null;
+            updated.DeleteSucceededAt = null;
+
+            if (updated.RetryCount >= _retryPolicy.MaxRetryCount)
+            {
+                updated.Status = FileProcessingStatus.PermanentlyFailed;
+                updated.AvailableForProcessingAt = null;
+            }
+            else
+            {
+                updated.Status = FileProcessingStatus.Pending;
+                updated.AvailableForProcessingAt = DateTime.UtcNow.Add(CalculateRetryDelay(updated.RetryCount));
+            }
+
+            return updated;
+        }
+
+        private static QueueEventRecord CreateProcessingStartedEvent(FileMetadata metadata)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.ProcessingStarted,
+                OccurredAtUtc = metadata.ProcessingStartTime ?? DateTime.UtcNow,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTimeUtc = metadata.ProcessingStartTime,
+                RetryCount = metadata.RetryCount,
+                AvailableForProcessingAtUtc = null,
+                ErrorMessage = metadata.LastError,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension,
+            };
+        }
+
+        private static QueueEventRecord CreateProcessingCompletedEvent(
+            FileMetadata metadata,
+            DateTime processingStartTimeUtc,
+            DateTime completedAtUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.ProcessingCompleted,
+                OccurredAtUtc = completedAtUtc,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Completed,
+                ProcessingStartTimeUtc = processingStartTimeUtc,
+                RetryCount = metadata.RetryCount,
+                AvailableForProcessingAtUtc = null,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension,
+            };
+        }
+
+        private static QueueEventRecord CreateDeleteRequestedEvent(FileMetadata metadata, DateTime occurredAtUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.DeleteRequested,
+                OccurredAtUtc = occurredAtUtc,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Completed,
+                RetryCount = metadata.RetryCount,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension,
+            };
+        }
+
+        private static QueueEventRecord CreateProcessingFailedEvent(
+            FileMetadata metadata,
+            string errorMessage,
+            DateTime expectedProcessingStartTimeUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.ProcessingFailed,
+                OccurredAtUtc = metadata.LastFailedAt ?? DateTime.UtcNow,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = metadata.Status,
+                ProcessingStartTimeUtc = expectedProcessingStartTimeUtc,
+                RetryCount = metadata.RetryCount,
+                AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
+                ErrorMessage = errorMessage,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension,
+            };
+        }
+
         /// <inheritdoc/>
         public async Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct = default)
         {
             var removedCount = 0;
-            var tenantIds = await _repository.GetAllTenantIdsAsync(ct).ConfigureAwait(false);
+            var tenantIds = await _projectionStore.GetProjectedTenantIdsAsync(ct).ConfigureAwait(false);
 
             // Process one tenant at a time to avoid allocating a single list of all files
             // across every tenant (O(total_files) memory spike -> O(max_tenant_files) peak).
-            // EnumerateTenantMetadataRaw returns the live cache values without cloning - we
-            // only read stable fields (PhysicalPath, TenantId, FileKey) so this is safe.
-            // Use all known tenant IDs, not only hot in-memory tenants, so cold SQLite-only
+            // Use all projected tenant IDs, not only hot in-memory tenants, so cold SQLite-only
             // tenants also have stale metadata reconciled before they are leased again.
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
 
-                var tenantMetadata = _repository.SnapshotTenantMetadataRaw(tenantId);
+                var tenantMetadata = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
                 var physicalPathExistsCache = new Dictionary<string, bool>(PhysicalPathComparer);
 
                 foreach (var metadata in tenantMetadata)
@@ -329,7 +622,10 @@ namespace Locus.Storage
                         // Use default for the full cleanup sequence once a candidate orphan has
                         // been selected; otherwise a mid-flight cancellation could leave cleanup
                         // work half-applied.
-                        var removed = await _repository.RemoveAsync(metadata.TenantId, metadata.FileKey, default);
+                        var removed = await _projectionStore.RemoveProjectedFileAsync(
+                            metadata.TenantId,
+                            metadata.FileKey,
+                            default).ConfigureAwait(false);
                         if (!removed)
                         {
                             _logger.LogDebug(
@@ -342,7 +638,7 @@ namespace Locus.Storage
                         {
                             try
                             {
-                                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default).ConfigureAwait(false);
                             }
                             catch (Exception ex)
                             {
@@ -358,7 +654,7 @@ namespace Locus.Storage
                                 await _directoryQuotaManager.DecrementFileCountAsync(
                                     metadata.TenantId,
                                     normalizedDirectoryPath,
-                                    default);
+                                    default).ConfigureAwait(false);
                             }
                             catch (Exception ex)
                             {

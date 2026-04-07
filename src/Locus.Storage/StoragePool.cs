@@ -22,7 +22,8 @@ namespace Locus.Storage
     public class StoragePool : IStoragePool
     {
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
-        private readonly MetadataRepository _metadataRepository;
+        private readonly IQueueProjectionStore _projectionStore;
+        private readonly IQueueProjectionWriteStore _projectionWriteStore;
         private readonly ITenantQuotaManager _tenantQuotaManager;
         private readonly IDirectoryQuotaManager _directoryQuotaManager;
         private readonly ITenantManager _tenantManager;
@@ -63,7 +64,9 @@ namespace Locus.Storage
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger,
             StorageVolumeRegistry? volumeRegistry = null,
-            IQueueEventJournal? queueEventJournal = null)
+            IQueueEventJournal? queueEventJournal = null,
+            IQueueProjectionStore? projectionStore = null,
+            IQueueProjectionWriteStore? projectionWriteStore = null)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
@@ -73,7 +76,9 @@ namespace Locus.Storage
                 logger,
                 DefaultCompletionGuardStripeCount,
                 volumeRegistry,
-                queueEventJournal)
+                queueEventJournal,
+                projectionStore,
+                projectionWriteStore)
         {
         }
 
@@ -89,9 +94,15 @@ namespace Locus.Storage
             ILogger<StoragePool> logger,
             int completionGuardStripeCount,
             StorageVolumeRegistry? volumeRegistry = null,
-            IQueueEventJournal? queueEventJournal = null)
+            IQueueEventJournal? queueEventJournal = null,
+            IQueueProjectionStore? projectionStore = null,
+            IQueueProjectionWriteStore? projectionWriteStore = null)
         {
-            _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
+            if (metadataRepository == null)
+                throw new ArgumentNullException(nameof(metadataRepository));
+
+            _projectionStore = projectionStore ?? new MetadataRepositoryQueueProjectionStore(metadataRepository);
+            _projectionWriteStore = projectionWriteStore ?? new MetadataRepositoryQueueProjectionWriteStore(metadataRepository);
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
             _directoryQuotaManager = directoryQuotaManager ?? throw new ArgumentNullException(nameof(directoryQuotaManager));
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
@@ -197,6 +208,17 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct = default)
         {
+            return await WriteFileAsync(tenant, content, originalFileName, null, ct).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> WriteFileAsync(
+            ITenantContext tenant,
+            Stream content,
+            string? originalFileName,
+            string? logicalDirectoryPath,
+            CancellationToken ct = default)
+        {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
 
@@ -209,13 +231,13 @@ namespace Locus.Storage
             // 2. Check tenant quota
             await _tenantQuotaManager.IncrementFileCountAsync(tenant.TenantId, ct);
             var tenantQuotaIncremented = true;
+            var normalizedLogicalDirectoryPath = DirectoryPathNormalizer.Normalize(logicalDirectoryPath);
 
             string? physicalPath = null;
-            string? directoryPath = null;
             IStorageVolume? volume = null;
             bool fileWritten = false;
             bool directoryQuotaIncremented = false;
-            bool acceptedJournalAppended = false;
+            bool acceptanceCompleted = false;
             CountingReadStream? countingStream = null;
 
             try
@@ -236,15 +258,8 @@ namespace Locus.Storage
                 // 6. Build physical file path using the volume's layout strategy
                 physicalPath = volume.BuildPhysicalPath(tenant.TenantId, fileKey, fileExtension);
 
-                // Derive the shard directory from the physical path so directory-level quotas
-                // are tracked per actual shard directory rather than a single root "/".
-                var tenantRootPath = Path.Combine(volume.MountPath, tenant.TenantId);
-                directoryPath = DirectoryPathNormalizer.NormalizeFromPhysicalPath(
-                    tenantRootPath,
-                    Path.GetDirectoryName(physicalPath));
-
                 // 7. Reserve directory quota after tenant quota succeeds.
-                await _directoryQuotaManager.IncrementFileCountAsync(tenant.TenantId, directoryPath, ct);
+                await _directoryQuotaManager.IncrementFileCountAsync(tenant.TenantId, normalizedLogicalDirectoryPath, ct);
                 directoryQuotaIncremented = true;
 
                 // 8. Capture the bytes that will be written: from current position to end.
@@ -267,7 +282,7 @@ namespace Locus.Storage
                     fileSize = countingStream.BytesRead;
 
                 // 10. Create file metadata. Write-behind keeps memory current and persists SQLite asynchronously.
-                // AddOrUpdateAsync never throws from the caller's perspective. If SQLite is unavailable,
+                // QueueProjectedFileAsync never throws from the caller's perspective. If SQLite is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
                 {
@@ -275,7 +290,7 @@ namespace Locus.Storage
                     TenantId = tenant.TenantId,
                     VolumeId = volume.VolumeId,
                     PhysicalPath = physicalPath,
-                    DirectoryPath = directoryPath,
+                    DirectoryPath = normalizedLogicalDirectoryPath,
                     FileSize = fileSize,
                     CreatedAt = DateTime.UtcNow,
                     Status = FileProcessingStatus.Pending,
@@ -288,10 +303,35 @@ namespace Locus.Storage
                     FileExtension = fileExtension
                 };
 
-                await AppendAcceptedQueueEventAsync(metadata).ConfigureAwait(false);
-                acceptedJournalAppended = true;
+                if (_queueEventJournal != null)
+                {
+                    QueueProjectionMetadataState.MarkAcceptedProjectionPending(metadata);
+                    await AppendAcceptedQueueEventAsync(metadata).ConfigureAwait(false);
+                    acceptanceCompleted = true;
+                }
+                else
+                {
+                    var tenantReservationConsumed = false;
+                    var directoryReservationConsumed = false;
+                    try
+                    {
+                        tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, ct).ConfigureAwait(false);
+                        directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(metadata.TenantId, metadata.DirectoryPath, ct).ConfigureAwait(false);
+                        QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
+                        acceptanceCompleted = true;
+                    }
+                    catch
+                    {
+                        await RollbackAcceptedProjectionAsync(
+                            metadata.TenantId,
+                            metadata.DirectoryPath,
+                            tenantReservationConsumed,
+                            directoryReservationConsumed).ConfigureAwait(false);
+                        throw;
+                    }
+                }
 
-                await _metadataRepository.AddOrUpdateAsync(metadata, ct);
+                await _projectionWriteStore.QueueProjectedFileAsync(metadata, ct);
 
                 _logger.LogDebug("File written successfully: {FileKey} for tenant {TenantId} at {PhysicalPath}",
                     fileKey, tenant.TenantId, physicalPath);
@@ -303,7 +343,7 @@ namespace Locus.Storage
                 var physicalWriteSucceeded = fileWritten;
                 var rollbackQuota = !physicalWriteSucceeded;
 
-                if (physicalWriteSucceeded && !acceptedJournalAppended && physicalPath != null)
+                if (physicalWriteSucceeded && !acceptanceCompleted && physicalPath != null)
                 {
                     try
                     {
@@ -329,17 +369,16 @@ namespace Locus.Storage
                 // If fileWritten==true the file exists on disk; the cleanup service will
                 // recover it as a Pending orphan on restart, so its quota slot is still needed.
                 // Guard with !fileWritten so that a future exception after the write
-                // (e.g. in AddOrUpdateAsync) does not incorrectly decrement the quota.
+                // (e.g. in QueueProjectedFileAsync) does not incorrectly decrement the quota.
                 if (rollbackQuota)
                 {
-                    if (directoryQuotaIncremented && !string.IsNullOrWhiteSpace(directoryPath))
+                    if (directoryQuotaIncremented)
                     {
-                        var rollbackDirectoryPath = directoryPath!;
                         try
                         {
                             await _directoryQuotaManager.DecrementFileCountAsync(
                                 tenant.TenantId,
-                                rollbackDirectoryPath,
+                                normalizedLogicalDirectoryPath,
                                 default);
                         }
                         catch (Exception rollbackEx)
@@ -348,7 +387,7 @@ namespace Locus.Storage
                                 rollbackEx,
                                 "Failed to rollback directory quota after write failure: Tenant={TenantId}, Directory={DirectoryPath}",
                                 tenant.TenantId,
-                                rollbackDirectoryPath);
+                                normalizedLogicalDirectoryPath);
                         }
                     }
 
@@ -368,10 +407,10 @@ namespace Locus.Storage
                     Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
                     _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
                 }
-                else if (physicalWriteSucceeded && !acceptedJournalAppended && physicalPath != null)
+                else if (physicalWriteSucceeded && !acceptanceCompleted && physicalPath != null)
                 {
                     _logger.LogError(
-                        "Physical file was written but queue journal append did not complete, leaving a manual recovery candidate at {PhysicalPath}",
+                        "Physical file was written but acceptance did not complete, leaving a manual recovery candidate at {PhysicalPath}",
                         physicalPath);
                 }
                 else if (physicalWriteSucceeded && physicalPath != null && volume != null)
@@ -396,7 +435,7 @@ namespace Locus.Storage
             await ValidateTenantAsync(tenant.TenantId, ct);
 
             // 2. Get file metadata
-            var metadata = await _metadataRepository.GetAsync(tenant.TenantId, fileKey, ct);
+            var metadata = await _projectionStore.GetProjectedFileAsync(tenant.TenantId, fileKey, ct).ConfigureAwait(false);
             if (metadata == null)
                 throw new FileNotFoundException($"File not found: {fileKey}");
 
@@ -429,7 +468,7 @@ namespace Locus.Storage
             await ValidateTenantAsync(tenant.TenantId, ct);
 
             // Get file metadata
-            var metadata = await _metadataRepository.GetAsync(tenant.TenantId, fileKey, ct);
+            var metadata = await _projectionStore.GetProjectedFileAsync(tenant.TenantId, fileKey, ct).ConfigureAwait(false);
             if (metadata == null)
                 return null;
 
@@ -461,7 +500,7 @@ namespace Locus.Storage
             await ValidateTenantAsync(tenant.TenantId, ct);
 
             // Get file metadata
-            var metadata = await _metadataRepository.GetAsync(tenant.TenantId, fileKey, ct);
+            var metadata = await _projectionStore.GetProjectedFileAsync(tenant.TenantId, fileKey, ct).ConfigureAwait(false);
             if (metadata == null)
                 return null;
 
@@ -498,7 +537,7 @@ namespace Locus.Storage
 
             // Delegate to file scheduler
             var location = await _fileScheduler.GetNextFileForProcessingAsync(tenant, ct);
-            if (location != null)
+            if (location != null && ShouldAppendQueueEventsInStoragePool())
             {
                 EnsureLease(location);
                 await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
@@ -524,10 +563,13 @@ namespace Locus.Storage
 
             // Delegate to file scheduler
             var locations = (await _fileScheduler.GetNextBatchForProcessingAsync(tenant, batchSize, ct)).ToList();
-            foreach (var location in locations)
+            if (ShouldAppendQueueEventsInStoragePool())
             {
-                EnsureLease(location);
-                await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
+                foreach (var location in locations)
+                {
+                    EnsureLease(location);
+                    await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
+                }
             }
 
             return locations;
@@ -546,7 +588,7 @@ namespace Locus.Storage
             try
             {
                 // Read current metadata before delegating so we can validate the active lease once.
-                var metadata = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, ct);
+                var metadata = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
                 if (metadata == null)
                     return;
 
@@ -565,7 +607,10 @@ namespace Locus.Storage
 
                 await _fileScheduler.MarkAsCompletedAsync(lease, ct);
 
-                var completed = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                if (!ShouldAppendQueueEventsInStoragePool())
+                    return;
+
+                var completed = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
                 if (completed == null)
                     return;
 
@@ -586,9 +631,12 @@ namespace Locus.Storage
             // Delegate to file scheduler
             await _fileScheduler.MarkAsFailedAsync(lease, errorMessage, ct);
 
-            var updated = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
-            if (updated != null)
-                await TryAppendQueueEventAsync(CreateProcessingFailedEvent(updated, errorMessage, lease.ProcessingStartTimeUtc)).ConfigureAwait(false);
+            if (ShouldAppendQueueEventsInStoragePool())
+            {
+                var updated = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                if (updated != null)
+                    await TryAppendQueueEventAsync(CreateProcessingFailedEvent(updated, errorMessage, lease.ProcessingStartTimeUtc)).ConfigureAwait(false);
+            }
         }
 
         /// <inheritdoc/>
@@ -760,6 +808,55 @@ namespace Locus.Storage
                 throw new ArgumentException("File key cannot be empty", nameof(lease));
         }
 
+        private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId, CancellationToken ct)
+        {
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+                return await tenantQuotaProjectionManager.ApplyAcceptedProjectionAsync(tenantId, ct).ConfigureAwait(false);
+
+            return false;
+        }
+
+        private async Task<bool> ApplyAcceptedDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct)
+        {
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                return await directoryQuotaProjectionManager
+                    .ApplyAcceptedProjectionAsync(tenantId, directoryPath, ct)
+                    .ConfigureAwait(false);
+            }
+
+            return false;
+        }
+
+        private async Task RollbackAcceptedProjectionAsync(
+            string tenantId,
+            string directoryPath,
+            bool tenantRestoreReservation,
+            bool directoryRestoreReservation)
+        {
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                await directoryQuotaProjectionManager
+                    .RollbackAcceptedProjectionAsync(tenantId, directoryPath, directoryRestoreReservation, default)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await _directoryQuotaManager.DecrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+            }
+
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                await tenantQuotaProjectionManager
+                    .RollbackAcceptedProjectionAsync(tenantId, tenantRestoreReservation, default)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await _tenantQuotaManager.DecrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+            }
+        }
+
         private async Task AppendAcceptedQueueEventAsync(FileMetadata metadata)
         {
             if (_queueEventJournal == null)
@@ -782,6 +879,13 @@ namespace Locus.Storage
                     FileExtension = metadata.FileExtension
                 },
                 default).ConfigureAwait(false);
+        }
+
+        private bool ShouldAppendQueueEventsInStoragePool()
+        {
+            return _queueEventJournal != null
+                && !(_fileScheduler is IQueueEventManagedFileScheduler managedScheduler
+                    && managedScheduler.HandlesQueueJournal);
         }
 
         private async Task TryAppendQueueEventAsync(QueueEventRecord record)

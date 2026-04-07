@@ -89,9 +89,9 @@ namespace Locus.Storage
     {
         /// <summary>
         /// Gets or sets the interval between recovery scans.
-        /// Default: 30 minutes.
+        /// Default: 6 hours.
         /// </summary>
-        public TimeSpan RecoveryInterval { get; set; } = TimeSpan.FromMinutes(30);
+        public TimeSpan RecoveryInterval { get; set; } = TimeSpan.FromHours(6);
 
         /// <summary>
         /// Gets or sets a value indicating whether the first recovery scan should run shortly after startup.

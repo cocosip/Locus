@@ -64,6 +64,15 @@ namespace Locus.FileSystem.Tests
         }
 
         [Fact]
+        public void Constructor_DefaultsForceFlushAfterWriteToTrue()
+        {
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+
+            var forceFlushAfterWrite = GetPrivateField<bool>(volume, "_forceFlushAfterWrite");
+            Assert.True(forceFlushAfterWrite);
+        }
+
+        [Fact]
         public async Task WriteAsync_CreatesFileSuccessfully()
         {
             // Arrange

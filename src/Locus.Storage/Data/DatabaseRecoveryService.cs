@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Storage;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -17,8 +18,9 @@ namespace Locus.Storage.Data
     /// </summary>
     public class DatabaseRecoveryService : IDatabaseRecoveryService
     {
-        private readonly MetadataRepository _metadataRepository;
-        private readonly DirectoryQuotaRepository _quotaRepository;
+        private readonly IQueueProjectionStore _projectionStore;
+        private readonly IMetadataProjectionMaintenanceStore _metadataMaintenanceStore;
+        private readonly IQuotaProjectionMaintenanceStore _quotaMaintenanceStore;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<DatabaseRecoveryService> _logger;
         private readonly string _metadataDirectory;
@@ -40,10 +42,19 @@ namespace Locus.Storage.Data
             string quotaDirectory,
             IReadOnlyDictionary<string, string>? volumeIdByPath = null,
             IQueueProjectionMaintenanceService? queueProjectionMaintenanceService = null,
-            IStorageCleanupService? storageCleanupService = null)
+            IStorageCleanupService? storageCleanupService = null,
+            IQueueProjectionStore? projectionStore = null,
+            IMetadataProjectionMaintenanceStore? metadataMaintenanceStore = null,
+            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null)
         {
-            _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
-            _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
+            if (metadataRepository == null)
+                throw new ArgumentNullException(nameof(metadataRepository));
+            if (quotaRepository == null)
+                throw new ArgumentNullException(nameof(quotaRepository));
+
+            _projectionStore = projectionStore ?? new MetadataRepositoryQueueProjectionStore(metadataRepository);
+            _metadataMaintenanceStore = metadataMaintenanceStore ?? new MetadataRepositoryProjectionMaintenanceStore(metadataRepository);
+            _quotaMaintenanceStore = quotaMaintenanceStore ?? new DirectoryQuotaRepositoryProjectionMaintenanceStore(quotaRepository);
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _metadataDirectory = metadataDirectory ?? throw new ArgumentNullException(nameof(metadataDirectory));
@@ -159,7 +170,7 @@ namespace Locus.Storage.Data
                 // that releases the lock on Dispose. The using declaration inside this try block
                 // guarantees the lock is released when the block exits (normally or via exception),
                 // while the catch block below handles all failures (including cancellation) uniformly.
-                using var rebuildHandle = await _metadataRepository.BeginDatabaseRebuildAsync(tenantId, ct);
+                using var rebuildHandle = await _metadataMaintenanceStore.BeginDatabaseRebuildAsync(tenantId, ct);
                 result.BackupPath = rebuildHandle.BackupPath;
 
                 if (result.BackupPath == null)
@@ -193,11 +204,7 @@ namespace Locus.Storage.Data
                         {
                             var fileInfo = _fileSystem.FileInfo.New(filePath);
                             var volumeId = ResolveVolumeId(volumePath);
-                            var relativePath = filePath.Length > tenantPath.Length
-                                ? filePath.Substring(tenantPath.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                                : string.Empty;
-                            var directoryPath = Locus.Storage.DirectoryPathNormalizer.NormalizeFromRelativePath(
-                                _fileSystem.Path.GetDirectoryName(relativePath));
+                            var directoryPath = DirectoryPathNormalizer.Normalize(null);
 
                             // Use the physical file name as key so rebuild is deterministic.
                             var fileName = _fileSystem.Path.GetFileName(filePath);
@@ -227,7 +234,8 @@ namespace Locus.Storage.Data
 
                             // Use direct write 鈥?rebuild must be persisted synchronously so the
                             // new DB file exists and is fully populated when this method returns.
-                            await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+                            QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
+                            await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
                             rebuiltFiles++;
 
                             if (scannedFiles % MetadataRebuildProgressCheckpoint == 0)
@@ -303,7 +311,7 @@ namespace Locus.Storage.Data
                 // that releases the lock on Dispose. The using declaration inside this try block
                 // guarantees the lock is released when the block exits (normally or via exception),
                 // while the catch block below handles all failures (including cancellation) uniformly.
-                using var rebuildHandle = await _quotaRepository.BeginDatabaseRebuildAsync(tenantId, ct);
+                using var rebuildHandle = await _quotaMaintenanceStore.BeginDatabaseRebuildAsync(tenantId, ct);
                 result.BackupPath = rebuildHandle.BackupPath;
 
                 if (result.BackupPath == null)
@@ -319,47 +327,39 @@ namespace Locus.Storage.Data
                 }
                 else
                 {
-                    // Step 2: Scan directories and rebuild quotas
-                    var directoryCounts = new Dictionary<string, int>();
-
-                    foreach (var volumePath in volumePaths)
-                    {
-                        var tenantPath = _fileSystem.Path.Combine(volumePath, tenantId);
-                        if (!_fileSystem.Directory.Exists(tenantPath))
-                            continue;
-
-                        ScanDirectoryRecursive(tenantPath, tenantPath, directoryCounts);
-                    }
-
-                    // Rebuild quota records
+                    var totalFileCount = CountPhysicalFilesForTenant(tenantId, volumePaths, ct);
                     var rebuiltQuotas = 0;
-                    foreach (var kvp in directoryCounts)
+
+                    try
                     {
-                        ct.ThrowIfCancellationRequested();
+                        await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
+                            tenantId,
+                            DirectoryPathNormalizer.Normalize(null),
+                            totalFileCount,
+                            ct).ConfigureAwait(false);
+                        rebuiltQuotas++;
 
-                        try
-                        {
-                            // BeginDatabaseRebuildAsync already holds the tenant lock (via the handle).
-                            // Use the rebuild-specific path to avoid re-acquiring the same lock and deadlocking.
-                            await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, kvp.Key, kvp.Value, ct);
-                            rebuiltQuotas++;
+                        await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
+                            tenantId,
+                            tenantId,
+                            totalFileCount,
+                            ct).ConfigureAwait(false);
+                        rebuiltQuotas++;
 
-                            _logger.LogDebug("Rebuilt quota for directory: {DirectoryPath}, Count: {Count}",
-                                kvp.Key, kvp.Value);
-                        }
-                        catch (Exception ex)
-                        {
-                            result.Errors.Add($"Failed to rebuild quota for {kvp.Key}: {ex.Message}");
-                            _logger.LogWarning(ex, "Failed to rebuild quota for directory {DirectoryPath}", kvp.Key);
-                        }
+                        result.RecordsRebuilt = rebuiltQuotas;
+                        result.Success = true;
+
+                        _logger.LogInformation(
+                            "Quota database rebuild completed for tenant {TenantId} from physical scan. RootCount={RootCount}, TenantCount={TenantCount}",
+                            tenantId,
+                            totalFileCount,
+                            totalFileCount);
                     }
-
-                    result.RecordsRebuilt = rebuiltQuotas;
-                    result.Success = true;
-
-                    _logger.LogInformation(
-                        "Quota database rebuild completed for tenant {TenantId}. Rebuilt {Count} records",
-                        tenantId, rebuiltQuotas);
+                    catch (Exception ex)
+                    {
+                        result.Errors.Add($"Failed to rebuild logical root quota for tenant {tenantId}: {ex.Message}");
+                        throw;
+                    }
                 }
             }
             catch (Exception ex)
@@ -387,37 +387,27 @@ namespace Locus.Storage.Data
             return result;
         }
 
-        /// <summary>
-        /// Scans directories recursively and counts files in each directory.
-        /// </summary>
-        private void ScanDirectoryRecursive(
-            string currentPath,
-            string rootPath,
-            Dictionary<string, int> directoryCounts)
+        private int CountPhysicalFilesForTenant(
+            string tenantId,
+            IEnumerable<string> volumePaths,
+            CancellationToken ct)
         {
-            if (!_fileSystem.Directory.Exists(currentPath))
-                return;
+            var totalFileCount = 0;
 
-            // Get relative path from root
-            var relativePath = currentPath.Substring(rootPath.Length).TrimStart(Path.DirectorySeparatorChar);
-            if (string.IsNullOrEmpty(relativePath))
-                relativePath = "/";
-            else
-                relativePath = "/" + relativePath.Replace("\\", "/");
-
-            // Count files in current directory (not recursive)
-            var fileCount = _fileSystem.Directory.GetFiles(currentPath).Length;
-            if (fileCount > 0 || directoryCounts.Count == 0) // Include root even if empty
+            foreach (var volumePath in volumePaths)
             {
-                directoryCounts[relativePath] = fileCount;
+                ct.ThrowIfCancellationRequested();
+
+                var tenantPath = _fileSystem.Path.Combine(volumePath, tenantId);
+                if (!_fileSystem.Directory.Exists(tenantPath))
+                    continue;
+
+                totalFileCount += _fileSystem.Directory
+                    .EnumerateFiles(tenantPath, "*", SearchOption.AllDirectories)
+                    .Count();
             }
 
-            // Scan subdirectories
-            var subdirectories = _fileSystem.Directory.GetDirectories(currentPath);
-            foreach (var subdirectory in subdirectories)
-            {
-                ScanDirectoryRecursive(subdirectory, rootPath, directoryCounts);
-            }
+            return totalFileCount;
         }
 
         /// <summary>
@@ -545,7 +535,7 @@ namespace Locus.Storage.Data
                 var projectionState = await _queueProjectionMaintenanceService
                     .RebuildTenantAsync(tenantId, ct)
                     .ConfigureAwait(false);
-                var rebuiltFiles = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                var rebuiltFiles = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false)).Count;
                 if (rebuiltFiles == 0 && HasAnyPhysicalFilesForTenant(tenantId, volumePaths))
                 {
                     _logger.LogWarning(
@@ -583,13 +573,15 @@ namespace Locus.Storage.Data
         {
             try
             {
-                var metadataCount = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                var projectedMetadata = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
+                var metadataCount = projectedMetadata.Count;
                 if (metadataCount == 0 && _queueProjectionMaintenanceService != null)
                 {
                     var projectionState = await _queueProjectionMaintenanceService
                         .RebuildTenantAsync(tenantId, ct)
                         .ConfigureAwait(false);
-                    metadataCount = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                    projectedMetadata = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
+                    metadataCount = projectedMetadata.Count;
 
                     if (metadataCount > 0)
                     {
@@ -620,13 +612,13 @@ namespace Locus.Storage.Data
                     return true;
                 }
 
-                var expectedDirectoryCounts = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false))
+                var expectedDirectoryCounts = projectedMetadata
                     .GroupBy(
                         metadata => DirectoryPathNormalizer.Normalize(metadata.DirectoryPath),
                         StringComparer.Ordinal)
                     .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
 
-                var existingDirectoryQuotas = (await _quotaRepository.GetAllAsync(tenantId, ct).ConfigureAwait(false))
+                var existingDirectoryQuotas = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false))
                     .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
                         && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
                     .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
@@ -647,19 +639,19 @@ namespace Locus.Storage.Data
                         && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
                         && !HasExplicitQuotaLimit(existingQuota))
                     {
-                        await _quotaRepository.RemoveAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
+                        await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
                         continue;
                     }
 
-                    await _quotaRepository.SetCurrentCountForRebuildAsync(
+                    await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
                         tenantId,
                         directoryPath,
                         expectedDirectoryCount,
                         ct).ConfigureAwait(false);
                 }
 
-                await _quotaRepository.SetCurrentCountForRebuildAsync(tenantId, tenantId, metadataCount, ct).ConfigureAwait(false);
-                result.RecordsRebuilt = (await _quotaRepository.GetAllAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(tenantId, tenantId, metadataCount, ct).ConfigureAwait(false);
+                result.RecordsRebuilt = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false)).Count;
                 result.Success = true;
                 _logger.LogInformation(
                     "Recovered quota database for tenant {TenantId} from projected metadata. RebuiltRecords={Records}, MetadataRecords={MetadataRecords}",

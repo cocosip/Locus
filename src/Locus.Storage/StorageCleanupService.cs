@@ -21,9 +21,12 @@ namespace Locus.Storage
     /// </summary>
     public class StorageCleanupService : IStorageCleanupService
     {
-        private readonly MetadataRepository _metadataRepository;
-        private readonly DirectoryQuotaRepository _quotaRepository;
+        private readonly IQueueProjectionStore _projectionStore;
+        private readonly IQueueProjectionCleanupStore _projectionCleanupStore;
+        private readonly IMetadataProjectionMaintenanceStore _metadataMaintenanceStore;
+        private readonly IQuotaProjectionMaintenanceStore _quotaMaintenanceStore;
         private readonly ITenantQuotaManager _tenantQuotaManager;
+        private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly ITenantManager? _tenantManager;
         private readonly IQueueEventJournal? _queueEventJournal;
         private readonly IFileSystem _fileSystem;
@@ -78,11 +81,24 @@ namespace Locus.Storage
             CleanupOptions? cleanupOptions = null,
             StorageVolumeRegistry? volumeRegistry = null,
             ITenantManager? tenantManager = null,
-            IQueueEventJournal? queueEventJournal = null)
+            IQueueEventJournal? queueEventJournal = null,
+            IDirectoryQuotaManager? directoryQuotaManager = null,
+            IQueueProjectionStore? projectionStore = null,
+            IQueueProjectionCleanupStore? projectionCleanupStore = null,
+            IMetadataProjectionMaintenanceStore? metadataMaintenanceStore = null,
+            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null)
         {
-            _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
-            _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
+            if (metadataRepository == null)
+                throw new ArgumentNullException(nameof(metadataRepository));
+            if (quotaRepository == null)
+                throw new ArgumentNullException(nameof(quotaRepository));
+
+            _projectionStore = projectionStore ?? new MetadataRepositoryQueueProjectionStore(metadataRepository);
+            _projectionCleanupStore = projectionCleanupStore ?? new MetadataRepositoryQueueProjectionCleanupStore(metadataRepository);
+            _metadataMaintenanceStore = metadataMaintenanceStore ?? new MetadataRepositoryProjectionMaintenanceStore(metadataRepository);
+            _quotaMaintenanceStore = quotaMaintenanceStore ?? new DirectoryQuotaRepositoryProjectionMaintenanceStore(quotaRepository);
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
+            _directoryQuotaManager = directoryQuotaManager;
             _tenantManager = tenantManager;
             _queueEventJournal = queueEventJournal;
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -273,7 +289,7 @@ namespace Locus.Storage
 
                 var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
                 var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
-                var knownPhysicalPaths = BuildKnownPhysicalPathSet(tenant.TenantId);
+                var knownPhysicalPaths = await BuildKnownPhysicalPathSetAsync(tenant.TenantId, ct).ConfigureAwait(false);
                 var existenceCache = _orphanRebuildLookupCacheSize > 0
                     ? new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer)
                     : null;
@@ -366,27 +382,27 @@ namespace Locus.Storage
                                         continue;
                                     }
 
-                                    var tenantQuotaCompensated = false;
-                                    var directoryQuotaCompensated = false;
+                                    var tenantReservationConsumed = false;
+                                    var directoryReservationConsumed = false;
                                     try
                                     {
-                                        await CompensateTenantQuotaIncrementAsync(metadata.TenantId, default);
-                                        tenantQuotaCompensated = true;
-
-                                        var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
-                                        await _quotaRepository.ForceIncrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
-                                        directoryQuotaCompensated = true;
+                                        tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, default);
+                                        directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(
+                                            metadata.TenantId,
+                                            metadata.DirectoryPath,
+                                            default);
+                                        QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
 
                                         // Persist rebuilt metadata only after quota compensation succeeds so we never
                                         // re-queue a file whose quota counters still under-report real usage.
-                                        await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
+                                        await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
                                     }
                                     catch
                                     {
                                         await RollbackRebuiltFileQuotaCompensationAsync(
                                             metadata,
-                                            tenantQuotaCompensated,
-                                            directoryQuotaCompensated);
+                                            tenantReservationConsumed,
+                                            directoryReservationConsumed);
                                         throw;
                                     }
 
@@ -635,10 +651,7 @@ namespace Locus.Storage
                 return null;
 
             var fileInfo = _fileSystem.FileInfo.New(physicalPath);
-            var tenantRootPath = _fileSystem.Path.Combine(volume.MountPath, tenantId);
-            var directoryPath = DirectoryPathNormalizer.NormalizeFromPhysicalPath(
-                tenantRootPath,
-                _fileSystem.Path.GetDirectoryName(physicalPath));
+            var directoryPath = DirectoryPathNormalizer.Normalize(null);
 
             return new FileMetadata
             {
@@ -660,10 +673,104 @@ namespace Locus.Storage
             };
         }
 
-        private async Task CompensateTenantQuotaIncrementAsync(string tenantId, CancellationToken ct = default)
+        private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                return await tenantQuotaProjectionManager.ApplyAcceptedProjectionAsync(tenantId, ct);
+            }
+
+            if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
+            {
+                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, ct);
+                return false;
+            }
+
+            await _tenantQuotaManager.IncrementFileCountAsync(tenantId, ct);
+            return false;
+        }
+
+        private async Task<bool> ApplyAcceptedDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct = default)
+        {
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(directoryPath);
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                return await directoryQuotaProjectionManager.ApplyAcceptedProjectionAsync(tenantId, normalizedDirectoryPath, ct);
+            }
+
+            await _quotaMaintenanceStore.ForceIncrementAsync(tenantId, normalizedDirectoryPath, ct);
+            return false;
+        }
+
+        private async Task RollbackAcceptedTenantProjectionAsync(
+            string tenantId,
+            bool restoreReservation,
+            CancellationToken ct = default)
+        {
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                await tenantQuotaProjectionManager.RollbackAcceptedProjectionAsync(tenantId, restoreReservation, ct);
+                return;
+            }
+
+            if (restoreReservation)
+                await _tenantQuotaManager.DecrementFileCountAsync(tenantId, ct);
+        }
+
+        private async Task RollbackAcceptedDirectoryProjectionAsync(
+            string tenantId,
+            string directoryPath,
+            bool restoreReservation,
+            CancellationToken ct = default)
+        {
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(directoryPath);
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                await directoryQuotaProjectionManager.RollbackAcceptedProjectionAsync(
+                    tenantId,
+                    normalizedDirectoryPath,
+                    restoreReservation,
+                    ct);
+                return;
+            }
+
+            if (restoreReservation)
+                await _quotaMaintenanceStore.DecrementAsync(tenantId, normalizedDirectoryPath, ct);
+        }
+
+        private async Task ApplyDeleteSucceededTenantProjectionAsync(string tenantId, CancellationToken ct = default)
+        {
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                await tenantQuotaProjectionManager.ApplyDeleteSucceededProjectionAsync(tenantId, ct);
+                return;
+            }
+
+            await _tenantQuotaManager.DecrementFileCountAsync(tenantId, ct);
+        }
+
+        private async Task ApplyDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct = default)
+        {
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(directoryPath);
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                await directoryQuotaProjectionManager.ApplyDeleteSucceededProjectionAsync(tenantId, normalizedDirectoryPath, ct);
+                return;
+            }
+
+            await _quotaMaintenanceStore.DecrementAsync(tenantId, normalizedDirectoryPath, ct);
+        }
+
+        private async Task RollbackDeleteSucceededTenantProjectionAsync(string tenantId, CancellationToken ct = default)
+        {
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                await tenantQuotaProjectionManager.RollbackDeleteSucceededProjectionAsync(tenantId, ct);
+                return;
+            }
 
             if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
             {
@@ -674,18 +781,34 @@ namespace Locus.Storage
             await _tenantQuotaManager.IncrementFileCountAsync(tenantId, ct);
         }
 
+        private async Task RollbackDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct = default)
+        {
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(directoryPath);
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                await directoryQuotaProjectionManager.RollbackDeleteSucceededProjectionAsync(tenantId, normalizedDirectoryPath, ct);
+                return;
+            }
+
+            await _quotaMaintenanceStore.ForceIncrementAsync(tenantId, normalizedDirectoryPath, ct);
+        }
+
         private async Task RollbackRebuiltFileQuotaCompensationAsync(
             FileMetadata metadata,
-            bool tenantQuotaCompensated,
-            bool directoryQuotaCompensated)
+            bool tenantRestoreReservation,
+            bool directoryRestoreReservation)
         {
             var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
 
-            if (directoryQuotaCompensated)
+            if (directoryRestoreReservation)
             {
                 try
                 {
-                    await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                    await RollbackAcceptedDirectoryProjectionAsync(
+                        metadata.TenantId,
+                        normalizedDirectoryPath,
+                        directoryRestoreReservation,
+                        default);
                 }
                 catch (Exception ex)
                 {
@@ -698,11 +821,11 @@ namespace Locus.Storage
                 }
             }
 
-            if (tenantQuotaCompensated)
+            if (tenantRestoreReservation)
             {
                 try
                 {
-                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                    await RollbackAcceptedTenantProjectionAsync(metadata.TenantId, tenantRestoreReservation, default);
                 }
                 catch (Exception ex)
                 {
@@ -721,7 +844,7 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var metadataEntries = (await _metadataRepository.GetByTenantAsync(tenantId, ct)).ToArray();
+            var metadataEntries = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false)).ToArray();
             var expectedTenantCount = metadataEntries.Length;
             var expectedDirectoryCounts = metadataEntries
                 .GroupBy(
@@ -729,7 +852,7 @@ namespace Locus.Storage
                     StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
 
-            var existingDirectoryQuotas = (await _quotaRepository.GetAllAsync(tenantId, ct))
+            var existingDirectoryQuotas = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct))
                 .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
                     && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
                 .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
@@ -749,11 +872,18 @@ namespace Locus.Storage
                     && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
                     && !HasExplicitQuotaLimit(existingQuota))
                 {
-                    await _quotaRepository.RemoveAsync(tenantId, directoryPath, ct);
+                    await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, directoryPath, ct);
                     continue;
                 }
 
-                await _quotaRepository.SetCurrentCountAsync(tenantId, directoryPath, expectedDirectoryCount, ct);
+                if (_directoryQuotaManager is IDirectoryQuotaReconciliationManager directoryQuotaReconciliationManager)
+                {
+                    await directoryQuotaReconciliationManager.SetFileCountAsync(tenantId, directoryPath, expectedDirectoryCount, ct);
+                }
+                else
+                {
+                    await _quotaMaintenanceStore.SetProjectedCountAsync(tenantId, directoryPath, expectedDirectoryCount, ct);
+                }
             }
 
             if (_tenantQuotaManager is ITenantQuotaReconciliationManager tenantQuotaReconciliationManager)
@@ -787,7 +917,7 @@ namespace Locus.Storage
 
         private async Task PruneZeroCountUnlimitedQuotaEntriesAsync(string tenantId, CancellationToken ct = default)
         {
-            var quotas = (await _quotaRepository.GetAllAsync(tenantId, ct)).ToArray();
+            var quotas = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct)).ToArray();
 
             foreach (var quota in quotas)
             {
@@ -802,7 +932,7 @@ namespace Locus.Storage
                 if (HasExplicitQuotaLimit(quota))
                     continue;
 
-                await _quotaRepository.RemoveAsync(tenantId, quota.DirectoryPath, ct);
+                    await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, quota.DirectoryPath, ct);
             }
         }
 
@@ -888,7 +1018,7 @@ namespace Locus.Storage
             while (true)
             {
                 var iterationStartedAt = Stopwatch.GetTimestamp();
-                var batch = await _metadataRepository.GetProcessingTimedOutAsync(
+                var batch = await _projectionCleanupStore.GetTimedOutProcessingFilesAsync(
                     tenantId,
                     timeoutCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
@@ -904,7 +1034,7 @@ namespace Locus.Storage
                     if (!metadata.ProcessingStartTime.HasValue)
                         continue;
 
-                    var reset = await _metadataRepository.TryResetTimedOutFileAsync(
+                    var reset = await _projectionCleanupStore.TryResetTimedOutFileAsync(
                         tenantId,
                         metadata.FileKey,
                         metadata.ProcessingStartTime.Value,
@@ -939,7 +1069,7 @@ namespace Locus.Storage
             while (true)
             {
                 var iterationStartedAt = Stopwatch.GetTimestamp();
-                var batch = await _metadataRepository.GetCompletedOlderThanAsync(
+                var batch = await _projectionCleanupStore.GetCompletedFilesOlderThanAsync(
                     tenantId,
                     completedCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
@@ -1001,7 +1131,7 @@ namespace Locus.Storage
                                 CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
                                 default).ConfigureAwait(false);
 
-                            await _metadataRepository.TryMarkDeleteSucceededAsync(
+                            await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
                                 metadata.TenantId,
                                 metadata.FileKey,
                                 metadata.CompletedAt.Value,
@@ -1050,7 +1180,7 @@ namespace Locus.Storage
             while (true)
             {
                 var iterationStartedAt = Stopwatch.GetTimestamp();
-                var batch = await _metadataRepository.GetPermanentlyFailedOlderThanAsync(
+                var batch = await _projectionCleanupStore.GetPermanentlyFailedFilesOlderThanAsync(
                     tenantId,
                     failedCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
@@ -1098,13 +1228,13 @@ namespace Locus.Storage
                     var metadataRemoved = false;
                     try
                     {
-                        await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                        await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
                         directoryQuotaDecremented = true;
 
-                        await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                        await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
                         tenantQuotaDecremented = true;
 
-                        metadataRemoved = await _metadataRepository.TryRemovePermanentlyFailedFileAsync(
+                        metadataRemoved = await _projectionCleanupStore.TryRemovePermanentlyFailedFileAsync(
                             metadata.TenantId,
                             metadata.FileKey,
                             metadata.LastFailedAt.Value,
@@ -1179,13 +1309,13 @@ namespace Locus.Storage
 
             try
             {
-                await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
                 directoryQuotaDecremented = true;
 
-                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
                 tenantQuotaDecremented = true;
 
-                metadataRemoved = await _metadataRepository.TryRemoveCompletedFileAsync(
+                metadataRemoved = await _projectionCleanupStore.TryRemoveCompletedFileAsync(
                     metadata.TenantId,
                     metadata.FileKey,
                     metadata.CompletedAt!.Value,
@@ -1253,7 +1383,7 @@ namespace Locus.Storage
             {
                 try
                 {
-                    await _quotaRepository.ForceIncrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                    await RollbackDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
                 }
                 catch (Exception ex)
                 {
@@ -1270,7 +1400,7 @@ namespace Locus.Storage
             {
                 try
                 {
-                    await CompensateTenantQuotaIncrementAsync(metadata.TenantId, default);
+                    await RollbackDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
                 }
                 catch (Exception ex)
                 {
@@ -1286,7 +1416,7 @@ namespace Locus.Storage
             {
                 try
                 {
-                    await _metadataRepository.AddOrUpdateDirectAsync(metadata, default);
+                    await _projectionStore.UpsertProjectedFileAsync(metadata, default).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -1369,7 +1499,7 @@ namespace Locus.Storage
 
                 try
                 {
-                    var (sizeBefore, sizeAfter) = await _metadataRepository.OptimizeDatabaseAsync(tenantId, ct);
+                    var (sizeBefore, sizeAfter) = await _metadataMaintenanceStore.OptimizeDatabaseAsync(tenantId, ct);
 
                     if (sizeBefore > 0) // Only count if database exists
                     {
@@ -1403,7 +1533,7 @@ namespace Locus.Storage
 
                 try
                 {
-                    var (sizeBefore, sizeAfter) = await _quotaRepository.OptimizeDatabaseAsync(tenantId, ct);
+                    var (sizeBefore, sizeAfter) = await _quotaMaintenanceStore.OptimizeDatabaseAsync(tenantId, ct);
 
                     if (sizeBefore > 0) // Only count if database exists
                     {
@@ -1601,7 +1731,7 @@ namespace Locus.Storage
 
         private async Task<string[]> GetMetadataTenantIdsSnapshotAsync(CancellationToken ct)
         {
-            var tenantIds = await _metadataRepository.GetAllTenantIdsAsync(ct);
+            var tenantIds = await _projectionStore.GetProjectedTenantIdsAsync(ct).ConfigureAwait(false);
             return tenantIds
                 .Where(tenantId => !string.IsNullOrWhiteSpace(tenantId))
                 .Distinct(StringComparer.Ordinal)
@@ -1610,7 +1740,7 @@ namespace Locus.Storage
 
         private async Task<string[]> GetQuotaTenantIdsSnapshotAsync(CancellationToken ct)
         {
-            var tenantIds = await _quotaRepository.GetAllTenantIdsAsync(ct);
+            var tenantIds = await _quotaMaintenanceStore.GetTenantIdsAsync(ct);
             return tenantIds
                 .Where(tenantId => !string.IsNullOrWhiteSpace(tenantId))
                 .Distinct(StringComparer.Ordinal)
@@ -1659,9 +1789,9 @@ namespace Locus.Storage
             return low;
         }
 
-        private HashSet<string> BuildKnownPhysicalPathSet(string tenantId)
+        private async Task<HashSet<string>> BuildKnownPhysicalPathSetAsync(string tenantId, CancellationToken ct)
         {
-            var metadataEntries = _metadataRepository.SnapshotTenantMetadataRaw(tenantId);
+            var metadataEntries = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
             var knownPaths = new HashSet<string>(_pathComparer);
 
             foreach (var metadata in metadataEntries)
