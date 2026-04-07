@@ -69,6 +69,16 @@ namespace Locus.Storage.Data
         public DateTime? ProcessingStartTime { get; set; }
 
         /// <summary>
+        /// Gets or sets the timestamp when processing completed successfully.
+        /// </summary>
+        public DateTime? CompletedAt { get; set; }
+
+        /// <summary>
+        /// Gets or sets the timestamp when physical deletion succeeded and the final projection cleanup is pending.
+        /// </summary>
+        public DateTime? DeleteSucceededAt { get; set; }
+
+        /// <summary>
         /// Gets or sets the earliest timestamp when this file is available for processing again.
         /// Used for delayed retry after failures.
         /// </summary>
@@ -112,6 +122,8 @@ namespace Locus.Storage.Data
                 LastFailedAt = LastFailedAt,
                 LastError = LastError,
                 ProcessingStartTime = ProcessingStartTime,
+                CompletedAt = CompletedAt,
+                DeleteSucceededAt = DeleteSucceededAt,
                 AvailableForProcessingAt = AvailableForProcessingAt,
                 OriginalFileName = OriginalFileName,
                 FileExtension = FileExtension,

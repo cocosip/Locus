@@ -38,6 +38,14 @@ namespace Locus.Core.Abstractions
         Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct = default);
 
         /// <summary>
+        /// Cleans up completed files older than the specified timespan.
+        /// Physical deletion is performed in the background and metadata is removed after delete success is durably recorded.
+        /// </summary>
+        /// <param name="olderThan">The age threshold for cleanup.</param>
+        /// <param name="ct">Cancellation token.</param>
+        Task CleanupCompletedFilesAsync(TimeSpan olderThan, CancellationToken ct = default);
+
+        /// <summary>
         /// Recovers orphaned files (physical files with no metadata) for the specified tenant
         /// by rebuilding their metadata entries and re-queuing them as Pending.
         /// </summary>

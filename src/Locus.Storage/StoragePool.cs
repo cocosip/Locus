@@ -29,6 +29,7 @@ namespace Locus.Storage
         private readonly ILogger<StoragePool> _logger;
         private readonly IFileScheduler _fileScheduler;
         private readonly StorageVolumeRegistry _volumeRegistry;
+        private readonly IQueueEventJournal? _queueEventJournal;
 
         // Cache a writable-volume snapshot and refresh periodically.
         // Selection then uses power-of-two choices to avoid pinning traffic to one volume.
@@ -61,7 +62,8 @@ namespace Locus.Storage
             ITenantManager tenantManager,
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger,
-            StorageVolumeRegistry? volumeRegistry = null)
+            StorageVolumeRegistry? volumeRegistry = null,
+            IQueueEventJournal? queueEventJournal = null)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
@@ -70,7 +72,8 @@ namespace Locus.Storage
                 fileScheduler,
                 logger,
                 DefaultCompletionGuardStripeCount,
-                volumeRegistry)
+                volumeRegistry,
+                queueEventJournal)
         {
         }
 
@@ -85,7 +88,8 @@ namespace Locus.Storage
             IFileScheduler fileScheduler,
             ILogger<StoragePool> logger,
             int completionGuardStripeCount,
-            StorageVolumeRegistry? volumeRegistry = null)
+            StorageVolumeRegistry? volumeRegistry = null,
+            IQueueEventJournal? queueEventJournal = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
@@ -94,6 +98,7 @@ namespace Locus.Storage
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
+            _queueEventJournal = queueEventJournal;
             if (completionGuardStripeCount <= 0)
                 throw new ArgumentOutOfRangeException(nameof(completionGuardStripeCount), "Completion guard stripe count must be greater than zero.");
 
@@ -210,6 +215,7 @@ namespace Locus.Storage
             IStorageVolume? volume = null;
             bool fileWritten = false;
             bool directoryQuotaIncremented = false;
+            bool acceptedJournalAppended = false;
             CountingReadStream? countingStream = null;
 
             try
@@ -242,9 +248,9 @@ namespace Locus.Storage
                 directoryQuotaIncremented = true;
 
                 // 8. Capture the bytes that will be written: from current position to end.
-                // Must be read BEFORE WriteAsync because CopyToAsync advances Position to the end.
-                // Using content.Length alone is wrong for streams not at position 0 �?it would
-                // report the total stream size rather than the bytes actually written.
+                // Must be read before WriteAsync because CopyToAsync advances Position to the end.
+                // Using content.Length alone is wrong for streams not at position 0 because it
+                // reports the total stream size rather than the bytes actually written.
                 var fileSize = content.CanSeek ? content.Length - content.Position : 0;
                 var contentToWrite = content;
                 if (!content.CanSeek)
@@ -260,7 +266,7 @@ namespace Locus.Storage
                 if (countingStream != null)
                     fileSize = countingStream.BytesRead;
 
-                // 10. Create file metadata �?Write-Behind: memory is updated immediately, SQLite write is async.
+                // 10. Create file metadata. Write-behind keeps memory current and persists SQLite asynchronously.
                 // AddOrUpdateAsync never throws from the caller's perspective. If SQLite is unavailable,
                 // the physical file stays safe on disk and will be recovered by the cleanup service on restart.
                 var metadata = new FileMetadata
@@ -282,6 +288,9 @@ namespace Locus.Storage
                     FileExtension = fileExtension
                 };
 
+                await AppendAcceptedQueueEventAsync(metadata).ConfigureAwait(false);
+                acceptedJournalAppended = true;
+
                 await _metadataRepository.AddOrUpdateAsync(metadata, ct);
 
                 _logger.LogDebug("File written successfully: {FileKey} for tenant {TenantId} at {PhysicalPath}",
@@ -291,12 +300,37 @@ namespace Locus.Storage
             }
             catch
             {
+                var physicalWriteSucceeded = fileWritten;
+                var rollbackQuota = !physicalWriteSucceeded;
+
+                if (physicalWriteSucceeded && !acceptedJournalAppended && physicalPath != null)
+                {
+                    try
+                    {
+                        await DeleteWrittenFileAsync(volume, physicalPath).ConfigureAwait(false);
+                        rollbackQuota = true;
+                        fileWritten = false;
+                        _logger.LogWarning(
+                            "Deleted physical file after queue journal append failed: Tenant={TenantId}, Path={PhysicalPath}",
+                            tenant.TenantId,
+                            physicalPath);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.LogError(
+                            cleanupEx,
+                            "Failed to delete physical file after queue journal append failure: Tenant={TenantId}, Path={PhysicalPath}",
+                            tenant.TenantId,
+                            physicalPath);
+                    }
+                }
+
                 // Only roll back the quota when the physical write never reached disk.
                 // If fileWritten==true the file exists on disk; the cleanup service will
-                // recover it as a Pending orphan on restart �?its quota slot is still needed.
+                // recover it as a Pending orphan on restart, so its quota slot is still needed.
                 // Guard with !fileWritten so that a future exception after the write
                 // (e.g. in AddOrUpdateAsync) does not incorrectly decrement the quota.
-                if (!fileWritten)
+                if (rollbackQuota)
                 {
                     if (directoryQuotaIncremented && !string.IsNullOrWhiteSpace(directoryPath))
                     {
@@ -328,13 +362,19 @@ namespace Locus.Storage
                 // so the next caller re-evaluates all volumes instead of reusing a stale (unhealthy)
                 // cached entry.  This is cheap: the next SelectVolumeForWrite() will re-probe IsHealthy
                 // (itself cached at 30 s) and pick the best available volume.
-                if (!fileWritten && volume != null)
+                if (!physicalWriteSucceeded && volume != null)
                 {
                     _cachedWritableVolumes = Array.Empty<IStorageVolume>();
                     Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
                     _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
                 }
-                else if (fileWritten && physicalPath != null && volume != null)
+                else if (physicalWriteSucceeded && !acceptedJournalAppended && physicalPath != null)
+                {
+                    _logger.LogError(
+                        "Physical file was written but queue journal append did not complete, leaving a manual recovery candidate at {PhysicalPath}",
+                        physicalPath);
+                }
+                else if (physicalWriteSucceeded && physicalPath != null && volume != null)
                 {
                     _logger.LogWarning("Transaction failed with physical file potentially orphaned at {PhysicalPath}", physicalPath);
                 }
@@ -457,7 +497,14 @@ namespace Locus.Storage
             await ValidateTenantAsync(tenant.TenantId, ct);
 
             // Delegate to file scheduler
-            return await _fileScheduler.GetNextFileForProcessingAsync(tenant, ct);
+            var location = await _fileScheduler.GetNextFileForProcessingAsync(tenant, ct);
+            if (location != null)
+            {
+                EnsureLease(location);
+                await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
+            }
+
+            return location;
         }
 
         /// <inheritdoc/>
@@ -476,163 +523,54 @@ namespace Locus.Storage
             await ValidateTenantAsync(tenant.TenantId, ct);
 
             // Delegate to file scheduler
-            return await _fileScheduler.GetNextBatchForProcessingAsync(tenant, batchSize, ct);
-        }
-
-        private async Task CompensateTenantQuotaIncrementAsync(string tenantId)
-        {
-            if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
+            var locations = (await _fileScheduler.GetNextBatchForProcessingAsync(tenant, batchSize, ct)).ToList();
+            foreach (var location in locations)
             {
-                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
-                return;
+                EnsureLease(location);
+                await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
             }
 
-            // Custom ITenantQuotaManager has no force-increment API; fall back to the normal
-            // increment but suppress quota-exceeded exceptions so compensation never masks the
-            // original error or leaves the counter permanently under-counted.
-            try
-            {
-                await _tenantQuotaManager.IncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
-            }
-            catch (TenantQuotaExceededException)
-            {
-                _logger.LogWarning(
-                    "Could not compensate tenant quota for {TenantId}: limit reached during rollback. " +
-                    "Quota counter may be under-counted by 1.",
-                    tenantId);
-            }
-        }
-
-        private async Task CompensateDirectoryQuotaIncrementAsync(string tenantId, string directoryPath)
-        {
-            if (_directoryQuotaManager is IDirectoryQuotaCompensationManager directoryQuotaCompensationManager)
-            {
-                await directoryQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
-                return;
-            }
-
-            // Same rationale as CompensateTenantQuotaIncrementAsync: suppress quota-exceeded
-            // exceptions so the rollback path never throws due to limit enforcement.
-            try
-            {
-                await _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
-            }
-            catch (DirectoryQuotaExceededException)
-            {
-                _logger.LogWarning(
-                    "Could not compensate directory quota for {TenantId}/{DirectoryPath}: limit reached during rollback. " +
-                    "Quota counter may be under-counted by 1.",
-                    tenantId, directoryPath);
-            }
+            return locations;
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default)
+        public async Task MarkAsCompletedAsync(FileProcessingLease lease, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(fileKey))
-                throw new ArgumentException("File key cannot be empty", nameof(fileKey));
+            ValidateLease(lease);
 
             // Concurrent duplicate completion calls for the same key must be idempotent.
-            // Without this guard, two callers can both read metadata before scheduler removal
-            // and both decrement quota.
-            var completionGuard = GetCompletionGuard(fileKey);
+            // Without this guard, two callers can both read metadata before scheduler update
+            // and both try to move the same file into Completed.
+            var completionGuard = GetCompletionGuard(lease.FileKey);
             await completionGuard.WaitAsync(ct);
             try
             {
-                // Read tenant before delegating �?scheduler removes metadata record.
-                var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, ct);
+                // Read current metadata before delegating so we can validate the active lease once.
+                var metadata = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, ct);
                 if (metadata == null)
-                    return; // Already completed by another caller.
+                    return;
+
+                if (metadata.Status == FileProcessingStatus.Completed)
+                    return;
 
                 if (metadata.Status != FileProcessingStatus.Processing
                     || !metadata.ProcessingStartTime.HasValue
-                    || metadata.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                    || metadata.ProcessingStartTime.Value != lease.ProcessingStartTimeUtc)
                 {
                     throw new FileProcessingLeaseMismatchException(
-                        fileKey,
-                        expectedProcessingStartTimeUtc,
+                        lease.FileKey,
+                        lease.ProcessingStartTimeUtc,
                         metadata.Status == FileProcessingStatus.Processing ? metadata.ProcessingStartTime : null);
                 }
 
-                var normalizedDirectoryPath = NormalizeDirectoryPathForQuota(metadata.DirectoryPath);
+                await _fileScheduler.MarkAsCompletedAsync(lease, ct);
 
-                // Decrement quotas BEFORE physical deletion + metadata removal.
-                // If quota decrement fails, abort completion so the file can be retried later
-                // without creating a "file gone but quota not decremented" split-brain state.
-                await _directoryQuotaManager.DecrementFileCountAsync(
-                    metadata.TenantId,
-                    normalizedDirectoryPath,
-                    default);
+                var completed = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                if (completed == null)
+                    return;
 
-                var tenantQuotaDecremented = false;
-                try
-                {
-                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
-                    tenantQuotaDecremented = true;
-                }
-                catch
-                {
-                    // Compensate directory quota on partial quota-success.
-                    try
-                    {
-                        await CompensateDirectoryQuotaIncrementAsync(
-                            metadata.TenantId,
-                            normalizedDirectoryPath);
-                    }
-                    catch (Exception compensationEx)
-                    {
-                        _logger.LogError(
-                            compensationEx,
-                            "Failed to compensate directory quota after tenant quota decrement failure: Tenant={TenantId}, Directory={DirectoryPath}",
-                            metadata.TenantId,
-                            normalizedDirectoryPath);
-                    }
-
-                    throw;
-                }
-
-                try
-                {
-                    // Delegate physical deletion + metadata removal to file scheduler.
-                    await _fileScheduler.MarkAsCompletedAsync(fileKey, expectedProcessingStartTimeUtc, ct);
-                }
-                catch
-                {
-                    // Completion failed after quota decrement; compensate both quotas best-effort.
-                    if (tenantQuotaDecremented)
-                    {
-                        try
-                        {
-                            await CompensateTenantQuotaIncrementAsync(metadata.TenantId);
-                        }
-                        catch (Exception compensationEx)
-                        {
-                            _logger.LogError(
-                                compensationEx,
-                                "Failed to compensate tenant quota after completion failure: Tenant={TenantId}, FileKey={FileKey}",
-                                metadata.TenantId,
-                                fileKey);
-                        }
-                    }
-
-                    try
-                    {
-                        await CompensateDirectoryQuotaIncrementAsync(
-                            metadata.TenantId,
-                            normalizedDirectoryPath);
-                    }
-                    catch (Exception compensationEx)
-                    {
-                        _logger.LogError(
-                            compensationEx,
-                            "Failed to compensate directory quota after completion failure: Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
-                            metadata.TenantId,
-                            normalizedDirectoryPath,
-                            fileKey);
-                    }
-
-                    throw;
-                }
+                await TryAppendQueueEventAsync(CreateProcessingCompletedEvent(completed, lease.ProcessingStartTimeUtc)).ConfigureAwait(false);
+                await TryAppendQueueEventAsync(CreateDeleteRequestedEvent(completed)).ConfigureAwait(false);
             }
             finally
             {
@@ -641,23 +579,31 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default)
+        public async Task MarkAsFailedAsync(FileProcessingLease lease, string errorMessage, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(fileKey))
-                throw new ArgumentException("File key cannot be empty", nameof(fileKey));
+            ValidateLease(lease);
 
             // Delegate to file scheduler
-            await _fileScheduler.MarkAsFailedAsync(fileKey, expectedProcessingStartTimeUtc, errorMessage, ct);
+            await _fileScheduler.MarkAsFailedAsync(lease, errorMessage, ct);
+
+            var updated = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+            if (updated != null)
+                await TryAppendQueueEventAsync(CreateProcessingFailedEvent(updated, errorMessage, lease.ProcessingStartTimeUtc)).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
-        public async Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default)
+        public async Task<FileProcessingStatus> GetFileStatusAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default)
         {
+            if (tenant == null)
+                throw new ArgumentNullException(nameof(tenant));
+
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(fileKey));
 
+            await ValidateTenantAsync(tenant.TenantId, ct);
+
             // Delegate to file scheduler
-            return await _fileScheduler.GetFileStatusAsync(fileKey, ct);
+            return await _fileScheduler.GetFileStatusAsync(tenant.TenantId, fileKey, ct);
         }
 
         /// <inheritdoc/>
@@ -759,7 +705,7 @@ namespace Locus.Storage
                 return cached;
 
             // Singleflight: only the CAS winner rebuilds the snapshot.
-            // Concurrent callers return the (slightly stale) cached value �?acceptable since
+            // Concurrent callers return the slightly stale cached value, which is acceptable since
             // the snapshot is refreshed at most every VolumeSnapshotRefreshTicks (1 s) anyway.
             if (Interlocked.CompareExchange(ref _volumeSnapshotRefreshInProgress, 1, 0) != 0)
                 return cached;
@@ -786,9 +732,172 @@ namespace Locus.Storage
             return _completionGuards[hash % _completionGuards.Length];
         }
 
-        private static string NormalizeDirectoryPathForQuota(string? directoryPath)
+        private static void EnsureLease(FileLocation location)
         {
-            return DirectoryPathNormalizer.Normalize(directoryPath);
+            if (location == null)
+                throw new ArgumentNullException(nameof(location));
+
+            if (location.Lease != null || !location.ProcessingStartTime.HasValue)
+                return;
+
+            location.Lease = new FileProcessingLease
+            {
+                TenantId = location.TenantId,
+                FileKey = location.FileKey,
+                ProcessingStartTimeUtc = location.ProcessingStartTime.Value
+            };
+        }
+
+        private static void ValidateLease(FileProcessingLease lease)
+        {
+            if (lease == null)
+                throw new ArgumentNullException(nameof(lease));
+
+            if (string.IsNullOrWhiteSpace(lease.TenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(lease));
+
+            if (string.IsNullOrWhiteSpace(lease.FileKey))
+                throw new ArgumentException("File key cannot be empty", nameof(lease));
+        }
+
+        private async Task AppendAcceptedQueueEventAsync(FileMetadata metadata)
+        {
+            if (_queueEventJournal == null)
+                return;
+
+            await _queueEventJournal.AppendAsync(
+                new QueueEventRecord
+                {
+                    TenantId = metadata.TenantId,
+                    FileKey = metadata.FileKey,
+                    EventType = QueueEventType.Accepted,
+                    OccurredAtUtc = metadata.CreatedAt,
+                    VolumeId = metadata.VolumeId,
+                    PhysicalPath = metadata.PhysicalPath,
+                    DirectoryPath = metadata.DirectoryPath,
+                    FileSize = metadata.FileSize,
+                    Status = metadata.Status,
+                    RetryCount = metadata.RetryCount,
+                    OriginalFileName = metadata.OriginalFileName,
+                    FileExtension = metadata.FileExtension
+                },
+                default).ConfigureAwait(false);
+        }
+
+        private async Task TryAppendQueueEventAsync(QueueEventRecord record)
+        {
+            if (_queueEventJournal == null)
+                return;
+
+            try
+            {
+                await _queueEventJournal.AppendAsync(record, default).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to append queue event {EventType} for tenant {TenantId}, file {FileKey}",
+                    record.EventType,
+                    record.TenantId,
+                    record.FileKey);
+            }
+        }
+
+        private static QueueEventRecord CreateProcessingStartedEvent(FileLocation location)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = location.TenantId,
+                FileKey = location.FileKey,
+                EventType = QueueEventType.ProcessingStarted,
+                OccurredAtUtc = location.ProcessingStartTime ?? DateTime.UtcNow,
+                VolumeId = location.VolumeId,
+                PhysicalPath = location.PhysicalPath,
+                DirectoryPath = location.DirectoryPath,
+                FileSize = location.FileSize,
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTimeUtc = location.ProcessingStartTime,
+                RetryCount = location.RetryCount,
+                AvailableForProcessingAtUtc = null,
+                ErrorMessage = location.LastError
+            };
+        }
+
+        private static QueueEventRecord CreateProcessingCompletedEvent(
+            FileMetadata metadata,
+            DateTime processingStartTimeUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.ProcessingCompleted,
+                OccurredAtUtc = metadata.CompletedAt ?? DateTime.UtcNow,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Completed,
+                ProcessingStartTimeUtc = processingStartTimeUtc,
+                RetryCount = metadata.RetryCount,
+                AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
+        }
+
+        private static QueueEventRecord CreateDeleteRequestedEvent(FileMetadata metadata)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.DeleteRequested,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Completed,
+                RetryCount = metadata.RetryCount,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
+        }
+
+        private static QueueEventRecord CreateProcessingFailedEvent(
+            FileMetadata metadata,
+            string errorMessage,
+            DateTime expectedProcessingStartTimeUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.ProcessingFailed,
+                OccurredAtUtc = metadata.LastFailedAt ?? DateTime.UtcNow,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = metadata.Status,
+                ProcessingStartTimeUtc = expectedProcessingStartTimeUtc,
+                RetryCount = metadata.RetryCount,
+                AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
+                ErrorMessage = errorMessage,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
+        }
+
+        private static Task DeleteWrittenFileAsync(IStorageVolume? volume, string physicalPath)
+        {
+            if (volume != null)
+                return volume.DeleteAsync(physicalPath, default);
+
+            File.Delete(physicalPath);
+            return Task.CompletedTask;
         }
 
         /// <summary>

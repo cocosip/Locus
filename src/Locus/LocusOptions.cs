@@ -151,6 +151,12 @@ namespace Locus
         public StoragePoolOptions StoragePool { get; set; } = new StoragePoolOptions();
 
         /// <summary>
+        /// Gets or sets durable queue journal options.
+        /// Supports appsettings binding under "Locus:QueueEventJournal".
+        /// </summary>
+        public QueueEventJournalOptions QueueEventJournal { get; set; } = new QueueEventJournalOptions();
+
+        /// <summary>
         /// Backward-compatible alias for MetadataRepository.DrainBatchSize.
         /// Prefer using MetadataRepository.DrainBatchSize.
         /// </summary>

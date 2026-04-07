@@ -89,33 +89,32 @@ namespace Locus.Core.Abstractions
             CancellationToken ct = default);
 
         /// <summary>
-        /// Marks a file as successfully processed and deletes it from storage.
-        /// This removes both the physical file and metadata, and decrements the tenant quota count.
+        /// Marks a file as successfully processed.
+        /// The file moves to Completed state first and is deleted later by the low-rate background reaper.
         /// Use this method after successfully processing a file obtained from GetNextFileForProcessingAsync.
         /// </summary>
-        /// <param name="fileKey">The unique file key.</param>
-        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
+        /// <param name="lease">The tenant-scoped processing lease returned when the file was allocated.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default);
+        Task MarkAsCompletedAsync(Models.FileProcessingLease lease, CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as failed processing.
         /// The file will be automatically retried based on the configured retry policy.
         /// If retry count exceeds the maximum, the file is marked as PermanentlyFailed.
         /// </summary>
-        /// <param name="fileKey">The unique file key.</param>
-        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
+        /// <param name="lease">The tenant-scoped processing lease returned when the file was allocated.</param>
         /// <param name="errorMessage">The error message describing the failure.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default);
+        Task MarkAsFailedAsync(Models.FileProcessingLease lease, string errorMessage, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current processing status of a file.
         /// </summary>
-        /// <param name="fileKey">The unique file key.</param>
+        /// <param name="tenant">The tenant context.</param>
+        /// <param name="fileKey">The unique file key within the tenant scope.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The current status of the file.</returns>
-        Task<Models.FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default);
+        Task<Models.FileProcessingStatus> GetFileStatusAsync(ITenantContext tenant, string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the total capacity across all configured storage volumes in bytes.

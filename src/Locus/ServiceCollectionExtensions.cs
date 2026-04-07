@@ -101,6 +101,7 @@ namespace Locus
 
             options.MetadataRepository.Validate();
             options.StoragePool.Validate();
+            options.QueueEventJournal.Validate();
 
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
@@ -196,6 +197,7 @@ namespace Locus
                 var fileScheduler = sp.GetRequiredService<IFileScheduler>();
                 var logger = sp.GetRequiredService<ILogger<StoragePool>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
+                var queueEventJournal = sp.GetService<IQueueEventJournal>();
 
                 // Volumes are NOT mounted here. StorageVolumeInitializationService mounts
                 // them asynchronously in StartAsync, before requests are accepted.
@@ -207,7 +209,8 @@ namespace Locus
                     fileScheduler,
                     logger,
                     options.StoragePool.CompletionGuardStripeCount,
-                    volumeRegistry);
+                    volumeRegistry,
+                    queueEventJournal);
             });
             services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 
@@ -222,6 +225,7 @@ namespace Locus
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
+                var queueEventJournal = sp.GetService<IQueueEventJournal>();
 
                 // Volumes are registered by StorageVolumeInitializationService after async mount.
                 return new StorageCleanupService(
@@ -234,7 +238,8 @@ namespace Locus
                     options.QuotaDirectory,
                     options.CleanupOptions,
                     volumeRegistry,
-                    tenantManager);
+                    tenantManager,
+                    queueEventJournal);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 
@@ -254,6 +259,8 @@ namespace Locus
                 var quotaRepo = sp.GetRequiredService<DirectoryQuotaRepository>();
                 var fileSystem = sp.GetRequiredService<IFileSystem>();
                 var logger = sp.GetRequiredService<ILogger<Locus.Storage.Data.DatabaseRecoveryService>>();
+                var queueProjectionMaintenanceService = sp.GetService<IQueueProjectionMaintenanceService>();
+                var storageCleanupService = sp.GetService<IStorageCleanupService>();
 
                 return new Locus.Storage.Data.DatabaseRecoveryService(
                     metadataRepo,
@@ -262,8 +269,46 @@ namespace Locus
                     logger,
                     options.MetadataDirectory,
                     options.QuotaDirectory,
-                    options.Volumes.ToDictionary(v => v.MountPath, v => v.VolumeId, StringComparer.OrdinalIgnoreCase));
+                    options.Volumes.ToDictionary(v => v.MountPath, v => v.VolumeId, StringComparer.OrdinalIgnoreCase),
+                    queueProjectionMaintenanceService,
+                    storageCleanupService);
             });
+
+            if (options.QueueEventJournal.Enabled)
+            {
+                services.AddSingleton(options.QueueEventJournal);
+                services.AddSingleton<IQueueEventJournal>(sp =>
+                {
+                    var fileSystem = sp.GetRequiredService<IFileSystem>();
+                    var logger = sp.GetRequiredService<ILogger<FileQueueEventJournal>>();
+                    return new FileQueueEventJournal(fileSystem, logger, options.QueueEventJournal.QueueDirectory);
+                });
+
+                services.AddSingleton<QueueEventProjectionService>(sp =>
+                {
+                    var journal = sp.GetRequiredService<IQueueEventJournal>();
+                    var metadataRepository = sp.GetRequiredService<MetadataRepository>();
+                    var tenantQuotaManager = sp.GetRequiredService<ITenantQuotaManager>();
+                    var directoryQuotaManager = sp.GetRequiredService<IDirectoryQuotaManager>();
+                    var fileSystem = sp.GetRequiredService<IFileSystem>();
+                    var logger = sp.GetRequiredService<ILogger<QueueEventProjectionService>>();
+                    var storageCleanupService = sp.GetRequiredService<IStorageCleanupService>();
+
+                    return new QueueEventProjectionService(
+                        journal,
+                        metadataRepository,
+                        tenantQuotaManager,
+                        directoryQuotaManager,
+                        fileSystem,
+                        options.QueueEventJournal,
+                        logger,
+                        storageCleanupService);
+                });
+                services.AddSingleton<IQueueProjectionMaintenanceService>(sp => sp.GetRequiredService<QueueEventProjectionService>());
+
+                if (options.QueueEventJournal.EnableProjection)
+                    services.AddHostedService(sp => sp.GetRequiredService<QueueEventProjectionService>());
+            }
 
             // Register background cleanup service if enabled
             if (options.EnableBackgroundCleanup)

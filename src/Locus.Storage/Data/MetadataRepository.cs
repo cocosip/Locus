@@ -18,7 +18,7 @@ namespace Locus.Storage.Data
 {
     /// <summary>
     /// Repository for file metadata storage using per-tenant SQLite with active-data in-memory caching.
-    /// Only keeps Pending/Processing/Failed files in memory. Completed files are immediately deleted.
+    /// Keeps all non-deleted file states in memory, including Completed files awaiting background reaping.
     ///
     /// Write-Behind Architecture:
     /// - AddOrUpdateAsync and RemoveAsync update in-memory cache first, then enqueue SQLite persistence asynchronously.
@@ -58,7 +58,7 @@ namespace Locus.Storage.Data
         private readonly string _metadataDirectory;
         private readonly SqliteOptions _sqliteOptions;
 
-        // Per-tenant in-memory cache (only active files: Pending/Processing/Failed)
+        // Per-tenant in-memory cache for all non-deleted file states.
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
 
         // Global fileKey -> tenantId index for O(1) cross-tenant lookup by file key.
@@ -111,6 +111,8 @@ namespace Locus.Storage.Data
         // Per-tenant status indexes for cleanup hot paths.
         private readonly ConcurrentDictionary<string, StatusTimestampIndex> _processingByStartTime;
         private readonly ConcurrentDictionary<string, object> _processingByStartTimeLocks;
+        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _completedByCompletedAt;
+        private readonly ConcurrentDictionary<string, object> _completedByCompletedAtLocks;
         private readonly ConcurrentDictionary<string, StatusTimestampIndex> _permanentlyFailedByLastFailedAt;
         private readonly ConcurrentDictionary<string, object> _permanentlyFailedByLastFailedAtLocks;
         private long _statusIndexSequence;
@@ -472,6 +474,8 @@ namespace Locus.Storage.Data
             _pendingFileCounts = new ConcurrentDictionary<string, int>();
             _processingByStartTime = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _processingByStartTimeLocks = new ConcurrentDictionary<string, object>();
+            _completedByCompletedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
+            _completedByCompletedAtLocks = new ConcurrentDictionary<string, object>();
             _permanentlyFailedByLastFailedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _permanentlyFailedByLastFailedAtLocks = new ConcurrentDictionary<string, object>();
             _delayedQueues = new ConcurrentDictionary<string, DelayedQueue>();
@@ -535,6 +539,8 @@ CREATE TABLE IF NOT EXISTS files (
     last_failed_at TEXT,
     last_error TEXT,
     processing_start_time TEXT,
+    completed_at TEXT,
+    delete_succeeded_at TEXT,
     available_for_processing_at TEXT,
     original_file_name TEXT,
     file_extension TEXT,
@@ -542,7 +548,8 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);
-CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_processing_at);";
+CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_processing_at);
+CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
         /// <summary>
         /// Gets or creates a SQLite connection for a tenant.
@@ -641,11 +648,14 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 cmd.ExecuteNonQuery();
             }
 
+            EnsureColumnExists(conn, "files", "completed_at", "TEXT");
+            EnsureColumnExists(conn, "files", "delete_succeeded_at", "TEXT");
+
             return conn;
         }
 
         /// <summary>
-        /// Loads active files (Pending/Processing/Failed) into memory for a tenant.
+        /// Loads active files into memory for a tenant.
         /// </summary>
         private void LoadActiveFilesForTenant(string tenantId, SqliteConnection conn)
         {
@@ -662,6 +672,10 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
                 FileProcessingStatus.Processing, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.Completed, orderByCreatedAt: false,
                 nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
@@ -724,6 +738,32 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             }
 
             return loaded;
+        }
+
+        private static void EnsureColumnExists(
+            SqliteConnection conn,
+            string tableName,
+            string columnName,
+            string columnDefinition)
+        {
+            using (var probe = conn.CreateCommand())
+            {
+                probe.CommandText = $"PRAGMA table_info({tableName});";
+                using (var reader = probe.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                            return;
+                    }
+                }
+            }
+
+            using (var alter = conn.CreateCommand())
+            {
+                alter.CommandText = $"ALTER TABLE {tableName} ADD COLUMN {columnName} {columnDefinition};";
+                alter.ExecuteNonQuery();
+            }
         }
 
         private int ApplyStartupLoadBatch(
@@ -935,6 +975,49 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
         }
 
         /// <summary>
+        /// Removes file metadata by file key with immediate synchronous SQLite deletion.
+        /// </summary>
+        internal Task<bool> RemoveDirectAsync(string tenantId, string fileKey, CancellationToken ct = default)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MetadataRepository));
+
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var cache = GetCache(tenantId);
+            var removed = cache.TryRemove(fileKey, out var removedMetadata);
+
+            if (removed)
+            {
+                _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                RemovePhysicalPathCandidate(tenantId, fileKey, removedMetadata?.PhysicalPath);
+
+                if (removedMetadata?.Status == FileProcessingStatus.Pending)
+                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+
+                InvalidatePendingGeneration(tenantId, fileKey);
+
+                lock (GetDatabaseLock(tenantId))
+                {
+                    var conn = GetDatabase(tenantId);
+                    using (var txn = conn.BeginTransaction())
+                    {
+                        DeleteFile(conn, txn, fileKey);
+                        txn.Commit();
+                    }
+                }
+
+                _logger.LogDebug("Directly removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+            }
+
+            return Task.FromResult(removed);
+        }
+
+        /// <summary>
         /// Resets a timed-out Processing file back to Pending if it still matches the expected state.
         /// Returns false when the record was removed or changed concurrently.
         /// </summary>
@@ -1030,6 +1113,113 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 InvalidatePendingGeneration(tenantId, fileKey);
                 EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
                 _logger.LogDebug("Conditionally removed permanently failed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                return true;
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Removes a Completed file if it still matches the expected completion timestamp.
+        /// Returns false when the record was removed or changed concurrently.
+        /// </summary>
+        public async Task<bool> TryRemoveCompletedFileAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedCompletedAtUtc,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return false;
+
+                if (current.Status != FileProcessingStatus.Completed
+                    || !current.CompletedAt.HasValue
+                    || current.CompletedAt.Value != expectedCompletedAtUtc)
+                {
+                    return false;
+                }
+
+                var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
+                    .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
+                if (!removed)
+                    return false;
+
+                _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
+                InvalidatePendingGeneration(tenantId, fileKey);
+                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
+                _logger.LogDebug("Conditionally removed completed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                return true;
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Marks a Completed file as physically deleted so background cleanup does not append
+        /// duplicate DeleteSucceeded events while projection catch-up is pending.
+        /// Returns false when the record was removed or changed concurrently.
+        /// </summary>
+        internal async Task<bool> TryMarkDeleteSucceededAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedCompletedAtUtc,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return false;
+
+                if (current.Status != FileProcessingStatus.Completed
+                    || !current.CompletedAt.HasValue
+                    || current.CompletedAt.Value != expectedCompletedAtUtc)
+                {
+                    return false;
+                }
+
+                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                    return true;
+
+                var updated = current.Clone();
+                updated.DeleteSucceededAt = deleteSucceededAtUtc;
+
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return false;
+
+                IndexStatusCandidate(current, updated);
+
+                lock (GetDatabaseLock(tenantId))
+                {
+                    var conn = GetDatabase(tenantId);
+                    UpsertFile(conn, updated);
+                }
+
                 return true;
             }
             finally
@@ -1418,6 +1608,39 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 _permanentlyFailedByLastFailedAt,
                 _permanentlyFailedByLastFailedAtLocks,
                 metadata => metadata.LastFailedAt,
+                additionalPredicate: null,
+                excludedFileKeys);
+
+            return Task.FromResult(results);
+        }
+
+        /// <summary>
+        /// Gets a bounded batch of files in Completed status whose completion time is older than the cutoff.
+        /// Excluded keys are deferred to later iterations so maintenance scans can progress past blocked records.
+        /// </summary>
+        public Task<IReadOnlyList<FileMetadata>> GetCompletedOlderThanAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            ISet<string>? excludedFileKeys = null,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (limit <= 0)
+                return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
+
+            ct.ThrowIfCancellationRequested();
+            var results = GetStatusBatchFromIndex(
+                tenantId,
+                cutoffUtc,
+                limit,
+                FileProcessingStatus.Completed,
+                _completedByCompletedAt,
+                _completedByCompletedAtLocks,
+                metadata => metadata.CompletedAt,
+                metadata => !metadata.DeleteSucceededAt.HasValue,
                 excludedFileKeys);
 
             return Task.FromResult(results);
@@ -1597,6 +1820,20 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 }
             }
 
+            if (current.Status == FileProcessingStatus.Completed && current.CompletedAt.HasValue)
+            {
+                if (statusChanged || previous?.CompletedAt != current.CompletedAt)
+                {
+                    EnqueueStatusIndex(
+                        _completedByCompletedAt,
+                        _completedByCompletedAtLocks,
+                        current.TenantId,
+                        current.FileKey,
+                        current.CompletedAt.Value,
+                        current.CreatedAt);
+                }
+            }
+
             if (current.Status == FileProcessingStatus.PermanentlyFailed && current.LastFailedAt.HasValue)
             {
                 if (statusChanged || previous?.LastFailedAt != current.LastFailedAt)
@@ -1645,6 +1882,7 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
             ConcurrentDictionary<string, StatusTimestampIndex> indexMap,
             ConcurrentDictionary<string, object> lockMap,
             Func<FileMetadata, DateTime?> timestampSelector,
+            Func<FileMetadata, bool>? additionalPredicate = null,
             ISet<string>? excludedFileKeys = null)
         {
             if (!indexMap.TryGetValue(tenantId, out var index) || index.Count == 0)
@@ -1723,6 +1961,12 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                             break;
                         }
 
+                        continue;
+                    }
+
+                    if (additionalPredicate != null && !additionalPredicate(metadata))
+                    {
+                        staleSkips++;
                         continue;
                     }
 
@@ -2442,6 +2686,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                 _delayedQueueLocks.TryRemove(tenantId, out _);
                 _processingByStartTime.TryRemove(tenantId, out _);
                 _processingByStartTimeLocks.TryRemove(tenantId, out _);
+                _completedByCompletedAt.TryRemove(tenantId, out _);
+                _completedByCompletedAtLocks.TryRemove(tenantId, out _);
                 _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
                 _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
@@ -2562,6 +2808,8 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
                     _delayedQueueLocks.TryRemove(tenantId, out _);
                     _processingByStartTime.TryRemove(tenantId, out _);
                     _processingByStartTimeLocks.TryRemove(tenantId, out _);
+                    _completedByCompletedAt.TryRemove(tenantId, out _);
+                    _completedByCompletedAtLocks.TryRemove(tenantId, out _);
                     _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
                     _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
@@ -2925,12 +3173,12 @@ CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_process
 INSERT INTO files (
     file_key, tenant_id, volume_id, physical_path, directory_path, file_size,
     created_at, status, retry_count, last_failed_at, last_error,
-    processing_start_time, available_for_processing_at,
+    processing_start_time, completed_at, delete_succeeded_at, available_for_processing_at,
     original_file_name, file_extension, metadata_json)
 VALUES (
     @file_key, @tenant_id, @volume_id, @physical_path, @directory_path, @file_size,
     @created_at, @status, @retry_count, @last_failed_at, @last_error,
-    @processing_start_time, @available_for_processing_at,
+    @processing_start_time, @completed_at, @delete_succeeded_at, @available_for_processing_at,
     @original_file_name, @file_extension, @metadata_json)
 ON CONFLICT(file_key) DO UPDATE SET
     tenant_id                  = excluded.tenant_id,
@@ -2944,6 +3192,8 @@ ON CONFLICT(file_key) DO UPDATE SET
     last_failed_at             = excluded.last_failed_at,
     last_error                 = excluded.last_error,
     processing_start_time      = excluded.processing_start_time,
+    completed_at               = excluded.completed_at,
+    delete_succeeded_at        = excluded.delete_succeeded_at,
     available_for_processing_at= excluded.available_for_processing_at,
     original_file_name         = excluded.original_file_name,
     file_extension             = excluded.file_extension,
@@ -2961,6 +3211,8 @@ ON CONFLICT(file_key) DO UPDATE SET
             cmd.Parameters.AddWithValue("@last_failed_at",             m.LastFailedAt.HasValue ? (object)m.LastFailedAt.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@last_error",                 (object?)m.LastError ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@processing_start_time",      m.ProcessingStartTime.HasValue ? (object)m.ProcessingStartTime.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@completed_at",               m.CompletedAt.HasValue ? (object)m.CompletedAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@delete_succeeded_at",        m.DeleteSucceededAt.HasValue ? (object)m.DeleteSucceededAt.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@available_for_processing_at",m.AvailableForProcessingAt.HasValue ? (object)m.AvailableForProcessingAt.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@original_file_name",         (object?)m.OriginalFileName ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@file_extension",             (object?)m.FileExtension ?? DBNull.Value);
@@ -3174,6 +3426,8 @@ ON CONFLICT(file_key) DO UPDATE SET
             _pendingFileCounts.Clear();
             _processingByStartTime.Clear();
             _processingByStartTimeLocks.Clear();
+            _completedByCompletedAt.Clear();
+            _completedByCompletedAtLocks.Clear();
             _permanentlyFailedByLastFailedAt.Clear();
             _permanentlyFailedByLastFailedAtLocks.Clear();
             _delayedQueues.Clear();

@@ -5,6 +5,7 @@ using System.IO.Abstractions;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
 using Microsoft.Data.Sqlite;
@@ -228,6 +229,89 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildMetadataDatabaseAsync_PrefersQueueProjectionRecoveryWhenAvailable()
+        {
+            var tenantId = $"tenant-rebuild-journal-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var tenantPath = Path.Combine(_volumePath, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            var physicalFile = Path.Combine(tenantPath, "journal-file.dcm");
+            _fileSystem.File.WriteAllText(physicalFile, "content");
+
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
+            using (var tempRepo = new MetadataRepository(_fileSystem, new Mock<ILogger<MetadataRepository>>().Object, _metadataDir, enableBackgroundPersistence: false))
+            {
+                await tempRepo.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = "temp",
+                    TenantId = tenantId,
+                    VolumeId = "vol",
+                    PhysicalPath = "/temp",
+                    DirectoryPath = "/",
+                    Status = FileProcessingStatus.Pending,
+                    CreatedAt = DateTime.UtcNow
+                }, default);
+            }
+
+            await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
+
+            var garbage = new byte[512];
+            new Random().NextBytes(garbage);
+            using (var stream = _fileSystem.File.Open(dbPath, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write(garbage, 0, garbage.Length);
+            }
+
+            var projectionMaintenance = new Mock<IQueueProjectionMaintenanceService>(MockBehavior.Strict);
+            projectionMaintenance
+                .Setup(x => x.RebuildTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .Returns<string, CancellationToken>(async (_, ct) =>
+                {
+                    await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+                    {
+                        FileKey = "journal-file",
+                        TenantId = tenantId,
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalFile,
+                        DirectoryPath = "/",
+                        FileSize = 7,
+                        Status = FileProcessingStatus.Pending,
+                        CreatedAt = DateTime.UtcNow
+                    }, ct);
+
+                    return new QueueProjectionTenantState
+                    {
+                        TenantId = tenantId,
+                        CursorOffset = 128,
+                        JournalSizeBytes = 128,
+                        LagBytes = 0,
+                        HasSnapshot = true,
+                        SnapshotCursorOffset = 128,
+                        SnapshotFileCount = 1
+                    };
+                });
+
+            var recoveryService = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                queueProjectionMaintenanceService: projectionMaintenance.Object);
+
+            var result = await recoveryService.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+            Assert.Equal(1, result.RecordsRebuilt);
+            projectionMaintenance.Verify(x => x.RebuildTenantAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+            Assert.Single(await _metadataRepository.GetByTenantAsync(tenantId, default));
+        }
+
+        [Fact]
         public async Task RebuildMetadataDatabaseAsync_UsesStableFileKeyAndConfiguredVolumeId()
         {
             // Arrange
@@ -389,8 +473,26 @@ namespace Locus.Storage.Tests
             Assert.True(result.Success);
             Assert.Equal(0, result.RecordsRebuilt);
             Assert.Null(result.BackupPath);
-            Assert.Single(result.Errors);
-            Assert.Contains("No database file found", result.Errors[0]);
+            Assert.Empty(result.Errors);
+        }
+
+        [Fact]
+        public async Task RebuildMetadataDatabaseAsync_CreatesDatabaseWhenMissingButPhysicalFilesExist()
+        {
+            var tenantId = $"tenant-no-db-files-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var tenantPath = Path.Combine(_volumePath, tenantId, "incoming");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            _fileSystem.File.WriteAllText(Path.Combine(tenantPath, "study-001.dcm"), "dicom");
+
+            var result = await _recoveryService.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+            Assert.Equal(1, result.RecordsRebuilt);
+            Assert.Null(result.BackupPath);
+            Assert.Single(await _metadataRepository.GetByTenantAsync(tenantId, default));
         }
 
         [Fact]
@@ -441,6 +543,67 @@ namespace Locus.Storage.Tests
 
             // Verify new database file exists
             Assert.True(_fileSystem.File.Exists(dbPath));
+        }
+
+        [Fact]
+        public async Task RebuildQuotaDatabaseAsync_PrefersMetadataReconciliationWhenAvailable()
+        {
+            var tenantId = $"tenant-rebuild-quota-metadata-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var dbPath = Path.Combine(_quotaDir, tenantId, "quotas.db");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "quota-file-001",
+                TenantId = tenantId,
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumePath, tenantId, "docs", "quota-file-001.dcm"),
+                DirectoryPath = "/docs",
+                FileSize = 11,
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, default);
+
+            using (var tempRepo = new DirectoryQuotaRepository(_fileSystem, new Mock<ILogger<DirectoryQuotaRepository>>().Object, _quotaDir, enableBackgroundFlush: false))
+            {
+                await tempRepo.GetOrCreateAsync(tenantId, "/", default);
+            }
+
+            await Task.Delay(100);
+            SqliteConnection.ClearAllPools();
+
+            var garbage = new byte[512];
+            new Random().NextBytes(garbage);
+            using (var stream = _fileSystem.File.Open(dbPath, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write(garbage, 0, garbage.Length);
+            }
+
+            var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
+            cleanupService
+                .Setup(x => x.ReconcileQuotaCountsAsync(tenantId, It.IsAny<CancellationToken>()))
+                .Returns<string, CancellationToken>(async (_, ct) =>
+                {
+                    await _quotaRepository.SetCurrentCountAsync(tenantId, "/docs", 1, ct);
+                });
+
+            var recoveryService = new DatabaseRecoveryService(
+                _metadataRepository,
+                _quotaRepository,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                storageCleanupService: cleanupService.Object);
+
+            var result = await recoveryService.RebuildQuotaDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+            Assert.True(result.RecordsRebuilt >= 1);
+            cleanupService.Verify(x => x.ReconcileQuotaCountsAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+            Assert.Contains((await _quotaRepository.GetAllAsync(tenantId, default)).ToArray(), q => q.DirectoryPath == "/docs" && q.CurrentCount == 1);
         }
 
         [Fact]

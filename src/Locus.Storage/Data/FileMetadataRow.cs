@@ -25,6 +25,8 @@ namespace Locus.Storage.Data
         public string? last_failed_at { get; set; }
         public string? last_error { get; set; }
         public string? processing_start_time { get; set; }
+        public string? completed_at { get; set; }
+        public string? delete_succeeded_at { get; set; }
         public string? available_for_processing_at { get; set; }
         public string? original_file_name { get; set; }
         public string? file_extension { get; set; }
@@ -49,6 +51,8 @@ namespace Locus.Storage.Data
                 LastFailedAt             = ParseNullableDateTime(last_failed_at),
                 LastError                = last_error,
                 ProcessingStartTime      = ParseNullableDateTime(processing_start_time),
+                CompletedAt              = ParseNullableDateTime(completed_at),
+                DeleteSucceededAt        = ParseNullableDateTime(delete_succeeded_at),
                 AvailableForProcessingAt = ParseNullableDateTime(available_for_processing_at),
                 OriginalFileName         = original_file_name,
                 FileExtension            = file_extension,

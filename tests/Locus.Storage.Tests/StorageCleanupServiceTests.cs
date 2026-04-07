@@ -1189,6 +1189,120 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupCompletedFilesAsync_WithJournal_DeletesPhysicalFileAndDoesNotAppendDeleteSucceededTwice()
+        {
+            var appendCount = 0;
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            queueEventJournal
+                .Setup(j => j.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.DeleteSucceeded
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == "completed-journal"),
+                    It.IsAny<CancellationToken>()))
+                .Callback<QueueEventRecord, CancellationToken>((_, __) => appendCount++)
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var physicalPath = Path.Combine(_volumePath, "completed-journal.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "completed-journal",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddMinutes(-5)
+            }, CancellationToken.None);
+
+            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", CancellationToken.None);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/done", CancellationToken.None);
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+            Assert.Equal(1, appendCount);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "completed-journal", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Completed, metadata!.Status);
+            Assert.NotNull(metadata.DeleteSucceededAt);
+
+            var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None);
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None);
+            Assert.Equal(1, tenantCount);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.CompletedRecordsRemoved);
+
+            queueEventJournal.VerifyAll();
+        }
+
+        [Fact]
+        public async Task CleanupCompletedFilesAsync_WithoutJournal_RemovesMetadataAndQuota()
+        {
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var physicalPath = Path.Combine(_volumePath, "completed-direct.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "completed-direct",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddMinutes(-5)
+            }, CancellationToken.None);
+
+            await _tenantQuotaManager.IncrementFileCountAsync("tenant-001", CancellationToken.None);
+            await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None);
+            await _quotaRepository.TryIncrementAsync("tenant-001", "/done", CancellationToken.None);
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "completed-direct", CancellationToken.None));
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None)).CurrentCount);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.CompletedRecordsRemoved);
+        }
+
+        [Fact]
         public async Task CleanupEmptyDirectoriesAsync_RemovesJunkFiles_ButPreservesDirectories()
         {
             // Arrange

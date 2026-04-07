@@ -25,6 +25,7 @@ namespace Locus.Storage
         private readonly DirectoryQuotaRepository _quotaRepository;
         private readonly ITenantQuotaManager _tenantQuotaManager;
         private readonly ITenantManager? _tenantManager;
+        private readonly IQueueEventJournal? _queueEventJournal;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
@@ -76,12 +77,14 @@ namespace Locus.Storage
             string quotaDirectory,
             CleanupOptions? cleanupOptions = null,
             StorageVolumeRegistry? volumeRegistry = null,
-            ITenantManager? tenantManager = null)
+            ITenantManager? tenantManager = null,
+            IQueueEventJournal? queueEventJournal = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
             _tenantManager = tenantManager;
+            _queueEventJournal = queueEventJournal;
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
@@ -225,6 +228,30 @@ namespace Locus.Storage
             Interlocked.Add(ref _permanentlyFailedFilesRemoved, removedCount);
             Interlocked.Add(ref _spaceFreed, spaceFreed);
             _logger.LogInformation("Cleaned up {Count} permanently failed files, freed {Size} bytes",
+                removedCount, spaceFreed);
+        }
+
+        /// <inheritdoc/>
+        public async Task CleanupCompletedFilesAsync(TimeSpan olderThan, CancellationToken ct = default)
+        {
+            _logger.LogInformation("Starting cleanup of completed files older than {TimeSpan}", olderThan);
+
+            var cutoffTime = DateTime.UtcNow - olderThan;
+            var removedCount = 0;
+            long spaceFreed = 0;
+
+            var tenantIds = await GetMetadataTenantIdsSnapshotAsync(ct);
+            foreach (var tenantId in tenantIds)
+            {
+                ct.ThrowIfCancellationRequested();
+                var tenantResult = await CleanupCompletedForTenantAsync(tenantId, cutoffTime, ct);
+                removedCount += tenantResult.RemovedCount;
+                spaceFreed += tenantResult.SpaceFreed;
+            }
+
+            Interlocked.Add(ref _completedRecordsRemoved, removedCount);
+            Interlocked.Add(ref _spaceFreed, spaceFreed);
+            _logger.LogInformation("Cleaned up {Count} completed files, freed {Size} bytes",
                 removedCount, spaceFreed);
         }
 
@@ -899,6 +926,117 @@ namespace Locus.Storage
             return resetCount;
         }
 
+        private async Task<(int RemovedCount, long SpaceFreed)> CleanupCompletedForTenantAsync(
+            string tenantId,
+            DateTime completedCutoffUtc,
+            CancellationToken ct = default)
+        {
+            int removedCount = 0;
+            long spaceFreed = 0;
+            var physicalPathExistsCache = new Dictionary<string, bool>(_pathComparer);
+            var blockedFileKeys = new HashSet<string>(StringComparer.Ordinal);
+
+            while (true)
+            {
+                var iterationStartedAt = Stopwatch.GetTimestamp();
+                var batch = await _metadataRepository.GetCompletedOlderThanAsync(
+                    tenantId,
+                    completedCutoffUtc,
+                    _statusCleanupBatchSizePerTenant,
+                    blockedFileKeys,
+                    ct);
+                if (batch.Count == 0)
+                {
+                    RecordStatusCleanupIteration("completed_cleanup", tenantId, 0, iterationStartedAt);
+                    break;
+                }
+
+                foreach (var metadata in batch)
+                {
+                    if (!metadata.CompletedAt.HasValue)
+                    {
+                        blockedFileKeys.Add(metadata.FileKey);
+                        continue;
+                    }
+
+                    var physicalFileExists = GetCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache);
+                    var hasVolume = _volumes.TryGetValue(metadata.VolumeId, out var volume);
+                    if (physicalFileExists && !hasVolume)
+                    {
+                        _logger.LogWarning(
+                            "Skipping completed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
+                            metadata.VolumeId,
+                            metadata.PhysicalPath);
+                        blockedFileKeys.Add(metadata.FileKey);
+                        continue;
+                    }
+
+                    try
+                    {
+                        if (physicalFileExists)
+                        {
+                            try
+                            {
+                                await volume!.DeleteAsync(metadata.PhysicalPath, ct);
+                                physicalPathExistsCache[metadata.PhysicalPath] = false;
+                            }
+                            catch (Exception ex) when (!RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
+                            {
+                                _logger.LogDebug(
+                                    ex,
+                                    "DeleteAsync threw after removing completed file {PhysicalPath}",
+                                    metadata.PhysicalPath);
+                            }
+
+                            if (RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
+                                throw new IOException($"Failed to delete physical file {metadata.PhysicalPath}");
+
+                            spaceFreed += metadata.FileSize;
+                        }
+
+                        if (_queueEventJournal != null)
+                        {
+                            var deleteSucceededAtUtc = DateTime.UtcNow;
+                            await _queueEventJournal.AppendAsync(
+                                CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                                default).ConfigureAwait(false);
+
+                            await _metadataRepository.TryMarkDeleteSucceededAsync(
+                                metadata.TenantId,
+                                metadata.FileKey,
+                                metadata.CompletedAt.Value,
+                                deleteSucceededAtUtc,
+                                ct).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await FinalizeCompletedWithoutJournalAsync(metadata, ct).ConfigureAwait(false);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Failed to cleanup completed file. Tenant={TenantId}, FileKey={FileKey}",
+                            metadata.TenantId,
+                            metadata.FileKey);
+                        blockedFileKeys.Add(metadata.FileKey);
+                        continue;
+                    }
+
+                    blockedFileKeys.Add(metadata.FileKey);
+                    removedCount++;
+                }
+
+                RecordStatusCleanupIteration("completed_cleanup", tenantId, batch.Count, iterationStartedAt);
+
+                if (batch.Count < _statusCleanupBatchSizePerTenant)
+                    break;
+            }
+
+            return (removedCount, spaceFreed);
+        }
+
         private async Task<(int RemovedCount, long SpaceFreed)> CleanupPermanentlyFailedForTenantAsync(
             string tenantId,
             DateTime failedCutoffUtc,
@@ -1030,6 +1168,61 @@ namespace Locus.Storage
             }
 
             return (removedCount, spaceFreed);
+        }
+
+        private async Task FinalizeCompletedWithoutJournalAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+            var directoryQuotaDecremented = false;
+            var tenantQuotaDecremented = false;
+            var metadataRemoved = false;
+
+            try
+            {
+                await _quotaRepository.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                directoryQuotaDecremented = true;
+
+                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
+                tenantQuotaDecremented = true;
+
+                metadataRemoved = await _metadataRepository.TryRemoveCompletedFileAsync(
+                    metadata.TenantId,
+                    metadata.FileKey,
+                    metadata.CompletedAt!.Value,
+                    ct);
+                if (!metadataRemoved)
+                    throw new InvalidOperationException($"Failed to remove completed metadata for file {metadata.FileKey}.");
+            }
+            catch
+            {
+                await RollbackPermanentlyFailedCleanupAsync(
+                    metadata,
+                    normalizedDirectoryPath,
+                    metadataRemoved,
+                    tenantQuotaDecremented,
+                    directoryQuotaDecremented);
+                throw;
+            }
+        }
+
+        private static QueueEventRecord CreateDeleteSucceededEvent(FileMetadata metadata, DateTime deleteSucceededAtUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.DeleteSucceeded,
+                OccurredAtUtc = deleteSucceededAtUtc,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Completed,
+                ProcessingStartTimeUtc = metadata.ProcessingStartTime,
+                RetryCount = metadata.RetryCount,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
         }
 
         private bool GetCachedPhysicalFileExists(string physicalPath, IDictionary<string, bool> cache)

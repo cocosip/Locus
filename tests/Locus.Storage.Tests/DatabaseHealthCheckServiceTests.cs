@@ -329,6 +329,34 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task StartAsync_AutoRecoversMissingTenantDatabasesWhenFilesExist()
+        {
+            var tenantId = $"tenant-auto-recover-missing-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            var tenantPath = Path.Combine(_volumePath, tenantId, "incoming");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            _fileSystem.File.WriteAllText(Path.Combine(tenantPath, "study-001.dcm"), "dicom");
+
+            var recoveryService = CreateRecoveryService();
+            var healthCheckService = CreateHealthCheckService(
+                recoveryService,
+                new[] { _volumePath },
+                autoRecoverCorruptedDatabases: true,
+                failFastOnRecoveryFailure: false);
+
+            await healthCheckService.StartAsync(default);
+
+            var metadataDbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
+            var quotaDbPath = Path.Combine(_quotaDir, tenantId, "quotas.db");
+
+            Assert.True(_fileSystem.File.Exists(metadataDbPath));
+            Assert.True(_fileSystem.File.Exists(quotaDbPath));
+            Assert.Single(await _metadataRepository.GetByTenantAsync(tenantId, default));
+            Assert.NotEmpty(await _quotaRepository.GetAllAsync(tenantId, default));
+
+            await healthCheckService.StopAsync(default);
+        }
+
+        [Fact]
         public async Task StartAsync_AutoRecoversCorruptedQuotaDatabase_WhenEnabled()
         {
             // Arrange

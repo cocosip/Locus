@@ -18,7 +18,8 @@ namespace Locus.Core.Abstractions
         bool IsDatabaseCorrupted(string dbPath);
 
         /// <summary>
-        /// Rebuilds a corrupted metadata database for a specific tenant by scanning physical files.
+        /// Rebuilds a corrupted metadata database for a specific tenant.
+        /// Implementations may prefer queue-journal recovery and fall back to physical file scanning.
         /// </summary>
         /// <param name="tenantId">The tenant ID.</param>
         /// <param name="volumePaths">List of volume mount paths to scan.</param>
@@ -30,7 +31,8 @@ namespace Locus.Core.Abstractions
             CancellationToken ct = default);
 
         /// <summary>
-        /// Rebuilds a corrupted quota database for a specific tenant by scanning directories.
+        /// Rebuilds a corrupted quota database for a specific tenant.
+        /// Implementations may prefer projected metadata reconciliation and fall back to directory scanning.
         /// </summary>
         /// <param name="tenantId">The tenant ID.</param>
         /// <param name="volumePaths">List of volume mount paths to scan.</param>

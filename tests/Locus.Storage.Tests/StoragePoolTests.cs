@@ -27,6 +27,7 @@ namespace Locus.Storage.Tests
         private readonly Mock<IDirectoryQuotaManager> _directoryQuotaManager;
         private readonly Mock<ITenantManager> _tenantManager;
         private readonly Mock<IFileScheduler> _fileScheduler;
+        private readonly Mock<IQueueEventJournal> _queueEventJournal;
         private readonly Mock<ILogger<StoragePool>> _logger;
         private readonly StoragePool _storagePool;
         private readonly Mock<IStorageVolume> _volume1;
@@ -99,6 +100,10 @@ namespace Locus.Storage.Tests
 
             // Setup file scheduler
             _fileScheduler = new Mock<IFileScheduler>();
+            _queueEventJournal = new Mock<IQueueEventJournal>();
+            _queueEventJournal
+                .Setup(m => m.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
 
             // Setup storage pool
             _logger = new Mock<ILogger<StoragePool>>();
@@ -108,7 +113,8 @@ namespace Locus.Storage.Tests
                 _directoryQuotaManager.Object,
                 _tenantManager.Object,
                 _fileScheduler.Object,
-                _logger.Object);
+                _logger.Object,
+                queueEventJournal: _queueEventJournal.Object);
 
             // Setup mock volumes with unique temporary directories
             _volume1Path = Path.Combine(Path.GetTempPath(), $"locus-test-vol1-{testId}");
@@ -247,6 +253,16 @@ namespace Locus.Storage.Tests
             }
         }
 
+        private static FileProcessingLease CreateLease(string tenantId, string fileKey, DateTime processingStartTimeUtc)
+        {
+            return new FileProcessingLease
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                ProcessingStartTimeUtc = processingStartTimeUtc
+            };
+        }
+
         [Fact]
         public async Task WriteFileAsync_CreatesFileSuccessfully()
         {
@@ -264,6 +280,70 @@ namespace Locus.Storage.Tests
             Assert.NotNull(location);
             Assert.Equal(fileKey, location.FileKey);
             Assert.Equal("tenant-001", location.TenantId);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_AppendsAcceptedQueueEvent()
+        {
+            // Arrange
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("test content"));
+
+            // Act
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "image.dcm", default);
+
+            // Assert
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.Accepted
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == fileKey
+                        && record.Status == FileProcessingStatus.Pending
+                        && record.OriginalFileName == "image.dcm"
+                        && record.FileExtension == ".dcm"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task GetNextFileForProcessingAsync_AppendsProcessingStartedQueueEvent()
+        {
+            var processingStartTime = DateTime.UtcNow;
+            _fileScheduler
+                .Setup(s => s.GetNextFileForProcessingAsync(_tenant.Object, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new FileLocation
+                {
+                    FileKey = "processing-001",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-001",
+                    PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "processing-001.dcm"),
+                    DirectoryPath = "/incoming",
+                    FileSize = 128,
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+                    Status = FileProcessingStatus.Processing,
+                    RetryCount = 0,
+                    ProcessingStartTime = processingStartTime
+                });
+
+            _queueEventJournal.Invocations.Clear();
+
+            var location = await _storagePool.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.NotNull(location);
+            Assert.NotNull(location!.Lease);
+            Assert.Equal("tenant-001", location.Lease!.TenantId);
+            Assert.Equal("processing-001", location.Lease.FileKey);
+            Assert.Equal(processingStartTime, location.Lease.ProcessingStartTimeUtc);
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.ProcessingStarted
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == "processing-001"
+                        && record.Status == FileProcessingStatus.Processing
+                        && record.ProcessingStartTimeUtc == processingStartTime),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
         }
 
         [Fact]
@@ -642,7 +722,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task MarkAsCompletedAsync_ConcurrentDuplicateCalls_DecrementsQuotaOnce()
+        public async Task MarkAsCompletedAsync_ConcurrentDuplicateCalls_LeavesCompletedStateOnce()
         {
             // Arrange
             var content = new MemoryStream(Encoding.UTF8.GetBytes("to complete"));
@@ -656,16 +736,21 @@ namespace Locus.Storage.Tests
             await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
 
             _fileScheduler
-                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
-                .Returns(async (string key, DateTime _, CancellationToken token) =>
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .Returns(async (FileProcessingLease lease, CancellationToken token) =>
                 {
-                    var current = await _metadataRepository.GetByFileKeyAsync(key, token);
+                    var current = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, token);
                     if (current != null)
-                        await _metadataRepository.RemoveAsync(current.TenantId, key, token);
+                    {
+                        current.Status = FileProcessingStatus.Completed;
+                        current.ProcessingStartTime = null;
+                        current.CompletedAt = DateTime.UtcNow;
+                        await _metadataRepository.AddOrUpdateAsync(current, token);
+                    }
                 });
 
             var tasks = Enumerable.Range(0, 20)
-                .Select(_ => _storagePool.MarkAsCompletedAsync(fileKey, processingStart, CancellationToken.None))
+                .Select(_ => _storagePool.MarkAsCompletedAsync(CreateLease("tenant-001", fileKey, processingStart), CancellationToken.None))
                 .ToArray();
 
             // Act
@@ -673,14 +758,17 @@ namespace Locus.Storage.Tests
 
             // Assert
             _tenantQuotaManager.Verify(
-                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
-                Times.Once);
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
             _directoryQuotaManager.Verify(
-                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<string>(), It.IsAny<CancellationToken>()),
-                Times.Once);
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
 
             var metadataAfterCompletion = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
-            Assert.Null(metadataAfterCompletion);
+            Assert.NotNull(metadataAfterCompletion);
+            Assert.Equal(FileProcessingStatus.Completed, metadataAfterCompletion!.Status);
+            Assert.Null(metadataAfterCompletion.ProcessingStartTime);
+            Assert.NotNull(metadataAfterCompletion.CompletedAt);
         }
 
         [Fact]
@@ -700,7 +788,7 @@ namespace Locus.Storage.Tests
 
             // Act
             var exception = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
-                _storagePool.MarkAsCompletedAsync(fileKey, staleProcessingStart, CancellationToken.None));
+                _storagePool.MarkAsCompletedAsync(CreateLease("tenant-001", fileKey, staleProcessingStart), CancellationToken.None));
 
             // Assert
             Assert.Equal(fileKey, exception.FileKey);
@@ -714,7 +802,7 @@ namespace Locus.Storage.Tests
                 m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
                 Times.Never);
             _fileScheduler.Verify(
-                m => m.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()),
+                m => m.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
                 Times.Never);
 
             var metadataAfterFailure = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
@@ -724,7 +812,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task MarkAsCompletedAsync_WhenCompletionFailsAfterLimitReduction_CompensatesQuotaBypass()
+        public async Task MarkAsCompletedAsync_WhenCompletionFails_KeepsQuotaAndMetadata()
         {
             var tenantQuotaManager = new TenantQuotaManager(
                 _quotaRepository,
@@ -781,7 +869,12 @@ namespace Locus.Storage.Tests
             }, CancellationToken.None);
 
             failingScheduler
-                .Setup(s => s.MarkAsCompletedAsync(targetFileKey, processingStart, It.IsAny<CancellationToken>()))
+                .Setup(s => s.MarkAsCompletedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == tenantId
+                        && lease.FileKey == targetFileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    It.IsAny<CancellationToken>()))
                 .Returns(async () =>
                 {
                     await tenantQuotaManager.SetTenantLimitAsync(tenantId, 1, CancellationToken.None);
@@ -790,7 +883,7 @@ namespace Locus.Storage.Tests
                 });
 
             await Assert.ThrowsAsync<IOException>(() =>
-                storagePool.MarkAsCompletedAsync(targetFileKey, processingStart, CancellationToken.None));
+                storagePool.MarkAsCompletedAsync(CreateLease(tenantId, targetFileKey, processingStart), CancellationToken.None));
 
             var tenantCount = await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None);
             var directoryCount = await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None);
@@ -799,6 +892,120 @@ namespace Locus.Storage.Tests
             Assert.Equal(2, tenantCount);
             Assert.Equal(2, directoryCount);
             Assert.NotNull(metadata);
+        }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_AppendsProcessingCompletedAndDeleteRequestedQueueEvents()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("complete-event"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "done.dcm", CancellationToken.None);
+            var processingStart = DateTime.UtcNow;
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            metadata.OriginalFileName = "done.dcm";
+            metadata.FileExtension = ".dcm";
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetAsync("tenant-001", fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Completed;
+                    current.ProcessingStartTime = null;
+                    current.CompletedAt = DateTime.UtcNow;
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                });
+
+            _queueEventJournal.Invocations.Clear();
+
+            await _storagePool.MarkAsCompletedAsync(CreateLease("tenant-001", fileKey, processingStart), CancellationToken.None);
+
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.ProcessingCompleted
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == fileKey
+                        && record.Status == FileProcessingStatus.Completed
+                        && record.ProcessingStartTimeUtc == processingStart
+                        && record.FileExtension == ".dcm"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.DeleteRequested
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == fileKey
+                        && record.Status == FileProcessingStatus.Completed),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task MarkAsFailedAsync_AppendsProcessingFailedQueueEvent()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("failed-event"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "failed.dcm", CancellationToken.None);
+            var processingStart = DateTime.UtcNow;
+            var retryAt = DateTime.UtcNow.AddMinutes(1);
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            metadata.OriginalFileName = "failed.dcm";
+            metadata.FileExtension = ".dcm";
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsFailedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    "decode failed",
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Pending;
+                    current.ProcessingStartTime = null;
+                    current.RetryCount = 1;
+                    current.LastError = "decode failed";
+                    current.LastFailedAt = DateTime.UtcNow;
+                    current.AvailableForProcessingAt = retryAt;
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                });
+
+            _queueEventJournal.Invocations.Clear();
+
+            await _storagePool.MarkAsFailedAsync(CreateLease("tenant-001", fileKey, processingStart), "decode failed", CancellationToken.None);
+
+            _queueEventJournal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.ProcessingFailed
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == fileKey
+                        && record.Status == FileProcessingStatus.Pending
+                        && record.RetryCount == 1
+                        && record.ErrorMessage == "decode failed"
+                        && record.AvailableForProcessingAtUtc == retryAt),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
         }
 
         [Fact]

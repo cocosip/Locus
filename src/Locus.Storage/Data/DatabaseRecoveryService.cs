@@ -24,6 +24,8 @@ namespace Locus.Storage.Data
         private readonly string _metadataDirectory;
         private readonly string _quotaDirectory;
         private readonly IReadOnlyDictionary<string, string> _volumeIdByPath;
+        private readonly IQueueProjectionMaintenanceService? _queueProjectionMaintenanceService;
+        private readonly IStorageCleanupService? _storageCleanupService;
         private const int MetadataRebuildProgressCheckpoint = 1000;
 
         /// <summary>
@@ -36,7 +38,9 @@ namespace Locus.Storage.Data
             ILogger<DatabaseRecoveryService> logger,
             string metadataDirectory,
             string quotaDirectory,
-            IReadOnlyDictionary<string, string>? volumeIdByPath = null)
+            IReadOnlyDictionary<string, string>? volumeIdByPath = null,
+            IQueueProjectionMaintenanceService? queueProjectionMaintenanceService = null,
+            IStorageCleanupService? storageCleanupService = null)
         {
             _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
             _quotaRepository = quotaRepository ?? throw new ArgumentNullException(nameof(quotaRepository));
@@ -45,6 +49,8 @@ namespace Locus.Storage.Data
             _metadataDirectory = metadataDirectory ?? throw new ArgumentNullException(nameof(metadataDirectory));
             _quotaDirectory = quotaDirectory ?? throw new ArgumentNullException(nameof(quotaDirectory));
             _volumeIdByPath = NormalizeVolumePathMap(volumeIdByPath);
+            _queueProjectionMaintenanceService = queueProjectionMaintenanceService;
+            _storageCleanupService = storageCleanupService;
         }
 
         /// <summary>
@@ -121,7 +127,8 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Rebuilds a corrupted metadata database for a specific tenant by scanning physical files.
+        /// Rebuilds a corrupted metadata database for a specific tenant.
+        /// Prefers queue-journal projection recovery when available and falls back to physical file scanning.
         /// Thread-safe: Acquires exclusive lock for this tenant, blocking all operations during rebuild.
         /// </summary>
         /// <param name="tenantId">The tenant ID.</param>
@@ -157,10 +164,13 @@ namespace Locus.Storage.Data
 
                 if (result.BackupPath == null)
                 {
-                    result.Success = true;
-                    result.Errors.Add("No database file found to rebuild");
-                    return result;
+                    _logger.LogInformation(
+                        "No existing metadata database file was found for tenant {TenantId}; creating a new one during rebuild",
+                        tenantId);
                 }
+
+                if (await TryRebuildMetadataFromQueueAsync(tenantId, volumePaths, result, ct).ConfigureAwait(false))
+                    return result;
 
                 // Step 2: Scan physical files and rebuild metadata
                 var rebuiltFiles = 0;
@@ -215,7 +225,7 @@ namespace Locus.Storage.Data
                                 FileExtension = _fileSystem.Path.GetExtension(filePath)
                             };
 
-                            // Use direct write â€?rebuild must be persisted synchronously so the
+                            // Use direct write éˆ¥?rebuild must be persisted synchronously so the
                             // new DB file exists and is fully populated when this method returns.
                             await _metadataRepository.AddOrUpdateDirectAsync(metadata, ct);
                             rebuiltFiles++;
@@ -260,7 +270,8 @@ namespace Locus.Storage.Data
         }
 
         /// <summary>
-        /// Rebuilds a corrupted quota database for a specific tenant by scanning directories.
+        /// Rebuilds a corrupted quota database for a specific tenant.
+        /// Prefers metadata-based reconciliation when available and falls back to directory scanning.
         /// Thread-safe: Acquires exclusive lock for this tenant, blocking all operations during rebuild.
         /// </summary>
         /// <param name="tenantId">The tenant ID.</param>
@@ -296,10 +307,13 @@ namespace Locus.Storage.Data
 
                 if (result.BackupPath == null)
                 {
-                    result.Success = true;
-                    result.Errors.Add("No database file found to rebuild");
-                    return result;
+                    _logger.LogInformation(
+                        "No existing quota database file was found for tenant {TenantId}; creating a new one during rebuild",
+                        tenantId);
                 }
+
+                if (await TryRebuildQuotaFromMetadataAsync(tenantId, volumePaths, result, ct).ConfigureAwait(false))
+                    return result;
 
                 // Step 2: Scan directories and rebuild quotas
                 var directoryCounts = new Dictionary<string, int>();
@@ -495,6 +509,134 @@ namespace Locus.Storage.Data
                 "Volume path {VolumePath} is not in the configured map, falling back to directory name {FallbackVolumeId}",
                 volumePath, fallback);
             return fallback;
+        }
+
+        private async Task<bool> TryRebuildMetadataFromQueueAsync(
+            string tenantId,
+            IEnumerable<string> volumePaths,
+            DatabaseRebuildResult result,
+            CancellationToken ct)
+        {
+            if (_queueProjectionMaintenanceService == null)
+                return false;
+
+            try
+            {
+                var projectionState = await _queueProjectionMaintenanceService
+                    .RebuildTenantAsync(tenantId, ct)
+                    .ConfigureAwait(false);
+                var rebuiltFiles = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                if (rebuiltFiles == 0 && HasAnyPhysicalFilesForTenant(tenantId, volumePaths))
+                {
+                    _logger.LogWarning(
+                        "Queue-based metadata recovery produced no records for tenant {TenantId} while physical files still exist; falling back to file scan",
+                        tenantId);
+                    return false;
+                }
+
+                result.RecordsRebuilt = rebuiltFiles;
+                result.Success = true;
+                _logger.LogInformation(
+                    "Recovered metadata database for tenant {TenantId} from queue journal. RebuiltRecords={Records}, LagBytes={LagBytes}, Snapshot={HasSnapshot}",
+                    tenantId,
+                    rebuiltFiles,
+                    projectionState.LagBytes,
+                    projectionState.HasSnapshot);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Queue-based metadata recovery failed for tenant {TenantId}; falling back to physical scan",
+                    tenantId);
+                result.Errors.Add($"Queue-based metadata recovery failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<bool> TryRebuildQuotaFromMetadataAsync(
+            string tenantId,
+            IEnumerable<string> volumePaths,
+            DatabaseRebuildResult result,
+            CancellationToken ct)
+        {
+            if (_storageCleanupService == null)
+                return false;
+
+            try
+            {
+                var metadataCount = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                if (metadataCount == 0 && _queueProjectionMaintenanceService != null)
+                {
+                    var projectionState = await _queueProjectionMaintenanceService
+                        .RebuildTenantAsync(tenantId, ct)
+                        .ConfigureAwait(false);
+                    metadataCount = (await _metadataRepository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).Count();
+
+                    if (metadataCount > 0)
+                    {
+                        _logger.LogInformation(
+                            "Recovered metadata from queue journal before quota rebuild for tenant {TenantId}. RebuiltRecords={Records}, LagBytes={LagBytes}, Snapshot={HasSnapshot}",
+                            tenantId,
+                            metadataCount,
+                            projectionState.LagBytes,
+                            projectionState.HasSnapshot);
+                    }
+                }
+
+                if (metadataCount == 0)
+                {
+                    if (HasAnyPhysicalFilesForTenant(tenantId, volumePaths))
+                    {
+                        _logger.LogWarning(
+                            "Quota rebuild for tenant {TenantId} could not use metadata or queue recovery while physical files still exist; falling back to directory scan",
+                            tenantId);
+                        return false;
+                    }
+
+                    result.Success = true;
+                    result.RecordsRebuilt = 0;
+                    _logger.LogInformation(
+                        "Quota rebuild for tenant {TenantId} found no metadata and no physical files; treating as empty tenant",
+                        tenantId);
+                    return true;
+                }
+
+                await _storageCleanupService.ReconcileQuotaCountsAsync(tenantId, ct).ConfigureAwait(false);
+                result.RecordsRebuilt = (await _quotaRepository.GetAllAsync(tenantId, ct).ConfigureAwait(false)).Count();
+                result.Success = true;
+                _logger.LogInformation(
+                    "Recovered quota database for tenant {TenantId} from projected metadata. RebuiltRecords={Records}, MetadataRecords={MetadataRecords}",
+                    tenantId,
+                    result.RecordsRebuilt,
+                    metadataCount);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Metadata-based quota recovery failed for tenant {TenantId}; falling back to directory scan",
+                    tenantId);
+                result.Errors.Add($"Metadata-based quota recovery failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool HasAnyPhysicalFilesForTenant(string tenantId, IEnumerable<string> volumePaths)
+        {
+            foreach (var volumePath in volumePaths)
+            {
+                var tenantPath = _fileSystem.Path.Combine(volumePath, tenantId);
+                if (!_fileSystem.Directory.Exists(tenantPath))
+                    continue;
+
+                if (_fileSystem.Directory.EnumerateFiles(tenantPath, "*", SearchOption.AllDirectories).Any())
+                    return true;
+            }
+
+            return false;
         }
 
     }

@@ -263,12 +263,12 @@ namespace Locus.Storage
         /// Checks for orphaned files (physical files without metadata) in storage volumes.
         /// Uses fast detection: only checks if files exist, does not count all files.
         /// </summary>
-        private Task CheckForOrphanedFilesAsync(CancellationToken ct = default)
+        private async Task CheckForOrphanedFilesAsync(CancellationToken ct = default)
         {
             if (!_volumePaths.Any())
             {
                 _logger.LogInformation("No database files found. No storage volumes configured yet.");
-                return Task.CompletedTask;
+                return;
             }
 
             // Get existing database tenant IDs from subdirectories: {metadataDirectory}/{tenantId}/metadata.db
@@ -333,6 +333,64 @@ namespace Locus.Storage
                     orphanedTenants.Count,
                     totalTenantsWithFiles,
                     string.Join(", ", orphanedTenants));
+
+                if (_autoRecoverCorruptedDatabases)
+                {
+                    var failedRecoveries = 0;
+                    foreach (var tenantId in orphanedTenants)
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        try
+                        {
+                            var metadataResult = await _recoveryService
+                                .RebuildMetadataDatabaseAsync(tenantId, _volumePaths, ct)
+                                .ConfigureAwait(false);
+                            if (!metadataResult.Success)
+                            {
+                                failedRecoveries++;
+                                _logger.LogError(
+                                    "Automatic metadata recovery failed for tenant {TenantId}. Errors={Errors}",
+                                    tenantId,
+                                    string.Join("; ", metadataResult.Errors));
+                                continue;
+                            }
+
+                            var quotaResult = await _recoveryService
+                                .RebuildQuotaDatabaseAsync(tenantId, _volumePaths, ct)
+                                .ConfigureAwait(false);
+                            if (!quotaResult.Success)
+                            {
+                                failedRecoveries++;
+                                _logger.LogError(
+                                    "Automatic quota recovery failed for tenant {TenantId}. Errors={Errors}",
+                                    tenantId,
+                                    string.Join("; ", quotaResult.Errors));
+                                continue;
+                            }
+
+                            _logger.LogWarning(
+                                "Automatically recovered missing tenant databases for tenant {TenantId}. MetadataRecords={MetadataRecords}, QuotaRecords={QuotaRecords}",
+                                tenantId,
+                                metadataResult.RecordsRebuilt,
+                                quotaResult.RecordsRebuilt);
+                        }
+                        catch (Exception ex)
+                        {
+                            failedRecoveries++;
+                            _logger.LogError(
+                                ex,
+                                "Exception during automatic recovery of missing tenant databases for tenant {TenantId}",
+                                tenantId);
+                        }
+                    }
+
+                    if (_failFastOnRecoveryFailure && failedRecoveries > 0)
+                    {
+                        throw new InvalidOperationException(
+                            "Automatic recovery of missing tenant databases failed during startup and fail-fast mode is enabled.");
+                    }
+                }
             }
             else
             {
@@ -340,8 +398,6 @@ namespace Locus.Storage
                     "No database files found, but all {TotalTenants} tenant(s) with physical files have valid metadata databases.",
                     totalTenantsWithFiles);
             }
-
-            return Task.CompletedTask;
         }
 
         /// <summary>

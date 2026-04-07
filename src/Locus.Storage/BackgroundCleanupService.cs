@@ -67,9 +67,16 @@ namespace Locus.Storage
 
                     // 3. Orphan recovery is now handled by OrphanFileRecoveryService (independent BackgroundService).
 
-                    // 4-5. Combined single-pass cleanup: timed-out and permanently-failed files.
+                    // 4. Low-rate cleanup for completed files that are ready for physical deletion.
+                    if (_options.CleanupCompletedFiles && _options.CompletedFileRetentionPeriod.HasValue)
+                    {
+                        await _cleanupService.CleanupCompletedFilesAsync(
+                            _options.CompletedFileRetentionPeriod.Value,
+                            stoppingToken);
+                    }
+
+                    // 5-6. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.
-                    // Note: Completed files are deleted immediately on MarkAsCompletedAsync and never accumulate.
                     await _cleanupService.CleanupFilesByStatusAsync(
                         _options.CleanupTimedOutFiles          ? _options.ProcessingTimeout         : null,
                         _options.CleanupPermanentlyFailedFiles ? _options.FailedFileRetentionPeriod : null,
@@ -185,6 +192,12 @@ namespace Locus.Storage
         public bool CleanupTimedOutFiles { get; set; } = true;
 
         /// <summary>
+        /// Gets or sets whether to cleanup completed files in the background.
+        /// Default: true.
+        /// </summary>
+        public bool CleanupCompletedFiles { get; set; } = true;
+
+        /// <summary>
         /// Gets or sets the processing timeout threshold.
         /// Files in Processing status longer than this will be reset to Pending.
         /// Default: 30 minutes.
@@ -196,6 +209,12 @@ namespace Locus.Storage
         /// Default: true.
         /// </summary>
         public bool CleanupPermanentlyFailedFiles { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the retention period before a completed file is reaped physically.
+        /// Default: zero, meaning the next cleanup cycle may delete it.
+        /// </summary>
+        public TimeSpan? CompletedFileRetentionPeriod { get; set; } = TimeSpan.Zero;
 
         /// <summary>
         /// Gets or sets whether to remove stale SQLite corruption backup files (*.corrupted.*).

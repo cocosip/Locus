@@ -163,7 +163,7 @@ namespace Locus.IntegrationTests
                 using var stream1 = await storagePool.ReadFileAsync(tenant!, file1.FileKey, default);
                 // Read and process the stream here if needed
             }
-            await fileScheduler.MarkAsCompletedAsync(file1.FileKey, file1.ProcessingStartTime!.Value, default);
+            await fileScheduler.MarkAsCompletedAsync(file1.Lease!, default);
 
             // Assert - File deleted
             await Assert.ThrowsAsync<FileNotFoundException>(() =>
@@ -172,10 +172,10 @@ namespace Locus.IntegrationTests
             // Act - Get second file and fail it
             var file2 = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);
             Assert.NotNull(file2);
-            await fileScheduler.MarkAsFailedAsync(file2.FileKey, file2.ProcessingStartTime!.Value, "Test failure", default);
+            await fileScheduler.MarkAsFailedAsync(file2.Lease!, "Test failure", default);
 
             // Assert - File goes back to pending
-            var file2Status = await fileScheduler.GetFileStatusAsync(file2.FileKey, default);
+            var file2Status = await fileScheduler.GetFileStatusAsync(tenant!.TenantId, file2.FileKey, default);
             Assert.Equal(FileProcessingStatus.Pending, file2Status);
         }
 
@@ -263,7 +263,7 @@ namespace Locus.IntegrationTests
             await cleanupService.CleanupTimedOutProcessingFilesAsync(TimeSpan.FromMilliseconds(1), default);
 
             // Assert - File should be reset to Pending
-            var status = await fileScheduler.GetFileStatusAsync(file.FileKey, default);
+            var status = await fileScheduler.GetFileStatusAsync(tenant!.TenantId, file.FileKey, default);
             Assert.Equal(FileProcessingStatus.Pending, status);
         }
 

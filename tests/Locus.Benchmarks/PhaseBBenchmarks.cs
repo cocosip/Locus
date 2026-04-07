@@ -271,12 +271,12 @@ namespace Locus.Benchmarks
             var tenantManager = new Mock<ITenantManager>();
             var scheduler = new Mock<IFileScheduler>();
             scheduler
-                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
-                .Returns(async (string fileKey, DateTime _, CancellationToken token) =>
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .Returns(async (FileProcessingLease lease, CancellationToken token) =>
                 {
-                    var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, token);
+                    var metadata = await _metadataRepository.GetAsync(lease.TenantId, lease.FileKey, token);
                     if (metadata != null)
-                        await _metadataRepository.RemoveAsync(metadata.TenantId, fileKey, token);
+                        await _metadataRepository.RemoveAsync(metadata.TenantId, lease.FileKey, token);
                 });
 
             _storagePool = new StoragePool(
@@ -326,7 +326,14 @@ namespace Locus.Benchmarks
                 tasks[worker] = Task.Run(async () =>
                 {
                     for (var i = start; i < end; i++)
-                        await _storagePool.MarkAsCompletedAsync(_fileKeys[i], _processingStartTime, CancellationToken.None);
+                    {
+                        await _storagePool.MarkAsCompletedAsync(new FileProcessingLease
+                        {
+                            TenantId = _tenantId,
+                            FileKey = _fileKeys[i],
+                            ProcessingStartTimeUtc = _processingStartTime
+                        }, CancellationToken.None);
+                    }
                 });
             }
 

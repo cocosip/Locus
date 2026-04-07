@@ -20,7 +20,6 @@ namespace Locus.Storage
     /// </summary>
     public class FileScheduler : IFileScheduler
     {
-        private const string CompleteDeleteFailedPrefix = "COMPLETE_DELETE_FAILED";
         private static readonly StringComparer PhysicalPathComparer =
             RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparer.OrdinalIgnoreCase
@@ -97,13 +96,13 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsProcessingAsync(string fileKey, CancellationToken ct = default)
+        public async Task MarkAsProcessingAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
-
-            if (!_repository.TryResolveTenantIdByFileKey(fileKey, out var tenantId))
-                throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
 
             const int maxAttempts = 3;
             for (var attempt = 0; attempt < maxAttempts; attempt++)
@@ -120,7 +119,7 @@ namespace Locus.Storage
                 }
             }
 
-            var latest = await _repository.GetByFileKeyAsync(fileKey, ct);
+            var latest = await _repository.GetAsync(tenantId, fileKey, ct);
             if (latest == null)
                 throw new System.IO.FileNotFoundException($"File not found: {fileKey}");
 
@@ -132,93 +131,56 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default)
+        public async Task MarkAsCompletedAsync(FileProcessingLease lease, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(fileKey))
-                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+            ValidateLease(lease);
 
-            if (!_repository.TryResolveTenantIdByFileKey(fileKey, out var tenantId))
+            var completedAtUtc = DateTime.UtcNow;
+            var updated = await _repository.TryUpdateProcessingFileAsync(
+                lease.TenantId,
+                lease.FileKey,
+                lease.ProcessingStartTimeUtc,
+                current =>
+                {
+                    current.Status = FileProcessingStatus.Completed;
+                    current.ProcessingStartTime = null;
+                    current.CompletedAt = completedAtUtc;
+                    current.DeleteSucceededAt = null;
+                    current.AvailableForProcessingAt = null;
+                    current.LastError = null;
+                    return current;
+                },
+                ct);
+            if (updated != null)
             {
-                _logger.LogWarning("Attempted to mark non-existent file as completed: {FileKey}", fileKey);
+                _logger.LogDebug("Marked file as completed: {FileKey}", lease.FileKey);
                 return;
             }
 
-            var removedMetadata = await _repository.TryRemoveProcessingFileAsync(
-                tenantId,
-                fileKey,
-                expectedProcessingStartTimeUtc,
-                ct);
-            var metadata = removedMetadata == null
-                ? await _repository.GetByFileKeyAsync(fileKey, ct)
-                : null;
-            if (removedMetadata == null)
-                throw CreateLeaseMismatchException(fileKey, expectedProcessingStartTimeUtc, metadata);
+            var metadata = await _repository.GetAsync(lease.TenantId, lease.FileKey, ct);
+            if (metadata?.Status == FileProcessingStatus.Completed)
+                return;
 
-            // Delete physical file if it exists. If deletion fails for reasons other than
-            // not-found, recreate metadata as PermanentlyFailed so maintenance cleanup can handle it.
-            Exception? deleteException = null;
-            if (!string.IsNullOrWhiteSpace(removedMetadata.PhysicalPath))
-            {
-                try
-                {
-                    await DeletePhysicalFileAsync(removedMetadata, ct);
-                    _logger.LogDebug("Deleted physical file: {PhysicalPath}", removedMetadata.PhysicalPath);
-                }
-                catch (Exception ex) when (ex is System.IO.FileNotFoundException || ex is System.IO.DirectoryNotFoundException)
-                {
-                    // File already gone - idempotent, proceed to metadata removal
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to delete physical file: {PhysicalPath}", removedMetadata.PhysicalPath);
-                    deleteException = ex;
-                }
-            }
-
-            if (deleteException != null)
-            {
-                // Clone before mutating so readers never see partial state.
-                var updated = removedMetadata.Clone();
-                updated.Status = FileProcessingStatus.PermanentlyFailed;
-                updated.LastFailedAt = DateTime.UtcNow;
-                updated.ProcessingStartTime = null;
-                updated.AvailableForProcessingAt = null;
-                updated.LastError = $"{CompleteDeleteFailedPrefix}: {deleteException.GetType().Name}: {deleteException.Message}";
-
-                await _repository.AddOrUpdateAsync(updated, ct);
-
-                _logger.LogWarning(
-                    "Marked file as PermanentlyFailed because physical delete failed: {FileKey}, Path: {PhysicalPath}",
-                    fileKey, removedMetadata.PhysicalPath);
-
-                throw new IOException($"Failed to delete physical file for completion: {fileKey}", deleteException);
-            }
-
-            _logger.LogDebug("Completed and deleted file: {FileKey}", fileKey);
+            if (updated == null)
+                throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
         }
 
         /// <inheritdoc/>
-        public async Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default)
+        public async Task MarkAsFailedAsync(FileProcessingLease lease, string errorMessage, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(fileKey))
-                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
-
-            if (!_repository.TryResolveTenantIdByFileKey(fileKey, out var tenantId))
-            {
-                _logger.LogWarning("Attempted to mark non-existent file as failed: {FileKey}", fileKey);
-                return;
-            }
+            ValidateLease(lease);
 
             var updated = await _repository.TryUpdateProcessingFileAsync(
-                tenantId,
-                fileKey,
-                expectedProcessingStartTimeUtc,
+                lease.TenantId,
+                lease.FileKey,
+                lease.ProcessingStartTimeUtc,
                 current =>
                 {
                     current.RetryCount++;
                     current.LastError = errorMessage;
                     current.LastFailedAt = DateTime.UtcNow;
                     current.ProcessingStartTime = null;
+                    current.DeleteSucceededAt = null;
 
                     if (current.RetryCount >= _retryPolicy.MaxRetryCount)
                     {
@@ -235,35 +197,32 @@ namespace Locus.Storage
                 },
                 ct);
             var metadata = updated == null
-                ? await _repository.GetByFileKeyAsync(fileKey, ct)
+                ? await _repository.GetAsync(lease.TenantId, lease.FileKey, ct)
                 : null;
             if (updated == null)
-                throw CreateLeaseMismatchException(fileKey, expectedProcessingStartTimeUtc, metadata);
+                throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
 
             if (updated.Status == FileProcessingStatus.PermanentlyFailed)
             {
                 _logger.LogError("File permanently failed after {RetryCount} retries: {FileKey}, Error: {Error}",
-                    updated.RetryCount, fileKey, errorMessage);
+                    updated.RetryCount, lease.FileKey, errorMessage);
             }
             else
             {
                 var delay = updated.AvailableForProcessingAt!.Value - DateTime.UtcNow;
                 _logger.LogWarning("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
-                    updated.RetryCount, _retryPolicy.MaxRetryCount, delay, fileKey, errorMessage);
+                    updated.RetryCount, _retryPolicy.MaxRetryCount, delay, lease.FileKey, errorMessage);
             }
         }
 
         /// <inheritdoc/>
-        public async Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct = default)
+        public async Task ResetProcessingStatusAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
-
-            if (!_repository.TryResolveTenantIdByFileKey(fileKey, out var tenantId))
-            {
-                _logger.LogWarning("Attempted to reset non-existent file: {FileKey}", fileKey);
-                return;
-            }
 
             const int maxAttempts = 3;
             for (var attempt = 0; attempt < maxAttempts; attempt++)
@@ -279,7 +238,7 @@ namespace Locus.Storage
                 return;
             }
 
-            var latest = await _repository.GetByFileKeyAsync(fileKey, ct);
+            var latest = await _repository.GetAsync(tenantId, fileKey, ct);
             if (latest == null)
             {
                 _logger.LogWarning("Attempted to reset non-existent file: {FileKey}", fileKey);
@@ -294,12 +253,15 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public async Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default)
+        public async Task<FileProcessingStatus> GetFileStatusAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            var metadata = await _repository.GetByFileKeyAsync(fileKey, ct);
+            var metadata = await _repository.GetAsync(tenantId, fileKey, ct);
 
             if (metadata == null)
             {
@@ -496,6 +458,15 @@ namespace Locus.Storage
         /// </summary>
         private FileLocation MapToFileLocation(FileMetadata metadata)
         {
+            var lease = metadata.ProcessingStartTime.HasValue
+                ? new FileProcessingLease
+                {
+                    TenantId = metadata.TenantId,
+                    FileKey = metadata.FileKey,
+                    ProcessingStartTimeUtc = metadata.ProcessingStartTime.Value
+                }
+                : null;
+
             return new FileLocation
             {
                 FileKey = metadata.FileKey,
@@ -509,8 +480,21 @@ namespace Locus.Storage
                 RetryCount = metadata.RetryCount,
                 LastFailedAt = metadata.LastFailedAt,
                 LastError = metadata.LastError,
-                ProcessingStartTime = metadata.ProcessingStartTime
+                ProcessingStartTime = metadata.ProcessingStartTime,
+                Lease = lease
             };
+        }
+
+        private static void ValidateLease(FileProcessingLease lease)
+        {
+            if (lease == null)
+                throw new ArgumentNullException(nameof(lease));
+
+            if (string.IsNullOrWhiteSpace(lease.TenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(lease));
+
+            if (string.IsNullOrWhiteSpace(lease.FileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(lease));
         }
 
         private static FileProcessingLeaseMismatchException CreateLeaseMismatchException(
@@ -524,19 +508,6 @@ namespace Locus.Storage
                 currentMetadata?.Status == FileProcessingStatus.Processing
                     ? currentMetadata.ProcessingStartTime
                     : null);
-        }
-
-        private Task DeletePhysicalFileAsync(FileMetadata metadata, CancellationToken ct = default)
-        {
-            if (_volumeRegistry != null
-                && !string.IsNullOrWhiteSpace(metadata.VolumeId)
-                && _volumeRegistry.TryGetVolume(metadata.VolumeId, out var volume))
-            {
-                return volume.DeleteAsync(metadata.PhysicalPath, ct);
-            }
-
-            _fileSystem.File.Delete(metadata.PhysicalPath);
-            return Task.CompletedTask;
         }
     }
 }

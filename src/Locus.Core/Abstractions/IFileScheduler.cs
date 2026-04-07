@@ -31,41 +31,42 @@ namespace Locus.Core.Abstractions
         /// <summary>
         /// Marks a file as currently being processed.
         /// </summary>
+        /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsProcessingAsync(string fileKey, CancellationToken ct = default);
+        Task MarkAsProcessingAsync(string tenantId, string fileKey, CancellationToken ct = default);
 
         /// <summary>
-        /// Marks a file as completed and deletes it from storage.
+        /// Marks a file as completed and leaves physical deletion to background cleanup.
         /// </summary>
-        /// <param name="fileKey">The unique file key.</param>
-        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
+        /// <param name="lease">The tenant-scoped processing lease returned when the file was allocated.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct = default);
+        Task MarkAsCompletedAsync(FileProcessingLease lease, CancellationToken ct = default);
 
         /// <summary>
         /// Marks a file as failed and returns it to the pool for retry or permanent failure.
         /// </summary>
-        /// <param name="fileKey">The unique file key.</param>
-        /// <param name="expectedProcessingStartTimeUtc">The processing start time returned when the file was allocated.</param>
+        /// <param name="lease">The tenant-scoped processing lease returned when the file was allocated.</param>
         /// <param name="errorMessage">The error message describing the failure.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct = default);
+        Task MarkAsFailedAsync(FileProcessingLease lease, string errorMessage, CancellationToken ct = default);
 
         /// <summary>
         /// Resets the processing status of a file to pending.
         /// </summary>
+        /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
-        Task ResetProcessingStatusAsync(string fileKey, CancellationToken ct = default);
+        Task ResetProcessingStatusAsync(string tenantId, string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Gets the current processing status of a file.
         /// </summary>
+        /// <param name="tenantId">The tenant identifier.</param>
         /// <param name="fileKey">The unique file key.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>The file processing status.</returns>
-        Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct = default);
+        Task<FileProcessingStatus> GetFileStatusAsync(string tenantId, string fileKey, CancellationToken ct = default);
 
         /// <summary>
         /// Cleans up orphaned metadata where physical files no longer exist.

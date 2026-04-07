@@ -66,5 +66,10 @@ namespace Locus.Core.Models
         /// Gets or sets the timestamp when the current processing lease started.
         /// </summary>
         public DateTime? ProcessingStartTime { get; set; }
+
+        /// <summary>
+        /// Gets or sets the processing lease returned to the caller when the file is allocated.
+        /// </summary>
+        public FileProcessingLease? Lease { get; set; }
     }
 }

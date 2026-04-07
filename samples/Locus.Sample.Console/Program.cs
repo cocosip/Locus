@@ -170,7 +170,7 @@ class Program
 
             try
             {
-                await pool.MarkAsCompletedAsync(next.FileKey, next.ProcessingStartTime!.Value, default);
+                await pool.MarkAsCompletedAsync(GetRequiredLease(next), default);
                 deleted++;
             }
             catch (Exception ex)
@@ -240,11 +240,11 @@ class Program
         // Cleanup
         var item1 = await pool.GetNextFileForProcessingAsync(t1, default);
         if (item1 != null)
-            await pool.MarkAsCompletedAsync(item1.FileKey, item1.ProcessingStartTime!.Value, default);
+            await pool.MarkAsCompletedAsync(GetRequiredLease(item1), default);
 
         var item2 = await pool.GetNextFileForProcessingAsync(t2, default);
         if (item2 != null)
-            await pool.MarkAsCompletedAsync(item2.FileKey, item2.ProcessingStartTime!.Value, default);
+            await pool.MarkAsCompletedAsync(GetRequiredLease(item2), default);
         WriteOk("Test files cleaned up.");
         Pause();
     }
@@ -303,7 +303,7 @@ class Program
             if (next == null)
                 break;
 
-            await pool.MarkAsCompletedAsync(next.FileKey, next.ProcessingStartTime!.Value, default);
+            await pool.MarkAsCompletedAsync(GetRequiredLease(next), default);
         }
         WriteOk($"Cleaned up {keys.Count} files.");
         Pause();
@@ -358,7 +358,7 @@ class Program
             WriteOk($"Write succeeded after re-enable. Key = {k[..16]}...");
             var allocated = await pool.GetNextFileForProcessingAsync(tenant, default);
             if (allocated != null)
-                await pool.MarkAsCompletedAsync(allocated.FileKey, allocated.ProcessingStartTime!.Value, default);
+                await pool.MarkAsCompletedAsync(GetRequiredLease(allocated), default);
         }
         catch (Exception ex)
         {
@@ -419,7 +419,7 @@ class Program
                 // Simulate work
                 await Task.Delay(15);
 
-                await pool.MarkAsCompletedAsync(file.FileKey, file.ProcessingStartTime!.Value, default);
+                await pool.MarkAsCompletedAsync(GetRequiredLease(file), default);
                 var n = Interlocked.Increment(ref processedCount);
                 System.Console.Write($"\r  Worker {workerId} — processed {n}/{fileCount}    ");
             }
@@ -462,16 +462,16 @@ class Program
 
             if (loc == null || loc.FileKey != fileKey)
             {
-                var st = await pool.GetFileStatusAsync(fileKey, default);
+                var st = await pool.GetFileStatusAsync(tenant, fileKey, default);
                 WriteInfo($"  Attempt {attempt}: file not available yet (status={st}, retry delay active).");
                 await Task.Delay(300);
                 continue;
             }
 
             WriteInfo($"  Attempt {attempt}: file dequeued — RetryCount={loc.RetryCount}, Status={loc.Status}");
-            await pool.MarkAsFailedAsync(fileKey, loc.ProcessingStartTime!.Value, $"Simulated failure #{attempt}", default);
+            await pool.MarkAsFailedAsync(GetRequiredLease(loc), $"Simulated failure #{attempt}", default);
 
-            var afterStatus = await pool.GetFileStatusAsync(fileKey, default);
+            var afterStatus = await pool.GetFileStatusAsync(tenant, fileKey, default);
             WriteInfo($"  After MarkAsFailed: status={afterStatus}");
 
             if (afterStatus == FileProcessingStatus.PermanentlyFailed)
@@ -484,7 +484,7 @@ class Program
             await Task.Delay(200); // give retry delay a moment
         }
 
-        var finalStatus = await pool.GetFileStatusAsync(fileKey, default);
+        var finalStatus = await pool.GetFileStatusAsync(tenant, fileKey, default);
         WriteInfo($"Final file status: {finalStatus}");
 
         if (finalStatus != FileProcessingStatus.PermanentlyFailed)
@@ -753,6 +753,22 @@ class Program
         System.Console.Write("  Press any key to return to menu...");
         System.Console.ResetColor();
         System.Console.ReadKey(intercept: true);
+    }
+
+    static FileProcessingLease GetRequiredLease(FileLocation file)
+    {
+        if (file.Lease != null)
+            return file.Lease;
+
+        if (!file.ProcessingStartTime.HasValue)
+            throw new InvalidOperationException($"Missing processing lease for file {file.FileKey}.");
+
+        return new FileProcessingLease
+        {
+            TenantId = file.TenantId,
+            FileKey = file.FileKey,
+            ProcessingStartTimeUtc = file.ProcessingStartTime.Value
+        };
     }
 
     static string FormatBytes(long bytes)
