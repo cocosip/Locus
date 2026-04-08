@@ -84,11 +84,11 @@ namespace Locus.Storage
 
         /// <summary>
         /// Gets or sets a value indicating whether projected tenant journals should be compacted.
-        /// This remains disabled by default so deployments can opt in only after validating
-        /// snapshot-based rebuild behavior for their workload.
-        /// Default: false.
+        /// Enabled by default so processed queue logs do not grow without bound once
+        /// snapshot-based recovery is available in normal runtime operation.
+        /// Default: true.
         /// </summary>
-        public bool EnableCompaction { get; set; } = false;
+        public bool EnableCompaction { get; set; } = true;
 
         /// <summary>
         /// Gets or sets the minimum processed bytes before a tenant journal is compacted.

@@ -98,6 +98,46 @@ var location = await storagePool.GetFileLocationAsync(tenant, fileKey, ct);
 - **Atomic Quota Operations**: Lock-free CAS counters + Write-Behind timer ensure concurrency safety
 - **Startup Volume Configuration**: Storage volumes are configured at startup and managed internally
 
+## Durable Queue and Recovery Model
+
+Locus separates file content, queue-state durability, and queryable projections into different layers:
+
+- **Physical files on storage volumes** hold the actual bytes
+- **Per-tenant `queue.log`** stores durable queue-state transitions such as `Accepted`,
+  `ProcessingStarted`, `ProcessingFailed`, `ProcessingTimedOut`, `ProcessingCompleted`,
+  `DeleteRequested`, and `DeleteSucceeded`
+- **Per-tenant SQLite projections** (`metadata.db` and `quotas.db`) provide the current queryable state
+- **In-memory caches** keep hot-path reads, leasing, and quota checks fast
+
+This means SQLite is still operationally important, but it is no longer the only durable truth:
+
+- file bytes are durable on the storage volumes
+- queue-state transitions are durable in `queue.log`
+- SQLite stores rebuildable local projections used by normal reads, scheduling, cleanup, and reconciliation
+
+For a full lifecycle walkthrough, including orphan recovery, startup rebuild, timeout reset, and delete
+reaping, see [`docs/storage-lifecycle-overview.md`](docs/storage-lifecycle-overview.md).
+
+## Queue Journal Growth and Compaction
+
+`queue.log` is append-only during normal operation, so it grows as files move through the queue lifecycle.
+To avoid unbounded growth, journal compaction is enabled by default.
+
+Compaction only runs when all of the following are true:
+
+1. The queue projector has caught up to the current tenant journal tail
+2. The processed byte range since the current base offset is at least `MinBytesBeforeCompaction`
+3. A projection snapshot has been saved so rebuild can continue from snapshot + journal tail replay
+
+Default behavior:
+
+- `EnableCompaction = true`
+- `EnableAutomaticSnapshots = true`
+- `MinBytesBeforeCompaction = 4 MB`
+
+When compaction runs, the already-projected prefix of `queue.log` is trimmed away. If the entire file has
+already been projected, the tenant journal is truncated to an empty file and its base/tail offsets advance.
+
 ## Core APIs
 
 ### IStoragePool - Unified Storage and Queue Management
