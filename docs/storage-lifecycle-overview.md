@@ -35,6 +35,29 @@
    - 热路径读写、调度、配额判断优先依赖内存缓存和索引。
    - SQLite 主要承担持久化投影和重启恢复的职责。
 
+## 正式架构图
+
+```mermaid
+flowchart LR
+    Client["调用方 / Worker"] --> Pool["StoragePool / IStoragePool"]
+    Pool --> Tenant["租户校验"]
+    Pool --> Projection["投影查询"]
+    Projection --> Cache["进程内 active-data cache"]
+    Cache -. "首次访问或重启后预热" .-> Sqlite["每租户 SQLite 投影<br/>metadata.db / quotas.db"]
+    Pool --> Volume["Storage Volume<br/>物理文件内容"]
+    Pool --> Journal["每租户 queue.log"]
+    Journal --> Projector["QueueEventProjectionService"]
+    Projector --> Sqlite
+    Projector --> Cache
+```
+
+### 架构职责定义
+
+- `Storage Volume` 保存文件真实字节内容，是文件内容的最终载体。
+- `queue.log` 保存队列状态迁移事件，是队列状态机的持久事实来源。
+- SQLite 保存可查询、可重建的本地投影，不负责承载文件二进制内容。
+- 进程内内存缓存承担热路径查询与调度加速，当前进程内优先命中它。
+
 ## 队列事件类型
 
 当前 `queue.log` 中会记录这些事件：
@@ -147,6 +170,42 @@ flowchart TD
 ## 二、直接读取流程
 
 这里说的“读取”，指的是按 `fileKey` 直接获取文件内容，不是队列式调度消费。
+
+### 读取链路正式图
+
+```mermaid
+sequenceDiagram
+    participant Caller as 调用方
+    participant StoragePool
+    participant ProjectionStore
+    participant Cache as 内存 metadata cache
+    participant SQLite as SQLite 投影
+    participant Volume as Storage Volume
+
+    Caller->>StoragePool: ReadFileAsync(tenant, fileKey)
+    StoragePool->>ProjectionStore: GetProjectedFileAsync(tenantId, fileKey)
+    ProjectionStore->>Cache: 查询 metadata
+
+    alt 当前租户缓存已预热
+        Cache-->>ProjectionStore: FileMetadata
+    else 首次访问租户或进程重启后
+        Cache->>SQLite: 加载 active projection rows
+        SQLite-->>Cache: 返回 active metadata
+        Cache-->>ProjectionStore: FileMetadata
+    end
+
+    ProjectionStore-->>StoragePool: FileMetadata
+    StoragePool->>Volume: ReadAsync(physicalPath)
+    Volume-->>StoragePool: Stream
+    StoragePool-->>Caller: Stream
+```
+
+### 正式结论
+
+- 直接读取文件内容时，不会从 SQLite 读取文件字节。
+- 读取动作先根据 `(tenantId, fileKey)` 查询 metadata 投影，再按 `PhysicalPath` 去 volume 打开物理文件。
+- 在当前进程内，metadata 查询优先命中内存缓存。
+- SQLite 的职责是投影持久化与重启恢复，而不是文件内容存储。
 
 ### 步骤
 

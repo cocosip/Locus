@@ -61,32 +61,47 @@ var location = await storagePool.GetFileLocationAsync(tenant, fileKey, ct);
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    Client["Client / Worker"] --> Pool["StoragePool / IStoragePool"]
+    Pool --> Tenant["Tenant validation"]
+    Pool --> Projection["Projection lookup"]
+    Projection --> Cache["In-memory active-data cache"]
+    Cache -. "warm on first access or restart" .-> Sqlite["Per-tenant SQLite projections<br/>metadata.db / quotas.db"]
+    Pool --> Volume["Storage volumes<br/>physical file bytes"]
+    Pool --> Journal["Per-tenant queue.log"]
+    Journal --> Projector["QueueEventProjectionService"]
+    Projector --> Sqlite
+    Projector --> Cache
 ```
-┌─────────────────────────────────────────────┐
-│   API Layer (IStoragePool)                 │
-│   - Unified storage + queue interface       │
-│   - File operations + processing control    │
-├─────────────────────────────────────────────┤
-│   Active-Data Cache (Per-Tenant)           │
-│   - Only Pending/Processing/Failed files    │
-│   - ConcurrentDictionary for fast lookups   │
-│   - Automatic cache invalidation            │
-├─────────────────────────────────────────────┤
-│   Persistence Layer (Per-Tenant SQLite)    │
-│   - MetadataRepository: File metadata       │
-│   - DirectoryQuotaRepository: Quota limits  │
-│   - Atomic operations with transactions     │
-├─────────────────────────────────────────────┤
-│   Tenant Management (JSON + Cache)         │
-│   - TenantMetadata: Status, creation date   │
-│   - 5-minute in-memory cache                │
-│   - Auto-create support                     │
-├─────────────────────────────────────────────┤
-│   Storage Volumes (Configured at startup)  │
-│   - LocalFileSystemVolume (implemented)     │
-│   - Network Drives (supported)              │
-│   - Extensible to Cloud Storage             │
-└─────────────────────────────────────────────┘
+
+### Read Path
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant StoragePool
+    participant ProjectionStore
+    participant Cache as In-Memory Cache
+    participant SQLite as SQLite Projection
+    participant Volume as Storage Volume
+
+    Caller->>StoragePool: ReadFileAsync(tenant, fileKey)
+    StoragePool->>ProjectionStore: GetProjectedFileAsync(tenantId, fileKey)
+    ProjectionStore->>Cache: Get metadata
+
+    alt Cache already warm
+        Cache-->>ProjectionStore: FileMetadata
+    else First tenant access or process restart
+        Cache->>SQLite: Load active projection rows
+        SQLite-->>Cache: Active file metadata
+        Cache-->>ProjectionStore: FileMetadata
+    end
+
+    ProjectionStore-->>StoragePool: FileMetadata
+    StoragePool->>Volume: ReadAsync(physicalPath)
+    Volume-->>StoragePool: Stream
+    StoragePool-->>Caller: Stream
 ```
 
 ### Key Design Decisions
@@ -114,6 +129,12 @@ This means SQLite is still operationally important, but it is no longer the only
 - file bytes are durable on the storage volumes
 - queue-state transitions are durable in `queue.log`
 - SQLite stores rebuildable local projections used by normal reads, scheduling, cleanup, and reconciliation
+
+Direct file reads should therefore be understood as:
+
+- metadata lookup is memory-first in the current process
+- SQLite is the projection persistence and rebuild source, not the file-content store
+- file bytes are always read from the mounted storage volume, never from SQLite blobs
 
 For a full lifecycle walkthrough, including orphan recovery, startup rebuild, timeout reset, and delete
 reaping, see [`docs/storage-lifecycle-overview.md`](docs/storage-lifecycle-overview.md).
