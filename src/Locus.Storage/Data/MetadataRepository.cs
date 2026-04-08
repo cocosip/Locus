@@ -113,6 +113,8 @@ namespace Locus.Storage.Data
         private readonly ConcurrentDictionary<string, object> _processingByStartTimeLocks;
         private readonly ConcurrentDictionary<string, StatusTimestampIndex> _completedByCompletedAt;
         private readonly ConcurrentDictionary<string, object> _completedByCompletedAtLocks;
+        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _deleteRequestedByCompletedAt;
+        private readonly ConcurrentDictionary<string, object> _deleteRequestedByCompletedAtLocks;
         private readonly ConcurrentDictionary<string, StatusTimestampIndex> _permanentlyFailedByLastFailedAt;
         private readonly ConcurrentDictionary<string, object> _permanentlyFailedByLastFailedAtLocks;
         private long _statusIndexSequence;
@@ -476,6 +478,8 @@ namespace Locus.Storage.Data
             _processingByStartTimeLocks = new ConcurrentDictionary<string, object>();
             _completedByCompletedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _completedByCompletedAtLocks = new ConcurrentDictionary<string, object>();
+            _deleteRequestedByCompletedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
+            _deleteRequestedByCompletedAtLocks = new ConcurrentDictionary<string, object>();
             _permanentlyFailedByLastFailedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _permanentlyFailedByLastFailedAtLocks = new ConcurrentDictionary<string, object>();
             _delayedQueues = new ConcurrentDictionary<string, DelayedQueue>();
@@ -676,6 +680,14 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
                 FileProcessingStatus.Completed, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.DeleteRequested, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.DeleteSucceeded, orderByCreatedAt: false,
                 nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
@@ -1145,7 +1157,8 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (!cache.TryGetValue(fileKey, out var current))
                     return false;
 
-                if (current.Status != FileProcessingStatus.Completed
+                if ((current.Status != FileProcessingStatus.Completed
+                    && current.Status != FileProcessingStatus.DeleteRequested)
                     || !current.CompletedAt.HasValue
                     || current.CompletedAt.Value != expectedCompletedAtUtc)
                 {
@@ -1196,7 +1209,8 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (!cache.TryGetValue(fileKey, out var current))
                     return false;
 
-                if (current.Status != FileProcessingStatus.Completed
+                if ((current.Status != FileProcessingStatus.Completed
+                    && current.Status != FileProcessingStatus.DeleteRequested)
                     || !current.CompletedAt.HasValue
                     || current.CompletedAt.Value != expectedCompletedAtUtc)
                 {
@@ -1207,6 +1221,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     return true;
 
                 var updated = current.Clone();
+                updated.Status = FileProcessingStatus.DeleteSucceeded;
                 updated.DeleteSucceededAt = deleteSucceededAtUtc;
 
                 if (!cache.TryUpdate(fileKey, updated, current))
@@ -1647,6 +1662,38 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         }
 
         /// <summary>
+        /// Gets a bounded batch of files in DeleteRequested status whose completion time is older than the cutoff.
+        /// Excluded keys are deferred to later iterations so maintenance scans can progress past blocked records.
+        /// </summary>
+        public Task<IReadOnlyList<FileMetadata>> GetDeleteRequestedOlderThanAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            ISet<string>? excludedFileKeys = null,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (limit <= 0)
+                return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
+
+            ct.ThrowIfCancellationRequested();
+            var results = GetStatusBatchFromIndex(
+                tenantId,
+                cutoffUtc,
+                limit,
+                FileProcessingStatus.DeleteRequested,
+                _deleteRequestedByCompletedAt,
+                _deleteRequestedByCompletedAtLocks,
+                metadata => metadata.CompletedAt,
+                metadata => !metadata.DeleteSucceededAt.HasValue,
+                excludedFileKeys);
+
+            return Task.FromResult(results);
+        }
+
+        /// <summary>
         /// Gets all file metadata with a specific status.
         /// </summary>
         public Task<IEnumerable<FileMetadata>> GetByStatusAsync(FileProcessingStatus status, CancellationToken ct = default)
@@ -1827,6 +1874,20 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     EnqueueStatusIndex(
                         _completedByCompletedAt,
                         _completedByCompletedAtLocks,
+                        current.TenantId,
+                        current.FileKey,
+                        current.CompletedAt.Value,
+                        current.CreatedAt);
+                }
+            }
+
+            if (current.Status == FileProcessingStatus.DeleteRequested && current.CompletedAt.HasValue)
+            {
+                if (statusChanged || previous?.CompletedAt != current.CompletedAt)
+                {
+                    EnqueueStatusIndex(
+                        _deleteRequestedByCompletedAt,
+                        _deleteRequestedByCompletedAtLocks,
                         current.TenantId,
                         current.FileKey,
                         current.CompletedAt.Value,
@@ -2686,10 +2747,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _delayedQueueLocks.TryRemove(tenantId, out _);
                 _processingByStartTime.TryRemove(tenantId, out _);
                 _processingByStartTimeLocks.TryRemove(tenantId, out _);
-                _completedByCompletedAt.TryRemove(tenantId, out _);
-                _completedByCompletedAtLocks.TryRemove(tenantId, out _);
-                _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-                _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+            _completedByCompletedAt.TryRemove(tenantId, out _);
+            _completedByCompletedAtLocks.TryRemove(tenantId, out _);
+            _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
+            _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
+            _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+            _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                 _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -2808,10 +2871,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     _delayedQueueLocks.TryRemove(tenantId, out _);
                     _processingByStartTime.TryRemove(tenantId, out _);
                     _processingByStartTimeLocks.TryRemove(tenantId, out _);
-                    _completedByCompletedAt.TryRemove(tenantId, out _);
-                    _completedByCompletedAtLocks.TryRemove(tenantId, out _);
-                    _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-                    _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+            _completedByCompletedAt.TryRemove(tenantId, out _);
+            _completedByCompletedAtLocks.TryRemove(tenantId, out _);
+            _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
+            _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
+            _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+            _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                     // Step 4: Backup corrupted database
                     backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
@@ -3428,6 +3493,8 @@ ON CONFLICT(file_key) DO UPDATE SET
             _processingByStartTimeLocks.Clear();
             _completedByCompletedAt.Clear();
             _completedByCompletedAtLocks.Clear();
+            _deleteRequestedByCompletedAt.Clear();
+            _deleteRequestedByCompletedAtLocks.Clear();
             _permanentlyFailedByLastFailedAt.Clear();
             _permanentlyFailedByLastFailedAtLocks.Clear();
             _delayedQueues.Clear();

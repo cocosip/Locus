@@ -365,7 +365,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task ExecuteAsync_DeleteRequestedPromotesProjectionToCompletedState()
+        public async Task ExecuteAsync_DeleteRequestedPromotesProjectionToDeleteRequestedState()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
             var directoryQuotaManager = CreateDirectoryQuotaManager();
@@ -418,7 +418,7 @@ namespace Locus.Storage.Tests
                 PhysicalPath = physicalPath,
                 DirectoryPath = directoryPath,
                 FileSize = 5,
-                Status = FileProcessingStatus.Completed
+                Status = FileProcessingStatus.DeleteRequested
             }, CancellationToken.None);
 
             var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
@@ -436,7 +436,7 @@ namespace Locus.Storage.Tests
             var rebuilt = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
 
             Assert.NotNull(rebuilt);
-            Assert.Equal(FileProcessingStatus.Completed, rebuilt!.Status);
+            Assert.Equal(FileProcessingStatus.DeleteRequested, rebuilt!.Status);
             Assert.Null(rebuilt.ProcessingStartTime);
             Assert.NotNull(rebuilt.CompletedAt);
             Assert.True(rebuilt.CompletedAt.Value >= processingStartTime);
@@ -545,13 +545,28 @@ namespace Locus.Storage.Tests
             {
                 TenantId = tenantId,
                 FileKey = fileKey,
+                EventType = QueueEventType.DeleteRequested,
+                OccurredAtUtc = DateTime.UtcNow.AddMilliseconds(500),
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 4,
+                Status = FileProcessingStatus.DeleteRequested,
+                OriginalFileName = "study.dcm",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
                 EventType = QueueEventType.DeleteSucceeded,
                 OccurredAtUtc = DateTime.UtcNow.AddSeconds(1),
                 VolumeId = "vol-001",
                 PhysicalPath = physicalPath,
                 DirectoryPath = directoryPath,
                 FileSize = 4,
-                Status = FileProcessingStatus.Completed,
+                Status = FileProcessingStatus.DeleteSucceeded,
                 OriginalFileName = "study.dcm",
                 FileExtension = ".dcm"
             }, CancellationToken.None);
@@ -1035,6 +1050,79 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, state.SnapshotFileCount);
             Assert.True(_fileSystem.File.Exists(snapshotPath));
             projectionStore.Verify(store => store.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task ExecuteAsync_AutomaticallySnapshotsTenantAfterProjectionCatchesUp()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-auto-snapshot";
+            const string fileKey = "file-auto-snapshot";
+            const string directoryPath = "/auto-snapshot";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "auto-snapshot", "file-auto-snapshot.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3, 4 });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 4,
+                Status = FileProcessingStatus.Pending,
+                OriginalFileName = "auto-snapshot.dcm",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal,
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    EnableAutomaticSnapshots = true,
+                    AutomaticSnapshotInterval = TimeSpan.FromHours(1),
+                    MinBytesBeforeAutomaticSnapshot = long.MaxValue,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object));
+
+            var snapshotPath = Path.Combine(_queueDirectory, tenantId, "projection.snapshot.json");
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(snapshotPath)), TimeSpan.FromSeconds(2));
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var state = await service.GetTenantStateAsync(tenantId, CancellationToken.None);
+            var rebuilt = await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None);
+
+            Assert.True(state.HasSnapshot);
+            Assert.True(state.SnapshotCursorOffset > 0);
+            Assert.Equal(1, state.SnapshotFileCount);
+            Assert.NotNull(rebuilt);
+            Assert.Equal(FileProcessingStatus.Pending, rebuilt!.Status);
         }
 
         [Fact]

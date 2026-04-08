@@ -1402,7 +1402,8 @@ namespace Locus.Storage.Tests
                     It.Is<QueueEventRecord>(record =>
                         record.EventType == QueueEventType.DeleteSucceeded
                         && record.TenantId == "tenant-001"
-                        && record.FileKey == "completed-journal"),
+                        && record.FileKey == "completed-journal"
+                        && record.Status == FileProcessingStatus.DeleteSucceeded),
                     It.IsAny<CancellationToken>()))
                 .Callback<QueueEventRecord, CancellationToken>((_, __) => appendCount++)
                 .Returns(Task.CompletedTask);
@@ -1431,7 +1432,7 @@ namespace Locus.Storage.Tests
                 DirectoryPath = "/done",
                 FileSize = 17,
                 CreatedAt = DateTime.UtcNow.AddMinutes(-10),
-                Status = FileProcessingStatus.Completed,
+                Status = FileProcessingStatus.DeleteRequested,
                 CompletedAt = DateTime.UtcNow.AddMinutes(-5)
             }, CancellationToken.None);
 
@@ -1445,7 +1446,7 @@ namespace Locus.Storage.Tests
 
             var metadata = await _metadataRepository.GetAsync("tenant-001", "completed-journal", CancellationToken.None);
             Assert.NotNull(metadata);
-            Assert.Equal(FileProcessingStatus.Completed, metadata!.Status);
+            Assert.Equal(FileProcessingStatus.DeleteSucceeded, metadata!.Status);
             Assert.NotNull(metadata.DeleteSucceededAt);
 
             var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None);

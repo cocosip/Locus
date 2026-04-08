@@ -1061,7 +1061,7 @@ namespace Locus.Storage.Tests
                         record.EventType == QueueEventType.DeleteRequested
                         && record.TenantId == "tenant-001"
                         && record.FileKey == fileKey
-                        && record.Status == FileProcessingStatus.Completed),
+                        && record.Status == FileProcessingStatus.DeleteRequested),
                     It.IsAny<CancellationToken>()),
                 Times.Once);
         }

@@ -209,7 +209,7 @@ namespace Locus.Storage
                     if (current == null)
                         return;
 
-                    if (current.Status == FileProcessingStatus.Completed)
+                    if (IsCompletionCommittedStatus(current.Status))
                         return;
 
                     if (current.Status != FileProcessingStatus.Processing
@@ -260,7 +260,7 @@ namespace Locus.Storage
                 }
 
                 var metadata = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
-                if (metadata?.Status == FileProcessingStatus.Completed)
+                if (metadata != null && IsCompletionCommittedStatus(metadata.Status))
                     return;
 
                 if (updated == null)
@@ -557,11 +557,18 @@ namespace Locus.Storage
                 PhysicalPath = metadata.PhysicalPath,
                 DirectoryPath = metadata.DirectoryPath,
                 FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Completed,
+                Status = FileProcessingStatus.DeleteRequested,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,
                 FileExtension = metadata.FileExtension,
             };
+        }
+
+        private static bool IsCompletionCommittedStatus(FileProcessingStatus status)
+        {
+            return status == FileProcessingStatus.Completed
+                || status == FileProcessingStatus.DeleteRequested
+                || status == FileProcessingStatus.DeleteSucceeded;
         }
 
         private static QueueEventRecord CreateProcessingFailedEvent(

@@ -592,7 +592,7 @@ namespace Locus.Storage
                 if (metadata == null)
                     return;
 
-                if (metadata.Status == FileProcessingStatus.Completed)
+                if (IsCompletionCommittedStatus(metadata.Status))
                     return;
 
                 if (metadata.Status != FileProcessingStatus.Processing
@@ -963,11 +963,18 @@ namespace Locus.Storage
                 PhysicalPath = metadata.PhysicalPath,
                 DirectoryPath = metadata.DirectoryPath,
                 FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Completed,
+                Status = FileProcessingStatus.DeleteRequested,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,
                 FileExtension = metadata.FileExtension
             };
+        }
+
+        private static bool IsCompletionCommittedStatus(FileProcessingStatus status)
+        {
+            return status == FileProcessingStatus.Completed
+                || status == FileProcessingStatus.DeleteRequested
+                || status == FileProcessingStatus.DeleteSucceeded;
         }
 
         private static QueueEventRecord CreateProcessingFailedEvent(

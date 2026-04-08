@@ -245,12 +245,21 @@ namespace Locus.Storage
             }
 
             var cursorOffset = batch.NextOffset;
+            var snapshotSaved = false;
             if (_options.EnableCompaction
                 && batch.ReachedEndOfFile
                 && await ShouldCompactTenantAsync(tenantId, cursorOffset, ct).ConfigureAwait(false))
             {
                 await SaveSnapshotAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
+                snapshotSaved = true;
                 cursorOffset = await _journal.CompactAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
+            }
+
+            if (!snapshotSaved
+                && batch.ReachedEndOfFile
+                && await ShouldSaveAutomaticSnapshotAsync(tenantId, cursorOffset, ct).ConfigureAwait(false))
+            {
+                await SaveSnapshotAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
             }
 
             await SaveCursorAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
@@ -401,11 +410,11 @@ namespace Locus.Storage
             var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
             if (existing == null)
             {
-                await EnsureMetadataExistsAsync(record, FileProcessingStatus.Completed, ct).ConfigureAwait(false);
+                await EnsureMetadataExistsAsync(record, FileProcessingStatus.DeleteRequested, ct).ConfigureAwait(false);
                 return;
             }
 
-            if (existing.Status == FileProcessingStatus.Completed
+            if (existing.Status == FileProcessingStatus.DeleteRequested
                 && existing.CompletedAt.HasValue
                 && !existing.ProcessingStartTime.HasValue
                 && !existing.AvailableForProcessingAt.HasValue
@@ -415,7 +424,7 @@ namespace Locus.Storage
             }
 
             var updated = existing.Clone();
-            updated.Status = FileProcessingStatus.Completed;
+            updated.Status = FileProcessingStatus.DeleteRequested;
             updated.ProcessingStartTime = null;
             updated.CompletedAt = existing.CompletedAt ?? record.OccurredAtUtc;
             updated.DeleteSucceededAt = null;
@@ -537,6 +546,10 @@ namespace Locus.Storage
                 RetryCount = record.RetryCount ?? 0,
                 ProcessingStartTime = record.ProcessingStartTimeUtc,
                 CompletedAt = IsCompletedEvent(record) ? record.OccurredAtUtc : null,
+                DeleteSucceededAt = record.EventType == QueueEventType.DeleteSucceeded
+                    || record.Status == FileProcessingStatus.DeleteSucceeded
+                    ? record.OccurredAtUtc
+                    : null,
                 AvailableForProcessingAt = record.AvailableForProcessingAtUtc,
                 LastError = record.ErrorMessage,
                 LastFailedAt = record.EventType == QueueEventType.ProcessingFailed ? record.OccurredAtUtc : null,
@@ -662,7 +675,9 @@ namespace Locus.Storage
             return record.EventType == QueueEventType.ProcessingCompleted
                 || record.EventType == QueueEventType.DeleteRequested
                 || record.EventType == QueueEventType.DeleteSucceeded
-                || record.Status == FileProcessingStatus.Completed;
+                || record.Status == FileProcessingStatus.Completed
+                || record.Status == FileProcessingStatus.DeleteRequested
+                || record.Status == FileProcessingStatus.DeleteSucceeded;
         }
 
         private async Task<long> LoadCursorAsync(string tenantId, CancellationToken ct)
@@ -733,6 +748,32 @@ namespace Locus.Storage
             return tailOffset >= cursorOffset
                 && cursorOffset >= baseOffset
                 && (cursorOffset - baseOffset) >= _options.MinBytesBeforeCompaction;
+        }
+
+        private async Task<bool> ShouldSaveAutomaticSnapshotAsync(string tenantId, long cursorOffset, CancellationToken ct)
+        {
+            if (!_options.EnableAutomaticSnapshots)
+                return false;
+
+            cursorOffset = await NormalizeCursorOffsetAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+            var snapshot = await LoadSnapshotAsync(tenantId, ct).ConfigureAwait(false);
+            if (snapshot == null)
+                return true;
+
+            if (cursorOffset < snapshot.CursorOffset)
+                return true;
+
+            if (cursorOffset == snapshot.CursorOffset)
+                return false;
+
+            var advancedBytes = cursorOffset - snapshot.CursorOffset;
+            if (advancedBytes >= _options.MinBytesBeforeAutomaticSnapshot)
+                return true;
+
+            if (_options.AutomaticSnapshotInterval == TimeSpan.Zero)
+                return true;
+
+            return DateTime.UtcNow - snapshot.CreatedAtUtc >= _options.AutomaticSnapshotInterval;
         }
 
         private async Task<QueueProjectionTenantState> BuildTenantStateAsync(string tenantId, CancellationToken ct)

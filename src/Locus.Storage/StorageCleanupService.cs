@@ -1069,12 +1069,19 @@ namespace Locus.Storage
             while (true)
             {
                 var iterationStartedAt = Stopwatch.GetTimestamp();
-                var batch = await _projectionCleanupStore.GetCompletedFilesOlderThanAsync(
-                    tenantId,
-                    completedCutoffUtc,
-                    _statusCleanupBatchSizePerTenant,
-                    blockedFileKeys,
-                    ct);
+                var batch = _queueEventJournal != null
+                    ? await _projectionCleanupStore.GetDeleteRequestedFilesOlderThanAsync(
+                        tenantId,
+                        completedCutoffUtc,
+                        _statusCleanupBatchSizePerTenant,
+                        blockedFileKeys,
+                        ct)
+                    : await _projectionCleanupStore.GetCompletedFilesOlderThanAsync(
+                        tenantId,
+                        completedCutoffUtc,
+                        _statusCleanupBatchSizePerTenant,
+                        blockedFileKeys,
+                        ct);
                 if (batch.Count == 0)
                 {
                     RecordStatusCleanupIteration("completed_cleanup", tenantId, 0, iterationStartedAt);
@@ -1347,7 +1354,7 @@ namespace Locus.Storage
                 PhysicalPath = metadata.PhysicalPath,
                 DirectoryPath = metadata.DirectoryPath,
                 FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Completed,
+                Status = FileProcessingStatus.DeleteSucceeded,
                 ProcessingStartTimeUtc = metadata.ProcessingStartTime,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,

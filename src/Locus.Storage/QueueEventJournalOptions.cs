@@ -56,6 +56,26 @@ namespace Locus.Storage
         public TimeSpan MaxProjectionTimePerCycle { get; set; } = TimeSpan.FromSeconds(2);
 
         /// <summary>
+        /// Gets or sets a value indicating whether projection snapshots should be refreshed automatically
+        /// after a tenant catches up to the current journal tail.
+        /// Default: true.
+        /// </summary>
+        public bool EnableAutomaticSnapshots { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the minimum time between automatic snapshot refreshes for the same tenant
+        /// when new journal progress exists.
+        /// Default: 15 minutes.
+        /// </summary>
+        public TimeSpan AutomaticSnapshotInterval { get; set; } = TimeSpan.FromMinutes(15);
+
+        /// <summary>
+        /// Gets or sets the minimum additional projected bytes before an automatic snapshot is refreshed.
+        /// Default: 1 MB.
+        /// </summary>
+        public long MinBytesBeforeAutomaticSnapshot { get; set; } = 1L * 1024L * 1024L;
+
+        /// <summary>
         /// Gets or sets a value indicating whether projected tenant journals should be compacted.
         /// This remains disabled by default so deployments can opt in only after validating
         /// snapshot-based rebuild behavior for their workload.
@@ -91,6 +111,12 @@ namespace Locus.Storage
 
             if (MaxProjectionTimePerCycle <= TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.MaxProjectionTimePerCycle must be greater than zero");
+
+            if (AutomaticSnapshotInterval < TimeSpan.Zero)
+                throw new InvalidOperationException("QueueEventJournal.AutomaticSnapshotInterval cannot be negative");
+
+            if (MinBytesBeforeAutomaticSnapshot < 0)
+                throw new InvalidOperationException("QueueEventJournal.MinBytesBeforeAutomaticSnapshot cannot be negative");
 
             if (MinBytesBeforeCompaction < 0)
                 throw new InvalidOperationException("QueueEventJournal.MinBytesBeforeCompaction cannot be negative");

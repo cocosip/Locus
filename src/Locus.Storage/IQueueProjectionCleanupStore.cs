@@ -43,6 +43,16 @@ namespace Locus.Storage
             CancellationToken ct = default);
 
         /// <summary>
+        /// Gets a bounded batch of projected files in DeleteRequested status older than the cutoff.
+        /// </summary>
+        Task<IReadOnlyList<FileMetadata>> GetDeleteRequestedFilesOlderThanAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            ISet<string>? excludedFileKeys = null,
+            CancellationToken ct = default);
+
+        /// <summary>
         /// Marks a projected completed file as DeleteSucceeded if it still matches the expected completion time.
         /// </summary>
         Task<bool> TryMarkDeleteSucceededAsync(

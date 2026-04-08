@@ -59,6 +59,17 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
+        public Task<IReadOnlyList<FileMetadata>> GetDeleteRequestedFilesOlderThanAsync(
+            string tenantId,
+            DateTime cutoffUtc,
+            int limit,
+            ISet<string>? excludedFileKeys = null,
+            CancellationToken ct = default)
+        {
+            return _repository.GetDeleteRequestedOlderThanAsync(tenantId, cutoffUtc, limit, excludedFileKeys, ct);
+        }
+
+        /// <inheritdoc/>
         public Task<bool> TryMarkDeleteSucceededAsync(
             string tenantId,
             string fileKey,

@@ -28,6 +28,16 @@ namespace Locus.Core.Models
         /// <summary>
         /// File processing has permanently failed after exceeding max retry count.
         /// </summary>
-        PermanentlyFailed = 4
+        PermanentlyFailed = 4,
+
+        /// <summary>
+        /// File processing completed and physical deletion has been requested.
+        /// </summary>
+        DeleteRequested = 5,
+
+        /// <summary>
+        /// Physical deletion succeeded and the final projection cleanup is pending.
+        /// </summary>
+        DeleteSucceeded = 6
     }
 }
