@@ -20,6 +20,13 @@ namespace Locus.Storage
         public bool Enabled { get; set; } = true;
 
         /// <summary>
+        /// Gets or sets a value indicating whether the legacy non-journal execution path is allowed.
+        /// This compatibility switch should remain false for normal production deployments.
+        /// Default: false.
+        /// </summary>
+        public bool AllowLegacyNonJournalMode { get; set; }
+
+        /// <summary>
         /// Gets or sets a value indicating whether the background projection worker is enabled.
         /// Default: true.
         /// </summary>
@@ -96,6 +103,19 @@ namespace Locus.Storage
         {
             if (string.IsNullOrWhiteSpace(QueueDirectory))
                 throw new InvalidOperationException("QueueEventJournal.QueueDirectory cannot be empty");
+
+            if (!Enabled && !AllowLegacyNonJournalMode)
+            {
+                throw new InvalidOperationException(
+                    "QueueEventJournal.Enabled=false is blocked by default. " +
+                    "Set QueueEventJournal.AllowLegacyNonJournalMode=true only for explicit compatibility or test scenarios.");
+            }
+
+            if (!Enabled && EnableProjection)
+            {
+                throw new InvalidOperationException(
+                    "QueueEventJournal.EnableProjection cannot be true when QueueEventJournal.Enabled is false.");
+            }
 
             if (MaxRecordsPerTenantPerCycle <= 0)
                 throw new InvalidOperationException("QueueEventJournal.MaxRecordsPerTenantPerCycle must be greater than zero");

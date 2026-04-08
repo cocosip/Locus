@@ -34,5 +34,10 @@ namespace Locus.Core.Models
         /// A completed file was deleted physically and can be removed from projections.
         /// </summary>
         DeleteSucceeded = 6,
+
+        /// <summary>
+        /// A processing lease timed out and the file was returned to pending state.
+        /// </summary>
+        ProcessingTimedOut = 7,
     }
 }

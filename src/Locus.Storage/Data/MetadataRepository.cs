@@ -1134,6 +1134,66 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         }
 
         /// <summary>
+        /// Marks a PermanentlyFailed file as DeleteSucceeded so journal-driven cleanup can hand off
+        /// final quota and metadata removal to the projection worker without reprocessing the same file.
+        /// Returns false when the record was removed or changed concurrently.
+        /// </summary>
+        public async Task<bool> TryMarkPermanentlyFailedDeleteSucceededAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return false;
+
+                if (current.Status != FileProcessingStatus.PermanentlyFailed
+                    || !current.LastFailedAt.HasValue
+                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                {
+                    return false;
+                }
+
+                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                    return true;
+
+                var updated = current.Clone();
+                updated.Status = FileProcessingStatus.DeleteSucceeded;
+                updated.CompletedAt = updated.CompletedAt ?? deleteSucceededAtUtc;
+                updated.DeleteSucceededAt = deleteSucceededAtUtc;
+
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return false;
+
+                IndexStatusCandidate(current, updated);
+
+                lock (GetDatabaseLock(tenantId))
+                {
+                    var conn = GetDatabase(tenantId);
+                    UpsertFile(conn, updated);
+                }
+
+                return true;
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
         /// Removes a Completed file if it still matches the expected completion timestamp.
         /// Returns false when the record was removed or changed concurrently.
         /// </summary>

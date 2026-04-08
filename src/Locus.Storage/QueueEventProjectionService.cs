@@ -279,6 +279,9 @@ namespace Locus.Storage
                 case QueueEventType.ProcessingFailed:
                     await ProjectProcessingFailedAsync(record, ct).ConfigureAwait(false);
                     return;
+                case QueueEventType.ProcessingTimedOut:
+                    await ProjectProcessingTimedOutAsync(record, ct).ConfigureAwait(false);
+                    return;
                 case QueueEventType.ProcessingCompleted:
                     await ProjectProcessingCompletedAsync(record, ct).ConfigureAwait(false);
                     return;
@@ -377,6 +380,29 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = status == FileProcessingStatus.Pending
                 ? record.AvailableForProcessingAtUtc
                 : null;
+
+            await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+        }
+
+        private async Task ProjectProcessingTimedOutAsync(QueueEventRecord record, CancellationToken ct)
+        {
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
+            if (existing == null)
+            {
+                existing = await EnsureMetadataExistsAsync(record, FileProcessingStatus.Pending, ct).ConfigureAwait(false);
+                if (existing == null)
+                    return;
+            }
+
+            if (ShouldSkipTimedOutProjection(existing, record))
+                return;
+
+            var updated = existing.Clone();
+            updated.Status = FileProcessingStatus.Pending;
+            updated.ProcessingStartTime = null;
+            updated.CompletedAt = null;
+            updated.DeleteSucceededAt = null;
+            updated.AvailableForProcessingAt = record.AvailableForProcessingAtUtc ?? record.OccurredAtUtc;
 
             await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -664,6 +690,56 @@ namespace Locus.Storage
                     existing.FileKey,
                     existing.CompletedAt.Value,
                     record.OccurredAtUtc);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool ShouldSkipTimedOutProjection(FileMetadata existing, QueueEventRecord record)
+        {
+            var eventProcessingStart = record.ProcessingStartTimeUtc ?? record.OccurredAtUtc;
+            if (existing.ProcessingStartTime.HasValue && existing.ProcessingStartTime.Value > eventProcessingStart)
+            {
+                _logger.LogDebug(
+                    "Skipping stale ProcessingTimedOut projection for file {FileKey}: existing lease {ExistingLease} > event lease {EventLease}",
+                    existing.FileKey,
+                    existing.ProcessingStartTime.Value,
+                    eventProcessingStart);
+                return true;
+            }
+
+            if (existing.LastFailedAt.HasValue && existing.LastFailedAt.Value >= record.OccurredAtUtc)
+            {
+                _logger.LogDebug(
+                    "Skipping stale ProcessingTimedOut projection for file {FileKey}: existing failure {LastFailedAt} >= event timeout {EventTimeout}",
+                    existing.FileKey,
+                    existing.LastFailedAt.Value,
+                    record.OccurredAtUtc);
+                return true;
+            }
+
+            if (existing.CompletedAt.HasValue && existing.CompletedAt.Value >= record.OccurredAtUtc)
+            {
+                _logger.LogDebug(
+                    "Skipping stale ProcessingTimedOut projection for file {FileKey}: existing completion {CompletedAt} >= event timeout {EventTimeout}",
+                    existing.FileKey,
+                    existing.CompletedAt.Value,
+                    record.OccurredAtUtc);
+                return true;
+            }
+
+            var eventAvailableForProcessingAt = record.AvailableForProcessingAtUtc ?? record.OccurredAtUtc;
+            if (existing.Status == FileProcessingStatus.Pending
+                && !existing.ProcessingStartTime.HasValue
+                && existing.AvailableForProcessingAt.HasValue
+                && existing.AvailableForProcessingAt.Value >= eventAvailableForProcessingAt)
+            {
+                _logger.LogDebug(
+                    "Skipping duplicate/stale ProcessingTimedOut projection for file {FileKey}: existing pending-at {ExistingPendingAt} >= event pending-at {EventPendingAt}",
+                    existing.FileKey,
+                    existing.AvailableForProcessingAt.Value,
+                    eventAvailableForProcessingAt);
                 return true;
             }
 

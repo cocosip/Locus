@@ -31,6 +31,7 @@ namespace Locus.Storage
         private readonly IFileScheduler _fileScheduler;
         private readonly StorageVolumeRegistry _volumeRegistry;
         private readonly IQueueEventJournal? _queueEventJournal;
+        private readonly bool _allowLegacyNonJournalMode;
 
         // Cache a writable-volume snapshot and refresh periodically.
         // Selection then uses power-of-two choices to avoid pinning traffic to one volume.
@@ -66,7 +67,8 @@ namespace Locus.Storage
             StorageVolumeRegistry? volumeRegistry = null,
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
-            IQueueProjectionWriteStore? projectionWriteStore = null)
+            IQueueProjectionWriteStore? projectionWriteStore = null,
+            bool allowLegacyNonJournalMode = true)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
@@ -78,7 +80,8 @@ namespace Locus.Storage
                 volumeRegistry,
                 queueEventJournal,
                 projectionStore,
-                projectionWriteStore)
+                projectionWriteStore,
+                allowLegacyNonJournalMode)
         {
         }
 
@@ -96,7 +99,8 @@ namespace Locus.Storage
             StorageVolumeRegistry? volumeRegistry = null,
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
-            IQueueProjectionWriteStore? projectionWriteStore = null)
+            IQueueProjectionWriteStore? projectionWriteStore = null,
+            bool allowLegacyNonJournalMode = true)
         {
             if (metadataRepository == null)
                 throw new ArgumentNullException(nameof(metadataRepository));
@@ -110,6 +114,7 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
             _queueEventJournal = queueEventJournal;
+            _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
             if (completionGuardStripeCount <= 0)
                 throw new ArgumentOutOfRangeException(nameof(completionGuardStripeCount), "Completion guard stripe count must be greater than zero.");
 
@@ -117,6 +122,7 @@ namespace Locus.Storage
             _completionGuards = Enumerable.Range(0, completionGuardStripeCount)
                 .Select(_ => new SemaphoreSlim(1, 1))
                 .ToArray();
+            ValidateLegacyNonJournalMode();
         }
 
         /// <summary>
@@ -886,6 +892,21 @@ namespace Locus.Storage
             return _queueEventJournal != null
                 && !(_fileScheduler is IQueueEventManagedFileScheduler managedScheduler
                     && managedScheduler.HandlesQueueJournal);
+        }
+
+        private void ValidateLegacyNonJournalMode()
+        {
+            if (_queueEventJournal != null)
+                return;
+
+            if (!_allowLegacyNonJournalMode)
+            {
+                throw new InvalidOperationException(
+                    "StoragePool requires IQueueEventJournal unless legacy non-journal mode is explicitly allowed.");
+            }
+
+            _logger.LogWarning(
+                "StoragePool is running without IQueueEventJournal. This legacy non-journal mode should only be used for explicit compatibility or tests.");
         }
 
         private async Task TryAppendQueueEventAsync(QueueEventRecord record)

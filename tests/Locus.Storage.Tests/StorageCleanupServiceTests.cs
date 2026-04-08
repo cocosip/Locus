@@ -307,6 +307,63 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupTimedOutProcessingFilesAsync_WithJournal_AppendsProcessingTimedOutEventAndResetsProjection()
+        {
+            var processingStartTime = DateTime.UtcNow.AddMinutes(-60);
+            var timedOutMetadata = new FileMetadata
+            {
+                FileKey = "file-timeout-journal",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumePath, "file-timeout-journal.dat"),
+                DirectoryPath = "/incoming",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStartTime,
+                CreatedAt = DateTime.UtcNow.AddHours(-1)
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(timedOutMetadata, default);
+
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            queueEventJournal
+                .Setup(j => j.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.ProcessingTimedOut
+                        && record.TenantId == "tenant-001"
+                        && record.FileKey == "file-timeout-journal"
+                        && record.Status == FileProcessingStatus.Pending
+                        && record.ProcessingStartTimeUtc == processingStartTime),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object,
+                directoryQuotaManager: _directoryQuotaManager);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await cleanupService.CleanupTimedOutProcessingFilesAsync(TimeSpan.FromMinutes(30), default);
+
+            var updatedMetadata = await _metadataRepository.GetAsync("tenant-001", "file-timeout-journal", default);
+            Assert.NotNull(updatedMetadata);
+            Assert.Equal(FileProcessingStatus.Pending, updatedMetadata!.Status);
+            Assert.Null(updatedMetadata.ProcessingStartTime);
+            Assert.NotNull(updatedMetadata.AvailableForProcessingAt);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(default);
+            Assert.Equal(1, stats.TimedOutFilesReset);
+
+            queueEventJournal.VerifyAll();
+        }
+
+        [Fact]
         public async Task CleanupPermanentlyFailedFilesAsync_DeletesOldFailedFiles()
         {
             // Arrange
@@ -342,6 +399,77 @@ namespace Locus.Storage.Tests
 
             var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", default);
             Assert.Equal(0, tenantCount);
+        }
+
+        [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_WithJournal_AppendsDeleteEventsAndLeavesDeleteSucceededState()
+        {
+            var appendCount = 0;
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            queueEventJournal
+                .Setup(j => j.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.DeleteRequested
+                        && records[0].Status == FileProcessingStatus.DeleteRequested
+                        && records[1].EventType == QueueEventType.DeleteSucceeded
+                        && records[1].Status == FileProcessingStatus.DeleteSucceeded
+                        && records[0].TenantId == "tenant-001"
+                        && records[1].TenantId == "tenant-001"
+                        && records[0].FileKey == "failed-journal"
+                        && records[1].FileKey == "failed-journal"),
+                    It.IsAny<CancellationToken>()))
+                .Callback<IReadOnlyList<QueueEventRecord>, CancellationToken>((_, __) => appendCount++)
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var physicalPath = Path.Combine(_volumePath, "failed-journal.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "failed-journal",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 14,
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-10),
+                CreatedAt = DateTime.UtcNow.AddDays(-10)
+            }, CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
+
+            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+            Assert.Equal(1, appendCount);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "failed-journal", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.DeleteSucceeded, metadata!.Status);
+            Assert.NotNull(metadata.DeleteSucceededAt);
+
+            var tenantCount = await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None);
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", CancellationToken.None);
+            Assert.Equal(1, tenantCount);
+            Assert.Equal(1, directoryQuota.CurrentCount);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
+
+            queueEventJournal.VerifyAll();
         }
 
         [Fact]
@@ -635,6 +763,24 @@ namespace Locus.Storage.Tests
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
             Assert.Equal(0, stats.OrphanedFilesRemoved);
             Assert.Equal(1, stats.OrphanedFilesRecovered);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFilesAsync_PreservesMeaningfulNestedLogicalDirectory()
+        {
+            var nestedPath = Path.Combine(_volumePath, "tenant-001", "incoming", "studies");
+            var orphanedFile = Path.Combine(nestedPath, "study-001.dcm");
+            _fileSystem.Directory.CreateDirectory(nestedPath);
+            _fileSystem.File.WriteAllText(orphanedFile, "orphaned content");
+
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, default);
+
+            var rebuilt = await _metadataRepository.GetAsync("tenant-001", "study-001", default);
+            Assert.NotNull(rebuilt);
+            Assert.Equal("/incoming/studies", rebuilt!.DirectoryPath);
+
+            var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/incoming/studies", default);
+            Assert.Equal(1, directoryQuota.CurrentCount);
         }
 
         [Fact]

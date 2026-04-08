@@ -221,7 +221,8 @@ namespace Locus
                     volumeRegistry,
                     tenantQuotaManager,
                     directoryQuotaManager,
-                    queueEventJournal);
+                    queueEventJournal,
+                    options.QueueEventJournal.AllowLegacyNonJournalMode);
             });
 
             // Register StoragePool as its concrete type so StorageVolumeInitializationService
@@ -252,7 +253,8 @@ namespace Locus
                     volumeRegistry,
                     queueEventJournal,
                     projectionStore,
-                    projectionWriteStore);
+                    projectionWriteStore,
+                    options.QueueEventJournal.AllowLegacyNonJournalMode);
             });
             services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 
@@ -291,7 +293,8 @@ namespace Locus
                     projectionStore,
                     projectionCleanupStore,
                     metadataMaintenanceStore,
-                    quotaMaintenanceStore);
+                    quotaMaintenanceStore,
+                    options.QueueEventJournal.AllowLegacyNonJournalMode);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 

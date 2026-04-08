@@ -29,6 +29,7 @@ namespace Locus.Storage
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly ITenantManager? _tenantManager;
         private readonly IQueueEventJournal? _queueEventJournal;
+        private readonly bool _allowLegacyNonJournalMode;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<StorageCleanupService> _logger;
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
@@ -86,7 +87,8 @@ namespace Locus.Storage
             IQueueProjectionStore? projectionStore = null,
             IQueueProjectionCleanupStore? projectionCleanupStore = null,
             IMetadataProjectionMaintenanceStore? metadataMaintenanceStore = null,
-            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null)
+            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null,
+            bool allowLegacyNonJournalMode = true)
         {
             if (metadataRepository == null)
                 throw new ArgumentNullException(nameof(metadataRepository));
@@ -101,6 +103,7 @@ namespace Locus.Storage
             _directoryQuotaManager = directoryQuotaManager;
             _tenantManager = tenantManager;
             _queueEventJournal = queueEventJournal;
+            _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumes = new ConcurrentDictionary<string, IStorageVolume>();
@@ -140,6 +143,22 @@ namespace Locus.Storage
             _pathComparison = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparison.OrdinalIgnoreCase
                 : StringComparison.Ordinal;
+            ValidateLegacyNonJournalMode();
+        }
+
+        private void ValidateLegacyNonJournalMode()
+        {
+            if (_queueEventJournal != null)
+                return;
+
+            if (!_allowLegacyNonJournalMode)
+            {
+                throw new InvalidOperationException(
+                    "StorageCleanupService requires IQueueEventJournal unless legacy non-journal mode is explicitly allowed.");
+            }
+
+            _logger.LogWarning(
+                "StorageCleanupService is running without IQueueEventJournal. This legacy non-journal mode should only be used for explicit compatibility or tests.");
         }
 
         /// <summary>
@@ -651,7 +670,10 @@ namespace Locus.Storage
                 return null;
 
             var fileInfo = _fileSystem.FileInfo.New(physicalPath);
-            var directoryPath = DirectoryPathNormalizer.Normalize(null);
+            var directoryPath = DirectoryPathNormalizer.NormalizeRecoveredLogicalDirectoryPath(
+                _fileSystem.Path.Combine(volume.MountPath, tenantId),
+                physicalPath,
+                fileKey);
 
             return new FileMetadata
             {
@@ -1034,17 +1056,40 @@ namespace Locus.Storage
                     if (!metadata.ProcessingStartTime.HasValue)
                         continue;
 
-                    var reset = await _projectionCleanupStore.TryResetTimedOutFileAsync(
-                        tenantId,
-                        metadata.FileKey,
-                        metadata.ProcessingStartTime.Value,
-                        nowUtc,
-                        ct);
-                    if (!reset)
-                        continue;
+                    try
+                    {
+                        if (_queueEventJournal != null)
+                        {
+                            await _queueEventJournal.AppendAsync(
+                                CreateProcessingTimedOutEvent(metadata, nowUtc),
+                                default).ConfigureAwait(false);
+                        }
 
-                    resetCount++;
-                    _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
+                        var reset = await _projectionCleanupStore.TryResetTimedOutFileAsync(
+                            tenantId,
+                            metadata.FileKey,
+                            metadata.ProcessingStartTime.Value,
+                            nowUtc,
+                            ct);
+                        if (!reset)
+                        {
+                            _logger.LogDebug(
+                                "Skipped timed-out reset for file {FileKey} because the processing lease changed concurrently",
+                                metadata.FileKey);
+                            continue;
+                        }
+
+                        resetCount++;
+                        _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Failed to reset timed-out file. Tenant={TenantId}, FileKey={FileKey}",
+                            tenantId,
+                            metadata.FileKey);
+                    }
                 }
 
                 RecordStatusCleanupIteration("timeout_reset", tenantId, batch.Count, iterationStartedAt);
@@ -1235,29 +1280,6 @@ namespace Locus.Storage
                     var metadataRemoved = false;
                     try
                     {
-                        await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
-                        directoryQuotaDecremented = true;
-
-                        await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
-                        tenantQuotaDecremented = true;
-
-                        metadataRemoved = await _projectionCleanupStore.TryRemovePermanentlyFailedFileAsync(
-                            metadata.TenantId,
-                            metadata.FileKey,
-                            metadata.LastFailedAt.Value,
-                            ct);
-                        if (!metadataRemoved)
-                        {
-                            blockedFileKeys.Add(metadata.FileKey);
-                            await RollbackPermanentlyFailedCleanupAsync(
-                                metadata,
-                                normalizedDirectoryPath,
-                                metadataRemoved: false,
-                                tenantQuotaDecremented,
-                                directoryQuotaDecremented);
-                            continue;
-                        }
-
                         if (physicalFileExists)
                         {
                             try
@@ -1277,6 +1299,51 @@ namespace Locus.Storage
                                 throw new IOException($"Failed to delete physical file {metadata.PhysicalPath}");
 
                             spaceFreed += metadata.FileSize;
+                        }
+
+                        if (_queueEventJournal != null)
+                        {
+                            var deleteRequestedAtUtc = DateTime.UtcNow;
+                            var deleteSucceededAtUtc = deleteRequestedAtUtc.AddTicks(1);
+                            await _queueEventJournal.AppendBatchAsync(
+                                new[]
+                                {
+                                    CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
+                                    CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                                },
+                                default).ConfigureAwait(false);
+
+                            await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
+                                metadata.TenantId,
+                                metadata.FileKey,
+                                metadata.LastFailedAt.Value,
+                                deleteSucceededAtUtc,
+                                ct).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                            directoryQuotaDecremented = true;
+
+                            await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
+                            tenantQuotaDecremented = true;
+
+                            metadataRemoved = await _projectionCleanupStore.TryRemovePermanentlyFailedFileAsync(
+                                metadata.TenantId,
+                                metadata.FileKey,
+                                metadata.LastFailedAt.Value,
+                                ct);
+                            if (!metadataRemoved)
+                            {
+                                blockedFileKeys.Add(metadata.FileKey);
+                                await RollbackPermanentlyFailedCleanupAsync(
+                                    metadata,
+                                    normalizedDirectoryPath,
+                                    metadataRemoved: false,
+                                    tenantQuotaDecremented,
+                                    directoryQuotaDecremented);
+                                continue;
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -1355,6 +1422,47 @@ namespace Locus.Storage
                 DirectoryPath = metadata.DirectoryPath,
                 FileSize = metadata.FileSize,
                 Status = FileProcessingStatus.DeleteSucceeded,
+                ProcessingStartTimeUtc = metadata.ProcessingStartTime,
+                RetryCount = metadata.RetryCount,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
+        }
+
+        private static QueueEventRecord CreateProcessingTimedOutEvent(FileMetadata metadata, DateTime availableForProcessingAtUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.ProcessingTimedOut,
+                OccurredAtUtc = availableForProcessingAtUtc,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.Pending,
+                ProcessingStartTimeUtc = metadata.ProcessingStartTime,
+                RetryCount = metadata.RetryCount,
+                AvailableForProcessingAtUtc = availableForProcessingAtUtc,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
+        }
+
+        private static QueueEventRecord CreateDeleteRequestedEvent(FileMetadata metadata, DateTime deleteRequestedAtUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.DeleteRequested,
+                OccurredAtUtc = deleteRequestedAtUtc,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = metadata.PhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.DeleteRequested,
                 ProcessingStartTimeUtc = metadata.ProcessingStartTime,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,

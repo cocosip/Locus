@@ -203,10 +203,6 @@ namespace Locus.Storage.Data
                         try
                         {
                             var fileInfo = _fileSystem.FileInfo.New(filePath);
-                            var volumeId = ResolveVolumeId(volumePath);
-                            var directoryPath = DirectoryPathNormalizer.Normalize(null);
-
-                            // Use the physical file name as key so rebuild is deterministic.
                             var fileName = _fileSystem.Path.GetFileName(filePath);
                             var fileKey = _fileSystem.Path.GetFileNameWithoutExtension(fileName);
                             if (string.IsNullOrWhiteSpace(fileKey))
@@ -215,6 +211,12 @@ namespace Locus.Storage.Data
                                 failedFiles++;
                                 continue;
                             }
+
+                            var volumeId = ResolveVolumeId(volumePath);
+                            var directoryPath = DirectoryPathNormalizer.NormalizeRecoveredLogicalDirectoryPath(
+                                tenantPath,
+                                filePath,
+                                fileKey);
 
                             var metadata = new FileMetadata
                             {
@@ -327,37 +329,27 @@ namespace Locus.Storage.Data
                 }
                 else
                 {
-                    var totalFileCount = CountPhysicalFilesForTenant(tenantId, volumePaths, ct);
-                    var rebuiltQuotas = 0;
+                    var expectedDirectoryCounts = BuildRecoveredDirectoryCountsFromPhysicalScan(tenantId, volumePaths, ct);
+                    var totalFileCount = expectedDirectoryCounts.Values.Sum();
 
                     try
                     {
-                        await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
+                        result.RecordsRebuilt = await ApplyRebuiltQuotaCountsAsync(
                             tenantId,
-                            DirectoryPathNormalizer.Normalize(null),
+                            expectedDirectoryCounts,
                             totalFileCount,
                             ct).ConfigureAwait(false);
-                        rebuiltQuotas++;
-
-                        await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
-                            tenantId,
-                            tenantId,
-                            totalFileCount,
-                            ct).ConfigureAwait(false);
-                        rebuiltQuotas++;
-
-                        result.RecordsRebuilt = rebuiltQuotas;
                         result.Success = true;
 
                         _logger.LogInformation(
-                            "Quota database rebuild completed for tenant {TenantId} from physical scan. RootCount={RootCount}, TenantCount={TenantCount}",
+                            "Quota database rebuild completed for tenant {TenantId} from physical scan. TenantCount={TenantCount}, LogicalDirectories={LogicalDirectories}",
                             tenantId,
                             totalFileCount,
-                            totalFileCount);
+                            expectedDirectoryCounts.Count);
                     }
                     catch (Exception ex)
                     {
-                        result.Errors.Add($"Failed to rebuild logical root quota for tenant {tenantId}: {ex.Message}");
+                        result.Errors.Add($"Failed to rebuild directory quotas for tenant {tenantId}: {ex.Message}");
                         throw;
                     }
                 }
@@ -387,12 +379,12 @@ namespace Locus.Storage.Data
             return result;
         }
 
-        private int CountPhysicalFilesForTenant(
+        private Dictionary<string, int> BuildRecoveredDirectoryCountsFromPhysicalScan(
             string tenantId,
             IEnumerable<string> volumePaths,
             CancellationToken ct)
         {
-            var totalFileCount = 0;
+            var directoryCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
             foreach (var volumePath in volumePaths)
             {
@@ -402,12 +394,25 @@ namespace Locus.Storage.Data
                 if (!_fileSystem.Directory.Exists(tenantPath))
                     continue;
 
-                totalFileCount += _fileSystem.Directory
-                    .EnumerateFiles(tenantPath, "*", SearchOption.AllDirectories)
-                    .Count();
+                foreach (var filePath in _fileSystem.Directory.EnumerateFiles(tenantPath, "*", SearchOption.AllDirectories))
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var fileKey = _fileSystem.Path.GetFileNameWithoutExtension(filePath);
+                    if (string.IsNullOrWhiteSpace(fileKey))
+                        continue;
+
+                    var directoryPath = DirectoryPathNormalizer.NormalizeRecoveredLogicalDirectoryPath(
+                        tenantPath,
+                        filePath,
+                        fileKey);
+                    directoryCounts[directoryPath] = directoryCounts.TryGetValue(directoryPath, out var currentCount)
+                        ? currentCount + 1
+                        : 1;
+                }
             }
 
-            return totalFileCount;
+            return directoryCounts;
         }
 
         /// <summary>
@@ -618,40 +623,11 @@ namespace Locus.Storage.Data
                         StringComparer.Ordinal)
                     .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
 
-                var existingDirectoryQuotas = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false))
-                    .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
-                        && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
-                    .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
-
-                var knownDirectoryPaths = new HashSet<string>(existingDirectoryQuotas.Keys, StringComparer.Ordinal);
-                foreach (var directoryPath in expectedDirectoryCounts.Keys)
-                    knownDirectoryPaths.Add(directoryPath);
-
-                foreach (var directoryPath in knownDirectoryPaths)
-                {
-                    ct.ThrowIfCancellationRequested();
-
-                    var expectedDirectoryCount = expectedDirectoryCounts.TryGetValue(directoryPath, out var count)
-                        ? count
-                        : 0;
-
-                    if (expectedDirectoryCount == 0
-                        && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
-                        && !HasExplicitQuotaLimit(existingQuota))
-                    {
-                        await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
-                        continue;
-                    }
-
-                    await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
-                        tenantId,
-                        directoryPath,
-                        expectedDirectoryCount,
-                        ct).ConfigureAwait(false);
-                }
-
-                await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(tenantId, tenantId, metadataCount, ct).ConfigureAwait(false);
-                result.RecordsRebuilt = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false)).Count;
+                result.RecordsRebuilt = await ApplyRebuiltQuotaCountsAsync(
+                    tenantId,
+                    expectedDirectoryCounts,
+                    metadataCount,
+                    ct).ConfigureAwait(false);
                 result.Success = true;
                 _logger.LogInformation(
                     "Recovered quota database for tenant {TenantId} from projected metadata. RebuiltRecords={Records}, MetadataRecords={MetadataRecords}",
@@ -669,6 +645,53 @@ namespace Locus.Storage.Data
                 result.Errors.Add($"Metadata-based quota recovery failed: {ex.Message}");
                 return false;
             }
+        }
+
+        private async Task<int> ApplyRebuiltQuotaCountsAsync(
+            string tenantId,
+            IReadOnlyDictionary<string, int> expectedDirectoryCounts,
+            int totalFileCount,
+            CancellationToken ct)
+        {
+            var existingDirectoryQuotas = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false))
+                .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
+                    && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
+                .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
+
+            var knownDirectoryPaths = new HashSet<string>(existingDirectoryQuotas.Keys, StringComparer.Ordinal);
+            foreach (var directoryPath in expectedDirectoryCounts.Keys)
+                knownDirectoryPaths.Add(directoryPath);
+
+            foreach (var directoryPath in knownDirectoryPaths)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var expectedDirectoryCount = expectedDirectoryCounts.TryGetValue(directoryPath, out var count)
+                    ? count
+                    : 0;
+
+                if (expectedDirectoryCount == 0
+                    && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
+                    && !HasExplicitQuotaLimit(existingQuota))
+                {
+                    await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
+                    tenantId,
+                    directoryPath,
+                    expectedDirectoryCount,
+                    ct).ConfigureAwait(false);
+            }
+
+            await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
+                tenantId,
+                tenantId,
+                totalFileCount,
+                ct).ConfigureAwait(false);
+
+            return (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false)).Count;
         }
 
         private static bool HasExplicitQuotaLimit(DirectoryQuota quota)

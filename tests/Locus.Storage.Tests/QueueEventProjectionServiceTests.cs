@@ -1205,6 +1205,99 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
         }
 
+        [Fact]
+        public async Task ExecuteAsync_ProjectsProcessingTimedOutBackToPendingWithoutFailureSemantics()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-timeout-001";
+            const string fileKey = "timeout-file-001";
+            const string directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "timeout-file-001.dcm");
+            var processingStartTime = DateTime.UtcNow.AddMinutes(-10);
+            var resetAt = DateTime.UtcNow.AddMinutes(-1);
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3 });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow.AddMinutes(-15),
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending,
+                RetryCount = 0,
+                OriginalFileName = "timeout-file-001.dcm",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.ProcessingStarted,
+                OccurredAtUtc = processingStartTime,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTimeUtc = processingStartTime
+            }, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.ProcessingTimedOut,
+                OccurredAtUtc = resetAt,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending,
+                ProcessingStartTimeUtc = processingStartTime,
+                RetryCount = 0,
+                AvailableForProcessingAtUtc = resetAt,
+                OriginalFileName = "timeout-file-001.dcm",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(async () =>
+                {
+                    var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+                    return metadata != null
+                        && metadata.Status == FileProcessingStatus.Pending
+                        && !metadata.ProcessingStartTime.HasValue;
+                }, TimeSpan.FromSeconds(2));
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var rebuilt = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(rebuilt);
+            Assert.Equal(FileProcessingStatus.Pending, rebuilt!.Status);
+            Assert.Null(rebuilt.ProcessingStartTime);
+            Assert.Equal(resetAt, rebuilt.AvailableForProcessingAt);
+            Assert.Null(rebuilt.LastFailedAt);
+            Assert.Null(rebuilt.LastError);
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+        }
+
         public void Dispose()
         {
             foreach (var disposable in _trackedDisposables)

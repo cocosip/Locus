@@ -229,7 +229,7 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.True(result.Success);
-            Assert.Equal(2, result.RecordsRebuilt);
+            Assert.Equal(3, result.RecordsRebuilt);
             Assert.NotNull(result.BackupPath);
             Assert.True(_fileSystem.File.Exists(result.BackupPath));
 
@@ -491,7 +491,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task RebuildMetadataDatabaseAsync_PhysicalScanUsesRootLogicalDirectoryForNestedFiles()
+        public async Task RebuildMetadataDatabaseAsync_PhysicalScanPreservesMeaningfulNestedLogicalDirectory()
         {
             var tenantId = $"tenant-nested-dir-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
             var nestedPath = Path.Combine(_volumePath, tenantId, "incoming", "studies");
@@ -506,10 +506,30 @@ namespace Locus.Storage.Tests
             Assert.True(result.Success);
 
             var metadata = (await _metadataRepository.GetByTenantAsync(tenantId, default)).Single();
-            Assert.Equal("/", metadata.DirectoryPath);
+            Assert.Equal("/incoming/studies", metadata.DirectoryPath);
             Assert.NotNull(metadata.Metadata);
             Assert.True(metadata.Metadata!.TryGetValue("queue.accepted_projection_applied", out var acceptedApplied));
             Assert.Equal(bool.TrueString, acceptedApplied);
+        }
+
+        [Fact]
+        public async Task RebuildMetadataDatabaseAsync_PhysicalScanStripsDetectedShardDirectories()
+        {
+            var tenantId = $"tenant-shard-dir-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+            const string fileKey = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+            var shardedPath = Path.Combine(_volumePath, tenantId, "a1", "b2");
+            _fileSystem.Directory.CreateDirectory(shardedPath);
+            _fileSystem.File.WriteAllText(Path.Combine(shardedPath, fileKey + ".dcm"), "content");
+
+            var result = await _recoveryService.RebuildMetadataDatabaseAsync(
+                tenantId,
+                new[] { _volumePath },
+                default);
+
+            Assert.True(result.Success);
+
+            var metadata = (await _metadataRepository.GetByTenantAsync(tenantId, default)).Single();
+            Assert.Equal("/", metadata.DirectoryPath);
         }
 
         [Fact]
@@ -637,10 +657,10 @@ namespace Locus.Storage.Tests
             Assert.True(_fileSystem.File.Exists(dbPath));
 
             var quotas = (await _quotaRepository.GetAllAsync(tenantId, default)).ToArray();
-            Assert.Contains(quotas, q => q.DirectoryPath == "/" && q.CurrentCount == 3);
+            Assert.Contains(quotas, q => q.DirectoryPath == "/documents" && q.CurrentCount == 2);
+            Assert.Contains(quotas, q => q.DirectoryPath == "/images" && q.CurrentCount == 1);
             Assert.Contains(quotas, q => q.DirectoryPath == tenantId && q.CurrentCount == 3);
-            Assert.DoesNotContain(quotas, q => q.DirectoryPath == "/documents");
-            Assert.DoesNotContain(quotas, q => q.DirectoryPath == "/images");
+            Assert.DoesNotContain(quotas, q => q.DirectoryPath == "/" && q.CurrentCount == 3);
         }
 
         [Fact]

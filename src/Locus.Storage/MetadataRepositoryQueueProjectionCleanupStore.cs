@@ -107,6 +107,22 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
+        public Task<bool> TryMarkPermanentlyFailedDeleteSucceededAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct = default)
+        {
+            return _repository.TryMarkPermanentlyFailedDeleteSucceededAsync(
+                tenantId,
+                fileKey,
+                expectedLastFailedAtUtc,
+                deleteSucceededAtUtc,
+                ct);
+        }
+
+        /// <inheritdoc/>
         public Task<bool> TryRemoveCompletedFileAsync(
             string tenantId,
             string fileKey,

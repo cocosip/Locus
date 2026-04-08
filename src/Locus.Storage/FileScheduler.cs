@@ -34,6 +34,7 @@ namespace Locus.Storage
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly IQueueEventJournal? _queueEventJournal;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _transitionGuards;
+        private readonly bool _allowLegacyNonJournalMode;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FileScheduler"/> class.
@@ -46,7 +47,8 @@ namespace Locus.Storage
             StorageVolumeRegistry? volumeRegistry = null,
             ITenantQuotaManager? tenantQuotaManager = null,
             IDirectoryQuotaManager? directoryQuotaManager = null,
-            IQueueEventJournal? queueEventJournal = null)
+            IQueueEventJournal? queueEventJournal = null,
+            bool allowLegacyNonJournalMode = true)
         {
             _projectionStore = projectionStore ?? throw new ArgumentNullException(nameof(projectionStore));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -56,7 +58,9 @@ namespace Locus.Storage
             _tenantQuotaManager = tenantQuotaManager;
             _directoryQuotaManager = directoryQuotaManager;
             _queueEventJournal = queueEventJournal;
+            _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
             _transitionGuards = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+            ValidateLegacyNonJournalMode();
         }
 
         /// <summary>
@@ -71,7 +75,8 @@ namespace Locus.Storage
             ITenantQuotaManager? tenantQuotaManager = null,
             IDirectoryQuotaManager? directoryQuotaManager = null,
             IQueueEventJournal? queueEventJournal = null,
-            IQueueProjectionStore? projectionStore = null)
+            IQueueProjectionStore? projectionStore = null,
+            bool allowLegacyNonJournalMode = true)
             : this(
                 projectionStore ?? new MetadataRepositoryQueueProjectionStore(repository ?? throw new ArgumentNullException(nameof(repository))),
                 fileSystem,
@@ -80,12 +85,28 @@ namespace Locus.Storage
                 volumeRegistry,
                 tenantQuotaManager,
                 directoryQuotaManager,
-                queueEventJournal)
+                queueEventJournal,
+                allowLegacyNonJournalMode)
         {
         }
 
         /// <inheritdoc/>
         public bool HandlesQueueJournal => _queueEventJournal != null;
+
+        private void ValidateLegacyNonJournalMode()
+        {
+            if (_queueEventJournal != null)
+                return;
+
+            if (!_allowLegacyNonJournalMode)
+            {
+                throw new InvalidOperationException(
+                    "FileScheduler requires IQueueEventJournal unless legacy non-journal mode is explicitly allowed.");
+            }
+
+            _logger.LogWarning(
+                "FileScheduler is running without IQueueEventJournal. This legacy non-journal mode should only be used for explicit compatibility or tests.");
+        }
 
         /// <inheritdoc/>
         public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default)
