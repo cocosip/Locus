@@ -771,9 +771,12 @@ namespace Locus.Storage.Tests
         [Fact]
         public async Task WriteFileAsync_RollsBackBothQuotas_WhenPhysicalWriteFails()
         {
+            _volume1
+                .Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("primary disk full"));
             _volume2
                 .Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
-                .ThrowsAsync(new IOException("disk full"));
+                .ThrowsAsync(new IOException("secondary disk full"));
 
             var content = new MemoryStream(Encoding.UTF8.GetBytes("write-fail"));
 
@@ -786,6 +789,67 @@ namespace Locus.Storage.Tests
             _directoryQuotaManager.Verify(
                 m => m.DecrementFileCountAsync("tenant-001", It.IsAny<string>(), It.IsAny<CancellationToken>()),
                 Times.Once);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_SeekableStreamRetriesAnotherHealthyVolumeAfterWriteFailure()
+        {
+            _volume2
+                .Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("disk full"));
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("retry-write"));
+
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "retry.dcm", default);
+            var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
+
+            Assert.NotNull(location);
+            Assert.Equal("vol-001", location!.VolumeId);
+            Assert.Contains(_volume1Path, location.PhysicalPath, StringComparison.OrdinalIgnoreCase);
+            Assert.True(_fileSystem.File.Exists(location.PhysicalPath));
+            _tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            _directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_ThrowsBeforeWriteWhenNoHealthyVolumeCanFitSeekableStream()
+        {
+            _volume1.SetupGet(v => v.AvailableSpace).Returns(4);
+            _volume2.SetupGet(v => v.AvailableSpace).Returns(5);
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("too-big"));
+
+            await Assert.ThrowsAsync<InsufficientStorageException>(() =>
+                _storagePool.WriteFileAsync(_tenant.Object, content, "too-big.bin", default));
+
+            _volume1.Verify(
+                v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            _volume2.Verify(
+                v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public async Task AddVolumeAsync_ForceRefreshesCachedHealthProbeDuringMountRetries()
+        {
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                allowLegacyNonJournalMode: true);
+            var volume = new RefreshingHealthTestVolume("vol-refresh", _volume1Path);
+
+            await storagePool.AddVolumeAsync(volume, initialDelayMs: 0, healthCheckDelayMs: 0, ct: CancellationToken.None);
+
+            Assert.True(volume.FreshProbeCount >= 3);
         }
 
         [Fact]
@@ -1379,6 +1443,48 @@ namespace Locus.Storage.Tests
 
                 base.Dispose(disposing);
             }
+        }
+
+        private sealed class RefreshingHealthTestVolume : IStorageVolume, IStorageVolumeHealthProbe
+        {
+            public RefreshingHealthTestVolume(string volumeId, string mountPath)
+            {
+                VolumeId = volumeId;
+                MountPath = mountPath;
+            }
+
+            public int FreshProbeCount { get; private set; }
+
+            public string VolumeId { get; }
+
+            public string MountPath { get; }
+
+            public long TotalCapacity => 1_024;
+
+            public long AvailableSpace => 1_024;
+
+            public bool IsHealthy
+            {
+                get => false;
+            }
+
+            public int ShardingDepth => 0;
+
+            public bool ProbeHealth()
+            {
+                FreshProbeCount++;
+                return FreshProbeCount >= 2;
+            }
+
+            public string BuildPhysicalPath(string tenantId, string fileKey, string? fileExtension)
+                => Path.Combine(MountPath, tenantId, string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension);
+
+            public Task DeleteAsync(string path, CancellationToken ct = default) => Task.CompletedTask;
+
+            public Task<Stream> ReadAsync(string path, CancellationToken ct = default)
+                => Task.FromResult<Stream>(new MemoryStream());
+
+            public Task WriteAsync(string path, Stream content, CancellationToken ct = default) => Task.CompletedTask;
         }
     }
 }

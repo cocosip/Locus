@@ -468,6 +468,46 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupOrphanedMetadataAsync_SkipsRowsWhenVolumeIsUnhealthy()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            var volumeRegistry = new StorageVolumeRegistry();
+            var volume = new Mock<IStorageVolume>(MockBehavior.Strict);
+            var fileKey = "orphan-volume-unhealthy";
+            var physicalPath = Path.Combine(_metadataDir, "missing-unhealthy.dat");
+
+            volume.SetupGet(v => v.VolumeId).Returns("vol-unhealthy");
+            volume.SetupGet(v => v.IsHealthy).Returns(false);
+            volumeRegistry.Register(volume.Object);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                VolumeId = "vol-unhealthy",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                volumeRegistry: volumeRegistry,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(0, removed);
+            Assert.NotNull(await _repository.GetAsync("tenant-001", fileKey, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_UpdatesMetadataToCompleted()
         {
             // Arrange

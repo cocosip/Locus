@@ -167,7 +167,7 @@ namespace Locus.Storage
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (volume.IsHealthy)
+                if (ProbeVolumeHealth(volume, forceRefresh: true))
                 {
                     healthyAttempts++;
                     _logger.LogDebug("Volume {VolumeId} health check passed (attempt {Attempt}/{MaxAttempts})",
@@ -245,12 +245,11 @@ namespace Locus.Storage
             bool directoryQuotaIncremented = false;
             bool acceptanceCompleted = false;
             CountingReadStream? countingStream = null;
+            var initialContentPosition = content.CanSeek ? content.Position : 0;
+            var expectedFileSize = content.CanSeek ? content.Length - content.Position : (long?)null;
 
             try
             {
-                // 3. Select storage volume (prioritize volume with most available space)
-                volume = SelectVolumeForWrite();
-
                 // 4. Generate unique file key
                 var fileKey = GenerateFileKey();
 
@@ -261,18 +260,15 @@ namespace Locus.Storage
                     fileExtension = Path.GetExtension(originalFileName);
                 }
 
-                // 6. Build physical file path using the volume's layout strategy
-                physicalPath = volume.BuildPhysicalPath(tenant.TenantId, fileKey, fileExtension);
-
-                // 7. Reserve directory quota after tenant quota succeeds.
+                // 6. Reserve directory quota after tenant quota succeeds.
                 await _directoryQuotaManager.IncrementFileCountAsync(tenant.TenantId, normalizedLogicalDirectoryPath, ct);
                 directoryQuotaIncremented = true;
 
-                // 8. Capture the bytes that will be written: from current position to end.
+                // 7. Capture the bytes that will be written: from current position to end.
                 // Must be read before WriteAsync because CopyToAsync advances Position to the end.
                 // Using content.Length alone is wrong for streams not at position 0 because it
                 // reports the total stream size rather than the bytes actually written.
-                var fileSize = content.CanSeek ? content.Length - content.Position : 0;
+                var fileSize = expectedFileSize ?? 0;
                 var contentToWrite = content;
                 if (!content.CanSeek)
                 {
@@ -280,9 +276,50 @@ namespace Locus.Storage
                     contentToWrite = countingStream;
                 }
 
-                // 9. Write file to volume
-                await volume.WriteAsync(physicalPath, contentToWrite, ct);
-                fileWritten = true; // Mark that physical file was written
+                // 8. Write file to volume. Seekable streams can be retried on another
+                // healthy volume because we can restore the original stream position.
+                var candidateVolumes = SelectVolumeCandidatesForWrite(expectedFileSize);
+                Exception? lastWriteException = null;
+                for (var attemptIndex = 0; attemptIndex < candidateVolumes.Length; attemptIndex++)
+                {
+                    volume = candidateVolumes[attemptIndex];
+                    physicalPath = volume.BuildPhysicalPath(tenant.TenantId, fileKey, fileExtension);
+
+                    if (content.CanSeek)
+                        content.Position = initialContentPosition;
+
+                    try
+                    {
+                        await volume.WriteAsync(physicalPath, contentToWrite, ct).ConfigureAwait(false);
+                        fileWritten = true;
+                        lastWriteException = null;
+                        break;
+                    }
+                    catch (Exception ex) when (content.CanSeek
+                        && attemptIndex + 1 < candidateVolumes.Length
+                        && IsRetryableWriteFailure(ex))
+                    {
+                        lastWriteException = ex;
+                        await TryCleanupFailedWriteAsync(volume, physicalPath).ConfigureAwait(false);
+                        InvalidateWritableVolumeSnapshot(volume);
+                        _logger.LogWarning(
+                            ex,
+                            "Write failed on volume {VolumeId}; retrying another healthy volume for tenant {TenantId}",
+                            volume.VolumeId,
+                            tenant.TenantId);
+                    }
+                }
+
+                if (!fileWritten)
+                {
+                    if (lastWriteException != null)
+                        throw lastWriteException;
+
+                    throw new InsufficientStorageException("No healthy storage volumes accepted the file write");
+                }
+
+                if (volume == null || physicalPath == null)
+                    throw new InvalidOperationException("Write completed without selecting a storage volume.");
 
                 if (countingStream != null)
                     fileSize = countingStream.BytesRead;
@@ -409,9 +446,7 @@ namespace Locus.Storage
                 // (itself cached at 30 s) and pick the best available volume.
                 if (!physicalWriteSucceeded && volume != null)
                 {
-                    _cachedWritableVolumes = Array.Empty<IStorageVolume>();
-                    Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
-                    _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
+                    InvalidateWritableVolumeSnapshot(volume);
                 }
                 else if (physicalWriteSucceeded && !acceptanceCompleted && physicalPath != null)
                 {
@@ -718,22 +753,28 @@ namespace Locus.Storage
         /// Uses a periodically refreshed healthy-volume snapshot + "power of two choices"
         /// to balance load while still favoring volumes with more free space.
         /// </summary>
-        private IStorageVolume SelectVolumeForWrite()
+        private IStorageVolume[] SelectVolumeCandidatesForWrite(long? requiredBytes)
         {
             var now = Stopwatch.GetTimestamp();
-            var writableVolumes = GetWritableVolumeSnapshot(now);
+            var writableVolumes = GetWritableVolumeSnapshot(now, requiredBytes);
 
             if (writableVolumes.Length == 0)
             {
-                var healthyCount = _volumes.Values.Count(v => v.IsHealthy);
+                var healthyCount = _volumes.Values.Count(v => ProbeVolumeHealth(v));
                 if (healthyCount == 0)
                     throw new InsufficientStorageException("No healthy storage volumes available");
+
+                if (requiredBytes.HasValue)
+                {
+                    throw new InsufficientStorageException(
+                        $"No healthy storage volume has enough free space for {requiredBytes.Value} bytes");
+                }
 
                 throw new InsufficientStorageException("All storage volumes are full");
             }
 
             if (writableVolumes.Length == 1)
-                return writableVolumes[0];
+                return writableVolumes;
 
             // Pick two pseudo-random distinct candidates and choose the one with more free space.
             var ticket = (uint)Interlocked.Increment(ref _volumeSelectionCounter);
@@ -746,38 +787,90 @@ namespace Locus.Storage
 
             var first = writableVolumes[firstIndex];
             var second = writableVolumes[secondIndex];
+            var preferred = first.AvailableSpace >= second.AvailableSpace ? first : second;
+            var alternate = ReferenceEquals(preferred, first) ? second : first;
 
-            return first.AvailableSpace >= second.AvailableSpace ? first : second;
+            return writableVolumes
+                .Where(v => !ReferenceEquals(v, preferred) && !ReferenceEquals(v, alternate))
+                .Prepend(alternate)
+                .Prepend(preferred)
+                .ToArray();
         }
 
-        private IStorageVolume[] GetWritableVolumeSnapshot(long nowTicks)
+        private IStorageVolume[] GetWritableVolumeSnapshot(long nowTicks, long? requiredBytes = null)
         {
             var cached = _cachedWritableVolumes;
             var lastRefresh = Interlocked.Read(ref _lastVolumeSnapshotTicks);
 
             if (lastRefresh != 0 && (nowTicks - lastRefresh) < VolumeSnapshotRefreshTicks)
-                return cached;
+                return FilterWritableVolumesByRequiredSpace(cached, requiredBytes);
 
             // Singleflight: only the CAS winner rebuilds the snapshot.
             // Concurrent callers return the slightly stale cached value, which is acceptable since
             // the snapshot is refreshed at most every VolumeSnapshotRefreshTicks (1 s) anyway.
             if (Interlocked.CompareExchange(ref _volumeSnapshotRefreshInProgress, 1, 0) != 0)
-                return cached;
+                return FilterWritableVolumesByRequiredSpace(cached, requiredBytes);
 
             try
             {
                 var refreshed = _volumes.Values
-                    .Where(v => v.IsHealthy && v.AvailableSpace > 0)
+                    .Where(v => ProbeVolumeHealth(v) && v.AvailableSpace > 0)
                     .ToArray();
 
                 _cachedWritableVolumes = refreshed;
                 Interlocked.Exchange(ref _lastVolumeSnapshotTicks, nowTicks);
-                return refreshed;
+                return FilterWritableVolumesByRequiredSpace(refreshed, requiredBytes);
             }
             finally
             {
                 Volatile.Write(ref _volumeSnapshotRefreshInProgress, 0);
             }
+        }
+
+        private static IStorageVolume[] FilterWritableVolumesByRequiredSpace(IStorageVolume[] volumes, long? requiredBytes)
+        {
+            if (!requiredBytes.HasValue || requiredBytes.Value <= 0)
+                return volumes;
+
+            return volumes
+                .Where(v => v.AvailableSpace >= requiredBytes.Value)
+                .ToArray();
+        }
+
+        private static bool ProbeVolumeHealth(IStorageVolume volume, bool forceRefresh = false)
+        {
+            if (forceRefresh && volume is IStorageVolumeHealthProbe healthProbe)
+                return healthProbe.ProbeHealth();
+
+            return volume.IsHealthy;
+        }
+
+        private static bool IsRetryableWriteFailure(Exception ex)
+        {
+            return ex is IOException || ex is UnauthorizedAccessException;
+        }
+
+        private async Task TryCleanupFailedWriteAsync(IStorageVolume volume, string physicalPath)
+        {
+            try
+            {
+                await DeleteWrittenFileAsync(volume, physicalPath).ConfigureAwait(false);
+            }
+            catch (Exception cleanupEx)
+            {
+                _logger.LogWarning(
+                    cleanupEx,
+                    "Failed to cleanup partial write at {PhysicalPath} on volume {VolumeId}",
+                    physicalPath,
+                    volume.VolumeId);
+            }
+        }
+
+        private void InvalidateWritableVolumeSnapshot(IStorageVolume volume)
+        {
+            _cachedWritableVolumes = Array.Empty<IStorageVolume>();
+            Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
+            _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
         }
 
         private SemaphoreSlim GetCompletionGuard(string fileKey)

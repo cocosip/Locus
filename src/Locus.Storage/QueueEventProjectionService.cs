@@ -135,10 +135,20 @@ namespace Locus.Storage
             try
             {
                 var cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
-                long? advancedCursorOffset;
-                while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                try
                 {
-                    cursorOffset = advancedCursorOffset.Value;
+                    long? advancedCursorOffset;
+                    while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                    {
+                        cursorOffset = advancedCursorOffset.Value;
+                    }
+                }
+                catch (DeferredProjectionException ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Deferred queue projection replay for tenant {TenantId} because the physical file could not be verified",
+                        tenantId);
                 }
 
                 return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
@@ -187,10 +197,20 @@ namespace Locus.Storage
 
                 try
                 {
-                    long? advancedCursorOffset;
-                    while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                    try
                     {
-                        cursorOffset = advancedCursorOffset.Value;
+                        long? advancedCursorOffset;
+                        while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                        {
+                            cursorOffset = advancedCursorOffset.Value;
+                        }
+                    }
+                    catch (DeferredProjectionException ex)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Deferred queue projection rebuild for tenant {TenantId} because the physical file could not be verified",
+                            tenantId);
                     }
 
                     await ReconcileQuotaCountsAfterRebuildAsync(tenantId, ct).ConfigureAwait(false);
@@ -217,7 +237,18 @@ namespace Locus.Storage
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                return (await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue;
+                try
+                {
+                    return (await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue;
+                }
+                catch (DeferredProjectionException ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Deferred queue projection for tenant {TenantId} because the physical file could not be verified",
+                        tenantId);
+                    return false;
+                }
             }
             finally
             {
@@ -531,7 +562,22 @@ namespace Locus.Storage
             FileProcessingStatus fallbackStatus,
             CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(record.PhysicalPath) || !_fileSystem.File.Exists(record.PhysicalPath))
+            var physicalPath = record.PhysicalPath;
+            if (string.IsNullOrWhiteSpace(physicalPath))
+                return null;
+
+            var confirmedPhysicalPath = physicalPath!;
+
+            if (!TryConfirmPhysicalFileExists(confirmedPhysicalPath, out var physicalFileExists))
+            {
+                throw new DeferredProjectionException(
+                    record.TenantId,
+                    record.FileKey,
+                    confirmedPhysicalPath,
+                    "Physical file existence could not be verified.");
+            }
+
+            if (!physicalFileExists)
                 return null;
 
             var metadata = BuildMetadata(record, fallbackStatus);
@@ -554,6 +600,74 @@ namespace Locus.Storage
                     tenantReservationConsumed,
                     directoryReservationConsumed).ConfigureAwait(false);
                 throw;
+            }
+        }
+
+        private bool TryConfirmPhysicalFileExists(string physicalPath, out bool physicalFileExists)
+        {
+            physicalFileExists = false;
+
+            if (_fileSystem.File.Exists(physicalPath))
+            {
+                try
+                {
+                    using (var stream = _fileSystem.File.Open(
+                        physicalPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
+                    {
+                    }
+
+                    physicalFileExists = true;
+                    return true;
+                }
+                catch (FileNotFoundException)
+                {
+                    return true;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    return true;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    return false;
+                }
+                catch (IOException)
+                {
+                    return false;
+                }
+            }
+
+            try
+            {
+                using (var stream = _fileSystem.File.Open(
+                    physicalPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                }
+
+                physicalFileExists = true;
+                return true;
+            }
+            catch (FileNotFoundException)
+            {
+                return true;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
             }
         }
 
@@ -1286,6 +1400,23 @@ namespace Locus.Storage
             public long CursorOffset { get; set; }
 
             public System.Collections.Generic.List<FileMetadata> Files { get; set; } = new System.Collections.Generic.List<FileMetadata>();
+        }
+
+        private sealed class DeferredProjectionException : IOException
+        {
+            public DeferredProjectionException(string tenantId, string fileKey, string physicalPath, string message)
+                : base(message)
+            {
+                TenantId = tenantId;
+                FileKey = fileKey;
+                PhysicalPath = physicalPath;
+            }
+
+            public string TenantId { get; }
+
+            public string FileKey { get; }
+
+            public string PhysicalPath { get; }
         }
     }
 }

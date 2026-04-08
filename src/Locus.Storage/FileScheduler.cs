@@ -710,6 +710,27 @@ namespace Locus.Storage
         {
             physicalFileMissing = false;
 
+            if (_volumeRegistry != null && !string.IsNullOrWhiteSpace(metadata.VolumeId))
+            {
+                if (!_volumeRegistry.TryGetVolume(metadata.VolumeId, out var volume))
+                {
+                    _logger.LogWarning(
+                        "Skipping orphaned metadata cleanup because volume {VolumeId} is unavailable for file {FileKey}",
+                        metadata.VolumeId,
+                        metadata.FileKey);
+                    return false;
+                }
+
+                if (!volume.IsHealthy)
+                {
+                    _logger.LogWarning(
+                        "Skipping orphaned metadata cleanup because volume {VolumeId} is unhealthy for file {FileKey}",
+                        metadata.VolumeId,
+                        metadata.FileKey);
+                    return false;
+                }
+            }
+
             if (physicalPathExistsCache.TryGetValue(metadata.PhysicalPath, out var physicalFileExists))
             {
                 physicalFileMissing = !physicalFileExists;
@@ -721,17 +742,6 @@ namespace Locus.Storage
             {
                 physicalPathExistsCache[metadata.PhysicalPath] = true;
                 return true;
-            }
-
-            if (_volumeRegistry != null
-                && !string.IsNullOrWhiteSpace(metadata.VolumeId)
-                && !_volumeRegistry.TryGetVolume(metadata.VolumeId, out _))
-            {
-                _logger.LogWarning(
-                    "Skipping orphaned metadata cleanup because volume {VolumeId} is unavailable for file {FileKey}",
-                    metadata.VolumeId,
-                    metadata.FileKey);
-                return false;
             }
 
             try

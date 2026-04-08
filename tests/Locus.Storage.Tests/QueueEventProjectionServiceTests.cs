@@ -192,6 +192,59 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReplayTenantAsync_DoesNotAdvanceCursorWhenPhysicalFileCannotBeVerified()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-deferred-accepted";
+            const string fileKey = "file-deferred-accepted";
+            const string directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "file-deferred-accepted.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3, 4 });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 4,
+                Status = FileProcessingStatus.Pending,
+                OriginalFileName = "deferred.dcm",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+            var cursorPath = Path.Combine(_queueDirectory, tenantId, "projector.cursor.json");
+
+            using (var lease = _fileSystem.File.Open(physicalPath, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                var deferredState = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+                Assert.Null(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+                Assert.Equal(0, deferredState.CursorOffset);
+                Assert.True(deferredState.LagBytes > 0);
+                Assert.False(_fileSystem.File.Exists(cursorPath));
+            }
+
+            var recoveredState = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+            var rebuilt = await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None);
+
+            Assert.NotNull(rebuilt);
+            Assert.Equal(fileKey, rebuilt!.FileKey);
+            Assert.Equal(0, recoveredState.LagBytes);
+            Assert.True(recoveredState.CursorOffset > 0);
+            Assert.True(_fileSystem.File.Exists(cursorPath));
+        }
+
+        [Fact]
         public async Task ExecuteAsync_ProjectsFailedEventWithRetryDelay()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
