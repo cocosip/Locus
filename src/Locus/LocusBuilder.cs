@@ -206,40 +206,6 @@ namespace Locus
         }
 
         /// <summary>
-        /// Enables the quota reconciliation maintenance service.
-        /// </summary>
-        /// <returns>The builder for chaining.</returns>
-        public LocusBuilder EnableQuotaReconciliation()
-        {
-            _options.EnableQuotaReconciliation = true;
-            return this;
-        }
-
-        /// <summary>
-        /// Disables the quota reconciliation maintenance service.
-        /// </summary>
-        /// <returns>The builder for chaining.</returns>
-        public LocusBuilder DisableQuotaReconciliation()
-        {
-            _options.EnableQuotaReconciliation = false;
-            return this;
-        }
-
-        /// <summary>
-        /// Configures quota reconciliation maintenance options.
-        /// </summary>
-        /// <param name="configure">Configuration action for quota reconciliation options.</param>
-        /// <returns>The builder for chaining.</returns>
-        public LocusBuilder WithQuotaReconciliationOptions(Action<Storage.QuotaReconciliationOptions> configure)
-        {
-            if (configure == null)
-                throw new ArgumentNullException(nameof(configure));
-
-            configure(_options.QuotaReconciliationOptions);
-            return this;
-        }
-
-        /// <summary>
         /// Enables the database health check on startup.
         /// </summary>
         /// <returns>The builder for chaining.</returns>

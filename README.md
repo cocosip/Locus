@@ -118,6 +118,10 @@ This means SQLite is still operationally important, but it is no longer the only
 For a full lifecycle walkthrough, including orphan recovery, startup rebuild, timeout reset, and delete
 reaping, see [`docs/storage-lifecycle-overview.md`](docs/storage-lifecycle-overview.md).
 
+Quota reconciliation is now treated as an explicit maintenance operation rather than a normal scheduled
+runtime feature. The manual maintenance APIs on `IStorageCleanupService` remain available for operator
+repair flows and recovery tooling.
+
 ## Queue Journal Growth and Compaction
 
 `queue.log` is append-only during normal operation, so it grows as files move through the queue lifecycle.
