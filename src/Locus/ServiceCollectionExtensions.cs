@@ -355,6 +355,7 @@ namespace Locus
                     var logger = sp.GetRequiredService<ILogger<QueueEventProjectionService>>();
                     var storageCleanupService = sp.GetRequiredService<IStorageCleanupService>();
                     var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
+                    var quotaMaintenanceStore = sp.GetRequiredService<IQuotaProjectionMaintenanceStore>();
 
                     return new QueueEventProjectionService(
                         journal,
@@ -365,7 +366,8 @@ namespace Locus
                         options.QueueEventJournal,
                         logger,
                         storageCleanupService,
-                        projectionStore);
+                        projectionStore,
+                        quotaMaintenanceStore);
                 });
                 services.AddSingleton<IQueueProjectionMaintenanceService>(sp => sp.GetRequiredService<QueueEventProjectionService>());
 

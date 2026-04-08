@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
@@ -34,6 +35,7 @@ namespace Locus.Storage
         private readonly QueueEventJournalOptions _options;
         private readonly ILogger<QueueEventProjectionService> _logger;
         private readonly IStorageCleanupService? _storageCleanupService;
+        private readonly IQuotaProjectionMaintenanceStore? _quotaMaintenanceStore;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantProjectionLocks;
 
         /// <summary>
@@ -48,7 +50,8 @@ namespace Locus.Storage
             QueueEventJournalOptions options,
             ILogger<QueueEventProjectionService> logger,
             IStorageCleanupService? storageCleanupService = null,
-            IQueueProjectionStore? projectionStore = null)
+            IQueueProjectionStore? projectionStore = null,
+            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null)
         {
             _journal = journal ?? throw new ArgumentNullException(nameof(journal));
             _projectionStore = projectionStore
@@ -61,6 +64,7 @@ namespace Locus.Storage
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _storageCleanupService = storageCleanupService;
+            _quotaMaintenanceStore = quotaMaintenanceStore;
             _tenantProjectionLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
         }
 
@@ -174,29 +178,27 @@ namespace Locus.Storage
             try
             {
                 await ClearTenantProjectionAsync(tenantId, ct).ConfigureAwait(false);
+                if (_quotaMaintenanceStore != null)
+                    await ResetQuotaProjectionAsync(tenantId, ct).ConfigureAwait(false);
+
                 var restoredCursorOffset = await TryRestoreSnapshotAsync(tenantId, ct).ConfigureAwait(false);
                 var cursorOffset = await NormalizeCursorOffsetAsync(tenantId, restoredCursorOffset ?? 0, ct).ConfigureAwait(false);
                 await SaveCursorAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
 
-                long? advancedCursorOffset;
-                while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                try
                 {
-                    cursorOffset = advancedCursorOffset.Value;
-                }
+                    long? advancedCursorOffset;
+                    while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                    {
+                        cursorOffset = advancedCursorOffset.Value;
+                    }
 
-                if (_storageCleanupService != null)
+                    await ReconcileQuotaCountsAfterRebuildAsync(tenantId, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!(ex is OperationCanceledException && ct.IsCancellationRequested))
                 {
-                    try
-                    {
-                        await _storageCleanupService.ReconcileQuotaCountsAsync(tenantId, ct).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(
-                            ex,
-                            "Projection rebuild restored metadata for tenant {TenantId}, but quota reconciliation failed",
-                            tenantId);
-                    }
+                    await TryReconcileQuotaCountsAfterFailedRebuildAsync(tenantId).ConfigureAwait(false);
+                    throw;
                 }
 
                 return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
@@ -786,10 +788,7 @@ namespace Locus.Storage
                 await stream.FlushAsync(ct).ConfigureAwait(false);
             }
 
-            if (_fileSystem.File.Exists(path))
-                _fileSystem.File.Delete(path);
-
-            _fileSystem.File.Move(tempPath, path);
+            ReplaceFileAtomically(tempPath, path);
         }
 
         private SemaphoreSlim GetTenantProjectionLock(string tenantId)
@@ -915,10 +914,7 @@ namespace Locus.Storage
                 await stream.FlushAsync(ct).ConfigureAwait(false);
             }
 
-            if (_fileSystem.File.Exists(snapshotPath))
-                _fileSystem.File.Delete(snapshotPath);
-
-            _fileSystem.File.Move(tempPath, snapshotPath);
+            ReplaceFileAtomically(tempPath, snapshotPath);
         }
 
         private async Task<long?> TryRestoreSnapshotAsync(string tenantId, CancellationToken ct)
@@ -975,6 +971,138 @@ namespace Locus.Storage
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+        }
+
+        private async Task ResetQuotaProjectionAsync(string tenantId, CancellationToken ct)
+        {
+            if (_quotaMaintenanceStore == null)
+                return;
+
+            using (var rebuildHandle = await _quotaMaintenanceStore.BeginDatabaseRebuildAsync(tenantId, ct).ConfigureAwait(false))
+            {
+                var quotaRows = await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false);
+                foreach (var quota in quotaRows)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    if (string.IsNullOrWhiteSpace(quota.DirectoryPath))
+                        continue;
+
+                    if (HasExplicitQuotaLimit(quota) || string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
+                    {
+                        await _quotaMaintenanceStore
+                            .SetProjectedCountForRebuildAsync(tenantId, quota.DirectoryPath, 0, ct)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, quota.DirectoryPath, ct).ConfigureAwait(false);
+                    }
+                }
+
+                await _quotaMaintenanceStore
+                    .SetProjectedCountForRebuildAsync(tenantId, tenantId, 0, ct)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        private async Task ReconcileQuotaCountsAfterRebuildAsync(string tenantId, CancellationToken ct)
+        {
+            if (_quotaMaintenanceStore != null)
+            {
+                await ReconcileQuotaCountsCoreAsync(tenantId, ct).ConfigureAwait(false);
+                return;
+            }
+
+            if (_storageCleanupService != null)
+            {
+                await _storageCleanupService.ReconcileQuotaCountsAsync(tenantId, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task TryReconcileQuotaCountsAfterFailedRebuildAsync(string tenantId)
+        {
+            try
+            {
+                await ReconcileQuotaCountsAfterRebuildAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception reconcileEx)
+            {
+                _logger.LogWarning(
+                    reconcileEx,
+                    "Projection rebuild left tenant {TenantId} in a partial state and quota reconciliation fallback also failed",
+                    tenantId);
+            }
+        }
+
+        private async Task ReconcileQuotaCountsCoreAsync(string tenantId, CancellationToken ct)
+        {
+            if (_quotaMaintenanceStore == null)
+                return;
+
+            var metadataEntries = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false)).ToArray();
+            var expectedTenantCount = metadataEntries.Length;
+            var expectedDirectoryCounts = metadataEntries
+                .GroupBy(metadata => NormalizeDirectoryPath(metadata.DirectoryPath), StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+
+            using (var rebuildHandle = await _quotaMaintenanceStore.BeginDatabaseRebuildAsync(tenantId, ct).ConfigureAwait(false))
+            {
+                var existingDirectoryQuotas = (await _quotaMaintenanceStore.GetQuotaRowsAsync(tenantId, ct).ConfigureAwait(false))
+                    .Where(quota => !string.IsNullOrWhiteSpace(quota.DirectoryPath)
+                        && !string.Equals(quota.DirectoryPath, tenantId, StringComparison.Ordinal))
+                    .ToDictionary(quota => quota.DirectoryPath, quota => quota, StringComparer.Ordinal);
+
+                var knownDirectoryPaths = new HashSet<string>(existingDirectoryQuotas.Keys, StringComparer.Ordinal);
+                foreach (var directoryPath in expectedDirectoryCounts.Keys)
+                    knownDirectoryPaths.Add(directoryPath);
+
+                foreach (var directoryPath in knownDirectoryPaths)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var expectedDirectoryCount = expectedDirectoryCounts.TryGetValue(directoryPath, out var count)
+                        ? count
+                        : 0;
+
+                    if (expectedDirectoryCount == 0
+                        && existingDirectoryQuotas.TryGetValue(directoryPath, out var existingQuota)
+                        && !HasExplicitQuotaLimit(existingQuota))
+                    {
+                        await _quotaMaintenanceStore.RemoveQuotaAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    await _quotaMaintenanceStore.SetProjectedCountForRebuildAsync(
+                        tenantId,
+                        directoryPath,
+                        expectedDirectoryCount,
+                        ct).ConfigureAwait(false);
+                }
+
+                await _quotaMaintenanceStore
+                    .SetProjectedCountForRebuildAsync(tenantId, tenantId, expectedTenantCount, ct)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        private static bool HasExplicitQuotaLimit(DirectoryQuota quota)
+        {
+            if (quota == null)
+                throw new ArgumentNullException(nameof(quota));
+
+            return quota.MaxCount > 0;
+        }
+
+        private void ReplaceFileAtomically(string tempPath, string destinationPath)
+        {
+            if (_fileSystem.File.Exists(destinationPath))
+            {
+                _fileSystem.File.Replace(tempPath, destinationPath, null);
+                return;
+            }
+
+            _fileSystem.File.Move(tempPath, destinationPath);
         }
 
         private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId)

@@ -344,6 +344,40 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task WriteFileAsync_WithRelativeSegments_NormalizesLogicalDirectoryBeforeQuotaAndJournal()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("logical-dir-normalized"));
+
+            var fileKey = await _storagePool.WriteFileAsync(
+                _tenant.Object,
+                content,
+                "scan.dcm",
+                "/incoming/../studies/./ct",
+                default);
+
+            var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
+
+            Assert.NotNull(location);
+            Assert.Equal("/studies/ct", location!.DirectoryPath);
+
+            _directoryQuotaManager.Verify(
+                manager => manager.IncrementFileCountAsync(
+                    "tenant-001",
+                    "/studies/ct",
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+
+            _queueEventJournal.Verify(
+                journal => journal.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.Accepted
+                        && record.FileKey == fileKey
+                        && record.DirectoryPath == "/studies/ct"),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task WriteFileAsync_WithoutLogicalDirectory_UsesRootDirectory()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("root-dir"));

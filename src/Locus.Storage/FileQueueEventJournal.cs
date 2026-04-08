@@ -256,8 +256,7 @@ namespace Locus.Storage
                     await destination.FlushAsync(ct).ConfigureAwait(false);
                 }
 
-                _fileSystem.File.Delete(path);
-                _fileSystem.File.Move(tempPath, path);
+                ReplaceFileAtomically(tempPath, path);
                 state.BaseOffset = processedOffset;
                 state.TailOffset = processedOffset + (length - relativeProcessedOffset);
                 SaveJournalState(tenantId, state);
@@ -354,11 +353,19 @@ namespace Locus.Storage
                 stream.Flush();
             }
 
-            if (_fileSystem.File.Exists(path))
-                _fileSystem.File.Delete(path);
-
-            _fileSystem.File.Move(tempPath, path);
+            ReplaceFileAtomically(tempPath, path);
             _stateCache[tenantId] = state;
+        }
+
+        private void ReplaceFileAtomically(string tempPath, string destinationPath)
+        {
+            if (_fileSystem.File.Exists(destinationPath))
+            {
+                _fileSystem.File.Replace(tempPath, destinationPath, null);
+                return;
+            }
+
+            _fileSystem.File.Move(tempPath, destinationPath);
         }
 
         private void NormalizeJournalState(string tenantId, JournalState state)

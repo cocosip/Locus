@@ -921,6 +921,81 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildTenantAsync_WithoutCleanupService_ReconcilesQuotaViaMaintenanceStore()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-008-maint";
+            const string fileKey = "file-008-maint";
+            const string directoryPath = "/incoming";
+            const string staleDirectoryPath = "/stale";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "file-008-maint.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 8, 8, 9 });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending
+            }, CancellationToken.None);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                TenantId = tenantId,
+                FileKey = "stale-008-maint",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumeDirectory, tenantId, "stale", "stale-008-maint.dcm"),
+                DirectoryPath = staleDirectoryPath,
+                FileSize = 1,
+                CreatedAt = DateTime.UtcNow,
+                Status = FileProcessingStatus.Pending
+            }, CancellationToken.None);
+
+            await _quotaRepository.SetCurrentCountAsync(tenantId, tenantId, 5, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync(tenantId, directoryPath, 3, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync(tenantId, staleDirectoryPath, 2, CancellationToken.None);
+
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal,
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                storageCleanupService: null,
+                projectionStore: null,
+                quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
+
+            var state = await service.RebuildTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(0, state.LagBytes);
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, staleDirectoryPath, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task SnapshotTenantAsync_AllowsRebuildToRestoreProjectionWithoutJournalReplay()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
@@ -1367,6 +1442,11 @@ namespace Locus.Storage.Tests
                 allowLegacyNonJournalMode: true);
         }
 
+        private IQuotaProjectionMaintenanceStore CreateQuotaMaintenanceStore()
+        {
+            return new DirectoryQuotaRepositoryProjectionMaintenanceStore(_quotaRepository);
+        }
+
         private FileQueueEventJournal CreateJournal()
         {
             return new FileQueueEventJournal(
@@ -1404,7 +1484,8 @@ namespace Locus.Storage.Tests
                     IdleCycleDelay = TimeSpan.FromMilliseconds(10),
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
-                new Mock<ILogger<QueueEventProjectionService>>().Object));
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
         }
 
         private T TrackDisposable<T>(T disposable)

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace Locus.Storage
@@ -20,9 +21,28 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(normalized) || normalized == ".")
                 return "/";
 
-            return normalized.StartsWith("/", StringComparison.Ordinal)
-                ? normalized
-                : "/" + normalized.TrimStart('/');
+            var segments = normalized.Split(['/'], StringSplitOptions.RemoveEmptyEntries);
+            var collapsedSegments = new List<string>(segments.Length);
+            foreach (var segment in segments)
+            {
+                if (segment == ".")
+                    continue;
+
+                if (segment == "..")
+                {
+                    if (collapsedSegments.Count > 0)
+                        collapsedSegments.RemoveAt(collapsedSegments.Count - 1);
+
+                    continue;
+                }
+
+                collapsedSegments.Add(segment);
+            }
+
+            if (collapsedSegments.Count == 0)
+                return "/";
+
+            return "/" + string.Join("/", collapsedSegments);
         }
 
         public static string NormalizeFromRelativePath(string? relativeDirectoryPath)

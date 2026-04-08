@@ -1115,18 +1115,17 @@ namespace Locus.Storage
             {
                 var iterationStartedAt = Stopwatch.GetTimestamp();
                 var batch = _queueEventJournal != null
-                    ? await _projectionCleanupStore.GetDeleteRequestedFilesOlderThanAsync(
+                    ? await GetJournalCompletedCleanupBatchAsync(
                         tenantId,
                         completedCutoffUtc,
-                        _statusCleanupBatchSizePerTenant,
                         blockedFileKeys,
-                        ct)
+                        ct).ConfigureAwait(false)
                     : await _projectionCleanupStore.GetCompletedFilesOlderThanAsync(
                         tenantId,
                         completedCutoffUtc,
                         _statusCleanupBatchSizePerTenant,
                         blockedFileKeys,
-                        ct);
+                        ct).ConfigureAwait(false);
                 if (batch.Count == 0)
                 {
                     RecordStatusCleanupIteration("completed_cleanup", tenantId, 0, iterationStartedAt);
@@ -1179,9 +1178,23 @@ namespace Locus.Storage
                         if (_queueEventJournal != null)
                         {
                             var deleteSucceededAtUtc = DateTime.UtcNow;
-                            await _queueEventJournal.AppendAsync(
-                                CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
-                                default).ConfigureAwait(false);
+                            if (metadata.Status == FileProcessingStatus.DeleteRequested)
+                            {
+                                await _queueEventJournal.AppendAsync(
+                                    CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                                    default).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                var deleteRequestedAtUtc = deleteSucceededAtUtc.AddTicks(-1);
+                                await _queueEventJournal.AppendBatchAsync(
+                                    new[]
+                                    {
+                                        CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
+                                        CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                                    },
+                                    default).ConfigureAwait(false);
+                            }
 
                             await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
                                 metadata.TenantId,
@@ -1217,6 +1230,41 @@ namespace Locus.Storage
             }
 
             return (removedCount, spaceFreed);
+        }
+
+        private async Task<IReadOnlyList<FileMetadata>> GetJournalCompletedCleanupBatchAsync(
+            string tenantId,
+            DateTime completedCutoffUtc,
+            ISet<string> blockedFileKeys,
+            CancellationToken ct)
+        {
+            var deleteRequestedBatch = await _projectionCleanupStore.GetDeleteRequestedFilesOlderThanAsync(
+                tenantId,
+                completedCutoffUtc,
+                _statusCleanupBatchSizePerTenant,
+                blockedFileKeys,
+                ct).ConfigureAwait(false);
+            if (deleteRequestedBatch.Count >= _statusCleanupBatchSizePerTenant)
+                return deleteRequestedBatch;
+
+            var excludedFileKeys = new HashSet<string>(blockedFileKeys, StringComparer.Ordinal);
+            foreach (var metadata in deleteRequestedBatch)
+            {
+                if (!string.IsNullOrWhiteSpace(metadata.FileKey))
+                    excludedFileKeys.Add(metadata.FileKey);
+            }
+
+            var completedBatch = await _projectionCleanupStore.GetCompletedFilesOlderThanAsync(
+                tenantId,
+                completedCutoffUtc,
+                _statusCleanupBatchSizePerTenant - deleteRequestedBatch.Count,
+                excludedFileKeys,
+                ct).ConfigureAwait(false);
+
+            if (completedBatch.Count == 0)
+                return deleteRequestedBatch;
+
+            return deleteRequestedBatch.Concat(completedBatch).ToArray();
         }
 
         private async Task<(int RemovedCount, long SpaceFreed)> CleanupPermanentlyFailedForTenantAsync(

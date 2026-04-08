@@ -1640,6 +1640,68 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupCompletedFilesAsync_WithJournal_AppendsMissingDeleteRequestedBeforeDeleteSucceeded()
+        {
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            queueEventJournal
+                .Setup(j => j.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.DeleteRequested
+                        && records[0].Status == FileProcessingStatus.DeleteRequested
+                        && records[0].TenantId == "tenant-001"
+                        && records[0].FileKey == "completed-needs-delete-requested"
+                        && records[1].EventType == QueueEventType.DeleteSucceeded
+                        && records[1].Status == FileProcessingStatus.DeleteSucceeded
+                        && records[1].TenantId == "tenant-001"
+                        && records[1].FileKey == "completed-needs-delete-requested"
+                        && records[0].OccurredAtUtc < records[1].OccurredAtUtc),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var physicalPath = Path.Combine(_volumePath, "completed-needs-delete-requested.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "completed-needs-delete-requested",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddMinutes(-5)
+            }, CancellationToken.None);
+
+            await SeedProjectedCountsAsync("tenant-001", "/done");
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "completed-needs-delete-requested", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.DeleteSucceeded, metadata!.Status);
+            Assert.NotNull(metadata.DeleteSucceededAt);
+
+            queueEventJournal.VerifyAll();
+        }
+
+        [Fact]
         public async Task CleanupCompletedFilesAsync_WithoutJournal_RemovesMetadataAndQuota()
         {
             var cleanupService = new StorageCleanupService(
