@@ -74,7 +74,14 @@ namespace Locus.Benchmarks
             var fileScheduler = new Mock<IFileScheduler>();
 
             var poolLogger = NullLogger<StoragePool>.Instance;
-            _storagePool = new StoragePool(_metadataRepository, tenantQuotaManager.Object, directoryQuotaManager.Object, tenantManager.Object, fileScheduler.Object, poolLogger);
+            _storagePool = new StoragePool(
+                _metadataRepository,
+                tenantQuotaManager.Object,
+                directoryQuotaManager.Object,
+                tenantManager.Object,
+                fileScheduler.Object,
+                poolLogger,
+                allowLegacyNonJournalMode: true);
 
             // Local filesystem — skip startup delays (no K8s PVC synchronization needed).
             var volumeLogger = NullLogger<LocalFileSystemVolume>.Instance;

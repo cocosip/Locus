@@ -229,7 +229,7 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.True(result.Success);
-            Assert.Equal(3, result.RecordsRebuilt);
+            Assert.Equal(2, result.RecordsRebuilt);
             Assert.NotNull(result.BackupPath);
             Assert.True(_fileSystem.File.Exists(result.BackupPath));
 
@@ -650,7 +650,7 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.True(result.Success);
-            Assert.Equal(2, result.RecordsRebuilt);
+            Assert.Equal(3, result.RecordsRebuilt);
             Assert.NotNull(result.BackupPath);
 
             // Verify new database file exists
@@ -868,14 +868,14 @@ namespace Locus.Storage.Tests
 
             await _recoveryService.RebuildQuotaDatabaseAsync(tenantId, new[] { _volumePath }, default);
 
-            // Set limit equal to rebuilt logical-root count; a further increment must be rejected.
-            var quota = await _quotaRepository.GetOrCreateAsync(tenantId, "/", default);
+            // Set limit equal to the rebuilt logical-directory count; a further increment must be rejected.
+            var quota = await _quotaRepository.GetOrCreateAsync(tenantId, "/documents", default);
             quota.MaxCount = 2;
             quota.Enabled = true;
             await _quotaRepository.UpdateAsync(tenantId, quota, default);
 
             // Act
-            var incremented = await _quotaRepository.TryIncrementAsync(tenantId, "/", default);
+            var incremented = await _quotaRepository.TryIncrementAsync(tenantId, "/documents", default);
 
             // Assert
             Assert.False(incremented);

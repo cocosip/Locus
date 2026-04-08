@@ -43,7 +43,7 @@ namespace Locus.Storage.Tests
                 enableBackgroundPersistence: false);
 
             _logger = new Mock<ILogger<FileScheduler>>();
-            _scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object);
+            _scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, allowLegacyNonJournalMode: true);
 
             _tenant = new Mock<ITenantContext>();
             _tenant.Setup(t => t.TenantId).Returns("tenant-001");
@@ -75,6 +75,15 @@ namespace Locus.Storage.Tests
                 FileKey = fileKey,
                 ProcessingStartTimeUtc = processingStartTimeUtc
             };
+        }
+
+        [Fact]
+        public void Constructor_WithoutJournal_RequiresExplicitLegacyAllowance()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                new FileScheduler(_repository, _fileSystem, _logger.Object));
+
+            Assert.Contains("legacy non-journal mode", ex.Message);
         }
 
         [Fact]
@@ -153,7 +162,8 @@ namespace Locus.Storage.Tests
                 _repository,
                 _fileSystem,
                 _logger.Object,
-                projectionStore: projectionStore.Object);
+                projectionStore: projectionStore.Object,
+                allowLegacyNonJournalMode: true);
 
             var location = await scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
 
@@ -195,7 +205,8 @@ namespace Locus.Storage.Tests
             var scheduler = new FileScheduler(
                 projectionStore.Object,
                 _fileSystem,
-                _logger.Object);
+                _logger.Object,
+                allowLegacyNonJournalMode: true);
 
             var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
 
@@ -365,7 +376,8 @@ namespace Locus.Storage.Tests
                 _fileSystem,
                 _logger.Object,
                 tenantQuotaManager: tenantQuotaManager.Object,
-                directoryQuotaManager: directoryQuotaManager.Object);
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
 
             var removed = await scheduler.CleanupOrphanedMetadataAsync(cts.Token);
 
@@ -403,7 +415,8 @@ namespace Locus.Storage.Tests
                 _fileSystem,
                 _logger.Object,
                 tenantQuotaManager: tenantQuotaManager.Object,
-                directoryQuotaManager: directoryQuotaManager.Object);
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
 
             var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
 
@@ -444,7 +457,8 @@ namespace Locus.Storage.Tests
                 _logger.Object,
                 volumeRegistry: volumeRegistry,
                 tenantQuotaManager: tenantQuotaManager.Object,
-                directoryQuotaManager: directoryQuotaManager.Object);
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
 
             var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
 
@@ -534,7 +548,7 @@ namespace Locus.Storage.Tests
             volume.SetupGet(v => v.VolumeId).Returns("vol-001");
             var registry = new StorageVolumeRegistry();
             registry.Register(volume.Object);
-            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, volumeRegistry: registry);
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, volumeRegistry: registry, allowLegacyNonJournalMode: true);
 
             await scheduler.MarkAsCompletedAsync(CreateLease("tenant-001", "file-volume-delete", processingStart), CancellationToken.None);
 
@@ -700,7 +714,7 @@ namespace Locus.Storage.Tests
         {
             // Arrange
             var retryPolicy = new FileRetryPolicy { MaxRetryCount = 3 };
-            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, retryPolicy);
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, retryPolicy, allowLegacyNonJournalMode: true);
             var processingStart = DateTime.UtcNow;
 
             var file = new FileMetadata
@@ -775,7 +789,7 @@ namespace Locus.Storage.Tests
                 UseExponentialBackoff = true
             };
 
-            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, retryPolicy);
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, retryPolicy, allowLegacyNonJournalMode: true);
             var firstProcessingStart = DateTime.UtcNow;
 
             var file = new FileMetadata
@@ -1284,7 +1298,8 @@ namespace Locus.Storage.Tests
                     _fileSystem,
                     _logger.Object,
                     tenantQuotaManager: tenantQuotaManager.Object,
-                    directoryQuotaManager: directoryQuotaManager.Object);
+                    directoryQuotaManager: directoryQuotaManager.Object,
+                    allowLegacyNonJournalMode: true);
 
                 var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
 
@@ -1339,7 +1354,8 @@ namespace Locus.Storage.Tests
                 _fileSystem,
                 _logger.Object,
                 tenantQuotaManager: tenantQuotaManager.Object,
-                directoryQuotaManager: directoryQuotaManager.Object);
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
 
             var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
 

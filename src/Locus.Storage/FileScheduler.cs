@@ -48,7 +48,7 @@ namespace Locus.Storage
             ITenantQuotaManager? tenantQuotaManager = null,
             IDirectoryQuotaManager? directoryQuotaManager = null,
             IQueueEventJournal? queueEventJournal = null,
-            bool allowLegacyNonJournalMode = true)
+            bool allowLegacyNonJournalMode = false)
         {
             _projectionStore = projectionStore ?? throw new ArgumentNullException(nameof(projectionStore));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -76,7 +76,7 @@ namespace Locus.Storage
             IDirectoryQuotaManager? directoryQuotaManager = null,
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
-            bool allowLegacyNonJournalMode = true)
+            bool allowLegacyNonJournalMode = false)
             : this(
                 projectionStore ?? new MetadataRepositoryQueueProjectionStore(repository ?? throw new ArgumentNullException(nameof(repository))),
                 fileSystem,

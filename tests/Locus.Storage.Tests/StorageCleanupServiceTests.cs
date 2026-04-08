@@ -105,7 +105,8 @@ namespace Locus.Storage.Tests
                 _metadataDir,
                 _quotaDir,
                 tenantManager: _tenantManager.Object,
-                directoryQuotaManager: _directoryQuotaManager);
+                directoryQuotaManager: _directoryQuotaManager,
+                allowLegacyNonJournalMode: true);
 
             // Setup mock volume
             _volumePath = Path.Combine(Path.GetTempPath(), $"locus-test-cleanup-vol-{testId}");
@@ -165,6 +166,24 @@ namespace Locus.Storage.Tests
         {
             await _tenantQuotaManager.ApplyAcceptedProjectionAsync(tenantId, CancellationToken.None);
             await _directoryQuotaManager.ApplyAcceptedProjectionAsync(tenantId, directoryPath, CancellationToken.None);
+        }
+
+        [Fact]
+        public void Constructor_WithoutJournal_RequiresExplicitLegacyAllowance()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                new StorageCleanupService(
+                    _metadataRepository,
+                    _quotaRepository,
+                    _tenantQuotaManager,
+                    _fileSystem,
+                    _logger.Object,
+                    _metadataDir,
+                    _quotaDir,
+                    tenantManager: _tenantManager.Object,
+                    directoryQuotaManager: _directoryQuotaManager));
+
+            Assert.Contains("legacy non-journal mode", ex.Message);
         }
 
         [Fact]
@@ -602,14 +621,15 @@ namespace Locus.Storage.Tests
                 new Mock<ILogger<StorageCleanupService>>().Object,
                 _metadataDir,
                 _quotaDir,
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), default);
 
             var metadata = await _metadataRepository.GetAsync("tenant-001", "file-tenant-quota", default);
             Assert.NotNull(metadata);
-            Assert.True(_fileSystem.File.Exists(physicalPath));
+            Assert.False(_fileSystem.File.Exists(physicalPath));
 
             var directoryQuota = await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", default);
             Assert.Equal(1, directoryQuota.CurrentCount);
@@ -617,7 +637,7 @@ namespace Locus.Storage.Tests
             var stats = await cleanupService.GetCleanupStatisticsAsync(default);
             Assert.Equal(0, stats.PermanentlyFailedFilesRemoved);
 
-            _volume.Verify(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()), Times.Never);
+            _volume.Verify(v => v.DeleteAsync(physicalPath, It.IsAny<CancellationToken>()), Times.Once);
         }
 
         [Fact]
@@ -661,6 +681,8 @@ namespace Locus.Storage.Tests
 
             var stats = await _cleanupService.GetCleanupStatisticsAsync(default);
             Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "file-concurrent-remove", default));
         }
 
         [Fact]
@@ -866,7 +888,8 @@ namespace Locus.Storage.Tests
                 {
                     MaxOrphanFilesPerRun = 10_000,
                     OrphanRebuildLookupCacheSize = 1
-                });
+                },
+                allowLegacyNonJournalMode: true);
             cleanupWithSmallCache.RegisterVolume(_volume.Object);
 
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -920,7 +943,8 @@ namespace Locus.Storage.Tests
                 {
                     MaxOrphanFilesPerRun = 2
                 },
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupWithSmallBudget.RegisterVolume(_volume.Object);
 
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -1013,7 +1037,8 @@ namespace Locus.Storage.Tests
                 _logger.Object,
                 _metadataDir,
                 _quotaDir,
-                tenantManager: tenantManager.Object);
+                tenantManager: tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var strayTenantPath = Path.Combine(_volumePath, "tenant-stray");
@@ -1151,7 +1176,8 @@ namespace Locus.Storage.Tests
                 _quotaDir,
                 tenantManager: _tenantManager.Object,
                 directoryQuotaManager: _directoryQuotaManager,
-                projectionStore: projectionStore.Object);
+                projectionStore: projectionStore.Object,
+                allowLegacyNonJournalMode: true);
 
             await cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
 
@@ -1201,7 +1227,8 @@ namespace Locus.Storage.Tests
                 tenantManager: _tenantManager.Object,
                 directoryQuotaManager: null,
                 projectionStore: projectionStore.Object,
-                quotaMaintenanceStore: quotaMaintenanceStore.Object);
+                quotaMaintenanceStore: quotaMaintenanceStore.Object,
+                allowLegacyNonJournalMode: true);
 
             await cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
 
@@ -1231,7 +1258,8 @@ namespace Locus.Storage.Tests
                 _logger.Object,
                 _metadataDir,
                 _quotaDir,
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -1270,7 +1298,8 @@ namespace Locus.Storage.Tests
                 _logger.Object,
                 _metadataDir,
                 _quotaDir,
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -1321,7 +1350,8 @@ namespace Locus.Storage.Tests
                 _quotaDir,
                 tenantManager: _tenantManager.Object,
                 directoryQuotaManager: _directoryQuotaManager,
-                projectionStore: projectionStore.Object);
+                projectionStore: projectionStore.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var tenantPath = Path.Combine(_volumePath, "tenant-001");
@@ -1382,7 +1412,8 @@ namespace Locus.Storage.Tests
                 _quotaDir,
                 tenantManager: _tenantManager.Object,
                 directoryQuotaManager: _directoryQuotaManager,
-                projectionStore: projectionStore.Object);
+                projectionStore: projectionStore.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             await cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
@@ -1407,7 +1438,8 @@ namespace Locus.Storage.Tests
                 {
                     CleanupBatchSizePerTenant = 1
                 },
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var blockedPhysicalPath = Path.Combine(_volumePath, "failed-stuck.dat");
@@ -1468,7 +1500,8 @@ namespace Locus.Storage.Tests
                 {
                     CleanupBatchSizePerTenant = 1
                 },
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var sharedBlockedPhysicalPath = Path.Combine(_volumePath, "failed-blocked-many.dat");
@@ -1617,7 +1650,8 @@ namespace Locus.Storage.Tests
                 _logger.Object,
                 _metadataDir,
                 _quotaDir,
-                tenantManager: _tenantManager.Object);
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             var physicalPath = Path.Combine(_volumePath, "completed-direct.dat");
@@ -1697,7 +1731,8 @@ namespace Locus.Storage.Tests
                 _quotaDir,
                 tenantManager: _tenantManager.Object,
                 directoryQuotaManager: _directoryQuotaManager,
-                projectionCleanupStore: projectionCleanupStore.Object);
+                projectionCleanupStore: projectionCleanupStore.Object,
+                allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
             await _metadataRepository.AddOrUpdateAsync(new FileMetadata

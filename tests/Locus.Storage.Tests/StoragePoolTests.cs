@@ -218,6 +218,21 @@ namespace Locus.Storage.Tests
             await _storagePool.AddVolumeAsync(_volume2.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
         }
 
+        [Fact]
+        public void Constructor_WithoutJournal_RequiresExplicitLegacyAllowance()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                new StoragePool(
+                    _metadataRepository,
+                    _tenantQuotaManager.Object,
+                    _directoryQuotaManager.Object,
+                    _tenantManager.Object,
+                    _fileScheduler.Object,
+                    _logger.Object));
+
+            Assert.Contains("legacy non-journal mode", ex.Message);
+        }
+
         public async Task DisposeAsync()
         {
             // Dispose repositories to release SQLite connections
@@ -549,7 +564,8 @@ namespace Locus.Storage.Tests
                 _tenantManager.Object,
                 _fileScheduler.Object,
                 _logger.Object,
-                projectionStore: projectionStore.Object);
+                projectionStore: projectionStore.Object,
+                allowLegacyNonJournalMode: true);
             await storagePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
 
             var location = await storagePool.GetFileLocationAsync(_tenant.Object, "projection-location", CancellationToken.None);
@@ -941,7 +957,8 @@ namespace Locus.Storage.Tests
                 directoryQuotaManager,
                 _tenantManager.Object,
                 failingScheduler.Object,
-                _logger.Object);
+                _logger.Object,
+                allowLegacyNonJournalMode: true);
 
             const string tenantId = "tenant-001";
             const string directoryPath = "/compensate";

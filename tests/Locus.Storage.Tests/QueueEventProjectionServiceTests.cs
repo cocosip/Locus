@@ -1363,7 +1363,8 @@ namespace Locus.Storage.Tests
                 new Mock<ILogger<StorageCleanupService>>().Object,
                 _metadataDirectory,
                 _quotaDirectory,
-                directoryQuotaManager: directoryQuotaManager);
+                directoryQuotaManager: directoryQuotaManager,
+                allowLegacyNonJournalMode: true);
         }
 
         private FileQueueEventJournal CreateJournal()

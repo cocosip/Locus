@@ -89,7 +89,8 @@ namespace Locus.Benchmarks
                 directoryQuotaManager.Object,
                 tenantManager.Object,
                 fileScheduler.Object,
-                NullLogger<StoragePool>.Instance);
+                NullLogger<StoragePool>.Instance,
+                allowLegacyNonJournalMode: true);
 
             var volume = new LocalFileSystemVolume(
                 _fileSystem,
@@ -206,7 +207,8 @@ namespace Locus.Benchmarks
                 directoryQuotaManager.Object,
                 tenantManager.Object,
                 fileScheduler.Object,
-                NullLogger<StoragePool>.Instance);
+                NullLogger<StoragePool>.Instance,
+                allowLegacyNonJournalMode: true);
 
             var volume = new LocalFileSystemVolume(
                 _fileSystem,

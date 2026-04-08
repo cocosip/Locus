@@ -232,7 +232,8 @@ namespace Locus.Benchmarks
                 new CleanupOptions
                 {
                     CleanupBatchSizePerTenant = 512
-                });
+                },
+                allowLegacyNonJournalMode: true);
 
             var volume = new Mock<IStorageVolume>();
             volume.Setup(v => v.VolumeId).Returns("vol-001");

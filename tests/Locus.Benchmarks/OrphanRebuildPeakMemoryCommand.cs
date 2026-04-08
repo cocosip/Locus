@@ -230,7 +230,8 @@ namespace Locus.Benchmarks
                 {
                     MaxOrphanFilesPerRun = options.MaxOrphanFilesPerRun,
                     OrphanRebuildLookupCacheSize = options.LookupCacheSize
-                });
+                },
+                allowLegacyNonJournalMode: true);
 
             var volume = new Mock<IStorageVolume>();
             volume.Setup(v => v.VolumeId).Returns("vol-001");

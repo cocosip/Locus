@@ -68,7 +68,7 @@ namespace Locus.Storage
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
             IQueueProjectionWriteStore? projectionWriteStore = null,
-            bool allowLegacyNonJournalMode = true)
+            bool allowLegacyNonJournalMode = false)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
@@ -100,7 +100,7 @@ namespace Locus.Storage
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
             IQueueProjectionWriteStore? projectionWriteStore = null,
-            bool allowLegacyNonJournalMode = true)
+            bool allowLegacyNonJournalMode = false)
         {
             if (metadataRepository == null)
                 throw new ArgumentNullException(nameof(metadataRepository));

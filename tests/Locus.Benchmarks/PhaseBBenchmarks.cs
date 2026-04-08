@@ -148,7 +148,8 @@ namespace Locus.Benchmarks
                 {
                     MaxOrphanFilesPerRun = int.MaxValue,
                     OrphanRebuildLookupCacheSize = 8192
-                });
+                },
+                allowLegacyNonJournalMode: true);
 
             var volume = new Mock<IStorageVolume>();
             volume.Setup(v => v.VolumeId).Returns("vol-001");
@@ -286,7 +287,8 @@ namespace Locus.Benchmarks
                 tenantManager.Object,
                 scheduler.Object,
                 NullLogger<StoragePool>.Instance,
-                CompletionGuardStripeCount);
+                CompletionGuardStripeCount,
+                allowLegacyNonJournalMode: true);
 
             _processingStartTime = DateTime.UtcNow;
             foreach (var fileKey in _fileKeys)
@@ -502,7 +504,8 @@ namespace Locus.Benchmarks
                 {
                     MaxOrphanFilesPerRun = maxOrphanFilesPerRun,
                     OrphanRebuildLookupCacheSize = 8192
-                });
+                },
+                allowLegacyNonJournalMode: true);
 
             var volume = new Mock<IStorageVolume>();
             volume.Setup(v => v.VolumeId).Returns("vol-001");

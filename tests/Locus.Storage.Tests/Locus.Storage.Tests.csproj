@@ -22,7 +22,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Locus.Storage\Locus.Storage.csproj" />
-    <ProjectReference Include="..\..\src\Locus.FileSystem\Locus.FileSystem.csproj" />
   </ItemGroup>
 
 </Project>

@@ -88,7 +88,7 @@ namespace Locus.Storage
             IQueueProjectionCleanupStore? projectionCleanupStore = null,
             IMetadataProjectionMaintenanceStore? metadataMaintenanceStore = null,
             IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null,
-            bool allowLegacyNonJournalMode = true)
+            bool allowLegacyNonJournalMode = false)
         {
             if (metadataRepository == null)
                 throw new ArgumentNullException(nameof(metadataRepository));
@@ -1335,14 +1335,24 @@ namespace Locus.Storage
                                 ct);
                             if (!metadataRemoved)
                             {
-                                blockedFileKeys.Add(metadata.FileKey);
-                                await RollbackPermanentlyFailedCleanupAsync(
-                                    metadata,
-                                    normalizedDirectoryPath,
-                                    metadataRemoved: false,
-                                    tenantQuotaDecremented,
-                                    directoryQuotaDecremented);
-                                continue;
+                                if (await WasMetadataRemovedConcurrentlyAsync(metadata, ct).ConfigureAwait(false))
+                                {
+                                    metadataRemoved = true;
+                                    _logger.LogDebug(
+                                        "Metadata for permanently-failed file {FileKey} was already removed concurrently after physical deletion",
+                                        metadata.FileKey);
+                                }
+                                else
+                                {
+                                    blockedFileKeys.Add(metadata.FileKey);
+                                    await RollbackPermanentlyFailedCleanupAsync(
+                                        metadata,
+                                        normalizedDirectoryPath,
+                                        metadataRemoved: false,
+                                        tenantQuotaDecremented,
+                                        directoryQuotaDecremented);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1395,7 +1405,12 @@ namespace Locus.Storage
                     metadata.CompletedAt!.Value,
                     ct);
                 if (!metadataRemoved)
+                {
+                    if (await WasMetadataRemovedConcurrentlyAsync(metadata, ct).ConfigureAwait(false))
+                        return;
+
                     throw new InvalidOperationException($"Failed to remove completed metadata for file {metadata.FileKey}.");
+                }
             }
             catch
             {
@@ -1407,6 +1422,12 @@ namespace Locus.Storage
                     directoryQuotaDecremented);
                 throw;
             }
+        }
+
+        private async Task<bool> WasMetadataRemovedConcurrentlyAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            var current = await _projectionStore.GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct).ConfigureAwait(false);
+            return current == null;
         }
 
         private static QueueEventRecord CreateDeleteSucceededEvent(FileMetadata metadata, DateTime deleteSucceededAtUtc)
