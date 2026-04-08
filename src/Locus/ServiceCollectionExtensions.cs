@@ -381,7 +381,7 @@ namespace Locus
             }
 
             // Register orphan file recovery service if enabled
-            if (options.EnableOrphanRecovery)
+            if (options.OrphanRecoveryOptions.Enabled)
             {
                 services.AddSingleton(options.OrphanRecoveryOptions);
                 services.AddHostedService<OrphanFileRecoveryService>();

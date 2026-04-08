@@ -177,7 +177,7 @@ namespace Locus
         /// <returns>The builder for chaining.</returns>
         public LocusBuilder EnableOrphanRecovery()
         {
-            _options.EnableOrphanRecovery = true;
+            _options.OrphanRecoveryOptions.Enabled = true;
             return this;
         }
 
@@ -187,7 +187,7 @@ namespace Locus
         /// <returns>The builder for chaining.</returns>
         public LocusBuilder DisableOrphanRecovery()
         {
-            _options.EnableOrphanRecovery = false;
+            _options.OrphanRecoveryOptions.Enabled = false;
             return this;
         }
 

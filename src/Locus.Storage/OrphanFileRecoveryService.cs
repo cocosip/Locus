@@ -88,6 +88,12 @@ namespace Locus.Storage
     public class OrphanRecoveryOptions
     {
         /// <summary>
+        /// Gets or sets a value indicating whether orphan file recovery is enabled.
+        /// Default: false.
+        /// </summary>
+        public bool Enabled { get; set; }
+
+        /// <summary>
         /// Gets or sets the interval between recovery scans.
         /// Default: 6 hours.
         /// </summary>
