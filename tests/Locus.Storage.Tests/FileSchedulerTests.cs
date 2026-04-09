@@ -1434,5 +1434,59 @@ namespace Locus.Storage.Tests
                 m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()),
                 Times.Exactly(2));
         }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_DoesNotDecrementQuotaForDeadLetteredRows()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "deadletter-orphan",
+                TenantId = "tenant-001",
+                PhysicalPath = Path.Combine(_metadataDir, "missing-deadlettered-file.dat"),
+                DirectoryPath = "/deadletter",
+                Status = FileProcessingStatus.DeadLettered,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "pending-orphan",
+                TenantId = "tenant-001",
+                PhysicalPath = Path.Combine(_metadataDir, "missing-pending-file.dat"),
+                DirectoryPath = "/deadletter",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", "/deadletter", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(2, removedCount);
+            Assert.Null(await _repository.GetAsync("tenant-001", "deadletter-orphan", CancellationToken.None));
+            Assert.Null(await _repository.GetAsync("tenant-001", "pending-orphan", CancellationToken.None));
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", "/deadletter", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
     }
 }

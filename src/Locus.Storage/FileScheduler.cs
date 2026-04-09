@@ -676,31 +676,34 @@ namespace Locus.Storage
                             continue;
                         }
 
-                        if (_tenantQuotaManager != null)
+                        if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
                         {
-                            try
+                            if (_tenantQuotaManager != null)
                             {
-                                await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default).ConfigureAwait(false);
+                                try
+                                {
+                                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to decrement tenant quota for orphaned file: {FileKey}", metadata.FileKey);
+                                }
                             }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex, "Failed to decrement tenant quota for orphaned file: {FileKey}", metadata.FileKey);
-                            }
-                        }
 
-                        if (_directoryQuotaManager != null)
-                        {
-                            try
+                            if (_directoryQuotaManager != null)
                             {
-                                var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
-                                await _directoryQuotaManager.DecrementFileCountAsync(
-                                    metadata.TenantId,
-                                    normalizedDirectoryPath,
-                                    default).ConfigureAwait(false);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex, "Failed to decrement directory quota for orphaned file: {FileKey}", metadata.FileKey);
+                                try
+                                {
+                                    var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+                                    await _directoryQuotaManager.DecrementFileCountAsync(
+                                        metadata.TenantId,
+                                        normalizedDirectoryPath,
+                                        default).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to decrement directory quota for orphaned file: {FileKey}", metadata.FileKey);
+                                }
                             }
                         }
 
