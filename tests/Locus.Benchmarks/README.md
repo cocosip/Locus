@@ -364,3 +364,52 @@ Run cold-start active-index loading benchmark:
 ```powershell
 dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.MetadataRepositoryColdStartBenchmarks*"
 ```
+
+## Architecture-Sensitive Benchmark Update (2026-04-09)
+
+The benchmark suite was refreshed after the queue/cleanup architecture changes introduced dead-letter
+disposition and made `DeadLettered` part of the active metadata lifecycle.
+
+### Benchmark adjustments
+
+- `CleanupLargeTenantBenchmarks` now seeds real permanently failed files on a mounted volume instead of
+  benchmarking the already-missing-file fallback path.
+- The cleanup benchmark now compares the current default `MoveToDeadLetter` path with the optional
+  `Delete` disposition so we can track the extra cost of preserving dead-letter artifacts.
+- `MetadataRepositoryColdStartBenchmarks` now includes `DeadLettered` rows in the 20,000-file startup
+  dataset and probes a dead-lettered record after load to keep the new state in the measured path.
+
+### Latest results
+
+Environment:
+- Ran on 2026-04-09 outside the sandbox.
+- BenchmarkDotNet v0.15.8, .NET 10.0.5, Windows 11 25H2.
+- Intel Core Ultra 9 185H, 22 logical cores / 16 physical cores.
+
+#### Cleanup Status Path
+
+| Scenario | Processing | PermanentlyFailed | Mean | StdDev | Allocated |
+|----------|-----------:|------------------:|-----:|-------:|----------:|
+| Move to dead letter | 1200 | 800 | 848.0 ms | 21.56 ms | 19.28 MB |
+| Delete permanently failed files | 1200 | 800 | 559.8 ms | 76.37 ms | 13.97 MB |
+
+Notes:
+- The current default `MoveToDeadLetter` path is about 51.5% slower than `Delete` in this synthetic run.
+- The additional cost comes from moving physical files and preserving metadata in `DeadLettered` state.
+
+#### Metadata Cold Start (includes `DeadLettered`)
+
+| Active files | Startup batch size | Mean | StdDev | Allocated |
+|-------------:|-------------------:|-----:|-------:|----------:|
+| 20000 | 512 | 114.6 ms | 22.38 ms | 29.94 MB |
+| 20000 | 2000 | 111.9 ms | 14.62 ms | 29.55 MB |
+
+Notes:
+- Including `DeadLettered` rows did not materially change the cold-start profile between the two tested
+  batch sizes.
+- `StartupLoadBatchSize=2000` was slightly faster and allocated slightly less memory in this run.
+
+### Raw reports
+
+- `BenchmarkDotNet.Artifacts/results/Locus.Benchmarks.CleanupLargeTenantBenchmarks-report-github.md`
+- `BenchmarkDotNet.Artifacts/results/Locus.Benchmarks.MetadataRepositoryColdStartBenchmarks-report-github.md`

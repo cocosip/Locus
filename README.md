@@ -410,6 +410,21 @@ Last updated: 2026-02-28 (BenchmarkDotNet v0.15.8, .NET 10.0.0, IterationCount=1
 - ✅ **100 KB write**: ~1.1 ms end-to-end (quota check + disk write + metadata)
 - ✅ **100-concurrent writes (1 MB)**: 229 ms total for 100 simultaneous writes, StdDev 5.2%
 
+#### Architecture-Sensitive Update (2026-04-09)
+
+The benchmark suite was updated after the cleanup lifecycle changed from delete-only handling to the
+default dead-letter disposition, and after `DeadLettered` became part of the active metadata lifecycle.
+
+| Benchmark | Parameters | Mean | StdDev | Allocated |
+|-----------|------------|-----:|-------:|----------:|
+| Cleanup status path (`MoveToDeadLetter`) | 1200 processing + 800 permanently failed | 848.0 ms | 21.56 ms | 19.28 MB |
+| Cleanup status path (`Delete`) | 1200 processing + 800 permanently failed | 559.8 ms | 76.37 ms | 13.97 MB |
+| Cold-start active-index load (`StartupLoadBatchSize=512`) | 20000 active rows, includes `DeadLettered` | 114.6 ms | 22.38 ms | 29.94 MB |
+| Cold-start active-index load (`StartupLoadBatchSize=2000`) | 20000 active rows, includes `DeadLettered` | 111.9 ms | 14.62 ms | 29.55 MB |
+
+These numbers were collected on 2026-04-09 with BenchmarkDotNet v0.15.8, .NET 10.0.5, Windows 11 25H2,
+on an Intel Core Ultra 9 185H host, and the runs were executed outside the sandbox as requested.
+
 ### Running Benchmarks
 
 ```bash

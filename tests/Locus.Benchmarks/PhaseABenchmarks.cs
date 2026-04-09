@@ -177,6 +177,7 @@ namespace Locus.Benchmarks
         private DirectoryQuotaRepository _quotaRepository = null!;
         private StorageCleanupService _cleanupService = null!;
         private string _rootDirectory = string.Empty;
+        private string _volumeDirectory = string.Empty;
         private readonly string _tenantId = "phasea-cleanup-large";
 
         [Params(1200)]
@@ -185,11 +186,15 @@ namespace Locus.Benchmarks
         [Params(800)]
         public int PermanentlyFailedFileCount;
 
+        [Params(PermanentlyFailedDisposition.MoveToDeadLetter, PermanentlyFailedDisposition.Delete)]
+        public PermanentlyFailedDisposition FailedDisposition;
+
         [GlobalSetup]
         public void Setup()
         {
             _fileSystem = new System.IO.Abstractions.FileSystem();
             _rootDirectory = Path.Combine(Path.GetTempPath(), $"locus-bench-cleanup-{Guid.NewGuid():N}");
+            _volumeDirectory = Path.Combine(_rootDirectory, "volume");
             _fileSystem.Directory.CreateDirectory(_rootDirectory);
         }
 
@@ -205,8 +210,11 @@ namespace Locus.Benchmarks
                 _fileSystem.Directory.Delete(metadataPath, recursive: true);
             if (_fileSystem.Directory.Exists(quotaPath))
                 _fileSystem.Directory.Delete(quotaPath, recursive: true);
+            if (_fileSystem.Directory.Exists(_volumeDirectory))
+                _fileSystem.Directory.Delete(_volumeDirectory, recursive: true);
             _fileSystem.Directory.CreateDirectory(metadataPath);
             _fileSystem.Directory.CreateDirectory(quotaPath);
+            _fileSystem.Directory.CreateDirectory(_volumeDirectory);
 
             _metadataRepository = new MetadataRepository(
                 _fileSystem,
@@ -231,27 +239,40 @@ namespace Locus.Benchmarks
                 quotaPath,
                 new CleanupOptions
                 {
-                    CleanupBatchSizePerTenant = 512
+                    CleanupBatchSizePerTenant = 512,
+                    PermanentlyFailedDisposition = FailedDisposition
                 },
                 allowLegacyNonJournalMode: true);
 
             var volume = new Mock<IStorageVolume>();
             volume.Setup(v => v.VolumeId).Returns("vol-001");
-            volume.Setup(v => v.MountPath).Returns(Path.Combine(_rootDirectory, "volume"));
+            volume.Setup(v => v.MountPath).Returns(_volumeDirectory);
             volume.Setup(v => v.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .Returns(Task.CompletedTask);
+                .Returns<string, CancellationToken>((path, _) =>
+                {
+                    if (_fileSystem.File.Exists(path))
+                        _fileSystem.File.Delete(path);
+
+                    return Task.CompletedTask;
+                });
             _cleanupService.RegisterVolume(volume.Object);
 
             var now = DateTime.UtcNow;
+            var processingDirectory = Path.Combine(_volumeDirectory, _tenantId, "processing");
+            var failedDirectory = Path.Combine(_volumeDirectory, _tenantId, "failed");
+            _fileSystem.Directory.CreateDirectory(processingDirectory);
+            _fileSystem.Directory.CreateDirectory(failedDirectory);
+
             for (int i = 0; i < ProcessingFileCount; i++)
             {
+                var filePath = Path.Combine(processingDirectory, $"processing-{i}.dcm");
                 _metadataRepository.AddOrUpdateAsync(new FileMetadata
                 {
                     FileKey = $"processing-{i}",
                     TenantId = _tenantId,
                     VolumeId = "vol-001",
-                    PhysicalPath = $"/bench/processing-{i}.dat",
-                    DirectoryPath = "/processing",
+                    PhysicalPath = filePath,
+                    DirectoryPath = processingDirectory,
                     FileSize = 1024,
                     Status = FileProcessingStatus.Processing,
                     ProcessingStartTime = now.AddMinutes(-30),
@@ -261,17 +282,22 @@ namespace Locus.Benchmarks
 
             for (int i = 0; i < PermanentlyFailedFileCount; i++)
             {
+                var fileKey = $"failed-{i}";
+                var filePath = Path.Combine(failedDirectory, $"{fileKey}.dcm");
+                _fileSystem.File.WriteAllText(filePath, "benchmark");
                 _metadataRepository.AddOrUpdateAsync(new FileMetadata
                 {
-                    FileKey = $"failed-{i}",
+                    FileKey = fileKey,
                     TenantId = _tenantId,
                     VolumeId = "vol-001",
-                    PhysicalPath = $"/bench/failed-{i}.dat",
-                    DirectoryPath = "/failed",
+                    PhysicalPath = filePath,
+                    DirectoryPath = failedDirectory,
                     FileSize = 1024,
                     Status = FileProcessingStatus.PermanentlyFailed,
                     LastFailedAt = now.AddDays(-14),
-                    CreatedAt = now.AddDays(-30)
+                    CreatedAt = now.AddDays(-30),
+                    OriginalFileName = $"{fileKey}.dcm",
+                    FileExtension = ".dcm"
                 }, CancellationToken.None).GetAwaiter().GetResult();
             }
         }
