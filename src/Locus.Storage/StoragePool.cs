@@ -386,23 +386,36 @@ namespace Locus.Storage
                 var physicalWriteSucceeded = fileWritten;
                 var rollbackQuota = !physicalWriteSucceeded;
 
-                if (physicalWriteSucceeded && !acceptanceCompleted && physicalPath != null)
+                if (!acceptanceCompleted && physicalPath != null)
                 {
                     try
                     {
                         await DeleteWrittenFileAsync(volume, physicalPath).ConfigureAwait(false);
                         rollbackQuota = true;
                         fileWritten = false;
-                        _logger.LogWarning(
-                            "Deleted physical file after queue journal append failed: Tenant={TenantId}, Path={PhysicalPath}",
-                            tenant.TenantId,
-                            physicalPath);
+                        if (physicalWriteSucceeded)
+                        {
+                            _logger.LogWarning(
+                                "Deleted physical file after queue journal append failed: Tenant={TenantId}, Path={PhysicalPath}",
+                                tenant.TenantId,
+                                physicalPath);
+                        }
+                        else
+                        {
+                            _logger.LogWarning(
+                                "Deleted residual physical file after write failure: Tenant={TenantId}, Path={PhysicalPath}",
+                                tenant.TenantId,
+                                physicalPath);
+                        }
                     }
                     catch (Exception cleanupEx)
                     {
+                        rollbackQuota = false;
                         _logger.LogError(
                             cleanupEx,
-                            "Failed to delete physical file after queue journal append failure: Tenant={TenantId}, Path={PhysicalPath}",
+                            physicalWriteSucceeded
+                                ? "Failed to delete physical file after queue journal append failure: Tenant={TenantId}, Path={PhysicalPath}"
+                                : "Failed to delete residual physical file after write failure: Tenant={TenantId}, Path={PhysicalPath}",
                             tenant.TenantId,
                             physicalPath);
                     }
@@ -581,7 +594,15 @@ namespace Locus.Storage
             if (location != null && ShouldAppendQueueEventsInStoragePool())
             {
                 EnsureLease(location);
-                await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
+                try
+                {
+                    await AppendQueueEventAsync(CreateProcessingStartedEvent(location), ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await RollbackFallbackProcessingStartAsync(tenant.TenantId, location.FileKey).ConfigureAwait(false);
+                    throw;
+                }
             }
 
             return location;
@@ -604,12 +625,23 @@ namespace Locus.Storage
 
             // Delegate to file scheduler
             var locations = (await _fileScheduler.GetNextBatchForProcessingAsync(tenant, batchSize, ct)).ToList();
-            if (ShouldAppendQueueEventsInStoragePool())
+            if (locations.Count > 0 && ShouldAppendQueueEventsInStoragePool())
             {
                 foreach (var location in locations)
-                {
                     EnsureLease(location);
-                    await TryAppendQueueEventAsync(CreateProcessingStartedEvent(location)).ConfigureAwait(false);
+
+                try
+                {
+                    await AppendQueueEventsAsync(
+                        locations.Select(CreateProcessingStartedEvent).ToArray(),
+                        ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await RollbackFallbackProcessingStartBatchAsync(
+                        tenant.TenantId,
+                        locations.Select(location => location.FileKey)).ConfigureAwait(false);
+                    throw;
                 }
             }
 
@@ -655,8 +687,21 @@ namespace Locus.Storage
                 if (completed == null)
                     return;
 
-                await TryAppendQueueEventAsync(CreateProcessingCompletedEvent(completed, lease.ProcessingStartTimeUtc)).ConfigureAwait(false);
-                await TryAppendQueueEventAsync(CreateDeleteRequestedEvent(completed)).ConfigureAwait(false);
+                try
+                {
+                    await AppendQueueEventsAsync(
+                        new[]
+                        {
+                            CreateProcessingCompletedEvent(completed, lease.ProcessingStartTimeUtc),
+                            CreateDeleteRequestedEvent(completed),
+                        },
+                        ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await RestoreProjectedMetadataAsync(metadata).ConfigureAwait(false);
+                    throw;
+                }
             }
             finally
             {
@@ -669,6 +714,10 @@ namespace Locus.Storage
         {
             ValidateLease(lease);
 
+            var previousMetadata = ShouldAppendQueueEventsInStoragePool()
+                ? await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false)
+                : null;
+
             // Delegate to file scheduler
             await _fileScheduler.MarkAsFailedAsync(lease, errorMessage, ct);
 
@@ -676,7 +725,21 @@ namespace Locus.Storage
             {
                 var updated = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
                 if (updated != null)
-                    await TryAppendQueueEventAsync(CreateProcessingFailedEvent(updated, errorMessage, lease.ProcessingStartTimeUtc)).ConfigureAwait(false);
+                {
+                    try
+                    {
+                        await AppendQueueEventAsync(
+                            CreateProcessingFailedEvent(updated, errorMessage, lease.ProcessingStartTimeUtc),
+                            ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        if (previousMetadata != null)
+                            await RestoreProjectedMetadataAsync(previousMetadata).ConfigureAwait(false);
+
+                        throw;
+                    }
+                }
             }
         }
 
@@ -1002,23 +1065,85 @@ namespace Locus.Storage
                 "StoragePool is running without IQueueEventJournal. This legacy non-journal mode should only be used for explicit compatibility or tests.");
         }
 
-        private async Task TryAppendQueueEventAsync(QueueEventRecord record)
+        private async Task AppendQueueEventAsync(QueueEventRecord record, CancellationToken ct)
         {
             if (_queueEventJournal == null)
                 return;
 
+            await _queueEventJournal.AppendAsync(record, ct).ConfigureAwait(false);
+        }
+
+        private async Task AppendQueueEventsAsync(IReadOnlyList<QueueEventRecord> records, CancellationToken ct)
+        {
+            if (_queueEventJournal == null || records.Count == 0)
+                return;
+
+            await _queueEventJournal.AppendBatchAsync(records, ct).ConfigureAwait(false);
+        }
+
+        private async Task RollbackFallbackProcessingStartAsync(string tenantId, string fileKey)
+        {
             try
             {
-                await _queueEventJournal.AppendAsync(record, default).ConfigureAwait(false);
+                await _fileScheduler.ResetProcessingStatusAsync(tenantId, fileKey, default).ConfigureAwait(false);
             }
-            catch (Exception ex)
+            catch (Exception rollbackEx)
             {
                 _logger.LogError(
-                    ex,
-                    "Failed to append queue event {EventType} for tenant {TenantId}, file {FileKey}",
-                    record.EventType,
-                    record.TenantId,
-                    record.FileKey);
+                    rollbackEx,
+                    "Failed to rollback processing lease after queue journal append failure: Tenant={TenantId}, FileKey={FileKey}",
+                    tenantId,
+                    fileKey);
+                throw new InvalidOperationException(
+                    $"Failed to rollback processing lease after queue journal append failure for file {fileKey}.",
+                    rollbackEx);
+            }
+        }
+
+        private async Task RollbackFallbackProcessingStartBatchAsync(string tenantId, IEnumerable<string> fileKeys)
+        {
+            Exception? rollbackFailure = null;
+            foreach (var fileKey in fileKeys.Distinct(StringComparer.Ordinal))
+            {
+                try
+                {
+                    await _fileScheduler.ResetProcessingStatusAsync(tenantId, fileKey, default).ConfigureAwait(false);
+                }
+                catch (Exception rollbackEx)
+                {
+                    rollbackFailure ??= rollbackEx;
+                    _logger.LogError(
+                        rollbackEx,
+                        "Failed to rollback processing lease after batch queue journal append failure: Tenant={TenantId}, FileKey={FileKey}",
+                        tenantId,
+                        fileKey);
+                }
+            }
+
+            if (rollbackFailure != null)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to rollback one or more processing leases after queue journal append failure for tenant {tenantId}.",
+                    rollbackFailure);
+            }
+        }
+
+        private async Task RestoreProjectedMetadataAsync(FileMetadata metadata)
+        {
+            try
+            {
+                await _projectionWriteStore.QueueProjectedFileAsync(metadata.Clone(), default).ConfigureAwait(false);
+            }
+            catch (Exception rollbackEx)
+            {
+                _logger.LogError(
+                    rollbackEx,
+                    "Failed to restore projected metadata after queue journal append failure: Tenant={TenantId}, FileKey={FileKey}",
+                    metadata.TenantId,
+                    metadata.FileKey);
+                throw new InvalidOperationException(
+                    $"Failed to restore projected metadata after queue journal append failure for file {metadata.FileKey}.",
+                    rollbackEx);
             }
         }
 

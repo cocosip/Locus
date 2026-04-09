@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.IO.Abstractions.TestingHelpers;
@@ -111,6 +112,9 @@ namespace Locus.Storage.Tests
             _queueEventJournal = new Mock<IQueueEventJournal>();
             _queueEventJournal
                 .Setup(m => m.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            _queueEventJournal
+                .Setup(m => m.AppendBatchAsync(It.IsAny<IReadOnlyList<QueueEventRecord>>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
 
             // Setup storage pool
@@ -792,6 +796,82 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task WriteFileAsync_CleansUpResidualFileWhenWriteThrowsAfterCreatingTarget()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>();
+            tenantQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            tenantQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            directoryQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var fileScheduler = new Mock<IFileScheduler>();
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                tenantQuotaManager.Object,
+                directoryQuotaManager.Object,
+                _tenantManager.Object,
+                fileScheduler.Object,
+                _logger.Object,
+                allowLegacyNonJournalMode: true);
+
+            var residualPath = Path.Combine(_volume1Path, "tenant-001", "partial.bin");
+            var failingVolume = new Mock<IStorageVolume>();
+            failingVolume.Setup(v => v.VolumeId).Returns("vol-partial");
+            failingVolume.Setup(v => v.MountPath).Returns(_volume1Path);
+            failingVolume.Setup(v => v.TotalCapacity).Returns(1_000_000L);
+            failingVolume.Setup(v => v.AvailableSpace).Returns(500_000L);
+            failingVolume.Setup(v => v.IsHealthy).Returns(true);
+            failingVolume.Setup(v => v.BuildPhysicalPath(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>()))
+                .Returns(residualPath);
+            failingVolume.Setup(v => v.WriteAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+                .Returns((string path, Stream content, CancellationToken _) =>
+                {
+                    var directory = Path.GetDirectoryName(path);
+                    if (!string.IsNullOrEmpty(directory) && !_fileSystem.Directory.Exists(directory))
+                        _fileSystem.Directory.CreateDirectory(directory);
+
+                    using (var stream = _fileSystem.File.Create(path))
+                    {
+                        var buffer = new byte[4];
+                        var bytesRead = content.Read(buffer, 0, buffer.Length);
+                        if (bytesRead > 0)
+                            stream.Write(buffer, 0, bytesRead);
+                    }
+
+                    throw new IOException("partial write");
+                });
+            failingVolume.Setup(v => v.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns((string path, CancellationToken _) =>
+                {
+                    if (_fileSystem.File.Exists(path))
+                        _fileSystem.File.Delete(path);
+
+                    return Task.CompletedTask;
+                });
+
+            await storagePool.AddVolumeAsync(failingVolume.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+
+            using var content = new NonSeekableReadStream(Encoding.UTF8.GetBytes("partial-write-content"));
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                storagePool.WriteFileAsync(_tenant.Object, content, "partial.bin", CancellationToken.None));
+
+            Assert.False(_fileSystem.File.Exists(residualPath));
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task WriteFileAsync_SeekableStreamRetriesAnotherHealthyVolumeAfterWriteFailure()
         {
             _volume2
@@ -1159,25 +1239,55 @@ namespace Locus.Storage.Tests
             await _storagePool.MarkAsCompletedAsync(CreateLease("tenant-001", fileKey, processingStart), CancellationToken.None);
 
             _queueEventJournal.Verify(
-                m => m.AppendAsync(
-                    It.Is<QueueEventRecord>(record =>
-                        record.EventType == QueueEventType.ProcessingCompleted
-                        && record.TenantId == "tenant-001"
-                        && record.FileKey == fileKey
-                        && record.Status == FileProcessingStatus.Completed
-                        && record.ProcessingStartTimeUtc == processingStart
-                        && record.FileExtension == ".dcm"),
+                m => m.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.ProcessingCompleted
+                        && records[0].TenantId == "tenant-001"
+                        && records[0].FileKey == fileKey
+                        && records[0].Status == FileProcessingStatus.Completed
+                        && records[0].ProcessingStartTimeUtc == processingStart
+                        && records[0].FileExtension == ".dcm"
+                        && records[1].EventType == QueueEventType.DeleteRequested
+                        && records[1].TenantId == "tenant-001"
+                        && records[1].FileKey == fileKey
+                        && records[1].Status == FileProcessingStatus.DeleteRequested),
                     It.IsAny<CancellationToken>()),
                 Times.Once);
+        }
 
-            _queueEventJournal.Verify(
-                m => m.AppendAsync(
-                    It.Is<QueueEventRecord>(record =>
-                        record.EventType == QueueEventType.DeleteRequested
-                        && record.TenantId == "tenant-001"
-                        && record.FileKey == fileKey
-                        && record.Status == FileProcessingStatus.DeleteRequested),
-                    It.IsAny<CancellationToken>()),
+        [Fact]
+        public async Task GetNextFileForProcessingAsync_WhenFallbackJournalAppendFails_ResetsProcessingStateAndThrows()
+        {
+            var processingStart = DateTime.UtcNow;
+            var location = new FileLocation
+            {
+                FileKey = "processing-start",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "processing-start.dcm"),
+                DirectoryPath = "/projection",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
+            };
+
+            _fileScheduler
+                .Setup(s => s.GetNextFileForProcessingAsync(_tenant.Object, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(location);
+            _fileScheduler
+                .Setup(s => s.ResetProcessingStatusAsync("tenant-001", "processing-start", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            _queueEventJournal
+                .Setup(m => m.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("journal unavailable"));
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                _storagePool.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None));
+
+            _fileScheduler.Verify(
+                s => s.ResetProcessingStatusAsync("tenant-001", "processing-start", It.IsAny<CancellationToken>()),
                 Times.Once);
         }
 
@@ -1240,22 +1350,65 @@ namespace Locus.Storage.Tests
                 CancellationToken.None);
 
             _queueEventJournal.Verify(
-                m => m.AppendAsync(
-                    It.Is<QueueEventRecord>(record =>
-                        record.EventType == QueueEventType.ProcessingCompleted
-                        && record.FileKey == "projection-complete"
-                        && record.DirectoryPath == "/projection"),
-                    It.IsAny<CancellationToken>()),
-                Times.Once);
-            _queueEventJournal.Verify(
-                m => m.AppendAsync(
-                    It.Is<QueueEventRecord>(record =>
-                        record.EventType == QueueEventType.DeleteRequested
-                        && record.FileKey == "projection-complete"
-                        && record.DirectoryPath == "/projection"),
+                m => m.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.ProcessingCompleted
+                        && records[0].FileKey == "projection-complete"
+                        && records[0].DirectoryPath == "/projection"
+                        && records[1].EventType == QueueEventType.DeleteRequested
+                        && records[1].FileKey == "projection-complete"
+                        && records[1].DirectoryPath == "/projection"),
                     It.IsAny<CancellationToken>()),
                 Times.Once);
             projectionStore.VerifyAll();
+        }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_WhenFallbackJournalAppendFails_RestoresProcessingProjectionAndThrows()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("complete-rollback"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, "rollback.dcm", CancellationToken.None);
+            var processingStart = DateTime.UtcNow;
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            metadata.CompletedAt = null;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetAsync("tenant-001", fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Completed;
+                    current.ProcessingStartTime = null;
+                    current.CompletedAt = DateTime.UtcNow;
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                });
+
+            _queueEventJournal
+                .Setup(m => m.AppendBatchAsync(It.IsAny<IReadOnlyList<QueueEventRecord>>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("journal unavailable"));
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                _storagePool.MarkAsCompletedAsync(
+                    CreateLease("tenant-001", fileKey, processingStart),
+                    CancellationToken.None));
+
+            var restored = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(restored);
+            Assert.Equal(FileProcessingStatus.Processing, restored!.Status);
+            Assert.Equal(processingStart, restored.ProcessingStartTime);
+            Assert.Null(restored.CompletedAt);
         }
 
         [Fact]
