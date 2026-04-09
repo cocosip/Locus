@@ -1454,6 +1454,90 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RecoverOrphanedFilesAsync_WithMultipleVolumes_LoadsKnownPhysicalPathsOncePerTenant()
+        {
+            var secondVolumePath = Path.Combine(Path.GetTempPath(), $"locus-test-cleanup-vol-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(secondVolumePath);
+
+            try
+            {
+                var secondVolume = new Mock<IStorageVolume>();
+                secondVolume.Setup(v => v.VolumeId).Returns("vol-002");
+                secondVolume.Setup(v => v.MountPath).Returns(secondVolumePath);
+                secondVolume
+                    .Setup(v => v.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                    .Returns(Task.CompletedTask);
+
+                var knownPath = Path.Combine(_volumePath, "tenant-001", "known-in-volume-one.dat");
+                _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(knownPath)!);
+                _fileSystem.File.WriteAllText(knownPath, "known");
+
+                var orphanPath = Path.Combine(secondVolumePath, "tenant-001", "rebuild-me.dat");
+                _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(orphanPath)!);
+                _fileSystem.File.WriteAllText(orphanPath, "orphan");
+
+                var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+                FileMetadata? capturedMetadata = null;
+                projectionStore
+                    .Setup(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new[]
+                    {
+                        new FileMetadata
+                        {
+                            FileKey = "known-in-volume-one",
+                            TenantId = "tenant-001",
+                            VolumeId = "vol-001",
+                            PhysicalPath = knownPath,
+                            DirectoryPath = "/",
+                            Status = FileProcessingStatus.Pending,
+                            CreatedAt = DateTime.UtcNow
+                        }
+                    });
+                projectionStore
+                    .Setup(store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+                    .Callback<FileMetadata, CancellationToken>((metadata, _) => capturedMetadata = metadata)
+                    .Returns(Task.CompletedTask);
+
+                var cleanupService = new StorageCleanupService(
+                    _metadataRepository,
+                    _quotaRepository,
+                    _tenantQuotaManager,
+                    _fileSystem,
+                    _logger.Object,
+                    _metadataDir,
+                    _quotaDir,
+                    tenantManager: _tenantManager.Object,
+                    directoryQuotaManager: _directoryQuotaManager,
+                    projectionStore: projectionStore.Object,
+                    allowLegacyNonJournalMode: true);
+                cleanupService.RegisterVolume(_volume.Object);
+                cleanupService.RegisterVolume(secondVolume.Object);
+
+                await cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+                Assert.NotNull(capturedMetadata);
+                Assert.Equal("tenant-001", capturedMetadata!.TenantId);
+                Assert.Equal("vol-002", capturedMetadata.VolumeId);
+                Assert.Equal(orphanPath, capturedMetadata.PhysicalPath);
+                Assert.Equal("rebuild-me", capturedMetadata.FileKey);
+                projectionStore.Verify(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()), Times.Once);
+                projectionStore.Verify(store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()), Times.Once);
+            }
+            finally
+            {
+                try
+                {
+                    if (_fileSystem.Directory.Exists(secondVolumePath))
+                        _fileSystem.Directory.Delete(secondVolumePath, recursive: true);
+                }
+                catch
+                {
+                    // Ignore cleanup errors in tests.
+                }
+            }
+        }
+
+        [Fact]
         public async Task CleanupPermanentlyFailedFilesAsync_SkipsBlockedBatchAndContinuesToLaterRecords()
         {
             var cleanupService = new StorageCleanupService(

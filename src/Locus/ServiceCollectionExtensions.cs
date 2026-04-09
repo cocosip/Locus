@@ -433,25 +433,6 @@ namespace Locus
             VolumeConfiguration config,
             IFileSystem fileSystem,
             IServiceProvider serviceProvider)
-        {
-            switch (config.VolumeType.ToLowerInvariant())
-            {
-                case "localfilesystem":
-                case "local":
-                    var logger = serviceProvider.GetRequiredService<ILogger<LocalFileSystemVolume>>();
-                    return new LocalFileSystemVolume(
-                        fileSystem,
-                        logger,
-                        config.VolumeId,
-                        config.MountPath,
-                        config.ShardingDepth,
-                        writeBufferSize: config.WriteBufferSize,
-                        copyBufferSize: config.CopyBufferSize,
-                        forceFlushAfterWrite: config.ForceFlushAfterWrite);
-
-                default:
-                    throw new NotSupportedException($"Volume type '{config.VolumeType}' is not supported");
-            }
-        }
+            => StorageVolumeFactory.CreateVolume(config, fileSystem, serviceProvider);
     }
 }

@@ -10,7 +10,7 @@ namespace Locus.Storage
     /// <summary>
     /// Adapts <see cref="MetadataRepository"/> to the scheduler-facing projection store contract.
     /// </summary>
-    public sealed class MetadataRepositoryQueueProjectionStore : IQueueProjectionStore
+    public sealed class MetadataRepositoryQueueProjectionStore : IQueueProjectionStore, IProjectionSnapshotSource
     {
         private readonly MetadataRepository _repository;
 
@@ -100,6 +100,11 @@ namespace Locus.Storage
         public async Task<IReadOnlyList<FileMetadata>> GetProjectedFilesAsync(string tenantId, CancellationToken ct = default)
         {
             return (await _repository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).ToList();
+        }
+
+        IReadOnlyList<FileMetadata> IProjectionSnapshotSource.CaptureProjectedFilesSnapshot(string tenantId)
+        {
+            return _repository.SnapshotTenantMetadataRaw(tenantId);
         }
     }
 }

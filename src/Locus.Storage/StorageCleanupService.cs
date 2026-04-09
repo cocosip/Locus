@@ -309,6 +309,8 @@ namespace Locus.Storage
             _logger.LogInformation("Starting orphaned file metadata rebuild for tenant: {TenantId}", tenant.TenantId);
 
             var rebuiltCount = 0;
+            HashSet<string>? knownPhysicalPaths = null;
+            Dictionary<string, bool>? existenceCache = null;
 
             foreach (var volume in _volumes.Values)
             {
@@ -318,10 +320,11 @@ namespace Locus.Storage
 
                 var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
                 var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
-                var knownPhysicalPaths = await BuildKnownPhysicalPathSetAsync(tenant.TenantId, ct).ConfigureAwait(false);
-                var existenceCache = _orphanRebuildLookupCacheSize > 0
-                    ? new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer)
-                    : null;
+                if (knownPhysicalPaths == null)
+                    knownPhysicalPaths = await BuildKnownPhysicalPathSetAsync(tenant.TenantId, ct).ConfigureAwait(false);
+
+                if (existenceCache == null && _orphanRebuildLookupCacheSize > 0)
+                    existenceCache = new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer);
 
                 await scanLock.WaitAsync(ct);
                 try
@@ -343,17 +346,22 @@ namespace Locus.Storage
                         try
                         {
                             var directoryScanState = GetOrphanDirectoryScanState(scanKey, directory);
-                            var resumeAfterPath = directoryScanState.ResumeAfterPath;
-                            var directoryFullyScanned = true;
-
-                            var fileEntries = directoryScanState.SortedEntries ?? EnumerateSortedOrphanScanEntries(directory);
-                            directoryScanState.SortedEntries = fileEntries;
-                            var resumeIndex = FindOrphanScanStartIndex(fileEntries, resumeAfterPath);
-
-                            for (var fileIndex = resumeIndex; fileIndex < fileEntries.Count; fileIndex++)
+                            var remainingBudget = _maxOrphanFilesPerRun - scannedThisRun;
+                            if (remainingBudget <= 0)
                             {
-                                var fileEntry = fileEntries[fileIndex];
+                                scanQueue.Enqueue(directory);
+                                budgetReached = true;
+                                break;
+                            }
 
+                            var fileBatch = EnumerateOrphanScanBatch(
+                                directory,
+                                directoryScanState.ResumeAfterPath,
+                                remainingBudget);
+                            var directoryFullyScanned = !fileBatch.HasMore;
+
+                            foreach (var fileEntry in fileBatch.Entries)
+                            {
                                 ct.ThrowIfCancellationRequested();
                                 scannedThisRun++;
 
@@ -464,6 +472,12 @@ namespace Locus.Storage
                                     budgetReached = true;
                                     break;
                                 }
+                            }
+
+                            if (!budgetReached && fileBatch.HasMore)
+                            {
+                                directoryFullyScanned = false;
+                                scanQueue.Enqueue(directory);
                             }
 
                             if (directoryFullyScanned)
@@ -638,7 +652,6 @@ namespace Locus.Storage
         private sealed class OrphanDirectoryScanState
         {
             public string? ResumeAfterPath { get; set; }
-            public List<OrphanFileScanEntry>? SortedEntries { get; set; }
         }
 
         /// <summary>
@@ -2176,46 +2189,33 @@ namespace Locus.Storage
                 .ToArray();
         }
 
-        private List<OrphanFileScanEntry> EnumerateSortedOrphanScanEntries(string directory)
+        private OrphanScanBatch EnumerateOrphanScanBatch(string directory, string? resumeAfterPath, int maxEntries)
         {
-            var entries = new List<OrphanFileScanEntry>();
+            if (maxEntries <= 0)
+                return new OrphanScanBatch(Array.Empty<OrphanFileScanEntry>(), hasMore: true);
+
+            var entries = new List<OrphanFileScanEntry>(maxEntries + 1);
 
             foreach (var physicalPath in _fileSystem.Directory.EnumerateFiles(directory))
             {
-                entries.Add(new OrphanFileScanEntry(
-                    physicalPath,
-                    NormalizePath(physicalPath) ?? physicalPath));
+                var normalizedPath = NormalizePath(physicalPath) ?? physicalPath;
+                if (!string.IsNullOrWhiteSpace(resumeAfterPath)
+                    && _pathComparer.Compare(normalizedPath, resumeAfterPath) <= 0)
+                {
+                    continue;
+                }
+
+                entries.Add(new OrphanFileScanEntry(physicalPath, normalizedPath));
+                entries.Sort((left, right) => _pathComparer.Compare(left.NormalizedPath, right.NormalizedPath));
+                if (entries.Count > maxEntries + 1)
+                    entries.RemoveAt(entries.Count - 1);
             }
 
-            entries.Sort((left, right) => _pathComparer.Compare(left.NormalizedPath, right.NormalizedPath));
+            var hasMore = entries.Count > maxEntries;
+            if (hasMore)
+                entries.RemoveAt(entries.Count - 1);
 
-            return entries;
-        }
-
-        private int FindOrphanScanStartIndex(IReadOnlyList<OrphanFileScanEntry> entries, string? resumeAfterPath)
-        {
-            if (string.IsNullOrWhiteSpace(resumeAfterPath) || entries.Count == 0)
-                return 0;
-
-            var low = 0;
-            var high = entries.Count;
-
-            while (low < high)
-            {
-                var mid = low + ((high - low) / 2);
-                var comparison = _pathComparer.Compare(entries[mid].NormalizedPath, resumeAfterPath);
-
-                if (comparison <= 0)
-                {
-                    low = mid + 1;
-                }
-                else
-                {
-                    high = mid;
-                }
-            }
-
-            return low;
+            return new OrphanScanBatch(entries, hasMore);
         }
 
         private async Task<HashSet<string>> BuildKnownPhysicalPathSetAsync(string tenantId, CancellationToken ct)
@@ -2256,6 +2256,19 @@ namespace Locus.Storage
             public string PhysicalPath { get; }
 
             public string NormalizedPath { get; }
+        }
+
+        private readonly struct OrphanScanBatch
+        {
+            public OrphanScanBatch(IReadOnlyList<OrphanFileScanEntry> entries, bool hasMore)
+            {
+                Entries = entries;
+                HasMore = hasMore;
+            }
+
+            public IReadOnlyList<OrphanFileScanEntry> Entries { get; }
+
+            public bool HasMore { get; }
         }
     }
 }

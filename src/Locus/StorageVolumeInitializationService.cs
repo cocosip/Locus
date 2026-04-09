@@ -1,10 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.IO.Abstractions;
 using System.Threading;
 using System.Threading.Tasks;
-using Locus.Core.Abstractions;
-using Locus.FileSystem;
 using Locus.Storage;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -46,24 +45,11 @@ namespace Locus
         {
             _logger.LogInformation("Mounting {Count} storage volume(s)...", _volumeConfigs.Count);
 
-            foreach (var config in _volumeConfigs)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
+            var mountTasks = _volumeConfigs
+                .Select(config => MountVolumeAsync(config, cancellationToken))
+                .ToArray();
 
-                // Create the volume once and share it between pool and cleanup service.
-                var volume = CreateVolume(config);
-                try
-                {
-                    await _pool.AddVolumeAsync(volume, config.InitialDelayMs, config.HealthCheckDelayMs, cancellationToken);
-                    _cleanupService.RegisterVolume(volume);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to mount volume {VolumeId} at {MountPath}",
-                        config.VolumeId, config.MountPath);
-                    throw;
-                }
-            }
+            await Task.WhenAll(mountTasks).ConfigureAwait(false);
 
             _logger.LogInformation("All {Count} storage volume(s) mounted successfully.", _volumeConfigs.Count);
         }
@@ -71,23 +57,25 @@ namespace Locus
         /// <inheritdoc/>
         public Task StopAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
-        private IStorageVolume CreateVolume(VolumeConfiguration config)
+        private async Task MountVolumeAsync(VolumeConfiguration config, CancellationToken cancellationToken)
         {
-            switch (config.VolumeType.ToLowerInvariant())
-            {
-                case "localfilesystem":
-                case "local":
-                    var logger = (ILogger<LocalFileSystemVolume>)_serviceProvider.GetService(
-                        typeof(ILogger<LocalFileSystemVolume>));
-                    return new LocalFileSystemVolume(
-                        _fileSystem,
-                        logger,
-                        config.VolumeId,
-                        config.MountPath,
-                        config.ShardingDepth);
+            cancellationToken.ThrowIfCancellationRequested();
 
-                default:
-                    throw new NotSupportedException($"Volume type '{config.VolumeType}' is not supported");
+            var volume = StorageVolumeFactory.CreateVolume(config, _fileSystem, _serviceProvider);
+            try
+            {
+                await _pool.AddVolumeAsync(volume, config.InitialDelayMs, config.HealthCheckDelayMs, cancellationToken)
+                    .ConfigureAwait(false);
+                _cleanupService.RegisterVolume(volume);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to mount volume {VolumeId} at {MountPath}",
+                    config.VolumeId,
+                    config.MountPath);
+                throw;
             }
         }
     }

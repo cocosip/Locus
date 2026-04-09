@@ -130,17 +130,20 @@ namespace Locus.Storage
         {
             ValidateTenantId(tenantId);
 
+            ProjectionMaintenanceWork? maintenanceWork = null;
+            long cursorOffset;
             var projectionLock = GetTenantProjectionLock(tenantId);
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
+                cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
                 try
                 {
-                    long? advancedCursorOffset;
-                    while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                    ProjectionCycleResult cycleResult;
+                    while ((cycleResult = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).AdvancedCursorOffset.HasValue)
                     {
-                        cursorOffset = advancedCursorOffset.Value;
+                        cursorOffset = cycleResult.AdvancedCursorOffset.Value;
+                        maintenanceWork = cycleResult.MaintenanceWork;
                     }
                 }
                 catch (DeferredProjectionException ex)
@@ -150,13 +153,16 @@ namespace Locus.Storage
                         "Deferred queue projection replay for tenant {TenantId} because the physical file could not be verified",
                         tenantId);
                 }
-
-                return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
             }
             finally
             {
                 projectionLock.Release();
             }
+
+            if (maintenanceWork != null)
+                await ExecuteProjectionMaintenanceAsync(maintenanceWork, ct).ConfigureAwait(false);
+
+            return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -164,18 +170,21 @@ namespace Locus.Storage
         {
             ValidateTenantId(tenantId);
 
+            ProjectionSnapshotCapture snapshotCapture;
             var projectionLock = GetTenantProjectionLock(tenantId);
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 var cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
-                await SaveSnapshotAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
-                return await BuildTenantStateAsync(tenantId, ct).ConfigureAwait(false);
+                snapshotCapture = await CaptureProjectionSnapshotAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
             }
             finally
             {
                 projectionLock.Release();
             }
+
+            await PersistSnapshotAsync(snapshotCapture, ct).ConfigureAwait(false);
+            return await BuildTenantStateAsync(tenantId, ct).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -183,6 +192,8 @@ namespace Locus.Storage
         {
             ValidateTenantId(tenantId);
 
+            ProjectionMaintenanceWork? maintenanceWork = null;
+            long cursorOffset;
             var projectionLock = GetTenantProjectionLock(tenantId);
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
@@ -192,17 +203,18 @@ namespace Locus.Storage
                     await ResetQuotaProjectionAsync(tenantId, ct).ConfigureAwait(false);
 
                 var restoredCursorOffset = await TryRestoreSnapshotAsync(tenantId, ct).ConfigureAwait(false);
-                var cursorOffset = await NormalizeCursorOffsetAsync(tenantId, restoredCursorOffset ?? 0, ct).ConfigureAwait(false);
+                cursorOffset = await NormalizeCursorOffsetAsync(tenantId, restoredCursorOffset ?? 0, ct).ConfigureAwait(false);
                 await SaveCursorAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
 
                 try
                 {
                     try
                     {
-                        long? advancedCursorOffset;
-                        while ((advancedCursorOffset = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue)
+                        ProjectionCycleResult cycleResult;
+                        while ((cycleResult = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).AdvancedCursorOffset.HasValue)
                         {
-                            cursorOffset = advancedCursorOffset.Value;
+                            cursorOffset = cycleResult.AdvancedCursorOffset.Value;
+                            maintenanceWork = cycleResult.MaintenanceWork;
                         }
                     }
                     catch (DeferredProjectionException ex)
@@ -220,26 +232,30 @@ namespace Locus.Storage
                     await TryReconcileQuotaCountsAfterFailedRebuildAsync(tenantId).ConfigureAwait(false);
                     throw;
                 }
-
-                return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
             }
             finally
             {
                 projectionLock.Release();
             }
+
+            if (maintenanceWork != null)
+                await ExecuteProjectionMaintenanceAsync(maintenanceWork, ct).ConfigureAwait(false);
+
+            return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
         }
 
         private async Task<bool> ProjectTenantAsync(string tenantId, CancellationToken ct)
         {
             ValidateTenantId(tenantId);
 
+            ProjectionCycleResult? cycleResult = null;
             var projectionLock = GetTenantProjectionLock(tenantId);
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 try
                 {
-                    return (await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false)).HasValue;
+                    cycleResult = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false);
                 }
                 catch (DeferredProjectionException ex)
                 {
@@ -254,9 +270,14 @@ namespace Locus.Storage
             {
                 projectionLock.Release();
             }
+
+            if (cycleResult?.MaintenanceWork != null)
+                await ExecuteProjectionMaintenanceAsync(cycleResult.MaintenanceWork, ct).ConfigureAwait(false);
+
+            return cycleResult?.AdvancedCursorOffset.HasValue == true;
         }
 
-        private async Task<long?> ProjectTenantCoreAsync(string tenantId, CancellationToken ct)
+        private async Task<ProjectionCycleResult> ProjectTenantCoreAsync(string tenantId, CancellationToken ct)
         {
             var offset = await LoadCursorAsync(tenantId, ct).ConfigureAwait(false);
             var batch = await _journal.ReadBatchAsync(tenantId, offset, _options.MaxRecordsPerTenantPerCycle, ct).ConfigureAwait(false);
@@ -265,10 +286,10 @@ namespace Locus.Storage
                 if (batch.NextOffset > offset)
                 {
                     await SaveCursorAsync(tenantId, batch.NextOffset, CancellationToken.None).ConfigureAwait(false);
-                    return batch.NextOffset;
+                    return new ProjectionCycleResult(batch.NextOffset, maintenanceWork: null);
                 }
 
-                return null;
+                return new ProjectionCycleResult(null, maintenanceWork: null);
             }
 
             foreach (var record in batch.Records)
@@ -278,25 +299,25 @@ namespace Locus.Storage
             }
 
             var cursorOffset = batch.NextOffset;
-            var snapshotSaved = false;
+            ProjectionMaintenanceWork? maintenanceWork = null;
             if (_options.EnableCompaction
                 && batch.ReachedEndOfFile
                 && await ShouldCompactTenantAsync(tenantId, cursorOffset, ct).ConfigureAwait(false))
             {
-                await SaveSnapshotAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
-                snapshotSaved = true;
-                cursorOffset = await _journal.CompactAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
+                var snapshotCapture = await CaptureProjectionSnapshotAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+                maintenanceWork = new ProjectionMaintenanceWork(snapshotCapture, compactAfterSnapshot: true);
             }
 
-            if (!snapshotSaved
+            if (maintenanceWork == null
                 && batch.ReachedEndOfFile
                 && await ShouldSaveAutomaticSnapshotAsync(tenantId, cursorOffset, ct).ConfigureAwait(false))
             {
-                await SaveSnapshotAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
+                var snapshotCapture = await CaptureProjectionSnapshotAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+                maintenanceWork = new ProjectionMaintenanceWork(snapshotCapture, compactAfterSnapshot: false);
             }
 
             await SaveCursorAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
-            return cursorOffset;
+            return new ProjectionCycleResult(cursorOffset, maintenanceWork);
         }
 
         private async Task ProjectRecordAsync(QueueEventRecord record, CancellationToken ct)
@@ -1068,20 +1089,42 @@ namespace Locus.Storage
             return cursorOffset < baseOffset ? baseOffset : cursorOffset;
         }
 
-        private async Task SaveSnapshotAsync(string tenantId, long cursorOffset, CancellationToken ct)
+        private async Task<ProjectionSnapshotCapture> CaptureProjectionSnapshotAsync(string tenantId, long cursorOffset, CancellationToken ct)
         {
-            var snapshotPath = GetSnapshotPath(tenantId);
+            ct.ThrowIfCancellationRequested();
+
+            IReadOnlyList<FileMetadata> metadata = _projectionStore is IProjectionSnapshotSource snapshotSource
+                ? snapshotSource.CaptureProjectedFilesSnapshot(tenantId)
+                : (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false)).ToArray();
+
+            return new ProjectionSnapshotCapture(tenantId, cursorOffset, metadata);
+        }
+
+        private async Task ExecuteProjectionMaintenanceAsync(ProjectionMaintenanceWork maintenanceWork, CancellationToken ct)
+        {
+            await PersistSnapshotAsync(maintenanceWork.SnapshotCapture, ct).ConfigureAwait(false);
+
+            if (maintenanceWork.CompactAfterSnapshot)
+            {
+                await _journal
+                    .CompactAsync(maintenanceWork.SnapshotCapture.TenantId, maintenanceWork.SnapshotCapture.CursorOffset, ct)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        private async Task PersistSnapshotAsync(ProjectionSnapshotCapture snapshotCapture, CancellationToken ct)
+        {
+            var snapshotPath = GetSnapshotPath(snapshotCapture.TenantId);
             var snapshotDirectory = _fileSystem.Path.GetDirectoryName(snapshotPath);
             if (snapshotDirectory is string directory && directory.Length > 0 && !_fileSystem.Directory.Exists(directory))
                 _fileSystem.Directory.CreateDirectory(directory);
 
-            var metadata = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
             var snapshot = new ProjectionSnapshot
             {
-                TenantId = tenantId,
+                TenantId = snapshotCapture.TenantId,
                 CreatedAtUtc = DateTime.UtcNow,
-                CursorOffset = cursorOffset,
-                Files = metadata
+                CursorOffset = snapshotCapture.CursorOffset,
+                Files = snapshotCapture.Metadata
                     .OrderBy(item => item.CreatedAt)
                     .ThenBy(item => item.FileKey, StringComparer.Ordinal)
                     .Select(item => item.Clone())
@@ -1467,6 +1510,48 @@ namespace Locus.Storage
             public long CursorOffset { get; set; }
 
             public System.Collections.Generic.List<FileMetadata> Files { get; set; } = new System.Collections.Generic.List<FileMetadata>();
+        }
+
+        private sealed class ProjectionCycleResult
+        {
+            public ProjectionCycleResult(long? advancedCursorOffset, ProjectionMaintenanceWork? maintenanceWork)
+            {
+                AdvancedCursorOffset = advancedCursorOffset;
+                MaintenanceWork = maintenanceWork;
+            }
+
+            public long? AdvancedCursorOffset { get; }
+
+            public ProjectionMaintenanceWork? MaintenanceWork { get; }
+        }
+
+        private sealed class ProjectionMaintenanceWork
+        {
+            public ProjectionMaintenanceWork(ProjectionSnapshotCapture snapshotCapture, bool compactAfterSnapshot)
+            {
+                SnapshotCapture = snapshotCapture ?? throw new ArgumentNullException(nameof(snapshotCapture));
+                CompactAfterSnapshot = compactAfterSnapshot;
+            }
+
+            public ProjectionSnapshotCapture SnapshotCapture { get; }
+
+            public bool CompactAfterSnapshot { get; }
+        }
+
+        private sealed class ProjectionSnapshotCapture
+        {
+            public ProjectionSnapshotCapture(string tenantId, long cursorOffset, IReadOnlyList<FileMetadata> metadata)
+            {
+                TenantId = tenantId ?? throw new ArgumentNullException(nameof(tenantId));
+                CursorOffset = cursorOffset;
+                Metadata = metadata ?? throw new ArgumentNullException(nameof(metadata));
+            }
+
+            public string TenantId { get; }
+
+            public long CursorOffset { get; }
+
+            public IReadOnlyList<FileMetadata> Metadata { get; }
         }
 
         private sealed class DeferredProjectionException : IOException
