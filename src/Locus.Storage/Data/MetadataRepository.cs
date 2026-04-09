@@ -1522,6 +1522,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (current.Status != FileProcessingStatus.Pending)
                     return null;
 
+                if (current.AvailableForProcessingAt.HasValue
+                    && current.AvailableForProcessingAt.Value > processingStartTimeUtc)
+                {
+                    return null;
+                }
+
                 var updated = current.Clone();
                 updated.Status = FileProcessingStatus.Processing;
                 updated.ProcessingStartTime = processingStartTimeUtc;

@@ -1051,6 +1051,31 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsProcessingAsync_ThrowsWhenRetryDelayHasNotElapsed()
+        {
+            var availableAt = DateTime.UtcNow.AddMinutes(10);
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-delayed",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Pending,
+                AvailableForProcessingAt = availableAt,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-1)
+            }, CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                _scheduler.MarkAsProcessingAsync("tenant-001", "file-delayed", CancellationToken.None));
+
+            Assert.Contains("not available for processing", ex.Message);
+
+            var metadata = await _repository.GetAsync("tenant-001", "file-delayed", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Pending, metadata!.Status);
+            Assert.Equal(availableAt, metadata.AvailableForProcessingAt);
+            Assert.Null(metadata.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task MarkAsProcessingAsync_ConcurrentCalls_OnlyOneSucceeds()
         {
             var file = new FileMetadata

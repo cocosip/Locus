@@ -889,7 +889,9 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var metadataEntries = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false)).ToArray();
+            var metadataEntries = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false))
+                .Where(ActiveQuotaMetadata.CountsTowardActiveQuota)
+                .ToArray();
             var expectedTenantCount = metadataEntries.Length;
             var expectedDirectoryCounts = metadataEntries
                 .GroupBy(
@@ -1133,7 +1135,7 @@ namespace Locus.Storage
         {
             int removedCount = 0;
             long spaceFreed = 0;
-            var physicalPathExistsCache = new Dictionary<string, bool>(_pathComparer);
+            var physicalPathExistsCache = new Dictionary<string, PhysicalFilePresence>(_pathComparer);
             var blockedFileKeys = new HashSet<string>(StringComparer.Ordinal);
 
             while (true)
@@ -1165,17 +1167,20 @@ namespace Locus.Storage
                         continue;
                     }
 
-                    var physicalFileExists = GetCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache);
-                    var hasVolume = _volumes.TryGetValue(metadata.VolumeId, out var volume);
-                    if (physicalFileExists && !hasVolume)
+                    var physicalFilePresence = GetCachedPhysicalFilePresence(metadata, physicalPathExistsCache);
+                    if (physicalFilePresence == PhysicalFilePresence.Unknown)
                     {
-                        _logger.LogWarning(
-                            "Skipping completed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
-                            metadata.VolumeId,
-                            metadata.PhysicalPath);
                         blockedFileKeys.Add(metadata.FileKey);
                         continue;
                     }
+
+                    if (!_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                    {
+                        blockedFileKeys.Add(metadata.FileKey);
+                        continue;
+                    }
+
+                    var physicalFileExists = physicalFilePresence == PhysicalFilePresence.Exists;
 
                     try
                     {
@@ -1183,8 +1188,8 @@ namespace Locus.Storage
                         {
                             try
                             {
-                                await volume!.DeleteAsync(metadata.PhysicalPath, ct);
-                                physicalPathExistsCache[metadata.PhysicalPath] = false;
+                                await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                physicalPathExistsCache[metadata.PhysicalPath] = PhysicalFilePresence.Missing;
                             }
                             catch (Exception ex) when (!RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
                             {
@@ -1299,7 +1304,7 @@ namespace Locus.Storage
         {
             int removedCount = 0;
             long spaceFreed = 0;
-            var physicalPathExistsCache = new Dictionary<string, bool>(_pathComparer);
+            var physicalPathExistsCache = new Dictionary<string, PhysicalFilePresence>(_pathComparer);
             var blockedFileKeys = new HashSet<string>(StringComparer.Ordinal);
 
             while (true)
@@ -1336,17 +1341,20 @@ namespace Locus.Storage
                             metadata.FileKey);
                     }
 
-                    var physicalFileExists = GetCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache);
-                    var hasVolume = _volumes.TryGetValue(metadata.VolumeId, out var volume);
-                    if (physicalFileExists && !hasVolume)
+                    var physicalFilePresence = GetCachedPhysicalFilePresence(metadata, physicalPathExistsCache);
+                    if (physicalFilePresence == PhysicalFilePresence.Unknown)
                     {
-                        _logger.LogWarning(
-                            "Skipping permanently failed cleanup because volume {VolumeId} is unavailable and file still exists: {PhysicalPath}",
-                            metadata.VolumeId,
-                            metadata.PhysicalPath);
                         blockedFileKeys.Add(metadata.FileKey);
                         continue;
                     }
+
+                    if (!_volumes.TryGetValue(metadata.VolumeId, out var volume))
+                    {
+                        blockedFileKeys.Add(metadata.FileKey);
+                        continue;
+                    }
+
+                    var physicalFileExists = physicalFilePresence == PhysicalFilePresence.Exists;
 
                     var directoryQuotaDecremented = false;
                     var tenantQuotaDecremented = false;
@@ -1367,8 +1375,8 @@ namespace Locus.Storage
                                 {
                                     try
                                     {
-                                        await volume!.DeleteAsync(metadata.PhysicalPath, ct);
-                                        physicalPathExistsCache[metadata.PhysicalPath] = false;
+                                        await volume.DeleteAsync(metadata.PhysicalPath, ct);
+                                        physicalPathExistsCache[metadata.PhysicalPath] = PhysicalFilePresence.Missing;
                                     }
                                     catch (Exception ex) when (!RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
                                     {
@@ -1454,8 +1462,8 @@ namespace Locus.Storage
                                 {
                                     await MoveFileAsync(metadata.PhysicalPath, deadLetterPhysicalPath, ct).ConfigureAwait(false);
                                     deadLetterMoveApplied = true;
-                                    physicalPathExistsCache[metadata.PhysicalPath] = false;
-                                    physicalPathExistsCache[deadLetterPhysicalPath] = true;
+                                    physicalPathExistsCache[metadata.PhysicalPath] = PhysicalFilePresence.Missing;
+                                    physicalPathExistsCache[deadLetterPhysicalPath] = PhysicalFilePresence.Exists;
                                 }
                                 else if (!physicalFileExists)
                                 {
@@ -1688,21 +1696,126 @@ namespace Locus.Storage
             };
         }
 
-        private bool GetCachedPhysicalFileExists(string physicalPath, IDictionary<string, bool> cache)
+        private PhysicalFilePresence GetCachedPhysicalFilePresence(
+            FileMetadata metadata,
+            IDictionary<string, PhysicalFilePresence> cache)
         {
-            if (cache.TryGetValue(physicalPath, out var exists))
-                return exists;
+            if (cache.TryGetValue(metadata.PhysicalPath, out var presence))
+                return presence;
 
-            exists = _fileSystem.File.Exists(physicalPath);
-            cache[physicalPath] = exists;
+            if (!_volumes.TryGetValue(metadata.VolumeId, out var volume))
+            {
+                _logger.LogWarning(
+                    "Skipping cleanup because volume {VolumeId} is unavailable for file {FileKey}",
+                    metadata.VolumeId,
+                    metadata.FileKey);
+                cache[metadata.PhysicalPath] = PhysicalFilePresence.Unknown;
+                return PhysicalFilePresence.Unknown;
+            }
+
+            if (!volume.IsHealthy)
+            {
+                _logger.LogWarning(
+                    "Skipping cleanup because volume {VolumeId} is unhealthy for file {FileKey}",
+                    metadata.VolumeId,
+                    metadata.FileKey);
+                cache[metadata.PhysicalPath] = PhysicalFilePresence.Unknown;
+                return PhysicalFilePresence.Unknown;
+            }
+
+            if (!TryConfirmPhysicalFileExists(metadata.PhysicalPath, out var exists))
+            {
+                _logger.LogWarning(
+                    "Skipping cleanup because physical file existence could not be confirmed for file {FileKey}: {PhysicalPath}",
+                    metadata.FileKey,
+                    metadata.PhysicalPath);
+                cache[metadata.PhysicalPath] = PhysicalFilePresence.Unknown;
+                return PhysicalFilePresence.Unknown;
+            }
+
+            presence = exists ? PhysicalFilePresence.Exists : PhysicalFilePresence.Missing;
+            cache[metadata.PhysicalPath] = presence;
+            return presence;
+        }
+
+        private bool RefreshCachedPhysicalFileExists(string physicalPath, IDictionary<string, PhysicalFilePresence> cache)
+        {
+            if (!TryConfirmPhysicalFileExists(physicalPath, out var exists))
+            {
+                cache[physicalPath] = PhysicalFilePresence.Unknown;
+                return true;
+            }
+
+            cache[physicalPath] = exists ? PhysicalFilePresence.Exists : PhysicalFilePresence.Missing;
             return exists;
         }
 
-        private bool RefreshCachedPhysicalFileExists(string physicalPath, IDictionary<string, bool> cache)
+        private bool TryConfirmPhysicalFileExists(string physicalPath, out bool physicalFileExists)
         {
-            var exists = _fileSystem.File.Exists(physicalPath);
-            cache[physicalPath] = exists;
-            return exists;
+            physicalFileExists = false;
+
+            if (_fileSystem.File.Exists(physicalPath))
+            {
+                try
+                {
+                    using (var stream = _fileSystem.File.Open(
+                        physicalPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
+                    {
+                    }
+
+                    physicalFileExists = true;
+                    return true;
+                }
+                catch (FileNotFoundException)
+                {
+                    return true;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    return true;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    return false;
+                }
+                catch (IOException)
+                {
+                    return false;
+                }
+            }
+
+            try
+            {
+                using (var stream = _fileSystem.File.Open(
+                    physicalPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                }
+
+                physicalFileExists = true;
+                return true;
+            }
+            catch (FileNotFoundException)
+            {
+                return true;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
         }
 
         private async Task RollbackProjectionCleanupAsync(
@@ -2195,6 +2308,7 @@ namespace Locus.Storage
                 return new OrphanScanBatch(Array.Empty<OrphanFileScanEntry>(), hasMore: true);
 
             var entries = new List<OrphanFileScanEntry>(maxEntries + 1);
+            var maxTrackedEntries = maxEntries + 1;
 
             foreach (var physicalPath in _fileSystem.Directory.EnumerateFiles(directory))
             {
@@ -2205,9 +2319,16 @@ namespace Locus.Storage
                     continue;
                 }
 
-                entries.Add(new OrphanFileScanEntry(physicalPath, normalizedPath));
-                entries.Sort((left, right) => _pathComparer.Compare(left.NormalizedPath, right.NormalizedPath));
-                if (entries.Count > maxEntries + 1)
+                var candidate = new OrphanFileScanEntry(physicalPath, normalizedPath);
+                if (entries.Count == maxTrackedEntries
+                    && _pathComparer.Compare(candidate.NormalizedPath, entries[entries.Count - 1].NormalizedPath) >= 0)
+                {
+                    continue;
+                }
+
+                var insertIndex = FindOrphanEntryInsertIndex(entries, candidate.NormalizedPath);
+                entries.Insert(insertIndex, candidate);
+                if (entries.Count > maxTrackedEntries)
                     entries.RemoveAt(entries.Count - 1);
             }
 
@@ -2216,6 +2337,22 @@ namespace Locus.Storage
                 entries.RemoveAt(entries.Count - 1);
 
             return new OrphanScanBatch(entries, hasMore);
+        }
+
+        private int FindOrphanEntryInsertIndex(IReadOnlyList<OrphanFileScanEntry> entries, string normalizedPath)
+        {
+            var low = 0;
+            var high = entries.Count;
+            while (low < high)
+            {
+                var mid = low + ((high - low) / 2);
+                if (_pathComparer.Compare(entries[mid].NormalizedPath, normalizedPath) < 0)
+                    low = mid + 1;
+                else
+                    high = mid;
+            }
+
+            return low;
         }
 
         private async Task<HashSet<string>> BuildKnownPhysicalPathSetAsync(string tenantId, CancellationToken ct)
@@ -2269,6 +2406,13 @@ namespace Locus.Storage
             public IReadOnlyList<OrphanFileScanEntry> Entries { get; }
 
             public bool HasMore { get; }
+        }
+
+        private enum PhysicalFilePresence
+        {
+            Missing = 0,
+            Exists = 1,
+            Unknown = 2
         }
     }
 }

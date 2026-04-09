@@ -1128,6 +1128,96 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RebuildTenantAsync_WithoutCleanupService_ExcludesDeadLetteredMetadataFromQuotaRebuild()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-deadletter-rebuild";
+            const string fileKey = "file-deadletter-rebuild";
+            const string directoryPath = "/failed";
+            var deadLetterPath = Path.Combine(
+                _volumeDirectory,
+                ".deadletter",
+                tenantId,
+                DateTime.UtcNow.ToString("yyyyMMdd"),
+                "fi",
+                "le",
+                "file-deadletter-rebuild.dcm");
+            var acceptedAt = DateTime.UtcNow.AddMinutes(-2);
+            var deadLetteredAt = acceptedAt.AddMinutes(1);
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(deadLetterPath)!);
+            _fileSystem.File.WriteAllBytes(deadLetterPath, new byte[] { 8, 9, 10 });
+
+            await journal.AppendBatchAsync(
+                new[]
+                {
+                    new QueueEventRecord
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        EventType = QueueEventType.Accepted,
+                        OccurredAtUtc = acceptedAt,
+                        VolumeId = "vol-001",
+                        PhysicalPath = deadLetterPath,
+                        DirectoryPath = directoryPath,
+                        FileSize = 3,
+                        Status = FileProcessingStatus.Pending
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        EventType = QueueEventType.DeadLettered,
+                        OccurredAtUtc = deadLetteredAt,
+                        VolumeId = "vol-001",
+                        PhysicalPath = deadLetterPath,
+                        DirectoryPath = directoryPath,
+                        FileSize = 3,
+                        Status = FileProcessingStatus.DeadLettered,
+                        RetryCount = 3
+                    }
+                },
+                CancellationToken.None);
+
+            await _quotaRepository.SetCurrentCountAsync(tenantId, tenantId, 5, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync(tenantId, directoryPath, 5, CancellationToken.None);
+
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal,
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                storageCleanupService: null,
+                projectionStore: null,
+                quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
+
+            var state = await service.RebuildTenantAsync(tenantId, CancellationToken.None);
+            var rebuilt = await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None);
+
+            Assert.Equal(0, state.LagBytes);
+            Assert.NotNull(rebuilt);
+            Assert.Equal(FileProcessingStatus.DeadLettered, rebuilt!.Status);
+            Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task SnapshotTenantAsync_AllowsRebuildToRestoreProjectionWithoutJournalReplay()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();

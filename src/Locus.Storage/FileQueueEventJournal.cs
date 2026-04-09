@@ -317,7 +317,12 @@ namespace Locus.Storage
             {
                 try
                 {
-                    using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    // Allow readers to coexist with atomic state-file replacement on Windows.
+                    using (var stream = _fileSystem.File.Open(
+                        path,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
                     {
                         var state = JsonSerializer.Deserialize<JournalState>(stream, JsonOptions);
                         if (state != null)
@@ -346,19 +351,60 @@ namespace Locus.Storage
                 _fileSystem.Directory.CreateDirectory(tenantDirectory);
 
             var path = GetJournalStatePath(tenantId);
-            var tempPath = path + ".tmp";
-            using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            var tempPath = path + ".tmp." + Guid.NewGuid().ToString("N");
+            try
             {
-                JsonSerializer.Serialize(stream, state, JsonOptions);
-                stream.Flush();
-            }
+                using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    JsonSerializer.Serialize(stream, state, JsonOptions);
+                    stream.Flush();
+                }
 
-            ReplaceFileAtomically(tempPath, path);
-            _stateCache[tenantId] = state;
+                ReplaceFileAtomically(tempPath, path);
+                _stateCache[tenantId] = state;
+            }
+            finally
+            {
+                if (_fileSystem.File.Exists(tempPath))
+                {
+                    try
+                    {
+                        _fileSystem.File.Delete(tempPath);
+                    }
+                    catch (IOException)
+                    {
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                    }
+                }
+            }
         }
 
         private void ReplaceFileAtomically(string tempPath, string destinationPath)
         {
+            const int maxAttempts = 5;
+            for (var attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                try
+                {
+                    if (_fileSystem.File.Exists(destinationPath))
+                    {
+                        _fileSystem.File.Replace(tempPath, destinationPath, null);
+                    }
+                    else
+                    {
+                        _fileSystem.File.Move(tempPath, destinationPath);
+                    }
+
+                    return;
+                }
+                catch (Exception ex) when (IsTransientReplaceFailure(ex) && attempt < maxAttempts - 1)
+                {
+                    Thread.Sleep(TimeSpan.FromMilliseconds(15 * (attempt + 1)));
+                }
+            }
+
             if (_fileSystem.File.Exists(destinationPath))
             {
                 _fileSystem.File.Replace(tempPath, destinationPath, null);
@@ -366,6 +412,11 @@ namespace Locus.Storage
             }
 
             _fileSystem.File.Move(tempPath, destinationPath);
+        }
+
+        private static bool IsTransientReplaceFailure(Exception exception)
+        {
+            return exception is IOException || exception is UnauthorizedAccessException;
         }
 
         private void NormalizeJournalState(string tenantId, JournalState state)

@@ -115,6 +115,7 @@ namespace Locus.Storage.Tests
             _volume = new Mock<IStorageVolume>();
             _volume.Setup(v => v.VolumeId).Returns("vol-001");
             _volume.Setup(v => v.MountPath).Returns(_volumePath);
+            _volume.Setup(v => v.IsHealthy).Returns(true);
             _volume.Setup(v => v.DeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .Returns((string path, CancellationToken ct) =>
                 {
@@ -1175,6 +1176,36 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReconcileQuotaCountsAsync_ExcludesDeadLetteredMetadataFromActiveQuota()
+        {
+            var deadLetterPath = Path.Combine(_volumePath, ".deadletter", "tenant-001", "20260409", "deadlettered.dat");
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(deadLetterPath)!);
+            _fileSystem.File.WriteAllText(deadLetterPath, "dead letter");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "deadlettered-quota",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = deadLetterPath,
+                DirectoryPath = "/failed",
+                FileSize = 11,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+                Status = FileProcessingStatus.DeadLettered,
+                DeadLetteredAt = DateTime.UtcNow.AddMinutes(-1)
+            }, CancellationToken.None);
+
+            await ((ITenantQuotaReconciliationManager)_tenantQuotaManager)
+                .SetFileCountAsync("tenant-001", 1, CancellationToken.None);
+            await _quotaRepository.SetCurrentCountAsync("tenant-001", "/failed", 1, CancellationToken.None);
+
+            await _cleanupService.ReconcileQuotaCountsAsync("tenant-001", CancellationToken.None);
+
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Null(await _quotaRepository.GetAsync("tenant-001", "/failed", CancellationToken.None));
+        }
+
+        [Fact]
         public async Task ReconcileQuotaCountsAsync_UsesProjectionStoreWhenProvided()
         {
             var physicalPath = Path.Combine(_volumePath, "tenant-001", "projection-owned.dat");
@@ -1602,6 +1633,32 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_SkipsWhenVolumeIsUnavailableAndMissingCannotBeConfirmed()
+        {
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "failed-unconfirmed-missing",
+                TenantId = "tenant-001",
+                VolumeId = "vol-unavailable",
+                PhysicalPath = Path.Combine(_volumePath, "missing-failed.dat"),
+                DirectoryPath = "/failed",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddDays(-10),
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-8)
+            }, CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
+
+            await _cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), CancellationToken.None);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "failed-unconfirmed-missing", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.PermanentlyFailed, metadata!.Status);
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", CancellationToken.None)).CurrentCount);
+        }
+
+        [Fact]
         public async Task CleanupPermanentlyFailedFilesAsync_ContinuesPastMoreThanDeferredSkipLimit()
         {
             var cleanupService = new StorageCleanupService(
@@ -1861,6 +1918,43 @@ namespace Locus.Storage.Tests
 
             var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
             Assert.Equal(1, stats.CompletedRecordsRemoved);
+        }
+
+        [Fact]
+        public async Task CleanupCompletedFilesAsync_SkipsWhenVolumeIsUnavailableAndMissingCannotBeConfirmed()
+        {
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "completed-unconfirmed-missing",
+                TenantId = "tenant-001",
+                VolumeId = "vol-unavailable",
+                PhysicalPath = Path.Combine(_volumePath, "missing-completed.dat"),
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddMinutes(-5)
+            }, CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/done");
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "completed-unconfirmed-missing", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.Completed, metadata!.Status);
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None)).CurrentCount);
         }
 
         [Fact]

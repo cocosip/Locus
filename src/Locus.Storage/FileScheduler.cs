@@ -210,6 +210,14 @@ namespace Locus.Storage
             if (latest.Status == FileProcessingStatus.Processing)
                 throw new FileAlreadyProcessingException($"File is already being processed: {fileKey}");
 
+            if (latest.Status == FileProcessingStatus.Pending
+                && latest.AvailableForProcessingAt.HasValue
+                && latest.AvailableForProcessingAt.Value > DateTime.UtcNow)
+            {
+                throw new InvalidOperationException(
+                    $"File {fileKey} is not available for processing until {latest.AvailableForProcessingAt.Value:O}.");
+            }
+
             throw new InvalidOperationException(
                 $"File {fileKey} changed state concurrently and is now {latest.Status}.");
         }

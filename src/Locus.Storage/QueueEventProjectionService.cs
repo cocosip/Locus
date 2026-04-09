@@ -1264,7 +1264,9 @@ namespace Locus.Storage
             if (_quotaMaintenanceStore == null)
                 return;
 
-            var metadataEntries = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false)).ToArray();
+            var metadataEntries = (await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false))
+                .Where(ActiveQuotaMetadata.CountsTowardActiveQuota)
+                .ToArray();
             var expectedTenantCount = metadataEntries.Length;
             var expectedDirectoryCounts = metadataEntries
                 .GroupBy(metadata => NormalizeDirectoryPath(metadata.DirectoryPath), StringComparer.Ordinal)
