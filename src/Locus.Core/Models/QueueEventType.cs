@@ -39,5 +39,10 @@ namespace Locus.Core.Models
         /// A processing lease timed out and the file was returned to pending state.
         /// </summary>
         ProcessingTimedOut = 7,
+
+        /// <summary>
+        /// A permanently failed file was moved to dead letter and removed from the active queue.
+        /// </summary>
+        DeadLettered = 8,
     }
 }

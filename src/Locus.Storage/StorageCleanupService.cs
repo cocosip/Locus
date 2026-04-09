@@ -41,6 +41,8 @@ namespace Locus.Storage
         private readonly TimeSpan _databaseOptimizationPauseBetweenBatches;
         private readonly int _maxOrphanFilesPerRun;
         private readonly int _orphanRebuildLookupCacheSize;
+        private readonly PermanentlyFailedDisposition _permanentlyFailedDisposition;
+        private readonly DeadLetterOptions _deadLetterOptions;
         private readonly StringComparer _pathComparer;
         private readonly StringComparison _pathComparison;
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
@@ -137,6 +139,8 @@ namespace Locus.Storage
             _orphanRebuildLookupCacheSize = options.OrphanRebuildLookupCacheSize > 0
                 ? options.OrphanRebuildLookupCacheSize
                 : 0;
+            _permanentlyFailedDisposition = options.PermanentlyFailedDisposition;
+            _deadLetterOptions = options.DeadLetter ?? new DeadLetterOptions();
             _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
@@ -245,6 +249,12 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct = default)
         {
+            if (_permanentlyFailedDisposition == PermanentlyFailedDisposition.Keep)
+            {
+                _logger.LogInformation("Skipping permanently failed disposition because the configured strategy is Keep");
+                return;
+            }
+
             _logger.LogInformation("Starting cleanup of permanently failed files older than {TimeSpan}", olderThan);
 
             var cutoffTime = DateTime.UtcNow - olderThan;
@@ -262,7 +272,7 @@ namespace Locus.Storage
 
             Interlocked.Add(ref _permanentlyFailedFilesRemoved, removedCount);
             Interlocked.Add(ref _spaceFreed, spaceFreed);
-            _logger.LogInformation("Cleaned up {Count} permanently failed files, freed {Size} bytes",
+            _logger.LogInformation("Applied permanent-failure disposition to {Count} file(s), freed {Size} bytes",
                 removedCount, spaceFreed);
         }
 
@@ -1000,7 +1010,9 @@ namespace Locus.Storage
 
             var now = DateTime.UtcNow;
             var timeoutCutoff = processingTimeout.HasValue ? now - processingTimeout.Value : (DateTime?)null;
-            var failedCutoff = failedRetentionPeriod.HasValue ? now - failedRetentionPeriod.Value : (DateTime?)null;
+            var failedCutoff = failedRetentionPeriod.HasValue && _permanentlyFailedDisposition != PermanentlyFailedDisposition.Keep
+                ? now - failedRetentionPeriod.Value
+                : (DateTime?)null;
 
             int resetCount = 0, removedFailed = 0;
             long spaceFreed = 0;
@@ -1025,7 +1037,7 @@ namespace Locus.Storage
             Interlocked.Add(ref _spaceFreed, spaceFreed);
 
             _logger.LogInformation(
-                "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed removed, {SpaceFreed} bytes freed",
+                "Combined cleanup completed: {TimedOut} timed-out reset, {Failed} permanently failed disposition applied, {SpaceFreed} bytes freed",
                 resetCount, removedFailed, spaceFreed);
         }
 
@@ -1325,97 +1337,198 @@ namespace Locus.Storage
 
                     var directoryQuotaDecremented = false;
                     var tenantQuotaDecremented = false;
-                    var metadataRemoved = false;
+                    var metadataTransitionApplied = false;
+                    var deadLetterMoveApplied = false;
+                    string? deadLetterPhysicalPath = null;
                     try
                     {
-                        if (physicalFileExists)
+                        switch (_permanentlyFailedDisposition)
                         {
-                            try
+                            case PermanentlyFailedDisposition.Keep:
+                                blockedFileKeys.Add(metadata.FileKey);
+                                continue;
+
+                            case PermanentlyFailedDisposition.Delete:
                             {
-                                await volume!.DeleteAsync(metadata.PhysicalPath, ct);
-                                physicalPathExistsCache[metadata.PhysicalPath] = false;
-                            }
-                            catch (Exception ex) when (!RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
-                            {
-                                _logger.LogDebug(
-                                    ex,
-                                    "DeleteAsync threw after removing permanently-failed file {PhysicalPath}",
-                                    metadata.PhysicalPath);
-                            }
-
-                            if (RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
-                                throw new IOException($"Failed to delete physical file {metadata.PhysicalPath}");
-
-                            spaceFreed += metadata.FileSize;
-                        }
-
-                        if (_queueEventJournal != null)
-                        {
-                            var deleteRequestedAtUtc = DateTime.UtcNow;
-                            var deleteSucceededAtUtc = deleteRequestedAtUtc.AddTicks(1);
-                            await _queueEventJournal.AppendBatchAsync(
-                                new[]
+                                if (physicalFileExists)
                                 {
-                                    CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
-                                    CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
-                                },
-                                default).ConfigureAwait(false);
+                                    try
+                                    {
+                                        await volume!.DeleteAsync(metadata.PhysicalPath, ct);
+                                        physicalPathExistsCache[metadata.PhysicalPath] = false;
+                                    }
+                                    catch (Exception ex) when (!RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
+                                    {
+                                        _logger.LogDebug(
+                                            ex,
+                                            "DeleteAsync threw after removing permanently-failed file {PhysicalPath}",
+                                            metadata.PhysicalPath);
+                                    }
 
-                            await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
-                                metadata.TenantId,
-                                metadata.FileKey,
-                                metadata.LastFailedAt.Value,
-                                deleteSucceededAtUtc,
-                                ct).ConfigureAwait(false);
-                        }
-                        else
-                        {
-                            await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
-                            directoryQuotaDecremented = true;
+                                    if (RefreshCachedPhysicalFileExists(metadata.PhysicalPath, physicalPathExistsCache))
+                                        throw new IOException($"Failed to delete physical file {metadata.PhysicalPath}");
 
-                            await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
-                            tenantQuotaDecremented = true;
+                                    spaceFreed += metadata.FileSize;
+                                }
 
-                            metadataRemoved = await _projectionCleanupStore.TryRemovePermanentlyFailedFileAsync(
-                                metadata.TenantId,
-                                metadata.FileKey,
-                                metadata.LastFailedAt.Value,
-                                ct);
-                            if (!metadataRemoved)
-                            {
-                                if (await WasMetadataRemovedConcurrentlyAsync(metadata, ct).ConfigureAwait(false))
+                                if (_queueEventJournal != null)
                                 {
-                                    metadataRemoved = true;
-                                    _logger.LogDebug(
-                                        "Metadata for permanently-failed file {FileKey} was already removed concurrently after physical deletion",
+                                    var deleteRequestedAtUtc = DateTime.UtcNow;
+                                    var deleteSucceededAtUtc = deleteRequestedAtUtc.AddTicks(1);
+                                    await _queueEventJournal.AppendBatchAsync(
+                                        new[]
+                                        {
+                                            CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
+                                            CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                                        },
+                                        default).ConfigureAwait(false);
+
+                                    await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
+                                        metadata.TenantId,
+                                        metadata.FileKey,
+                                        metadata.LastFailedAt.Value,
+                                        deleteSucceededAtUtc,
+                                        ct).ConfigureAwait(false);
+                                }
+
+                                else
+                                {
+                                    await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                                    directoryQuotaDecremented = true;
+
+                                    await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
+                                    tenantQuotaDecremented = true;
+
+                                    metadataTransitionApplied = await _projectionCleanupStore.TryRemovePermanentlyFailedFileAsync(
+                                        metadata.TenantId,
+                                        metadata.FileKey,
+                                        metadata.LastFailedAt.Value,
+                                        ct);
+                                    if (!metadataTransitionApplied)
+                                    {
+                                        if (await WasMetadataRemovedConcurrentlyAsync(metadata, ct).ConfigureAwait(false))
+                                        {
+                                            metadataTransitionApplied = true;
+                                            _logger.LogDebug(
+                                                "Metadata for permanently-failed file {FileKey} was already removed concurrently after physical deletion",
+                                                metadata.FileKey);
+                                        }
+                                        else
+                                        {
+                                            blockedFileKeys.Add(metadata.FileKey);
+                                            await RollbackProjectionCleanupAsync(
+                                                metadata,
+                                                normalizedDirectoryPath,
+                                                restoreMetadata: false,
+                                                tenantQuotaDecremented,
+                                                directoryQuotaDecremented);
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                break;
+                            }
+
+                            case PermanentlyFailedDisposition.MoveToDeadLetter:
+                            {
+                                var deadLetteredAtUtc = DateTime.UtcNow;
+                                deadLetterPhysicalPath = physicalFileExists
+                                    ? BuildDeadLetterPath(metadata, volume!, deadLetteredAtUtc)
+                                    : metadata.PhysicalPath;
+
+                                if (physicalFileExists && !PathsEqual(metadata.PhysicalPath, deadLetterPhysicalPath))
+                                {
+                                    await MoveFileAsync(metadata.PhysicalPath, deadLetterPhysicalPath, ct).ConfigureAwait(false);
+                                    deadLetterMoveApplied = true;
+                                    physicalPathExistsCache[metadata.PhysicalPath] = false;
+                                    physicalPathExistsCache[deadLetterPhysicalPath] = true;
+                                }
+                                else if (!physicalFileExists)
+                                {
+                                    _logger.LogWarning(
+                                        "Permanently failed file {FileKey} was already missing before dead-letter disposition; metadata will be transitioned without moving the file",
                                         metadata.FileKey);
+                                }
+
+                                if (_queueEventJournal != null)
+                                {
+                                    metadataTransitionApplied = await _projectionCleanupStore.TryMarkPermanentlyFailedDeadLetteredAsync(
+                                        metadata.TenantId,
+                                        metadata.FileKey,
+                                        metadata.LastFailedAt.Value,
+                                        deadLetteredAtUtc,
+                                        deadLetterPhysicalPath,
+                                        metadata.VolumeId,
+                                        projectionApplied: false,
+                                        ct).ConfigureAwait(false);
+                                    if (!metadataTransitionApplied)
+                                    {
+                                        if (await WasMetadataDeadLetteredConcurrentlyAsync(metadata, deadLetterPhysicalPath, deadLetteredAtUtc, ct).ConfigureAwait(false))
+                                        {
+                                            metadataTransitionApplied = true;
+                                        }
+                                        else
+                                        {
+                                            throw new InvalidOperationException($"Failed to mark permanently-failed file {metadata.FileKey} as dead-lettered before journal append.");
+                                        }
+                                    }
+
+                                    await _queueEventJournal.AppendAsync(
+                                        CreateDeadLetteredEvent(metadata, deadLetterPhysicalPath, deadLetteredAtUtc),
+                                        default).ConfigureAwait(false);
                                 }
                                 else
                                 {
-                                    blockedFileKeys.Add(metadata.FileKey);
-                                    await RollbackPermanentlyFailedCleanupAsync(
-                                        metadata,
-                                        normalizedDirectoryPath,
-                                        metadataRemoved: false,
-                                        tenantQuotaDecremented,
-                                        directoryQuotaDecremented);
-                                    continue;
+                                    await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                                    directoryQuotaDecremented = true;
+
+                                    await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
+                                    tenantQuotaDecremented = true;
+
+                                    metadataTransitionApplied = await _projectionCleanupStore.TryMarkPermanentlyFailedDeadLetteredAsync(
+                                        metadata.TenantId,
+                                        metadata.FileKey,
+                                        metadata.LastFailedAt.Value,
+                                        deadLetteredAtUtc,
+                                        deadLetterPhysicalPath,
+                                        metadata.VolumeId,
+                                        projectionApplied: true,
+                                        ct).ConfigureAwait(false);
+                                    if (!metadataTransitionApplied)
+                                    {
+                                        if (await WasMetadataDeadLetteredConcurrentlyAsync(metadata, deadLetterPhysicalPath, deadLetteredAtUtc, ct).ConfigureAwait(false))
+                                        {
+                                            metadataTransitionApplied = true;
+                                        }
+                                        else
+                                        {
+                                            throw new InvalidOperationException($"Failed to transition permanently-failed file {metadata.FileKey} to dead letter.");
+                                        }
+                                    }
                                 }
+
+                                break;
                             }
+
+                            default:
+                                throw new InvalidOperationException($"Unsupported permanently failed disposition: {_permanentlyFailedDisposition}");
                         }
                     }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex,
-                            "Failed to cleanup permanently-failed file. Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
+                            "Failed to apply permanent-failure disposition. Tenant={TenantId}, Directory={DirectoryPath}, FileKey={FileKey}",
                             metadata.TenantId, normalizedDirectoryPath, metadata.FileKey);
                         blockedFileKeys.Add(metadata.FileKey);
-                        await RollbackPermanentlyFailedCleanupAsync(
+                        await RollbackProjectionCleanupAsync(
                             metadata,
                             normalizedDirectoryPath,
-                            metadataRemoved,
+                            restoreMetadata: metadataTransitionApplied,
                             tenantQuotaDecremented,
                             directoryQuotaDecremented);
+                        if (deadLetterMoveApplied && deadLetterPhysicalPath != null)
+                            await TryRollbackDeadLetterMoveAsync(metadata.PhysicalPath, deadLetterPhysicalPath);
                         continue;
                     }
 
@@ -1462,10 +1575,10 @@ namespace Locus.Storage
             }
             catch
             {
-                await RollbackPermanentlyFailedCleanupAsync(
+                await RollbackProjectionCleanupAsync(
                     metadata,
                     normalizedDirectoryPath,
-                    metadataRemoved,
+                    restoreMetadata: metadataRemoved,
                     tenantQuotaDecremented,
                     directoryQuotaDecremented);
                 throw;
@@ -1493,6 +1606,29 @@ namespace Locus.Storage
                 Status = FileProcessingStatus.DeleteSucceeded,
                 ProcessingStartTimeUtc = metadata.ProcessingStartTime,
                 RetryCount = metadata.RetryCount,
+                OriginalFileName = metadata.OriginalFileName,
+                FileExtension = metadata.FileExtension
+            };
+        }
+
+        private static QueueEventRecord CreateDeadLetteredEvent(
+            FileMetadata metadata,
+            string deadLetterPhysicalPath,
+            DateTime deadLetteredAtUtc)
+        {
+            return new QueueEventRecord
+            {
+                TenantId = metadata.TenantId,
+                FileKey = metadata.FileKey,
+                EventType = QueueEventType.DeadLettered,
+                OccurredAtUtc = deadLetteredAtUtc,
+                VolumeId = metadata.VolumeId,
+                PhysicalPath = deadLetterPhysicalPath,
+                DirectoryPath = metadata.DirectoryPath,
+                FileSize = metadata.FileSize,
+                Status = FileProcessingStatus.DeadLettered,
+                RetryCount = metadata.RetryCount,
+                ErrorMessage = metadata.LastError,
                 OriginalFileName = metadata.OriginalFileName,
                 FileExtension = metadata.FileExtension
             };
@@ -1556,10 +1692,10 @@ namespace Locus.Storage
             return exists;
         }
 
-        private async Task RollbackPermanentlyFailedCleanupAsync(
+        private async Task RollbackProjectionCleanupAsync(
             FileMetadata metadata,
             string normalizedDirectoryPath,
-            bool metadataRemoved,
+            bool restoreMetadata,
             bool tenantQuotaDecremented,
             bool directoryQuotaDecremented)
         {
@@ -1596,7 +1732,7 @@ namespace Locus.Storage
                 }
             }
 
-            if (metadataRemoved)
+            if (restoreMetadata)
             {
                 try
                 {
@@ -1611,6 +1747,115 @@ namespace Locus.Storage
                         metadata.FileKey);
                 }
             }
+        }
+
+        private async Task TryRollbackDeadLetterMoveAsync(string originalPath, string deadLetterPath)
+        {
+            try
+            {
+                if (!_fileSystem.File.Exists(deadLetterPath))
+                    return;
+
+                if (_fileSystem.File.Exists(originalPath))
+                    return;
+
+                await MoveFileAsync(deadLetterPath, originalPath, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to rollback dead-letter move from {DeadLetterPath} back to {OriginalPath}",
+                    deadLetterPath,
+                    originalPath);
+            }
+        }
+
+        private async Task MoveFileAsync(string sourcePath, string destinationPath, CancellationToken ct)
+        {
+            if (PathsEqual(sourcePath, destinationPath))
+                return;
+
+            var destinationDirectory = _fileSystem.Path.GetDirectoryName(destinationPath);
+            if (!string.IsNullOrWhiteSpace(destinationDirectory) && !_fileSystem.Directory.Exists(destinationDirectory))
+            {
+                var destinationDirectoryPath = destinationDirectory!;
+                _fileSystem.Directory.CreateDirectory(destinationDirectoryPath);
+            }
+
+            try
+            {
+                _fileSystem.File.Move(sourcePath, destinationPath);
+                return;
+            }
+            catch (IOException) when (!_fileSystem.File.Exists(destinationPath))
+            {
+                using (var source = _fileSystem.File.Open(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var destination = _fileSystem.File.Open(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    await source.CopyToAsync(destination, 81920, ct).ConfigureAwait(false);
+                    await destination.FlushAsync(ct).ConfigureAwait(false);
+                }
+
+                _fileSystem.File.Delete(sourcePath);
+            }
+        }
+
+        private string BuildDeadLetterPath(FileMetadata metadata, IStorageVolume volume, DateTime deadLetteredAtUtc)
+        {
+            var rootPath = _deadLetterOptions.RootPath;
+            if (string.IsNullOrWhiteSpace(rootPath))
+                rootPath = ".deadletter";
+
+            var parts = new List<string>
+            {
+                _fileSystem.Path.IsPathRooted(rootPath)
+                    ? _fileSystem.Path.GetFullPath(rootPath)
+                    : _fileSystem.Path.GetFullPath(_fileSystem.Path.Combine(volume.MountPath, rootPath))
+            };
+
+            if (_deadLetterOptions.IncludeTenantInPath)
+                parts.Add(metadata.TenantId);
+
+            if (_deadLetterOptions.IncludeDatePartition)
+                parts.Add(deadLetteredAtUtc.ToString("yyyyMMdd"));
+
+            var shardingDepth = Math.Max(0, _deadLetterOptions.ShardingDepth);
+            for (var i = 0; i < shardingDepth; i++)
+            {
+                var start = i * 2;
+                if (start + 1 >= metadata.FileKey.Length)
+                    break;
+
+                parts.Add(metadata.FileKey.Substring(start, 2));
+            }
+
+            var fileExtension = metadata.FileExtension ?? string.Empty;
+            parts.Add(metadata.FileKey + fileExtension);
+            return _fileSystem.Path.Combine(parts.ToArray());
+        }
+
+        private bool PathsEqual(string left, string right)
+        {
+            var normalizedLeft = _fileSystem.Path.GetFullPath(left);
+            var normalizedRight = _fileSystem.Path.GetFullPath(right);
+            return string.Equals(normalizedLeft, normalizedRight, _pathComparison);
+        }
+
+        private async Task<bool> WasMetadataDeadLetteredConcurrentlyAsync(
+            FileMetadata metadata,
+            string deadLetterPhysicalPath,
+            DateTime deadLetteredAtUtc,
+            CancellationToken ct)
+        {
+            var current = await _projectionStore.GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct).ConfigureAwait(false);
+            if (current == null)
+                return false;
+
+            return current.Status == FileProcessingStatus.DeadLettered
+                && current.DeadLetteredAt.HasValue
+                && current.DeadLetteredAt.Value >= deadLetteredAtUtc
+                && PathsEqual(current.PhysicalPath, deadLetterPhysicalPath);
         }
 
         private void RecordStatusCleanupIteration(

@@ -38,6 +38,11 @@ namespace Locus.Core.Models
         /// <summary>
         /// Physical deletion succeeded and the final projection cleanup is pending.
         /// </summary>
-        DeleteSucceeded = 6
+        DeleteSucceeded = 6,
+
+        /// <summary>
+        /// File processing permanently failed and the physical file was moved to dead letter.
+        /// </summary>
+        DeadLettered = 7
     }
 }

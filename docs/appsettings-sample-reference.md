@@ -364,10 +364,10 @@
       "InitialDelay": "00:02:00"
     },
 
-    // 是否启用后台清理服务
-    "EnableBackgroundCleanup": true,
-
     "CleanupOptions": {
+      // 是否启用后台清理服务
+      "Enabled": true,
+
       // 后台清理轮询间隔
       "CleanupInterval": "00:30:00",
 
@@ -381,14 +381,22 @@
       // 超过后，Processing 会被重置回 Pending
       "ProcessingTimeout": "00:30:00",
 
-      // 是否清理永久失败文件
-      "CleanupPermanentlyFailedFiles": true,
+      // 永久失败文件处置策略
+      "PermanentlyFailedDisposition": "MoveToDeadLetter",
 
       // 是否删除数据库损坏恢复后留下的 .corrupted.* 备份文件
       "CleanupInvalidDatabaseBackups": true,
 
-      // 永久失败文件保留多久后再删
+      // 永久失败文件保留期
       "FailedFileRetentionPeriod": "7.00:00:00",
+
+      // dead letter 目录配置
+      "DeadLetter": {
+        "RootPath": ".deadletter",
+        "IncludeTenantInPath": true,
+        "IncludeDatePartition": true,
+        "ShardingDepth": 2
+      },
 
       // 是否回收已完成文件
       // true 时，已完成文件在保留期后会被后台物理删除
@@ -431,7 +439,7 @@
 | `EnableDatabaseHealthCheck` | 启动数据库健康检查 | 启动时检查 metadata / quota 数据库是否损坏。 |
 | `AutoRecoverCorruptedDatabasesOnStartup` | 启动自动恢复损坏数据库 | 如果启动健康检查发现数据库损坏，尝试自动重建。 |
 | `FailFastOnStartupRecoveryFailure` | 启动恢复失败时快速失败 | 为 `true` 时，如果自动恢复仍失败，应用启动直接失败，避免带着损坏状态继续运行。 |
-| `EnableBackgroundCleanup` | 启用后台清理服务 | 控制 `BackgroundCleanupService` 是否启动。 |
+| `CleanupOptions.Enabled` | 启用后台清理服务 | 控制 `BackgroundCleanupService` 是否启动。 |
 
 ## MetadataRepository
 
@@ -573,23 +581,43 @@
 
 `CleanupOptions` 控制后台清理服务 `BackgroundCleanupService` 的行为。它主要负责脏数据收敛、状态回收、空间回收，而不是业务级重建。
 
+推荐理解方式：
+- `CleanupTimedOutFiles` / `ProcessingTimeout` 负责把卡死的处理中任务放回队列
+- `PermanentlyFailedDisposition` / `FailedFileRetentionPeriod` 负责处理已经达到最大重试次数的文件
+- `CleanupCompletedFiles` / `CompletedFileRetentionPeriod` 负责回收已成功处理完成的物理文件
+- `OptimizeDatabases` 这一组负责定期压缩 SQLite，回收数据库文件中的空洞空间
+
 | 字段 | 含义 | 说明 |
 |---|---|---|
-| `CleanupInterval` | 清理轮询间隔 | 后台清理每隔多久跑一轮。 |
-| `InitialDelay` | 启动首次清理延迟 | 避免应用刚启动时就立刻触发清理负载。 |
-| `CleanupTimedOutFiles` | 清理处理超时文件 | 为 `true` 时，会把长时间卡在 `Processing` 的文件重置回可处理状态。 |
-| `ProcessingTimeout` | 处理超时阈值 | 超过这个时间仍未完成的 `Processing` 文件会被视为超时。 |
-| `CleanupPermanentlyFailedFiles` | 清理永久失败文件 | 为 `true` 时，超过保留期的 `PermanentlyFailed` 文件会被删除。 |
-| `CleanupInvalidDatabaseBackups` | 清理数据库损坏备份文件 | 删除数据库自动恢复过程中留下的 `.corrupted.*` 文件。 |
-| `FailedFileRetentionPeriod` | 永久失败文件保留期 | 给排障、人工取证预留的时间窗口。 |
-| `CleanupCompletedFiles` | 清理已完成文件 | 为 `true` 时，已完成文件在保留期后会被物理删除。 |
-| `CompletedFileRetentionPeriod` | 已完成文件保留期 | 已完成后多久允许后台回收物理文件。 |
-| `OptimizeDatabases` | 优化数据库 | 定期压缩 SQLite，回收删除记录留下的空间。 |
-| `DatabaseOptimizationInterval` | 数据库优化间隔 | 两次数据库压缩之间的最短间隔。 |
-| `CleanupBatchSizePerTenant` | 每租户单轮清理批量 | 限制每轮状态清理对单个租户处理多少条记录。 |
-| `OrphanRebuildLookupCacheSize` | 孤儿恢复查找缓存大小 | 用于孤儿文件恢复时加速物理路径查找。 |
-| `DatabaseOptimizationTenantBatchSize` | 数据库优化分批租户数 | 一次优化多少个租户数据库后暂停一下。 |
-| `DatabaseOptimizationPauseBetweenBatches` | 数据库优化批次间暂停 | 降低长时间连续 VACUUM 带来的 I/O 抖动。 |
+| `Enabled` | 启用后台清理服务 | 控制 `BackgroundCleanupService` 是否注册并运行。默认 `true`。如果你希望完全手动触发清理而不是后台周期执行，可以设为 `false`。 |
+| `CleanupInterval` | 清理轮询间隔 | 后台清理每隔多久跑一轮。值越小，状态收敛越快，但后台 I/O 越频繁。 |
+| `InitialDelay` | 启动首次清理延迟 | 服务启动后先等待多久再跑第一轮。适合给卷挂载、数据库恢复、投影追平留出缓冲时间。 |
+| `CleanupTimedOutFiles` | 清理处理超时文件 | 为 `true` 时，会把长时间卡在 `Processing` 的文件重置回可处理状态。适合处理进程崩溃、节点重启、线程卡死这类场景。 |
+| `ProcessingTimeout` | 处理超时阈值 | 超过这个时间仍未完成的 `Processing` 文件会被视为超时。这个值应该大于你的正常最大处理时长，否则可能把仍在执行的任务误判为超时。 |
+| `PermanentlyFailedDisposition` | 永久失败文件处置策略 | 控制永久失败文件在保留期后如何处理。`Keep` 表示保留原地不动；`MoveToDeadLetter` 表示转入 dead letter 并从活跃配额中扣除；`Delete` 表示物理删除。默认是 `MoveToDeadLetter`，更适合生产环境排障。 |
+| `CleanupInvalidDatabaseBackups` | 清理数据库损坏备份文件 | 删除数据库自动恢复过程中留下的 `.corrupted.*` 文件。一般建议保持开启，否则这些备份文件会长期堆积。 |
+| `FailedFileRetentionPeriod` | 永久失败文件保留期 | 文件进入 `PermanentlyFailed` 后，至少保留多久才应用 `PermanentlyFailedDisposition`。这个窗口主要用于人工排障、重试分析、问题取证。 |
+| `DeadLetter.RootPath` | dead letter 根目录 | 永久失败文件转移后的目标根目录。相对路径会解析到所属 volume 下，绝对路径则直接使用该路径。 |
+| `DeadLetter.IncludeTenantInPath` | dead letter 路径包含租户 | 为 `true` 时，会在 dead letter 下按租户分层。多租户场景建议开启，便于隔离和人工查找。 |
+| `DeadLetter.IncludeDatePartition` | dead letter 路径包含日期分区 | 为 `true` 时，会追加 `yyyyMMdd` 目录。适合按天归档、限流清理、人工排查某天的失败文件。 |
+| `DeadLetter.ShardingDepth` | dead letter 分片深度 | 控制 dead letter 目录按 `FileKey` 分片的层数。目录中文件很多时建议保留 1 到 2 级，避免单目录过大。 |
+| `CleanupCompletedFiles` | 清理已完成文件 | 为 `true` 时，已成功处理完成的文件在保留期后会被后台物理删除。适用于“处理成功后源文件不再保留”的消费型场景。 |
+| `CompletedFileRetentionPeriod` | 已完成文件保留期 | 已完成后多久允许后台回收物理文件。设为 `00:00:00` 表示下一轮清理就可以删除；设得更长则可以给下游系统留出额外的读取或审计窗口。 |
+| `OptimizeDatabases` | 优化数据库 | 定期压缩 SQLite，回收删除记录留下的空间。数据库较大时这是重操作，建议放在业务低峰时段。 |
+| `DatabaseOptimizationInterval` | 数据库优化间隔 | 两次数据库压缩之间的最短间隔。删除、状态变更多的场景可以配得短一些；普通场景按天或按周即可。 |
+| `CleanupBatchSizePerTenant` | 每租户单轮清理批量 | 限制每轮状态清理对单个租户最多处理多少条记录。值越大，单轮收敛越快；值越小，对其他租户更公平，也更平滑。 |
+| `MaxOrphanFilesPerRun` | 每轮孤儿恢复最大扫描文件数 | 控制每个租户每个 volume 在一次孤儿恢复中最多扫描多少物理文件。目录特别大时可以降低这个值，避免单轮扫描过重。小于等于 0 表示不设上限。 |
+| `OrphanRebuildLookupCacheSize` | 孤儿恢复查找缓存大小 | 用于孤儿文件恢复时缓存物理路径查找结果，减少重复访问文件系统。文件很多时建议保留默认值；设为 `0` 表示关闭缓存。 |
+| `DatabaseOptimizationTenantBatchSize` | 数据库优化分批租户数 | 一次优化多少个租户数据库后暂停一下。租户很多时这个参数可以降低单次持续 I/O 时间。 |
+| `DatabaseOptimizationPauseBetweenBatches` | 数据库优化批次间暂停 | 每一批租户数据库优化完成后，额外暂停多久。主要用于降低连续 `VACUUM` 带来的磁盘抖动。 |
+
+### PermanentlyFailedDisposition 取值建议
+
+| 取值 | 说明 | 适用场景 |
+|---|---|---|
+| `Keep` | 到期后也不自动动文件，只保留在 `PermanentlyFailed` | 完全人工介入、严禁系统自动挪动或删除失败文件 |
+| `MoveToDeadLetter` | 到期后转入 dead letter，并从活跃配额中移除 | 推荐默认值，既保留排障证据，又不占用活跃处理池 |
+| `Delete` | 到期后直接删除物理文件 | 失败文件没有保留价值，且你明确接受自动删除 |
 
 ## 当前样例的配置取向
 

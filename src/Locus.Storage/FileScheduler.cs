@@ -269,8 +269,10 @@ namespace Locus.Storage
                         current.ProcessingStartTime = null;
                         current.CompletedAt = completedAtUtc;
                         current.DeleteSucceededAt = null;
+                        current.DeadLetteredAt = null;
                         current.AvailableForProcessingAt = null;
                         current.LastError = null;
+                        QueueProjectionMetadataState.ClearDeadLetterProjection(current);
                         return current;
                     },
                     ct).ConfigureAwait(false);
@@ -341,6 +343,8 @@ namespace Locus.Storage
                         current.LastFailedAt = DateTime.UtcNow;
                         current.ProcessingStartTime = null;
                         current.DeleteSucceededAt = null;
+                        current.DeadLetteredAt = null;
+                        QueueProjectionMetadataState.ClearDeadLetterProjection(current);
 
                         if (current.RetryCount >= _retryPolicy.MaxRetryCount)
                         {
@@ -505,6 +509,8 @@ namespace Locus.Storage
             updated.LastFailedAt = DateTime.UtcNow;
             updated.ProcessingStartTime = null;
             updated.DeleteSucceededAt = null;
+            updated.DeadLetteredAt = null;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
             if (updated.RetryCount >= _retryPolicy.MaxRetryCount)
             {

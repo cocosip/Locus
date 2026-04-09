@@ -123,6 +123,28 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
+        public Task<bool> TryMarkPermanentlyFailedDeadLetteredAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deadLetteredAtUtc,
+            string deadLetterPhysicalPath,
+            string? volumeId,
+            bool projectionApplied,
+            CancellationToken ct = default)
+        {
+            return _repository.TryMarkPermanentlyFailedDeadLetteredAsync(
+                tenantId,
+                fileKey,
+                expectedLastFailedAtUtc,
+                deadLetteredAtUtc,
+                deadLetterPhysicalPath,
+                volumeId,
+                projectionApplied,
+                ct);
+        }
+
+        /// <inheritdoc/>
         public Task<bool> TryRemoveCompletedFileAsync(
             string tenantId,
             string fileKey,

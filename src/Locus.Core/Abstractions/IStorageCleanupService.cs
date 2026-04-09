@@ -31,9 +31,9 @@ namespace Locus.Core.Abstractions
         Task CleanupAllEmptyDirectoriesAsync(CancellationToken ct = default);
 
         /// <summary>
-        /// Cleans up permanently failed files older than the specified timespan.
+        /// Applies the configured permanent-failure disposition to files older than the specified timespan.
         /// </summary>
-        /// <param name="olderThan">The age threshold for cleanup.</param>
+        /// <param name="olderThan">The age threshold before the disposition is applied.</param>
         /// <param name="ct">Cancellation token.</param>
         Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct = default);
 
@@ -88,7 +88,7 @@ namespace Locus.Core.Abstractions
         /// Pass null for any parameter to skip that cleanup category.
         /// </summary>
         /// <param name="processingTimeout">Reset Processing files older than this to Pending. Null to skip.</param>
-        /// <param name="failedRetentionPeriod">Delete PermanentlyFailed files older than this. Null to skip.</param>
+        /// <param name="failedRetentionPeriod">Apply the configured disposition to PermanentlyFailed files older than this. Null to skip.</param>
         /// <param name="ct">Cancellation token.</param>
         Task CleanupFilesByStatusAsync(
             TimeSpan? processingTimeout,

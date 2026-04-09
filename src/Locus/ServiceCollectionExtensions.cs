@@ -375,10 +375,11 @@ namespace Locus
                     services.AddHostedService(sp => sp.GetRequiredService<QueueEventProjectionService>());
             }
 
+            services.AddSingleton(options.CleanupOptions);
+
             // Register background cleanup service if enabled
-            if (options.EnableBackgroundCleanup)
+            if (options.CleanupOptions.Enabled)
             {
-                services.AddSingleton(options.CleanupOptions);
                 services.AddHostedService<BackgroundCleanupService>();
             }
 

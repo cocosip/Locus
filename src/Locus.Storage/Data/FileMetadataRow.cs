@@ -27,6 +27,7 @@ namespace Locus.Storage.Data
         public string? processing_start_time { get; set; }
         public string? completed_at { get; set; }
         public string? delete_succeeded_at { get; set; }
+        public string? dead_lettered_at { get; set; }
         public string? available_for_processing_at { get; set; }
         public string? original_file_name { get; set; }
         public string? file_extension { get; set; }
@@ -53,6 +54,7 @@ namespace Locus.Storage.Data
                 ProcessingStartTime      = ParseNullableDateTime(processing_start_time),
                 CompletedAt              = ParseNullableDateTime(completed_at),
                 DeleteSucceededAt        = ParseNullableDateTime(delete_succeeded_at),
+                DeadLetteredAt          = ParseNullableDateTime(dead_lettered_at),
                 AvailableForProcessingAt = ParseNullableDateTime(available_for_processing_at),
                 OriginalFileName         = original_file_name,
                 FileExtension            = file_extension,

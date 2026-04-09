@@ -52,7 +52,7 @@ namespace Locus.Storage.Tests
                     CleanupInterval = TimeSpan.FromHours(1),
                     OptimizeDatabases = false,
                     CleanupTimedOutFiles = false,
-                    CleanupPermanentlyFailedFiles = false,
+                    PermanentlyFailedDisposition = PermanentlyFailedDisposition.Keep,
                     CleanupInvalidDatabaseBackups = true
                 },
                 logger.Object);
@@ -65,6 +65,29 @@ namespace Locus.Storage.Tests
             cleanupService.Verify(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.CleanupInvalidDatabaseFilesAsync(It.IsAny<CancellationToken>()), Times.Once);
             cleanupService.Verify(s => s.GetCleanupStatisticsAsync(It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task ExecuteAsync_SkipsCleanupTasks_WhenDisabled()
+        {
+            var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
+            var fileScheduler = new Mock<IFileScheduler>(MockBehavior.Strict);
+            var logger = new Mock<ILogger<BackgroundCleanupService>>();
+
+            var service = new TestBackgroundCleanupService(
+                cleanupService.Object,
+                fileScheduler.Object,
+                new CleanupOptions
+                {
+                    Enabled = false,
+                    InitialDelay = TimeSpan.Zero
+                },
+                logger.Object);
+
+            await service.RunAsync(CancellationToken.None);
+
+            cleanupService.VerifyNoOtherCalls();
+            fileScheduler.VerifyNoOtherCalls();
         }
 
         private sealed class TestBackgroundCleanupService : BackgroundCleanupService

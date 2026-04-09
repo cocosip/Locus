@@ -324,6 +324,9 @@ namespace Locus.Storage
                 case QueueEventType.DeleteSucceeded:
                     await ProjectDeleteSucceededAsync(record, ct).ConfigureAwait(false);
                     return;
+                case QueueEventType.DeadLettered:
+                    await ProjectDeadLetteredAsync(record, ct).ConfigureAwait(false);
+                    return;
                 default:
                     return;
             }
@@ -382,8 +385,10 @@ namespace Locus.Storage
             updated.ProcessingStartTime = eventProcessingStart;
             updated.CompletedAt = null;
             updated.DeleteSucceededAt = null;
+            updated.DeadLetteredAt = null;
             updated.AvailableForProcessingAt = null;
             updated.LastError = record.ErrorMessage ?? updated.LastError;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
             await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -407,12 +412,14 @@ namespace Locus.Storage
             updated.ProcessingStartTime = null;
             updated.CompletedAt = null;
             updated.DeleteSucceededAt = null;
+            updated.DeadLetteredAt = null;
             updated.RetryCount = record.RetryCount ?? updated.RetryCount;
             updated.LastError = record.ErrorMessage;
             updated.LastFailedAt = record.OccurredAtUtc;
             updated.AvailableForProcessingAt = status == FileProcessingStatus.Pending
                 ? record.AvailableForProcessingAtUtc
                 : null;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
             await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -435,7 +442,9 @@ namespace Locus.Storage
             updated.ProcessingStartTime = null;
             updated.CompletedAt = null;
             updated.DeleteSucceededAt = null;
+            updated.DeadLetteredAt = null;
             updated.AvailableForProcessingAt = record.AvailableForProcessingAtUtc ?? record.OccurredAtUtc;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
             await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -458,8 +467,10 @@ namespace Locus.Storage
             updated.ProcessingStartTime = null;
             updated.CompletedAt = record.OccurredAtUtc;
             updated.DeleteSucceededAt = null;
+            updated.DeadLetteredAt = null;
             updated.AvailableForProcessingAt = null;
             updated.LastError = null;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
             await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -487,8 +498,10 @@ namespace Locus.Storage
             updated.ProcessingStartTime = null;
             updated.CompletedAt = existing.CompletedAt ?? record.OccurredAtUtc;
             updated.DeleteSucceededAt = null;
+            updated.DeadLetteredAt = null;
             updated.AvailableForProcessingAt = null;
             updated.LastError = null;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
             await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -603,6 +616,56 @@ namespace Locus.Storage
             }
         }
 
+        private async Task ProjectDeadLetteredAsync(QueueEventRecord record, CancellationToken ct)
+        {
+            var existing = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
+            if (existing == null)
+            {
+                existing = await EnsureMetadataExistsAsync(record, FileProcessingStatus.DeadLettered, ct).ConfigureAwait(false);
+                if (existing == null)
+                    return;
+            }
+
+            if (QueueProjectionMetadataState.IsDeadLetterProjectionApplied(existing)
+                && existing.Status == FileProcessingStatus.DeadLettered
+                && existing.DeadLetteredAt.HasValue
+                && existing.DeadLetteredAt.Value >= record.OccurredAtUtc)
+            {
+                return;
+            }
+
+            var directoryPath = DirectoryPathNormalizer.Normalize(existing.DirectoryPath);
+            var tenantQuotaDecremented = false;
+            var directoryQuotaDecremented = false;
+
+            try
+            {
+                await ApplyDeleteSucceededDirectoryProjectionAsync(existing.TenantId, directoryPath).ConfigureAwait(false);
+                directoryQuotaDecremented = true;
+
+                await ApplyDeleteSucceededTenantProjectionAsync(existing.TenantId).ConfigureAwait(false);
+                tenantQuotaDecremented = true;
+
+                var updated = existing.Clone();
+                updated.Status = FileProcessingStatus.DeadLettered;
+                updated.ProcessingStartTime = null;
+                updated.CompletedAt = null;
+                updated.DeleteSucceededAt = null;
+                updated.DeadLetteredAt = record.OccurredAtUtc;
+                updated.AvailableForProcessingAt = null;
+                updated.PhysicalPath = record.PhysicalPath ?? existing.PhysicalPath;
+                updated.VolumeId = record.VolumeId ?? existing.VolumeId;
+                QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(updated);
+
+                await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                await RollbackDeleteSucceededProjectionAsync(existing.TenantId, directoryPath, tenantQuotaDecremented, directoryQuotaDecremented).ConfigureAwait(false);
+                throw;
+            }
+        }
+
         private bool TryConfirmPhysicalFileExists(string physicalPath, out bool physicalFileExists)
         {
             physicalFileExists = false;
@@ -690,6 +753,10 @@ namespace Locus.Storage
                 CompletedAt = IsCompletedEvent(record) ? record.OccurredAtUtc : null,
                 DeleteSucceededAt = record.EventType == QueueEventType.DeleteSucceeded
                     || record.Status == FileProcessingStatus.DeleteSucceeded
+                    ? record.OccurredAtUtc
+                    : null,
+                DeadLetteredAt = record.EventType == QueueEventType.DeadLettered
+                    || record.Status == FileProcessingStatus.DeadLettered
                     ? record.OccurredAtUtc
                     : null,
                 AvailableForProcessingAt = record.AvailableForProcessingAtUtc,

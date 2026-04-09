@@ -44,10 +44,15 @@ namespace Locus
         public Storage.CleanupOptions CleanupOptions { get; set; } = new Storage.CleanupOptions();
 
         /// <summary>
-        /// Gets or sets whether to enable the background cleanup service.
-        /// Default: true
+        /// Backward-compatible alias for CleanupOptions.Enabled.
+        /// Prefer using CleanupOptions.Enabled.
         /// </summary>
-        public bool EnableBackgroundCleanup { get; set; } = true;
+        [Obsolete("Use CleanupOptions.Enabled instead.")]
+        public bool EnableBackgroundCleanup
+        {
+            get => CleanupOptions.Enabled;
+            set => CleanupOptions.Enabled = value;
+        }
 
         /// <summary>
         /// Gets or sets the orphan file recovery options.

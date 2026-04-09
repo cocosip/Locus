@@ -79,6 +79,11 @@ namespace Locus.Storage.Data
         public DateTime? DeleteSucceededAt { get; set; }
 
         /// <summary>
+        /// Gets or sets the timestamp when the file was moved to dead letter.
+        /// </summary>
+        public DateTime? DeadLetteredAt { get; set; }
+
+        /// <summary>
         /// Gets or sets the earliest timestamp when this file is available for processing again.
         /// Used for delayed retry after failures.
         /// </summary>
@@ -124,6 +129,7 @@ namespace Locus.Storage.Data
                 ProcessingStartTime = ProcessingStartTime,
                 CompletedAt = CompletedAt,
                 DeleteSucceededAt = DeleteSucceededAt,
+                DeadLetteredAt = DeadLetteredAt,
                 AvailableForProcessingAt = AvailableForProcessingAt,
                 OriginalFileName = OriginalFileName,
                 FileExtension = FileExtension,

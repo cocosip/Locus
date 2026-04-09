@@ -39,6 +39,12 @@ namespace Locus.Storage
         /// <inheritdoc/>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
+            if (!_options.Enabled)
+            {
+                _logger.LogInformation("BackgroundCleanupService is disabled by CleanupOptions.Enabled");
+                return;
+            }
+
             _logger.LogInformation("BackgroundCleanupService started");
 
             // Wait for initial delay before first cleanup
@@ -78,8 +84,10 @@ namespace Locus.Storage
                     // 5-6. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.
                     await _cleanupService.CleanupFilesByStatusAsync(
-                        _options.CleanupTimedOutFiles          ? _options.ProcessingTimeout         : null,
-                        _options.CleanupPermanentlyFailedFiles ? _options.FailedFileRetentionPeriod : null,
+                        _options.CleanupTimedOutFiles ? _options.ProcessingTimeout : null,
+                        _options.PermanentlyFailedDisposition == PermanentlyFailedDisposition.Keep
+                            ? null
+                            : _options.FailedFileRetentionPeriod,
                         stoppingToken);
 
                     // 6. Remove stale corruption backup files left over from rebuild operations.
@@ -185,6 +193,12 @@ namespace Locus.Storage
     public class CleanupOptions
     {
         /// <summary>
+        /// Gets or sets whether the background cleanup hosted service is enabled.
+        /// Default: true.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
         /// Gets or sets the interval between cleanup runs.
         /// Default: 1 hour.
         /// </summary>
@@ -216,10 +230,10 @@ namespace Locus.Storage
         public TimeSpan? ProcessingTimeout { get; set; } = TimeSpan.FromMinutes(30);
 
         /// <summary>
-        /// Gets or sets whether to cleanup permanently failed files.
-        /// Default: true.
+        /// Gets or sets how permanently failed files are handled after the retention period elapses.
+        /// Default: MoveToDeadLetter.
         /// </summary>
-        public bool CleanupPermanentlyFailedFiles { get; set; } = true;
+        public PermanentlyFailedDisposition PermanentlyFailedDisposition { get; set; } = PermanentlyFailedDisposition.MoveToDeadLetter;
 
         /// <summary>
         /// Gets or sets the retention period before a completed file is reaped physically.
@@ -238,6 +252,12 @@ namespace Locus.Storage
         /// Default: 3 days.
         /// </summary>
         public TimeSpan? FailedFileRetentionPeriod { get; set; } = TimeSpan.FromDays(3);
+
+        /// <summary>
+        /// Gets or sets dead-letter storage options used when permanently failed files are moved
+        /// out of the active queue instead of being deleted.
+        /// </summary>
+        public DeadLetterOptions DeadLetter { get; set; } = new DeadLetterOptions();
 
         /// <summary>
         /// Gets or sets whether to optimize (shrink) SQLite databases periodically.
@@ -287,5 +307,57 @@ namespace Locus.Storage
         /// Default: 200 milliseconds.
         /// </summary>
         public TimeSpan DatabaseOptimizationPauseBetweenBatches { get; set; } = TimeSpan.FromMilliseconds(200);
+    }
+
+    /// <summary>
+    /// Defines how permanently failed files are handled once the retention period elapses.
+    /// </summary>
+    public enum PermanentlyFailedDisposition
+    {
+        /// <summary>
+        /// Keep permanently failed files in place for manual intervention.
+        /// </summary>
+        Keep = 0,
+
+        /// <summary>
+        /// Move permanently failed files to a dead-letter area and remove them from active quotas.
+        /// </summary>
+        MoveToDeadLetter = 1,
+
+        /// <summary>
+        /// Delete permanently failed files physically and remove their metadata.
+        /// </summary>
+        Delete = 2,
+    }
+
+    /// <summary>
+    /// Configures how permanently failed files are stored when they are moved to dead letter.
+    /// </summary>
+    public sealed class DeadLetterOptions
+    {
+        /// <summary>
+        /// Gets or sets the dead-letter root path.
+        /// Relative paths are resolved under the owning volume mount path.
+        /// Default: ".deadletter".
+        /// </summary>
+        public string RootPath { get; set; } = ".deadletter";
+
+        /// <summary>
+        /// Gets or sets whether tenant identifiers are included under the dead-letter root.
+        /// Default: true.
+        /// </summary>
+        public bool IncludeTenantInPath { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether a yyyyMMdd partition directory is inserted before shard segments.
+        /// Default: true.
+        /// </summary>
+        public bool IncludeDatePartition { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the shard depth under the dead-letter root.
+        /// Default: 2.
+        /// </summary>
+        public int ShardingDepth { get; set; } = 2;
     }
 }

@@ -646,6 +646,85 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReplayTenantAsync_DeadLetteredEventAppliesQuotaDecrementAndKeepsMetadata()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-deadletter-001";
+            const string fileKey = "file-deadletter-001";
+            const string directoryPath = "/failed";
+            var deadLetterPath = Path.Combine(
+                _volumeDirectory,
+                ".deadletter",
+                tenantId,
+                DateTime.UtcNow.ToString("yyyyMMdd"),
+                "fi",
+                "le",
+                "file-deadletter-001.dcm");
+            var deadLetteredAt = DateTime.UtcNow;
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(deadLetterPath)!);
+            _fileSystem.File.WriteAllBytes(deadLetterPath, new byte[] { 4, 5, 6 });
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                VolumeId = "vol-001",
+                PhysicalPath = deadLetterPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+                Status = FileProcessingStatus.DeadLettered,
+                RetryCount = 3,
+                LastError = "final processing failure",
+                LastFailedAt = DateTime.UtcNow.AddMinutes(-2),
+                DeadLetteredAt = deadLetteredAt.AddSeconds(-1),
+                Metadata = new Dictionary<string, string>
+                {
+                    ["queue.accepted_projection_applied"] = bool.TrueString,
+                    ["queue.dead_letter_projection_applied"] = bool.FalseString
+                }
+            }, CancellationToken.None);
+
+            await tenantQuotaManager.ApplyAcceptedProjectionAsync(tenantId, CancellationToken.None);
+            await directoryQuotaManager.ApplyAcceptedProjectionAsync(tenantId, directoryPath, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.DeadLettered,
+                OccurredAtUtc = deadLetteredAt,
+                VolumeId = "vol-001",
+                PhysicalPath = deadLetterPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.DeadLettered,
+                RetryCount = 3,
+                ErrorMessage = "final processing failure",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            var rebuilt = await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None);
+
+            Assert.NotNull(rebuilt);
+            Assert.Equal(FileProcessingStatus.DeadLettered, rebuilt!.Status);
+            Assert.Equal(deadLetterPath, rebuilt.PhysicalPath);
+            Assert.Equal(deadLetteredAt, rebuilt.DeadLetteredAt);
+            Assert.True(rebuilt.Metadata!.TryGetValue("queue.dead_letter_projection_applied", out var deadLetterApplied));
+            Assert.Equal(bool.TrueString, deadLetterApplied);
+            Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task ExecuteAsync_IgnoresStaleStartedReplayAfterFailure()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();

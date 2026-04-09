@@ -169,7 +169,7 @@ public class BackgroundCleanupService : BackgroundService
                 // 2. 清理处理超时的文件（重新放回池子）
                 await _cleanupService.CleanupTimedOutProcessingFilesAsync(_options.ProcessingTimeout, stoppingToken);
 
-                // 3. 清理永久失败的文件
+                // 3. 对永久失败文件应用已配置的处置策略
                 await _cleanupService.CleanupPermanentlyFailedFilesAsync(_options.FailedFileRetentionPeriod, stoppingToken);
 
                 // 4. 优化数据库（独立时间间隔，例如每周一次）
@@ -377,7 +377,7 @@ public interface IStorageCleanupService
     // 清理已完成的文件记录（从元数据中删除，但保留物理文件）
     Task CleanupCompletedFileRecordsAsync(TimeSpan olderThan, CancellationToken ct);
 
-    // 清理永久失败的文件（删除物理文件和元数据）
+    // 对永久失败的文件应用已配置的处置策略（默认转入 dead letter）
     Task CleanupPermanentlyFailedFilesAsync(TimeSpan olderThan, CancellationToken ct);
 
     // 清理孤立文件（物理文件存在但元数据不存在）
@@ -619,9 +619,10 @@ Define custom exceptions:
                                     CleanupPermanentlyFailedFilesAsync()
                                                  │
                                                  ↓
-                                         ┌─────────────┐
-                                         │  文件被删除  │
-                                         └─────────────┘
+                                         ┌──────────────────────┐
+                                         │ 应用处置策略         │
+                                         │ 默认转入 dead letter │
+                                         └──────────────────────┘
 ```
 
 **关键点：**
@@ -1061,8 +1062,8 @@ foreach (var watcher in watchers)
 配置自动清理，避免磁盘占满：
 ```json
 {
-  "EnableBackgroundCleanup": true,
   "CleanupOptions": {
+    "Enabled": true,
     "CleanupInterval": "01:00:00",
     "ProcessingTimeout": "00:30:00",
     "FailedFileRetentionPeriod": "7.00:00:00"

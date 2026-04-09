@@ -157,7 +157,7 @@ namespace Locus
         /// <returns>The builder for chaining.</returns>
         public LocusBuilder EnableBackgroundCleanup()
         {
-            _options.EnableBackgroundCleanup = true;
+            _options.CleanupOptions.Enabled = true;
             return this;
         }
 
@@ -167,7 +167,7 @@ namespace Locus
         /// <returns>The builder for chaining.</returns>
         public LocusBuilder DisableBackgroundCleanup()
         {
-            _options.EnableBackgroundCleanup = false;
+            _options.CleanupOptions.Enabled = false;
             return this;
         }
 

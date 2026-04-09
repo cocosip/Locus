@@ -11,6 +11,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Dapper;
 using Locus.Core.Models;
+using Locus.Storage;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -545,6 +546,7 @@ CREATE TABLE IF NOT EXISTS files (
     processing_start_time TEXT,
     completed_at TEXT,
     delete_succeeded_at TEXT,
+    dead_lettered_at TEXT,
     available_for_processing_at TEXT,
     original_file_name TEXT,
     file_extension TEXT,
@@ -654,6 +656,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             EnsureColumnExists(conn, "files", "completed_at", "TEXT");
             EnsureColumnExists(conn, "files", "delete_succeeded_at", "TEXT");
+            EnsureColumnExists(conn, "files", "dead_lettered_at", "TEXT");
 
             return conn;
         }
@@ -696,6 +699,10 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
                 FileProcessingStatus.PermanentlyFailed, orderByCreatedAt: false,
+                nowUtc, ref pendingCount, ref batchCount);
+            totalLoaded += LoadActiveFilesByStatusInBatches(
+                tenantId, conn, cache, pendingQueue,
+                FileProcessingStatus.DeadLettered, orderByCreatedAt: false,
                 nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
@@ -1173,6 +1180,79 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 updated.Status = FileProcessingStatus.DeleteSucceeded;
                 updated.CompletedAt = updated.CompletedAt ?? deleteSucceededAtUtc;
                 updated.DeleteSucceededAt = deleteSucceededAtUtc;
+
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return false;
+
+                IndexStatusCandidate(current, updated);
+
+                lock (GetDatabaseLock(tenantId))
+                {
+                    var conn = GetDatabase(tenantId);
+                    UpsertFile(conn, updated);
+                }
+
+                return true;
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Marks a PermanentlyFailed file as DeadLettered if it still matches the expected failure timestamp.
+        /// Returns false when the record was removed or changed concurrently.
+        /// </summary>
+        public async Task<bool> TryMarkPermanentlyFailedDeadLetteredAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deadLetteredAtUtc,
+            string deadLetterPhysicalPath,
+            string? volumeId,
+            bool projectionApplied,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            if (string.IsNullOrWhiteSpace(deadLetterPhysicalPath))
+                throw new ArgumentException("Dead-letter physical path cannot be empty", nameof(deadLetterPhysicalPath));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return false;
+
+                if (current.Status != FileProcessingStatus.PermanentlyFailed
+                    || !current.LastFailedAt.HasValue
+                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                {
+                    return false;
+                }
+
+                var updated = current.Clone();
+                updated.Status = FileProcessingStatus.DeadLettered;
+                updated.ProcessingStartTime = null;
+                updated.CompletedAt = null;
+                updated.DeleteSucceededAt = null;
+                updated.DeadLetteredAt = deadLetteredAtUtc;
+                updated.AvailableForProcessingAt = null;
+                updated.PhysicalPath = deadLetterPhysicalPath;
+                if (!string.IsNullOrWhiteSpace(volumeId))
+                    updated.VolumeId = volumeId!;
+
+                if (projectionApplied)
+                    QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(updated);
+                else
+                    QueueProjectionMetadataState.MarkDeadLetterProjectionPending(updated);
 
                 if (!cache.TryUpdate(fileKey, updated, current))
                     return false;
@@ -3298,12 +3378,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 INSERT INTO files (
     file_key, tenant_id, volume_id, physical_path, directory_path, file_size,
     created_at, status, retry_count, last_failed_at, last_error,
-    processing_start_time, completed_at, delete_succeeded_at, available_for_processing_at,
+    processing_start_time, completed_at, delete_succeeded_at, dead_lettered_at, available_for_processing_at,
     original_file_name, file_extension, metadata_json)
 VALUES (
     @file_key, @tenant_id, @volume_id, @physical_path, @directory_path, @file_size,
     @created_at, @status, @retry_count, @last_failed_at, @last_error,
-    @processing_start_time, @completed_at, @delete_succeeded_at, @available_for_processing_at,
+    @processing_start_time, @completed_at, @delete_succeeded_at, @dead_lettered_at, @available_for_processing_at,
     @original_file_name, @file_extension, @metadata_json)
 ON CONFLICT(file_key) DO UPDATE SET
     tenant_id                  = excluded.tenant_id,
@@ -3319,6 +3399,7 @@ ON CONFLICT(file_key) DO UPDATE SET
     processing_start_time      = excluded.processing_start_time,
     completed_at               = excluded.completed_at,
     delete_succeeded_at        = excluded.delete_succeeded_at,
+    dead_lettered_at           = excluded.dead_lettered_at,
     available_for_processing_at= excluded.available_for_processing_at,
     original_file_name         = excluded.original_file_name,
     file_extension             = excluded.file_extension,
@@ -3338,6 +3419,7 @@ ON CONFLICT(file_key) DO UPDATE SET
             cmd.Parameters.AddWithValue("@processing_start_time",      m.ProcessingStartTime.HasValue ? (object)m.ProcessingStartTime.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@completed_at",               m.CompletedAt.HasValue ? (object)m.CompletedAt.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@delete_succeeded_at",        m.DeleteSucceededAt.HasValue ? (object)m.DeleteSucceededAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@dead_lettered_at",           m.DeadLetteredAt.HasValue ? (object)m.DeadLetteredAt.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@available_for_processing_at",m.AvailableForProcessingAt.HasValue ? (object)m.AvailableForProcessingAt.Value.ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("@original_file_name",         (object?)m.OriginalFileName ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@file_extension",             (object?)m.FileExtension ?? DBNull.Value);

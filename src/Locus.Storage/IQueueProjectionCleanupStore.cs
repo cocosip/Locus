@@ -92,6 +92,19 @@ namespace Locus.Storage
             CancellationToken ct = default);
 
         /// <summary>
+        /// Marks a projected permanently-failed file as DeadLettered if it still matches the expected failure timestamp.
+        /// </summary>
+        Task<bool> TryMarkPermanentlyFailedDeadLetteredAsync(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deadLetteredAtUtc,
+            string deadLetterPhysicalPath,
+            string? volumeId,
+            bool projectionApplied,
+            CancellationToken ct = default);
+
+        /// <summary>
         /// Removes a projected completed file if it still matches the expected completion timestamp.
         /// </summary>
         Task<bool> TryRemoveCompletedFileAsync(
