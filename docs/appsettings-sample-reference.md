@@ -93,6 +93,11 @@
       // true：queue.log 会被持续投影到 SQLite
       "EnableProjection": true,
 
+      // append 成功后，延迟/防抖写入 queue.state.json 的间隔
+      // queue.log 仍然保持同步 flush，成功语义不变
+      // 设为 00:00:00 可回退到每次 append 立即写 state 文件的旧行为
+      "StateFlushDebounce": "00:00:01",
+
       // 单个租户每轮最多处理多少条 queue 记录
       "MaxRecordsPerTenantPerCycle": 256,
 
@@ -473,6 +478,7 @@
 | `Enabled` | 是否启用 durable queue | 生产环境建议始终为 `true`。 |
 | `AllowLegacyNonJournalMode` | 允许旧版非 journal 模式 | 兼容开关。生产环境建议始终为 `false`。 |
 | `EnableProjection` | 启用后台投影 | 为 `true` 时，由后台服务将 queue 事件投影到 SQLite 元数据与配额库。 |
+| `StateFlushDebounce` | state 文件防抖落盘间隔 | 控制 append 成功后 `queue.state.json` 多久批量/防抖写入。`queue.log` 仍保持同步 flush；设为 `00:00:00` 表示回退到每次 append 都立即写 state 文件。 |
 | `MaxRecordsPerTenantPerCycle` | 单租户单轮最大投影记录数 | 控制每轮每个租户最多处理多少条 journal 记录。 |
 | `MaxTenantsPerCycle` | 单轮最大处理租户数 | 控制一轮投影最多扫描多少个租户的日志。 |
 | `BusyCycleDelay` | 忙时轮询间隔 | 当上一轮仍有工作时，后台投影线程等待多久再继续。 |

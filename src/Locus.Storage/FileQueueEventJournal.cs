@@ -17,7 +17,7 @@ namespace Locus.Storage
     /// <summary>
     /// Stores durable queue events as per-tenant JSONL logs.
     /// </summary>
-    public class FileQueueEventJournal : IQueueEventJournal
+    public class FileQueueEventJournal : IQueueEventJournal, IDisposable
     {
         private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
@@ -25,12 +25,18 @@ namespace Locus.Storage
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = false,
         };
+        private static readonly TimeSpan DefaultStateFlushDebounce = TimeSpan.FromSeconds(1);
 
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<FileQueueEventJournal> _logger;
         private readonly string _queueDirectory;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _appendLocks;
         private readonly ConcurrentDictionary<string, JournalState> _stateCache;
+        private readonly ConcurrentDictionary<string, byte> _dirtyStateTenants;
+        private readonly Timer? _stateFlushTimer;
+        private readonly TimeSpan _stateFlushDebounce;
+        private int _stateFlushInProgress;
+        private bool _disposed;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FileQueueEventJournal"/> class.
@@ -38,7 +44,8 @@ namespace Locus.Storage
         public FileQueueEventJournal(
             IFileSystem fileSystem,
             ILogger<FileQueueEventJournal> logger,
-            string queueDirectory)
+            string queueDirectory,
+            TimeSpan? stateFlushDebounce = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -48,9 +55,14 @@ namespace Locus.Storage
             _queueDirectory = queueDirectory;
             _appendLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
             _stateCache = new ConcurrentDictionary<string, JournalState>(StringComparer.Ordinal);
+            _dirtyStateTenants = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            _stateFlushDebounce = stateFlushDebounce ?? DefaultStateFlushDebounce;
 
             if (!_fileSystem.Directory.Exists(_queueDirectory))
                 _fileSystem.Directory.CreateDirectory(_queueDirectory);
+
+            if (_stateFlushDebounce > TimeSpan.Zero)
+                _stateFlushTimer = new Timer(OnStateFlushTimer, null, Timeout.Infinite, Timeout.Infinite);
         }
 
         /// <inheritdoc/>
@@ -114,7 +126,7 @@ namespace Locus.Storage
                     state.TailOffset = state.BaseOffset + stream.Length;
                 }
 
-                SaveJournalState(tenantId!, state);
+                MarkJournalStateDirty(tenantId!);
             }
             finally
             {
@@ -362,6 +374,7 @@ namespace Locus.Storage
 
                 ReplaceFileAtomically(tempPath, path);
                 _stateCache[tenantId] = state;
+                _dirtyStateTenants.TryRemove(tenantId, out _);
             }
             finally
             {
@@ -375,6 +388,81 @@ namespace Locus.Storage
                     {
                     }
                     catch (UnauthorizedAccessException)
+                    {
+                    }
+                }
+            }
+        }
+
+        private void MarkJournalStateDirty(string tenantId)
+        {
+            if (_stateFlushDebounce == TimeSpan.Zero)
+            {
+                SaveJournalState(tenantId, LoadJournalState(tenantId));
+                return;
+            }
+
+            _dirtyStateTenants[tenantId] = 0;
+            if (_disposed || _stateFlushTimer == null)
+                return;
+
+            try
+            {
+                _stateFlushTimer.Change(_stateFlushDebounce, Timeout.InfiniteTimeSpan);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private void OnStateFlushTimer(object state)
+        {
+            _ = FlushDirtyJournalStatesAsync();
+        }
+
+        private async Task FlushDirtyJournalStatesAsync()
+        {
+            if (_disposed)
+                return;
+
+            if (Interlocked.CompareExchange(ref _stateFlushInProgress, 1, 0) != 0)
+                return;
+
+            try
+            {
+                var dirtyTenants = _dirtyStateTenants.Keys.ToArray();
+                foreach (var tenantId in dirtyTenants)
+                {
+                    if (!_dirtyStateTenants.ContainsKey(tenantId))
+                        continue;
+
+                    var appendLock = _appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+                    await appendLock.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        if (_dirtyStateTenants.ContainsKey(tenantId))
+                            SaveJournalState(tenantId, LoadJournalState(tenantId));
+                    }
+                    finally
+                    {
+                        appendLock.Release();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to flush debounced queue journal state file");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _stateFlushInProgress, 0);
+                if (!_disposed && !_dirtyStateTenants.IsEmpty && _stateFlushTimer != null)
+                {
+                    try
+                    {
+                        _stateFlushTimer.Change(_stateFlushDebounce, Timeout.InfiniteTimeSpan);
+                    }
+                    catch (ObjectDisposedException)
                     {
                     }
                 }
@@ -442,6 +530,41 @@ namespace Locus.Storage
             public long BaseOffset { get; set; }
 
             public long TailOffset { get; set; }
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+
+            if (_stateFlushTimer != null)
+            {
+                try
+                {
+                    _stateFlushTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                _stateFlushTimer.Dispose();
+            }
+
+            if (!_dirtyStateTenants.IsEmpty)
+            {
+                try
+                {
+                    foreach (var tenantId in _dirtyStateTenants.Keys.ToArray())
+                        SaveJournalState(tenantId, LoadJournalState(tenantId));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to flush queue journal state during disposal");
+                }
+            }
         }
     }
 }

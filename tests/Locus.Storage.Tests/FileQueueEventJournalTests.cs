@@ -146,8 +146,65 @@ namespace Locus.Storage.Tests
             Assert.Equal(tailOffset, remainingBatch.NextOffset);
         }
 
+        [Fact]
+        public async Task AppendAsync_AfterCompaction_RestartRebuildsTailOffsetFromJournalLog()
+        {
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-001",
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-001",
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            var firstBatch = await _journal.ReadBatchAsync("tenant-001", 0, 1, CancellationToken.None);
+            var compactedOffset = await _journal.CompactAsync("tenant-001", firstBatch.NextOffset, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-001",
+                FileKey = "file-003",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                _queueDirectory);
+            try
+            {
+                var remainingBatch = await restartedJournal.ReadBatchAsync("tenant-001", compactedOffset, 10, CancellationToken.None);
+                var baseOffset = await restartedJournal.GetBaseOffsetAsync("tenant-001", CancellationToken.None);
+                var tailOffset = await restartedJournal.GetTailOffsetAsync("tenant-001", CancellationToken.None);
+
+                Assert.Equal(compactedOffset, baseOffset);
+                Assert.Equal(2, remainingBatch.Records.Count);
+                Assert.Equal("file-002", remainingBatch.Records[0].FileKey);
+                Assert.Equal("file-003", remainingBatch.Records[1].FileKey);
+                Assert.Equal(tailOffset, remainingBatch.NextOffset);
+            }
+            finally
+            {
+                restartedJournal.Dispose();
+            }
+        }
+
         public void Dispose()
         {
+            try
+            {
+                _journal.Dispose();
+            }
+            catch
+            {
+            }
+
             try
             {
                 if (_fileSystem.Directory.Exists(_queueDirectory))

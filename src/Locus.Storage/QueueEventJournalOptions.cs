@@ -33,6 +33,14 @@ namespace Locus.Storage
         public bool EnableProjection { get; set; } = true;
 
         /// <summary>
+        /// Gets or sets the debounce interval used before persisting queue.state.json
+        /// after accepted journal appends. Set to <see cref="TimeSpan.Zero"/> to force
+        /// immediate state-file persistence on every append (legacy behavior).
+        /// Default: 1 second.
+        /// </summary>
+        public TimeSpan StateFlushDebounce { get; set; } = TimeSpan.FromSeconds(1);
+
+        /// <summary>
         /// Gets or sets the maximum number of journal records to project for a tenant in one cycle.
         /// Default: 64.
         /// </summary>
@@ -128,6 +136,9 @@ namespace Locus.Storage
 
             if (IdleCycleDelay < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.IdleCycleDelay cannot be negative");
+
+            if (StateFlushDebounce < TimeSpan.Zero)
+                throw new InvalidOperationException("QueueEventJournal.StateFlushDebounce cannot be negative");
 
             if (MaxProjectionTimePerCycle <= TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.MaxProjectionTimePerCycle must be greater than zero");

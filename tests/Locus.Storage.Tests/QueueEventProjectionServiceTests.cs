@@ -1671,10 +1671,10 @@ namespace Locus.Storage.Tests
 
         private FileQueueEventJournal CreateJournal()
         {
-            return new FileQueueEventJournal(
+            return TrackDisposable(new FileQueueEventJournal(
                 _fileSystem,
                 new Mock<ILogger<FileQueueEventJournal>>().Object,
-                _queueDirectory);
+                _queueDirectory));
         }
 
         private QueueEventProjectionService CreateProjectionService(

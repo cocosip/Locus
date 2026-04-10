@@ -46,5 +46,17 @@ namespace Locus.Storage.Tests
             var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
             Assert.Contains("EnableProjection", ex.Message);
         }
+
+        [Fact]
+        public void Validate_NegativeStateFlushDebounce_Throws()
+        {
+            var options = new QueueEventJournalOptions
+            {
+                StateFlushDebounce = TimeSpan.FromMilliseconds(-1)
+            };
+
+            var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
+            Assert.Contains("StateFlushDebounce", ex.Message);
+        }
     }
 }

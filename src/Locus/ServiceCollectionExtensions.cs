@@ -342,7 +342,11 @@ namespace Locus
                 {
                     var fileSystem = sp.GetRequiredService<IFileSystem>();
                     var logger = sp.GetRequiredService<ILogger<FileQueueEventJournal>>();
-                    return new FileQueueEventJournal(fileSystem, logger, options.QueueEventJournal.QueueDirectory);
+                    return new FileQueueEventJournal(
+                        fileSystem,
+                        logger,
+                        options.QueueEventJournal.QueueDirectory,
+                        options.QueueEventJournal.StateFlushDebounce);
                 });
 
                 services.AddSingleton<QueueEventProjectionService>(sp =>
