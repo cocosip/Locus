@@ -107,6 +107,44 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AppendAsync_PersistsJournalFormatAsStringInStateFile()
+        {
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    StateFlushDebounce = TimeSpan.Zero,
+                });
+
+            try
+            {
+                await journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-state-format",
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+            }
+            finally
+            {
+                journal.Dispose();
+            }
+
+            var statePath = Path.Combine(_queueDirectory, "tenant-state-format", "queue.state.json");
+            string stateJson;
+            using (var stream = _fileSystem.File.Open(statePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(stream))
+            {
+                stateJson = reader.ReadToEnd();
+            }
+
+            Assert.Contains("\"format\":\"BinaryV1\"", stateJson);
+        }
+
+        [Fact]
         public async Task CompactAsync_PreservesLogicalOffsetsAcrossCompaction()
         {
             await _journal.AppendAsync(new QueueEventRecord
@@ -335,7 +373,16 @@ namespace Locus.Storage.Tests
 
             try
             {
-                var initialBatch = await restartedJournal.ReadBatchAsync("tenant-corrupt-tail", 0, 10, CancellationToken.None);
+                QueueJournalMetricCapture? metrics = null;
+                QueueEventReadBatch initialBatch;
+                using (metrics = new QueueJournalMetricCapture())
+                {
+                    initialBatch = await restartedJournal.ReadBatchAsync("tenant-corrupt-tail", 0, 10, CancellationToken.None);
+
+                    Assert.Equal(1, metrics.GetCount("locus.queue_journal.corrupt_tail.detected"));
+                    Assert.Equal(1, metrics.GetCount("locus.queue_journal.corrupt_tail.auto_repaired"));
+                }
+
                 var repairedLength = _fileSystem.FileInfo.New(journalPath).Length;
 
                 Assert.Equal(2, initialBatch.Records.Count);

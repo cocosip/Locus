@@ -61,5 +61,40 @@ namespace Locus.Core.Models
         /// Gets or sets the UTC timestamp when the latest sequence gap was detected.
         /// </summary>
         public DateTime? LastGapDetectedAtUtc { get; set; }
+
+        /// <summary>
+        /// Gets or sets the expected sequence number when the latest gap was detected.
+        /// </summary>
+        public long? GapExpectedSequenceNumber { get; set; }
+
+        /// <summary>
+        /// Gets or sets the observed sequence number when the latest gap was detected.
+        /// </summary>
+        public long? GapObservedSequenceNumber { get; set; }
+
+        /// <summary>
+        /// Gets or sets the active journal format detected for the tenant.
+        /// </summary>
+        public string? JournalFormat { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether a corrupt journal tail was detected.
+        /// </summary>
+        public bool JournalCorruptTailDetected { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC timestamp when the latest corrupt journal tail was detected.
+        /// </summary>
+        public DateTime? LastJournalCorruptTailDetectedAtUtc { get; set; }
+
+        /// <summary>
+        /// Gets or sets the logical offset where the latest corrupt journal tail started.
+        /// </summary>
+        public long? LastJournalCorruptTailOffset { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of times the tenant journal has been auto-repaired.
+        /// </summary>
+        public int JournalAutoRepairCount { get; set; }
     }
 }

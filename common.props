@@ -13,7 +13,7 @@
     <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and SQLite metadata management.</Description>
 
     <!-- Version information -->
-    <Version>1.2.7</Version>
+    <Version>1.2.8</Version>
 
     <!-- Build configuration -->
     <LangVersion>latest</LangVersion>

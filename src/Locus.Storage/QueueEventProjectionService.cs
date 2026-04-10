@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -21,6 +22,8 @@ namespace Locus.Storage
     /// </summary>
     public class QueueEventProjectionService : BackgroundService, IQueueProjectionMaintenanceService
     {
+        private static readonly EventId SequenceGapDetectedEventId = new EventId(4201, nameof(SequenceGapDetectedEventId));
+        private static readonly EventId SequenceGapRecoveryFailedEventId = new EventId(4202, nameof(SequenceGapRecoveryFailedEventId));
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -341,8 +344,10 @@ namespace Locus.Storage
                 cursor.LastGapDetectedAtUtc = DateTime.UtcNow;
                 cursor.GapExpectedSequenceNumber = expectedSequence;
                 cursor.GapObservedSequenceNumber = sequenceNumber;
+                QueueJournalMetrics.RecordSequenceGapDetected();
 
                 _logger.LogWarning(
+                    SequenceGapDetectedEventId,
                     "Queue journal sequence gap detected for tenant {TenantId}: expected {ExpectedSequenceNumber} but observed {ObservedSequenceNumber}. Triggering orphan recovery.",
                     tenantId,
                     expectedSequence,
@@ -366,6 +371,7 @@ namespace Locus.Storage
 
             try
             {
+                QueueJournalMetrics.RecordSequenceGapRecoveryAttempted();
                 await _storageCleanupService
                     .RecoverOrphanedFilesAsync(new ProjectionRecoveryTenantContext(tenantId), ct)
                     .ConfigureAwait(false);
@@ -376,7 +382,9 @@ namespace Locus.Storage
             }
             catch (Exception ex)
             {
+                QueueJournalMetrics.RecordSequenceGapRecoveryFailed();
                 _logger.LogWarning(
+                    SequenceGapRecoveryFailedEventId,
                     ex,
                     "Automatic orphan recovery after queue sequence gap failed for tenant {TenantId} (expected {ExpectedSequenceNumber}, observed {ObservedSequenceNumber})",
                     tenantId,
@@ -1084,9 +1092,34 @@ namespace Locus.Storage
             return _fileSystem.Path.Combine(_options.QueueDirectory, tenantId, "queue.log");
         }
 
+        private string GetJournalStatePath(string tenantId)
+        {
+            return _fileSystem.Path.Combine(_options.QueueDirectory, tenantId, "queue.state.json");
+        }
+
         private string GetSnapshotPath(string tenantId)
         {
             return _fileSystem.Path.Combine(_options.QueueDirectory, tenantId, "projection.snapshot.json");
+        }
+
+        private async Task<JournalStateView?> LoadJournalStateViewAsync(string tenantId, CancellationToken ct)
+        {
+            var path = GetJournalStatePath(tenantId);
+            if (!_fileSystem.File.Exists(path))
+                return null;
+
+            try
+            {
+                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    return await JsonSerializer.DeserializeAsync<JournalStateView>(stream, JsonOptions, ct).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex) when (ex is IOException || ex is JsonException || ex is UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Failed to load queue journal state view for tenant {TenantId}", tenantId);
+                return null;
+            }
         }
 
         private static string NormalizeDirectoryPath(string? directoryPath)
@@ -1147,6 +1180,7 @@ namespace Locus.Storage
             cursor.Offset = await NormalizeCursorOffsetAsync(tenantId, cursor.Offset, ct).ConfigureAwait(false);
             var journalSizeBytes = await _journal.GetTailOffsetAsync(tenantId, ct).ConfigureAwait(false);
             var snapshot = await LoadSnapshotAsync(tenantId, ct).ConfigureAwait(false);
+            var journalState = await LoadJournalStateViewAsync(tenantId, ct).ConfigureAwait(false);
             return new QueueProjectionTenantState
             {
                 TenantId = tenantId,
@@ -1160,6 +1194,13 @@ namespace Locus.Storage
                 LastProjectedSequenceNumber = cursor.LastSequenceNumber,
                 GapDetected = cursor.GapDetected,
                 LastGapDetectedAtUtc = cursor.LastGapDetectedAtUtc,
+                GapExpectedSequenceNumber = cursor.GapExpectedSequenceNumber,
+                GapObservedSequenceNumber = cursor.GapObservedSequenceNumber,
+                JournalFormat = journalState?.Format?.ToString(),
+                JournalCorruptTailDetected = journalState?.CorruptTailDetected ?? false,
+                LastJournalCorruptTailDetectedAtUtc = journalState?.LastCorruptTailDetectedAtUtc,
+                LastJournalCorruptTailOffset = journalState?.LastCorruptTailOffset,
+                JournalAutoRepairCount = journalState?.AutoRepairCount ?? 0,
             };
         }
 
@@ -1615,6 +1656,20 @@ namespace Locus.Storage
             public long CursorOffset { get; set; }
 
             public System.Collections.Generic.List<FileMetadata> Files { get; set; } = new System.Collections.Generic.List<FileMetadata>();
+        }
+
+        private sealed class JournalStateView
+        {
+            [JsonConverter(typeof(JsonStringEnumConverter))]
+            public JournalFormat? Format { get; set; }
+
+            public bool CorruptTailDetected { get; set; }
+
+            public DateTime? LastCorruptTailDetectedAtUtc { get; set; }
+
+            public long? LastCorruptTailOffset { get; set; }
+
+            public int AutoRepairCount { get; set; }
         }
 
         private sealed class ProjectionCycleResult

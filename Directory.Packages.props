@@ -13,6 +13,7 @@
     <PackageVersion Include="System.IO.Abstractions" Version="22.1.0" />
     <PackageVersion Include="System.Threading.Channels" Version="9.0.0" />
     <PackageVersion Include="System.Text.Json" Version="9.0.1" />
+    <PackageVersion Include="System.Diagnostics.DiagnosticSource" Version="9.0.0" />
     <!-- Microsoft Extensions (using 9.x for better compatibility with netstandard2.0) -->
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
     <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />

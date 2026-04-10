@@ -1644,11 +1644,20 @@ namespace Locus.Storage.Tests
             var replayJournal = CreateJournal(JournalFormat.JsonLines);
             var service = CreateProjectionService(replayJournal, tenantQuotaManager, directoryQuotaManager, cleanupService.Object);
 
-            var state = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+            QueueProjectionTenantState state;
+            using (var metrics = new QueueJournalMetricCapture())
+            {
+                state = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+                Assert.Equal(1, metrics.GetCount("locus.queue_journal.sequence_gap.detected"));
+                Assert.Equal(1, metrics.GetCount("locus.queue_journal.sequence_gap.recovery_attempted"));
+                Assert.Equal(0, metrics.GetCount("locus.queue_journal.sequence_gap.recovery_failed"));
+            }
 
             Assert.True(state.GapDetected);
             Assert.Equal(3, state.LastProjectedSequenceNumber);
             Assert.True(state.LastGapDetectedAtUtc.HasValue);
+            Assert.Equal(2L, state.GapExpectedSequenceNumber);
+            Assert.Equal(3L, state.GapObservedSequenceNumber);
             Assert.NotNull(await _metadataRepository.GetAsync(tenantId, "file-gap-001", CancellationToken.None));
             Assert.NotNull(await _metadataRepository.GetAsync(tenantId, "file-gap-003", CancellationToken.None));
             Assert.Null(await _metadataRepository.GetAsync(tenantId, "file-gap-002", CancellationToken.None));
@@ -1656,6 +1665,51 @@ namespace Locus.Storage.Tests
             cleanupService.Verify(service => service.RecoverOrphanedFilesAsync(
                 It.Is<ITenantContext>(tenant => tenant.TenantId == tenantId),
                 It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task GetTenantStateAsync_AfterJournalTailRepair_ExposesJournalHealthDiagnostics()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var initialJournal = CreateJournal(JournalFormat.BinaryV1);
+
+            const string tenantId = "tenant-journal-health";
+
+            await initialJournal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await initialJournal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            initialJournal.Dispose();
+
+            var journalPath = Path.Combine(_queueDirectory, tenantId, "queue.log");
+            using (var stream = _fileSystem.File.Open(journalPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+            {
+                var corruptTail = new byte[] { 1, 2, 3, 4, 5 };
+                stream.Write(corruptTail, 0, corruptTail.Length);
+            }
+
+            var repairedJournal = CreateJournal(JournalFormat.BinaryV1);
+            await repairedJournal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+            var service = CreateProjectionService(repairedJournal, tenantQuotaManager, directoryQuotaManager);
+            var state = await service.GetTenantStateAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(nameof(JournalFormat.BinaryV1), state.JournalFormat);
+            Assert.True(state.JournalCorruptTailDetected);
+            Assert.True(state.LastJournalCorruptTailDetectedAtUtc.HasValue);
+            Assert.True(state.LastJournalCorruptTailOffset.HasValue);
+            Assert.True(state.JournalAutoRepairCount >= 1);
         }
 
         public void Dispose()

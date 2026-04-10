@@ -5,6 +5,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -18,6 +19,9 @@ namespace Locus.Storage
     /// </summary>
     public class FileQueueEventJournal : IQueueEventJournal, IDisposable
     {
+        private static readonly EventId CorruptTailReadEventId = new EventId(4101, nameof(CorruptTailReadEventId));
+        private static readonly EventId CorruptTailTruncatedEventId = new EventId(4102, nameof(CorruptTailTruncatedEventId));
+        private static readonly EventId CorruptTailStateScanEventId = new EventId(4103, nameof(CorruptTailStateScanEventId));
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -189,7 +193,9 @@ namespace Locus.Storage
                 var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
                 if (result.EncounteredCorruptTail)
                 {
+                    QueueJournalMetrics.RecordCorruptTailDetected(codec.Format, "read");
                     _logger.LogWarning(
+                        CorruptTailReadEventId,
                         "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
                         tenantId,
                         state.BaseOffset + result.NextOffset,
@@ -816,7 +822,14 @@ namespace Locus.Storage
                     await stream.FlushAsync(ct).ConfigureAwait(false);
                 }
 
+                state.CorruptTailDetected = true;
+                state.LastCorruptTailDetectedAtUtc = DateTime.UtcNow;
+                state.LastCorruptTailOffset = state.BaseOffset + expectedLength;
+                state.AutoRepairCount++;
+                QueueJournalMetrics.RecordCorruptTailAutoRepaired(state.Format);
+
                 _logger.LogWarning(
+                    CorruptTailTruncatedEventId,
                     "Truncated corrupt queue journal tail for tenant {TenantId} from {OriginalLength} bytes to {RecoveredLength} bytes.",
                     tenantId,
                     fileLength,
@@ -1058,7 +1071,12 @@ namespace Locus.Storage
 
                     if (scan.EncounteredCorruptTail)
                     {
+                        state.CorruptTailDetected = true;
+                        state.LastCorruptTailDetectedAtUtc = DateTime.UtcNow;
+                        state.LastCorruptTailOffset = state.TailOffset;
+                        QueueJournalMetrics.RecordCorruptTailDetected(state.Format, "state_scan");
                         _logger.LogWarning(
+                            CorruptTailStateScanEventId,
                             "Queue journal corrupt tail detected for tenant {TenantId} while loading state. Using recovered tail offset {TailOffset} for format {Format}.",
                             tenantId,
                             state.TailOffset,
@@ -1155,7 +1173,16 @@ namespace Locus.Storage
 
             public long LastSequenceNumber { get; set; }
 
+            [JsonConverter(typeof(JsonStringEnumConverter))]
             public JournalFormat Format { get; set; } = JournalFormat.JsonLines;
+
+            public bool CorruptTailDetected { get; set; }
+
+            public DateTime? LastCorruptTailDetectedAtUtc { get; set; }
+
+            public long? LastCorruptTailOffset { get; set; }
+
+            public int AutoRepairCount { get; set; }
         }
 
         /// <inheritdoc/>

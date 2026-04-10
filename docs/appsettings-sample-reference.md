@@ -17,6 +17,71 @@
   - [appsettings.json](/D:/Code/dotnet/Locus/samples/Locus.Sample.Console/appsettings.json)
   - [appsettings-sample-reference.md](/D:/Code/dotnet/Locus/docs/appsettings-sample-reference.md)
 
+## QueueEventJournal 调参建议
+
+结合当前本地 benchmark 结果，`QueueEventJournal` 建议按下面三档理解：
+
+- 稳妥版：
+  - `JournalFormat = BinaryV1`
+  - `AckMode = Durable`
+  - `Linger = 3ms`
+  - 适合作为默认生产配置，保持“`WriteFileAsync` 返回成功时 journal 已持久化”的语义不变
+- 吞吐版：
+  - `JournalFormat = BinaryV1`
+  - `AckMode = Balanced`
+  - `Linger = 3ms ~ 5ms`
+  - `BalancedFlushWindow = 10ms ~ 15ms`
+  - 适合热点租户 burst 写入明显、但仍希望风险窗口可控的场景
+- 极限版：
+  - `JournalFormat = BinaryV1`
+  - `AckMode = Async`
+  - 不建议作为默认生产配置，更适合压测或低一致性要求场景
+
+这轮本地 benchmark 的结论可以概括为：
+
+- Binary 在“单租户热点 burst”下优势非常明显，吞吐提升远大于仅靠微批参数细调
+- Binary 在“多租户 fan-out”下仍有稳定收益，同时显著降低分配
+- `BalancedFlushWindow` 只对 `AckMode = Balanced` 生效，不会改变 `Durable` 的确认语义
+- 如果目标是并发多文件写入吞吐，应优先做 binary codec；如果目标是单条极低延迟，不能只靠格式切换做判断
+
+## QueueEventJournal 观测信号
+
+当前 `QueueEventJournal` 已经具备基础的 metrics、状态字段和日志事件，用来覆盖：
+
+- sequence gap detection
+- corrupt tail detection
+- auto-repair / auto-recovery
+
+建议把它们理解成三层：
+
+- metrics：适合做告警和趋势统计
+- `QueueProjectionTenantState`：适合做维护态查询
+- `queue.state.json` 与日志：适合做单租户排障
+
+当前核心 metrics 包括：
+
+- `locus.queue_journal.sequence_gap.detected`
+- `locus.queue_journal.sequence_gap.recovery_attempted`
+- `locus.queue_journal.sequence_gap.recovery_failed`
+- `locus.queue_journal.corrupt_tail.detected`
+- `locus.queue_journal.corrupt_tail.auto_repaired`
+
+当前维护态会额外暴露这些字段：
+
+- `GapExpectedSequenceNumber`
+- `GapObservedSequenceNumber`
+- `JournalFormat`
+- `JournalCorruptTailDetected`
+- `LastJournalCorruptTailDetectedAtUtc`
+- `LastJournalCorruptTailOffset`
+- `JournalAutoRepairCount`
+
+其中 `queue.state.json` 里的 `Format` 现在按字符串持久化，例如 `BinaryV1`，方便人工排障。
+
+更完整的说明见：
+
+- [queue-journal-observability.md](/D:/Code/dotnet/Locus/docs/queue-journal-observability.md)
+
 ## 完整配置示例（JSONC 注释版）
 
 下面这份配置使用 `jsonc` 风格写注释，目的是帮助理解字段含义。
