@@ -88,6 +88,12 @@
       // true：queue.log 会持续投影到 metadata / quota
       "EnableProjection": true,
 
+      // 新建或空 journal 默认使用的编码格式
+      // BinaryV1：推荐默认值，热点租户 burst 吞吐更好，分配更低
+      // JsonLines：保留兼容格式，适合老 journal 持续读取/追加
+      // 注意：已有非空 queue.log 会自动探测格式并继续沿用，不会在单文件内混写 JSON/binary
+      "JournalFormat": "BinaryV1",
+
       // append 的确认策略
       // Durable：默认值。批次写入并 flush 后才返回
       // Balanced：先写入，再在极短窗口内合并 flush，吞吐更高但风险略增
@@ -99,7 +105,7 @@
       "StateFlushDebounce": "00:00:01",
 
       // 单租户 writer 在发现有积压时，用于收敛微批的等待窗口
-      // 1ms 是比较保守的起始值：既尽量合批，又不明显拉高单次延迟
+      // 3ms 是当前偏稳妥的默认值：优先提升并发吞吐，同时保持 Durable 语义不变
       "Linger": "00:00:00.003",
 
       // 单个 journal append 批次最多合并多少条记录
@@ -113,7 +119,7 @@
 
       // 仅对 AckMode=Balanced 生效
       // 写入后允许延后 flush 的最大窗口
-      // 5ms 的目的是只做非常短的合批，不把延迟和风险窗口放大太多
+      // 10ms 仍然是保守窗口，重点是提升合批收益而不是追求极限低延迟
       "BalancedFlushWindow": "00:00:00.010",
 
       // projector 每轮每个租户最多投影多少条记录

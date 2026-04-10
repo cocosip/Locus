@@ -1601,7 +1601,7 @@ namespace Locus.Storage.Tests
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
             var directoryQuotaManager = CreateDirectoryQuotaManager();
-            var initialJournal = CreateJournal();
+            var initialJournal = CreateJournal(JournalFormat.JsonLines);
             var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
 
             const string tenantId = "tenant-sequence-gap";
@@ -1641,7 +1641,7 @@ namespace Locus.Storage.Tests
                     It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
 
-            var replayJournal = CreateJournal();
+            var replayJournal = CreateJournal(JournalFormat.JsonLines);
             var service = CreateProjectionService(replayJournal, tenantQuotaManager, directoryQuotaManager, cleanupService.Object);
 
             var state = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
@@ -1734,10 +1734,19 @@ namespace Locus.Storage.Tests
 
         private FileQueueEventJournal CreateJournal()
         {
+            return CreateJournal(JournalFormat.BinaryV1);
+        }
+
+        private FileQueueEventJournal CreateJournal(JournalFormat format)
+        {
             return TrackDisposable(new FileQueueEventJournal(
                 _fileSystem,
                 new Mock<ILogger<FileQueueEventJournal>>().Object,
-                _queueDirectory));
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = format,
+                }));
         }
 
         private QueueEventProjectionService CreateProjectionService(

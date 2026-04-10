@@ -41,6 +41,13 @@ namespace Locus.Storage
         public TimeSpan StateFlushDebounce { get; set; } = TimeSpan.FromSeconds(1);
 
         /// <summary>
+        /// Gets or sets the default journal encoding for newly created or empty tenant logs.
+        /// Existing non-empty journals are auto-detected and continue to use their current format.
+        /// Default: <see cref="Locus.Storage.JournalFormat.BinaryV1"/>.
+        /// </summary>
+        public JournalFormat JournalFormat { get; set; } = JournalFormat.BinaryV1;
+
+        /// <summary>
         /// Gets or sets the linger window used by the per-tenant writer to coalesce
         /// queued append requests into a micro-batch when backlog exists.
         /// Default: 1 millisecond.
@@ -178,6 +185,12 @@ namespace Locus.Storage
 
             if (StateFlushDebounce < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.StateFlushDebounce cannot be negative");
+
+            if (!Enum.IsDefined(typeof(JournalFormat), JournalFormat))
+                throw new InvalidOperationException("QueueEventJournal.JournalFormat is invalid");
+
+            if (!Enum.IsDefined(typeof(QueueEventJournalAckMode), AckMode))
+                throw new InvalidOperationException("QueueEventJournal.AckMode is invalid");
 
             if (Linger < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.Linger cannot be negative");

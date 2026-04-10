@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,11 +14,10 @@ using Microsoft.Extensions.Logging;
 namespace Locus.Storage
 {
     /// <summary>
-    /// Stores durable queue events as per-tenant JSONL logs.
+    /// Stores durable queue events as per-tenant journals with configurable codecs.
     /// </summary>
     public class FileQueueEventJournal : IQueueEventJournal, IDisposable
     {
-        private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -43,6 +41,9 @@ namespace Locus.Storage
         private readonly int _maxBatchRecords;
         private readonly int _maxBatchBytes;
         private readonly QueueEventJournalAckMode _ackMode;
+        private readonly JournalFormat _defaultFormat;
+        private readonly IQueueEventJournalCodec _jsonCodec;
+        private readonly IQueueEventJournalCodec _binaryCodec;
         private int _stateFlushInProgress;
         private bool _disposed;
 
@@ -92,6 +93,9 @@ namespace Locus.Storage
             _maxBatchRecords = options.MaxBatchRecords;
             _maxBatchBytes = options.MaxBatchBytes;
             _ackMode = options.AckMode;
+            _defaultFormat = options.JournalFormat;
+            _jsonCodec = new JsonQueueEventJournalCodec();
+            _binaryCodec = new BinaryQueueEventJournalCodec();
 
             if (!_fileSystem.Directory.Exists(_queueDirectory))
                 _fileSystem.Directory.CreateDirectory(_queueDirectory);
@@ -172,63 +176,31 @@ namespace Locus.Storage
             if (!_fileSystem.File.Exists(path))
                 return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), state.BaseOffset, true);
 
-            var records = new List<QueueEventRecord>(maxRecords);
             var effectiveOffset = offset < state.BaseOffset ? state.BaseOffset : offset;
             var nextRelativeOffset = effectiveOffset - state.BaseOffset;
-            var reachedEndOfFile = true;
+            await RepairCorruptTailIfNeededAsync(tenantId, state, ct).ConfigureAwait(false);
 
-            using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             {
                 if (nextRelativeOffset > stream.Length)
                     nextRelativeOffset = stream.Length;
 
-                stream.Seek(nextRelativeOffset, SeekOrigin.Begin);
-                using (var reader = new StreamReader(stream, Utf8NoBom, detectEncodingFromByteOrderMarks: true, bufferSize: 16 * 1024, leaveOpen: true))
+                var codec = GetCodec(tenantId);
+                var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
+                if (result.EncounteredCorruptTail)
                 {
-                    while (records.Count < maxRecords)
-                    {
-                        ct.ThrowIfCancellationRequested();
-
-                        var line = await reader.ReadLineAsync().ConfigureAwait(false);
-                        if (line == null)
-                            break;
-
-                        nextRelativeOffset += Utf8NoBom.GetByteCount(line) + 1;
-                        if (line.Length == 0)
-                            continue;
-
-                        try
-                        {
-                            var record = JsonSerializer.Deserialize<QueueEventRecord>(line, JsonOptions);
-                            if (record == null)
-                                continue;
-
-                            if (!ValidatePayloadChecksum(record))
-                            {
-                                _logger.LogWarning(
-                                    "Skipping queue journal line with invalid CRC for tenant {TenantId} at offset {Offset}",
-                                    tenantId,
-                                    state.BaseOffset + nextRelativeOffset);
-                                continue;
-                            }
-
-                            records.Add(record);
-                        }
-                        catch (JsonException ex)
-                        {
-                            _logger.LogWarning(
-                                ex,
-                                "Skipping invalid queue journal line for tenant {TenantId} at offset {Offset}",
-                                tenantId,
-                                state.BaseOffset + nextRelativeOffset);
-                        }
-                    }
+                    _logger.LogWarning(
+                        "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
+                        tenantId,
+                        state.BaseOffset + result.NextOffset,
+                        codec.Format);
                 }
 
-                reachedEndOfFile = nextRelativeOffset >= stream.Length;
+                return new QueueEventReadBatch(
+                    result.Records,
+                    state.BaseOffset + result.NextOffset,
+                    result.ReachedEndOfFile);
             }
-
-            return new QueueEventReadBatch(records, state.BaseOffset + nextRelativeOffset, reachedEndOfFile);
         }
 
         /// <inheritdoc/>
@@ -247,6 +219,7 @@ namespace Locus.Storage
                 CloseTenantAppendStream(tenantId);
 
                 var state = LoadJournalState(tenantId);
+                await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                 var path = GetJournalPath(tenantId);
                 if (!_fileSystem.File.Exists(path))
                     return state.BaseOffset;
@@ -498,6 +471,7 @@ namespace Locus.Storage
             try
             {
                 var state = LoadJournalState(writer.TenantId);
+                await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
                 var serializedRecords = SerializeBatch(state, batch);
                 if (serializedRecords.Count == 0)
                     return;
@@ -526,17 +500,14 @@ namespace Locus.Storage
         {
             var serializedRecords = new List<SerializedRecord>();
             var nextSequence = state.LastSequenceNumber;
+            var codec = GetCodec(state.Format);
 
             foreach (var request in batch)
             {
                 foreach (var record in request.Records)
                 {
                     nextSequence++;
-                    record.SequenceNumber = nextSequence;
-                    record.PayloadCrc32 = ComputePayloadChecksum(record);
-
-                    var line = JsonSerializer.Serialize(record, JsonOptions) + "\n";
-                    serializedRecords.Add(new SerializedRecord(Utf8NoBom.GetBytes(line)));
+                    serializedRecords.Add(new SerializedRecord(codec.SerializeRecord(record, nextSequence)));
                 }
             }
 
@@ -557,7 +528,7 @@ namespace Locus.Storage
                 GetJournalPath(writer.TenantId),
                 FileMode.Append,
                 FileAccess.Write,
-                FileShare.Read);
+                FileShare.Read | FileShare.Delete);
             writer.LastFlushUtc = DateTime.UtcNow;
             return writer.AppendStream;
         }
@@ -720,21 +691,6 @@ namespace Locus.Storage
             return total;
         }
 
-        private bool ValidatePayloadChecksum(QueueEventRecord record)
-        {
-            if (!record.PayloadCrc32.HasValue)
-                return true;
-
-            return ComputePayloadChecksum(record) == record.PayloadCrc32.Value;
-        }
-
-        private uint ComputePayloadChecksum(QueueEventRecord record)
-        {
-            var payload = CloneRecord(record);
-            payload.PayloadCrc32 = null;
-            return QueueEventCrc32.Compute(JsonSerializer.Serialize(payload, JsonOptions));
-        }
-
         private void CloseTenantAppendStream(string tenantId)
         {
             if (_tenantWriters.TryGetValue(tenantId, out var writer))
@@ -779,6 +735,110 @@ namespace Locus.Storage
         private string GetJournalStatePath(string tenantId)
         {
             return _fileSystem.Path.Combine(GetTenantDirectory(tenantId), "queue.state.json");
+        }
+
+        private IQueueEventJournalCodec GetCodec(string tenantId)
+        {
+            return GetCodec(ResolveJournalFormat(tenantId));
+        }
+
+        private IQueueEventJournalCodec GetCodec(JournalFormat format)
+        {
+            return format == JournalFormat.BinaryV1 ? _binaryCodec : _jsonCodec;
+        }
+
+        private JournalFormat ResolveJournalFormat(string tenantId)
+        {
+            var path = GetJournalPath(tenantId);
+            if (!_fileSystem.File.Exists(path))
+                return _defaultFormat;
+
+            try
+            {
+                var fileInfo = _fileSystem.FileInfo.New(path);
+                if (fileInfo.Length == 0)
+                    return _defaultFormat;
+
+                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    var prefix = new byte[4];
+                    var bytesRead = stream.Read(prefix, 0, prefix.Length);
+                    if (BinaryQueueEventJournalCodec.MatchesMagic(prefix, bytesRead))
+                        return JournalFormat.BinaryV1;
+
+                    if (bytesRead > 0 && prefix[0] == (byte)'{')
+                        return JournalFormat.JsonLines;
+                }
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Failed to detect queue journal format for tenant {TenantId}. Falling back to configured default.", tenantId);
+            }
+
+            return _defaultFormat;
+        }
+
+        private async Task RepairCorruptTailIfNeededAsync(string tenantId, JournalState state, CancellationToken ct)
+        {
+            var appendLock = _appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: false).ConfigureAwait(false);
+        }
+
+        private async Task RepairCorruptTailCoreAsync(
+            string tenantId,
+            JournalState state,
+            SemaphoreSlim appendLock,
+            CancellationToken ct,
+            bool lockAlreadyHeld)
+        {
+            var path = GetJournalPath(tenantId);
+            if (!_fileSystem.File.Exists(path))
+                return;
+
+            var expectedLength = Math.Max(0, state.TailOffset - state.BaseOffset);
+            var fileLength = _fileSystem.FileInfo.New(path).Length;
+            if (fileLength <= expectedLength)
+                return;
+
+            if (!lockAlreadyHeld)
+                await appendLock.WaitAsync(ct).ConfigureAwait(false);
+
+            try
+            {
+                fileLength = _fileSystem.FileInfo.New(path).Length;
+                if (fileLength <= expectedLength)
+                    return;
+
+                CloseTenantAppendStream(tenantId);
+                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Write, FileShare.Read))
+                {
+                    stream.SetLength(expectedLength);
+                    await stream.FlushAsync(ct).ConfigureAwait(false);
+                }
+
+                _logger.LogWarning(
+                    "Truncated corrupt queue journal tail for tenant {TenantId} from {OriginalLength} bytes to {RecoveredLength} bytes.",
+                    tenantId,
+                    fileLength,
+                    expectedLength);
+
+                SaveJournalState(tenantId, state);
+            }
+            finally
+            {
+                if (!lockAlreadyHeld)
+                    appendLock.Release();
+            }
+        }
+
+        private QueueEventJournalCodecScanResult ScanJournal(string tenantId, JournalFormat format)
+        {
+            var path = GetJournalPath(tenantId);
+            if (!_fileSystem.File.Exists(path))
+                return new QueueEventJournalCodecScanResult(0, 0, false);
+
+            using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                return GetCodec(format).Scan(stream);
         }
 
         private JournalState LoadJournalState(string tenantId)
@@ -979,6 +1039,7 @@ namespace Locus.Storage
             if (state.LastSequenceNumber < 0)
                 state.LastSequenceNumber = 0;
 
+            state.Format = ResolveJournalFormat(tenantId);
             var path = GetJournalPath(tenantId);
             var fileLength = _fileSystem.File.Exists(path)
                 ? _fileSystem.FileInfo.New(path).Length
@@ -987,50 +1048,33 @@ namespace Locus.Storage
             if (state.TailOffset < state.BaseOffset)
                 state.TailOffset = state.BaseOffset;
 
-            var minimumTailOffset = state.BaseOffset + fileLength;
-            if (state.TailOffset < minimumTailOffset)
-                state.TailOffset = minimumTailOffset;
-
-            if (state.LastSequenceNumber == 0 && fileLength > 0)
-                state.LastSequenceNumber = RecoverLastSequenceNumberFromJournal(tenantId);
-        }
-
-        private long RecoverLastSequenceNumberFromJournal(string tenantId)
-        {
-            var path = GetJournalPath(tenantId);
-            if (!_fileSystem.File.Exists(path))
-                return 0;
-
-            var lastSequence = 0L;
-            try
+            if (fileLength > 0)
             {
-                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var reader = new StreamReader(stream, Utf8NoBom, detectEncodingFromByteOrderMarks: true, bufferSize: 16 * 1024, leaveOpen: false))
+                try
                 {
-                    string? line;
-                    while ((line = reader.ReadLine()) != null)
-                    {
-                        if (line.Length == 0)
-                            continue;
+                    var scan = ScanJournal(tenantId, state.Format);
+                    state.TailOffset = state.BaseOffset + scan.LastValidOffset;
+                    state.LastSequenceNumber = Math.Max(state.LastSequenceNumber, scan.LastSequenceNumber);
 
-                        try
-                        {
-                            var record = JsonSerializer.Deserialize<QueueEventRecord>(line, JsonOptions);
-                            if (record?.SequenceNumber.HasValue == true && record.SequenceNumber.Value > lastSequence)
-                                lastSequence = record.SequenceNumber.Value;
-                        }
-                        catch (JsonException)
-                        {
-                        }
+                    if (scan.EncounteredCorruptTail)
+                    {
+                        _logger.LogWarning(
+                            "Queue journal corrupt tail detected for tenant {TenantId} while loading state. Using recovered tail offset {TailOffset} for format {Format}.",
+                            tenantId,
+                            state.TailOffset,
+                            state.Format);
                     }
                 }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidDataException)
+                {
+                    _logger.LogWarning(ex, "Failed to scan queue journal state for tenant {TenantId}", tenantId);
+                    state.TailOffset = Math.Max(state.TailOffset, state.BaseOffset + fileLength);
+                }
             }
-            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            else
             {
-                _logger.LogWarning(ex, "Failed to rebuild queue journal sequence state for tenant {TenantId}", tenantId);
+                state.TailOffset = state.BaseOffset;
             }
-
-            return lastSequence;
         }
 
         private sealed class PendingAppendRequest
@@ -1110,6 +1154,8 @@ namespace Locus.Storage
             public long TailOffset { get; set; }
 
             public long LastSequenceNumber { get; set; }
+
+            public JournalFormat Format { get; set; } = JournalFormat.JsonLines;
         }
 
         /// <inheritdoc/>

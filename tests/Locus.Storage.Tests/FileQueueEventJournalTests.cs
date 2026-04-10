@@ -26,7 +26,11 @@ namespace Locus.Storage.Tests
             _journal = new FileQueueEventJournal(
                 _fileSystem,
                 new Mock<ILogger<FileQueueEventJournal>>().Object,
-                _queueDirectory);
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                });
         }
 
         [Fact]
@@ -219,6 +223,134 @@ namespace Locus.Storage.Tests
                 Assert.Equal("file-002", remainingBatch.Records[0].FileKey);
                 Assert.Equal("file-003", remainingBatch.Records[1].FileKey);
                 Assert.Equal(tailOffset, remainingBatch.NextOffset);
+            }
+            finally
+            {
+                restartedJournal.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task AppendAsync_WithBinaryDefault_ReusesExistingJsonJournalWithoutMixingFormats()
+        {
+            var jsonJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.JsonLines,
+                });
+
+            try
+            {
+                await jsonJournal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-compat",
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+            }
+            finally
+            {
+                jsonJournal.Dispose();
+            }
+
+            var binaryDefaultJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                });
+
+            try
+            {
+                await binaryDefaultJournal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-compat",
+                    FileKey = "file-002",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                var batch = await binaryDefaultJournal.ReadBatchAsync("tenant-compat", 0, 10, CancellationToken.None);
+                var journalPath = Path.Combine(_queueDirectory, "tenant-compat", "queue.log");
+                string[] lines;
+                using (var stream = _fileSystem.File.Open(journalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var reader = new StreamReader(stream))
+                {
+                    lines = reader
+                        .ReadToEnd()
+                        .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                }
+
+                Assert.Equal(2, batch.Records.Count);
+                Assert.Equal("file-001", batch.Records[0].FileKey);
+                Assert.Equal("file-002", batch.Records[1].FileKey);
+                Assert.Equal(2, lines.Length);
+                Assert.All(lines, line => Assert.StartsWith("{", line));
+            }
+            finally
+            {
+                binaryDefaultJournal.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ReadBatchAsync_BinaryJournalWithCorruptTail_TruncatesTailAndAllowsFurtherAppends()
+        {
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-corrupt-tail",
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-corrupt-tail",
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            _journal.Dispose();
+
+            var journalPath = Path.Combine(_queueDirectory, "tenant-corrupt-tail", "queue.log");
+            using (var stream = _fileSystem.File.Open(journalPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+            {
+                var corruptTail = new byte[] { 1, 2, 3, 4, 5, 6, 7 };
+                stream.Write(corruptTail, 0, corruptTail.Length);
+            }
+
+            var corruptedLength = _fileSystem.FileInfo.New(journalPath).Length;
+            var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                });
+
+            try
+            {
+                var initialBatch = await restartedJournal.ReadBatchAsync("tenant-corrupt-tail", 0, 10, CancellationToken.None);
+                var repairedLength = _fileSystem.FileInfo.New(journalPath).Length;
+
+                Assert.Equal(2, initialBatch.Records.Count);
+                Assert.True(repairedLength < corruptedLength);
+
+                await restartedJournal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-corrupt-tail",
+                    FileKey = "file-003",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                var finalBatch = await restartedJournal.ReadBatchAsync("tenant-corrupt-tail", 0, 10, CancellationToken.None);
+                Assert.Equal(3, finalBatch.Records.Count);
+                Assert.Equal(3L, finalBatch.Records[2].SequenceNumber);
             }
             finally
             {

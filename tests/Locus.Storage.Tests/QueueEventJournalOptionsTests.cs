@@ -64,6 +64,7 @@ namespace Locus.Storage.Tests
         {
             var options = new QueueEventJournalOptions
             {
+                JournalFormat = JournalFormat.BinaryV1,
                 Linger = TimeSpan.FromMilliseconds(1),
                 MaxBatchRecords = 16,
                 MaxBatchBytes = 256 * 1024,
@@ -84,6 +85,18 @@ namespace Locus.Storage.Tests
 
             var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
             Assert.Contains("MaxBatchRecords", ex.Message);
+        }
+
+        [Fact]
+        public void Validate_InvalidJournalFormat_Throws()
+        {
+            var options = new QueueEventJournalOptions
+            {
+                JournalFormat = (JournalFormat)99
+            };
+
+            var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
+            Assert.Contains("JournalFormat", ex.Message);
         }
     }
 }

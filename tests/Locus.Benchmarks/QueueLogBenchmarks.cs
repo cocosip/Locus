@@ -51,6 +51,7 @@ namespace Locus.Benchmarks
                 new QueueEventJournalOptions
                 {
                     QueueDirectory = Path.Combine(_rootDirectory, "queue"),
+                    JournalFormat = JournalFormat.JsonLines,
                     StateFlushDebounce = TimeSpan.FromSeconds(1),
                     AckMode = AckMode,
                     Linger = TimeSpan.FromMilliseconds(LingerMs),
@@ -162,6 +163,7 @@ namespace Locus.Benchmarks
                 new QueueEventJournalOptions
                 {
                     QueueDirectory = Path.Combine(_rootDirectory, "queue"),
+                    JournalFormat = JournalFormat.JsonLines,
                     StateFlushDebounce = TimeSpan.FromSeconds(1),
                     AckMode = AckMode,
                     Linger = TimeSpan.FromMilliseconds(LingerMs),
