@@ -148,3 +148,4 @@ Locus is a file storage pool system targeting .NET netstandard2.0 that provides:
 
 ### 配置调整
 - 如果 LocusOptions 或者他引用的任何子 Options 发生变更后，项目中的配置  *.appsettings.json 都要跟着调整，同时需要更新 appsettings-sample-reference.md 配置说明文档
+- dotnet build, dotnet test 等命令，不要在沙箱里面运行。你的沙箱环境有问题，会导致无法获取正确的输出，并且会导致 dotnet 产生很多后台无用进程

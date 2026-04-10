@@ -100,7 +100,7 @@
 
       // 单租户 writer 在发现有积压时，用于收敛微批的等待窗口
       // 1ms 是比较保守的起始值：既尽量合批，又不明显拉高单次延迟
-      "Linger": "00:00:00.001",
+      "Linger": "00:00:00.003",
 
       // 单个 journal append 批次最多合并多少条记录
       "MaxBatchRecords": 16,
@@ -114,7 +114,7 @@
       // 仅对 AckMode=Balanced 生效
       // 写入后允许延后 flush 的最大窗口
       // 5ms 的目的是只做非常短的合批，不把延迟和风险窗口放大太多
-      "BalancedFlushWindow": "00:00:00.005",
+      "BalancedFlushWindow": "00:00:00.010",
 
       // projector 每轮每个租户最多投影多少条记录
       "MaxRecordsPerTenantPerCycle": 256,
@@ -466,9 +466,9 @@
 `BalancedFlushWindow`
 - 只对 `AckMode=Balanced` 生效
 - 表示“写完但尚未 flush”允许停留的最大时间窗口
-- 当前给 `5ms`，是保守起始值：
+- 当前给 `10ms`，是偏吞吐优先的保守起始值：
   - 足够给多个小批次一个极短的合并机会
-  - 不明显拉高单次请求延迟
+  - 会比 `5ms` 更容易收敛出更大的批次
   - 不把宕机时的未 flush 风险窗口放大太多
 
 ## 推荐调参思路
@@ -476,15 +476,15 @@
 如果目标是“更稳”：
 
 - `AckMode = Durable`
-- `Linger = 1ms`
+- `Linger = 3ms`
 - `MaxBatchRecords = 16`
 - `MaxBatchBytes = 262144`
 
 如果目标是“吞吐更高，但仍希望风险窗口很小”：
 
 - `AckMode = Balanced`
-- `BalancedFlushWindow = 5ms`
-- `Linger = 1ms ~ 2ms`
+- `BalancedFlushWindow = 10ms`
+- `Linger = 3ms ~ 5ms`
 - 再结合压测看是否要提高 `MaxBatchRecords`
 
 如果目标是“极限吞吐”：
