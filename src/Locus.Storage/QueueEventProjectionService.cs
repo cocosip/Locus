@@ -279,13 +279,15 @@ namespace Locus.Storage
 
         private async Task<ProjectionCycleResult> ProjectTenantCoreAsync(string tenantId, CancellationToken ct)
         {
-            var offset = await LoadCursorAsync(tenantId, ct).ConfigureAwait(false);
+            var cursor = await LoadCursorStateAsync(tenantId, ct).ConfigureAwait(false);
+            var offset = cursor.Offset;
             var batch = await _journal.ReadBatchAsync(tenantId, offset, _options.MaxRecordsPerTenantPerCycle, ct).ConfigureAwait(false);
             if (batch.Records.Count == 0)
             {
                 if (batch.NextOffset > offset)
                 {
-                    await SaveCursorAsync(tenantId, batch.NextOffset, CancellationToken.None).ConfigureAwait(false);
+                    cursor.Offset = batch.NextOffset;
+                    await SaveCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
                     return new ProjectionCycleResult(batch.NextOffset, maintenanceWork: null);
                 }
 
@@ -295,6 +297,7 @@ namespace Locus.Storage
             foreach (var record in batch.Records)
             {
                 ct.ThrowIfCancellationRequested();
+                await ApplySequenceTrackingAsync(tenantId, cursor, record, ct).ConfigureAwait(false);
                 await ProjectRecordAsync(record, ct).ConfigureAwait(false);
             }
 
@@ -316,8 +319,70 @@ namespace Locus.Storage
                 maintenanceWork = new ProjectionMaintenanceWork(snapshotCapture, compactAfterSnapshot: false);
             }
 
-            await SaveCursorAsync(tenantId, cursorOffset, CancellationToken.None).ConfigureAwait(false);
+            cursor.Offset = cursorOffset;
+            await SaveCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
             return new ProjectionCycleResult(cursorOffset, maintenanceWork);
+        }
+
+        private async Task ApplySequenceTrackingAsync(
+            string tenantId,
+            ProjectionCursor cursor,
+            QueueEventRecord record,
+            CancellationToken ct)
+        {
+            if (!record.SequenceNumber.HasValue || record.SequenceNumber.Value <= 0)
+                return;
+
+            var sequenceNumber = record.SequenceNumber.Value;
+            if (cursor.LastSequenceNumber > 0 && sequenceNumber > cursor.LastSequenceNumber + 1)
+            {
+                var expectedSequence = cursor.LastSequenceNumber + 1;
+                cursor.GapDetected = true;
+                cursor.LastGapDetectedAtUtc = DateTime.UtcNow;
+                cursor.GapExpectedSequenceNumber = expectedSequence;
+                cursor.GapObservedSequenceNumber = sequenceNumber;
+
+                _logger.LogWarning(
+                    "Queue journal sequence gap detected for tenant {TenantId}: expected {ExpectedSequenceNumber} but observed {ObservedSequenceNumber}. Triggering orphan recovery.",
+                    tenantId,
+                    expectedSequence,
+                    sequenceNumber);
+
+                await TriggerGapRecoveryAsync(tenantId, expectedSequence, sequenceNumber, ct).ConfigureAwait(false);
+            }
+
+            if (sequenceNumber > cursor.LastSequenceNumber)
+                cursor.LastSequenceNumber = sequenceNumber;
+        }
+
+        private async Task TriggerGapRecoveryAsync(
+            string tenantId,
+            long expectedSequence,
+            long observedSequence,
+            CancellationToken ct)
+        {
+            if (_storageCleanupService == null)
+                return;
+
+            try
+            {
+                await _storageCleanupService
+                    .RecoverOrphanedFilesAsync(new ProjectionRecoveryTenantContext(tenantId), ct)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Automatic orphan recovery after queue sequence gap failed for tenant {TenantId} (expected {ExpectedSequenceNumber}, observed {ObservedSequenceNumber})",
+                    tenantId,
+                    expectedSequence,
+                    observedSequence);
+            }
         }
 
         private async Task ProjectRecordAsync(QueueEventRecord record, CancellationToken ct)
@@ -960,20 +1025,31 @@ namespace Locus.Storage
                 || record.Status == FileProcessingStatus.DeleteSucceeded;
         }
 
-        private async Task<long> LoadCursorAsync(string tenantId, CancellationToken ct)
+        private async Task<ProjectionCursor> LoadCursorStateAsync(string tenantId, CancellationToken ct)
         {
             var path = GetCursorPath(tenantId);
             if (!_fileSystem.File.Exists(path))
-                return 0;
+                return new ProjectionCursor();
 
             using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
                 var cursor = await JsonSerializer.DeserializeAsync<ProjectionCursor>(stream, JsonOptions, ct).ConfigureAwait(false);
-                return cursor?.Offset ?? 0;
+                return cursor ?? new ProjectionCursor();
             }
         }
 
-        private async Task SaveCursorAsync(string tenantId, long offset, CancellationToken ct)
+        private async Task<long> LoadCursorAsync(string tenantId, CancellationToken ct)
+        {
+            var cursor = await LoadCursorStateAsync(tenantId, ct).ConfigureAwait(false);
+            return cursor.Offset;
+        }
+
+        private Task SaveCursorAsync(string tenantId, long offset, CancellationToken ct)
+        {
+            return SaveCursorStateAsync(tenantId, new ProjectionCursor { Offset = offset }, ct);
+        }
+
+        private async Task SaveCursorStateAsync(string tenantId, ProjectionCursor cursor, CancellationToken ct)
         {
             var path = GetCursorPath(tenantId);
             var directory = _fileSystem.Path.GetDirectoryName(path);
@@ -986,7 +1062,7 @@ namespace Locus.Storage
             var tempPath = path + ".tmp";
             using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
             {
-                await JsonSerializer.SerializeAsync(stream, new ProjectionCursor { Offset = offset }, JsonOptions, ct).ConfigureAwait(false);
+                await JsonSerializer.SerializeAsync(stream, cursor, JsonOptions, ct).ConfigureAwait(false);
                 await stream.FlushAsync(ct).ConfigureAwait(false);
             }
 
@@ -1055,26 +1131,43 @@ namespace Locus.Storage
 
         private async Task<QueueProjectionTenantState> BuildTenantStateAsync(string tenantId, CancellationToken ct)
         {
-            var cursorOffset = await GetEffectiveCursorOffsetAsync(tenantId, ct).ConfigureAwait(false);
-            return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+            var cursor = await GetEffectiveCursorStateAsync(tenantId, ct).ConfigureAwait(false);
+            return await BuildTenantStateAsync(tenantId, cursor, ct).ConfigureAwait(false);
         }
 
         private async Task<QueueProjectionTenantState> BuildTenantStateAsync(string tenantId, long cursorOffset, CancellationToken ct)
         {
-            cursorOffset = await NormalizeCursorOffsetAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+            var cursor = await GetEffectiveCursorStateAsync(tenantId, ct).ConfigureAwait(false);
+            cursor.Offset = await NormalizeCursorOffsetAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
+            return await BuildTenantStateAsync(tenantId, cursor, ct).ConfigureAwait(false);
+        }
+
+        private async Task<QueueProjectionTenantState> BuildTenantStateAsync(string tenantId, ProjectionCursor cursor, CancellationToken ct)
+        {
+            cursor.Offset = await NormalizeCursorOffsetAsync(tenantId, cursor.Offset, ct).ConfigureAwait(false);
             var journalSizeBytes = await _journal.GetTailOffsetAsync(tenantId, ct).ConfigureAwait(false);
             var snapshot = await LoadSnapshotAsync(tenantId, ct).ConfigureAwait(false);
             return new QueueProjectionTenantState
             {
                 TenantId = tenantId,
-                CursorOffset = cursorOffset,
+                CursorOffset = cursor.Offset,
                 JournalSizeBytes = journalSizeBytes,
-                LagBytes = Math.Max(0, journalSizeBytes - cursorOffset),
+                LagBytes = Math.Max(0, journalSizeBytes - cursor.Offset),
                 HasSnapshot = snapshot != null,
                 SnapshotCreatedAtUtc = snapshot?.CreatedAtUtc,
                 SnapshotCursorOffset = snapshot?.CursorOffset ?? 0,
-                SnapshotFileCount = snapshot?.Files.Count ?? 0
+                SnapshotFileCount = snapshot?.Files.Count ?? 0,
+                LastProjectedSequenceNumber = cursor.LastSequenceNumber,
+                GapDetected = cursor.GapDetected,
+                LastGapDetectedAtUtc = cursor.LastGapDetectedAtUtc,
             };
+        }
+
+        private async Task<ProjectionCursor> GetEffectiveCursorStateAsync(string tenantId, CancellationToken ct)
+        {
+            var cursor = await LoadCursorStateAsync(tenantId, ct).ConfigureAwait(false);
+            cursor.Offset = await NormalizeCursorOffsetAsync(tenantId, cursor.Offset, ct).ConfigureAwait(false);
+            return cursor;
         }
 
         private async Task<long> GetEffectiveCursorOffsetAsync(string tenantId, CancellationToken ct)
@@ -1501,6 +1594,16 @@ namespace Locus.Storage
         private sealed class ProjectionCursor
         {
             public long Offset { get; set; }
+
+            public long LastSequenceNumber { get; set; }
+
+            public bool GapDetected { get; set; }
+
+            public DateTime? LastGapDetectedAtUtc { get; set; }
+
+            public long? GapExpectedSequenceNumber { get; set; }
+
+            public long? GapObservedSequenceNumber { get; set; }
         }
 
         private sealed class ProjectionSnapshot
@@ -1571,6 +1674,18 @@ namespace Locus.Storage
             public string FileKey { get; }
 
             public string PhysicalPath { get; }
+        }
+
+        private sealed class ProjectionRecoveryTenantContext : ITenantContext
+        {
+            public ProjectionRecoveryTenantContext(string tenantId)
+            {
+                TenantId = tenantId ?? throw new ArgumentNullException(nameof(tenantId));
+            }
+
+            public string TenantId { get; }
+
+            public TenantStatus Status => TenantStatus.Enabled;
         }
     }
 }

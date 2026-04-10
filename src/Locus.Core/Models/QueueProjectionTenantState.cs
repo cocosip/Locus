@@ -46,5 +46,20 @@ namespace Locus.Core.Models
         /// Gets or sets the number of file records stored in the latest snapshot.
         /// </summary>
         public int SnapshotFileCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the last projected journal sequence number.
+        /// </summary>
+        public long LastProjectedSequenceNumber { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the projector has detected a sequence gap.
+        /// </summary>
+        public bool GapDetected { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC timestamp when the latest sequence gap was detected.
+        /// </summary>
+        public DateTime? LastGapDetectedAtUtc { get; set; }
     }
 }

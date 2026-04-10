@@ -6,6 +6,7 @@ using System.IO.Abstractions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Locus.Storage.Data;
@@ -1595,6 +1596,68 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
         }
 
+        [Fact]
+        public async Task ReplayTenantAsync_WhenSequenceGapDetected_TriggersRecoveryAndReportsGapState()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var initialJournal = CreateJournal();
+            var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
+
+            const string tenantId = "tenant-sequence-gap";
+            const string directoryPath = "/incoming";
+            var createdAt = DateTime.UtcNow;
+
+            for (var i = 1; i <= 3; i++)
+            {
+                var fileKey = "file-gap-00" + i;
+                var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", fileKey + ".dcm");
+                _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+                _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { (byte)i, 2, 3, 4 });
+
+                await initialJournal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = fileKey,
+                    EventType = QueueEventType.Accepted,
+                    OccurredAtUtc = createdAt.AddSeconds(i),
+                    VolumeId = "vol-001",
+                    PhysicalPath = physicalPath,
+                    DirectoryPath = directoryPath,
+                    FileSize = 4,
+                    Status = FileProcessingStatus.Pending,
+                }, CancellationToken.None);
+            }
+
+            initialJournal.Dispose();
+
+            var journalPath = Path.Combine(_queueDirectory, tenantId, "queue.log");
+            var lines = _fileSystem.File.ReadAllLines(journalPath);
+            _fileSystem.File.WriteAllLines(journalPath, new[] { lines[0], lines[2] });
+
+            cleanupService
+                .Setup(service => service.RecoverOrphanedFilesAsync(
+                    It.Is<ITenantContext>(tenant => tenant.TenantId == tenantId),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var replayJournal = CreateJournal();
+            var service = CreateProjectionService(replayJournal, tenantQuotaManager, directoryQuotaManager, cleanupService.Object);
+
+            var state = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.True(state.GapDetected);
+            Assert.Equal(3, state.LastProjectedSequenceNumber);
+            Assert.True(state.LastGapDetectedAtUtc.HasValue);
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, "file-gap-001", CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, "file-gap-003", CancellationToken.None));
+            Assert.Null(await _metadataRepository.GetAsync(tenantId, "file-gap-002", CancellationToken.None));
+
+            cleanupService.Verify(service => service.RecoverOrphanedFilesAsync(
+                It.Is<ITenantContext>(tenant => tenant.TenantId == tenantId),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
         public void Dispose()
         {
             foreach (var disposable in _trackedDisposables)
@@ -1687,7 +1750,8 @@ namespace Locus.Storage.Tests
         private QueueEventProjectionService CreateProjectionService(
             FileQueueEventJournal journal,
             TenantQuotaManager tenantQuotaManager,
-            DirectoryQuotaManager directoryQuotaManager)
+            DirectoryQuotaManager directoryQuotaManager,
+            IStorageCleanupService? storageCleanupService = null)
         {
             return TrackDisposable(new QueueEventProjectionService(
                 journal,
@@ -1707,6 +1771,7 @@ namespace Locus.Storage.Tests
                     MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
                 },
                 new Mock<ILogger<QueueEventProjectionService>>().Object,
+                storageCleanupService,
                 quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
         }
 

@@ -58,5 +58,32 @@ namespace Locus.Storage.Tests
             var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
             Assert.Contains("StateFlushDebounce", ex.Message);
         }
+
+        [Fact]
+        public void Validate_DefaultKafkaStyleBatchingOptions_AreAccepted()
+        {
+            var options = new QueueEventJournalOptions
+            {
+                Linger = TimeSpan.FromMilliseconds(1),
+                MaxBatchRecords = 16,
+                MaxBatchBytes = 256 * 1024,
+                WriterIdleTimeout = TimeSpan.FromSeconds(30),
+                AckMode = QueueEventJournalAckMode.Durable,
+            };
+
+            options.Validate();
+        }
+
+        [Fact]
+        public void Validate_InvalidBatchSize_Throws()
+        {
+            var options = new QueueEventJournalOptions
+            {
+                MaxBatchRecords = 0
+            };
+
+            var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
+            Assert.Contains("MaxBatchRecords", ex.Message);
+        }
     }
 }

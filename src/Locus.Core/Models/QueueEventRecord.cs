@@ -38,6 +38,16 @@ namespace Locus.Core.Models
         public DateTime OccurredAtUtc { get; set; } = DateTime.UtcNow;
 
         /// <summary>
+        /// Gets or sets the per-tenant monotonic sequence number assigned by the journal writer.
+        /// </summary>
+        public long? SequenceNumber { get; set; }
+
+        /// <summary>
+        /// Gets or sets the CRC32 checksum for the serialized record payload.
+        /// </summary>
+        public uint? PayloadCrc32 { get; set; }
+
+        /// <summary>
         /// Gets or sets the volume identifier.
         /// </summary>
         public string? VolumeId { get; set; }

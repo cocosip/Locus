@@ -345,8 +345,7 @@ namespace Locus
                     return new FileQueueEventJournal(
                         fileSystem,
                         logger,
-                        options.QueueEventJournal.QueueDirectory,
-                        options.QueueEventJournal.StateFlushDebounce);
+                        options.QueueEventJournal);
                 });
 
                 services.AddSingleton<QueueEventProjectionService>(sp =>

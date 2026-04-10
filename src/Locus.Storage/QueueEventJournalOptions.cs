@@ -41,6 +41,45 @@ namespace Locus.Storage
         public TimeSpan StateFlushDebounce { get; set; } = TimeSpan.FromSeconds(1);
 
         /// <summary>
+        /// Gets or sets the linger window used by the per-tenant writer to coalesce
+        /// queued append requests into a micro-batch when backlog exists.
+        /// Default: 1 millisecond.
+        /// </summary>
+        public TimeSpan Linger { get; set; } = TimeSpan.FromMilliseconds(1);
+
+        /// <summary>
+        /// Gets or sets the maximum number of queued append requests that may be
+        /// coalesced into a single journal write.
+        /// Default: 16.
+        /// </summary>
+        public int MaxBatchRecords { get; set; } = 16;
+
+        /// <summary>
+        /// Gets or sets the maximum serialized payload size in bytes that may be
+        /// coalesced into a single journal write.
+        /// Default: 262144 bytes.
+        /// </summary>
+        public int MaxBatchBytes { get; set; } = 256 * 1024;
+
+        /// <summary>
+        /// Gets or sets the idle timeout after which the per-tenant append stream is closed.
+        /// Default: 30 seconds.
+        /// </summary>
+        public TimeSpan WriterIdleTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// Gets or sets the append acknowledgment mode.
+        /// Default: <see cref="QueueEventJournalAckMode.Durable"/>.
+        /// </summary>
+        public QueueEventJournalAckMode AckMode { get; set; } = QueueEventJournalAckMode.Durable;
+
+        /// <summary>
+        /// Gets or sets the flush window used by <see cref="QueueEventJournalAckMode.Balanced"/>.
+        /// Default: 5 milliseconds.
+        /// </summary>
+        public TimeSpan BalancedFlushWindow { get; set; } = TimeSpan.FromMilliseconds(5);
+
+        /// <summary>
         /// Gets or sets the maximum number of journal records to project for a tenant in one cycle.
         /// Default: 64.
         /// </summary>
@@ -139,6 +178,21 @@ namespace Locus.Storage
 
             if (StateFlushDebounce < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.StateFlushDebounce cannot be negative");
+
+            if (Linger < TimeSpan.Zero)
+                throw new InvalidOperationException("QueueEventJournal.Linger cannot be negative");
+
+            if (MaxBatchRecords <= 0)
+                throw new InvalidOperationException("QueueEventJournal.MaxBatchRecords must be greater than zero");
+
+            if (MaxBatchBytes <= 0)
+                throw new InvalidOperationException("QueueEventJournal.MaxBatchBytes must be greater than zero");
+
+            if (WriterIdleTimeout < TimeSpan.Zero)
+                throw new InvalidOperationException("QueueEventJournal.WriterIdleTimeout cannot be negative");
+
+            if (BalancedFlushWindow < TimeSpan.Zero)
+                throw new InvalidOperationException("QueueEventJournal.BalancedFlushWindow cannot be negative");
 
             if (MaxProjectionTimePerCycle <= TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.MaxProjectionTimePerCycle must be greater than zero");

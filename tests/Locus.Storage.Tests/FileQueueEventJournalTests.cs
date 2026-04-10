@@ -65,10 +65,41 @@ namespace Locus.Storage.Tests
             Assert.Equal(2, batch.Records.Count);
             Assert.Equal("file-001", batch.Records[0].FileKey);
             Assert.Equal("file-002", batch.Records[1].FileKey);
+            Assert.Equal(1L, batch.Records[0].SequenceNumber);
+            Assert.Equal(2L, batch.Records[1].SequenceNumber);
+            Assert.True(batch.Records[0].PayloadCrc32.HasValue);
+            Assert.True(batch.Records[1].PayloadCrc32.HasValue);
             Assert.True(batch.NextOffset > 0);
             Assert.True(batch.ReachedEndOfFile);
             Assert.Contains("tenant-001", tenantIds);
             Assert.Contains("tenant-002", tenantIds);
+        }
+
+        [Fact]
+        public async Task AppendAsync_ConcurrentRequests_AssignsMonotonicSequenceNumbers()
+        {
+            var appendTasks = new Task[24];
+            for (var i = 0; i < appendTasks.Length; i++)
+            {
+                var index = i;
+                appendTasks[i] = _journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-concurrent",
+                    FileKey = "file-" + index.ToString("D2"),
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+            }
+
+            await Task.WhenAll(appendTasks);
+
+            var batch = await _journal.ReadBatchAsync("tenant-concurrent", 0, 64, CancellationToken.None);
+
+            Assert.Equal(appendTasks.Length, batch.Records.Count);
+            for (var i = 0; i < batch.Records.Count; i++)
+            {
+                Assert.Equal(i + 1, batch.Records[i].SequenceNumber);
+                Assert.True(batch.Records[i].PayloadCrc32.HasValue);
+            }
         }
 
         [Fact]
