@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.IO;
 using Locus.Core.Models;
 using Microsoft.Extensions.Logging;
 
@@ -842,7 +843,7 @@ namespace Locus.Storage
                 using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Write, FileShare.Read))
                 {
                     stream.SetLength(expectedLength);
-                    await stream.FlushAsync(ct).ConfigureAwait(false);
+                    await DurableFileWrite.FlushToDiskAsync(stream, ct).ConfigureAwait(false);
                 }
 
                 state.CorruptTailDetected = true;
@@ -929,7 +930,7 @@ namespace Locus.Storage
                 using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
                     JsonSerializer.Serialize(stream, state, JsonOptions);
-                    stream.Flush();
+                    DurableFileWrite.FlushToDisk(stream);
                 }
 
                 ReplaceFileAtomically(tempPath, path);

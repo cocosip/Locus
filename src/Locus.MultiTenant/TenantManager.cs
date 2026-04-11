@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Exceptions;
+using Locus.Core.IO;
 using Locus.Core.Models;
 using Locus.MultiTenant.Models;
 using Microsoft.Extensions.Logging;
@@ -214,11 +215,11 @@ namespace Locus.MultiTenant
                 StoragePath = resolvedStoragePath
             };
 
-            await SaveTenantMetadataAsync(metadata, ct);
-
             var storagePath = metadata.StoragePath;
             if (!_fileSystem.Directory.Exists(storagePath))
                 _fileSystem.Directory.CreateDirectory(storagePath);
+
+            await SaveTenantMetadataAsync(metadata, ct);
 
             _cache.TryRemove(tenantId, out _);
             InvalidateAllTenantsCache();
@@ -355,7 +356,7 @@ namespace Locus.MultiTenant
                 using (var stream = _fileSystem.File.Create(tempPath))
                 {
                     await JsonSerializer.SerializeAsync(stream, metadata, JsonOptions, ct);
-                    await stream.FlushAsync(ct);
+                    await DurableFileWrite.FlushToDiskAsync(stream, ct).ConfigureAwait(false);
                 }
 
                 if (_fileSystem.File.Exists(metadataPath))

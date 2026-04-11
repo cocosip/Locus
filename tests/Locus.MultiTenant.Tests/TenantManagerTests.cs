@@ -65,6 +65,51 @@ namespace Locus.MultiTenant.Tests
         }
 
         [Fact]
+        public async Task CreateTenantAsync_DoesNotPersistMetadataWhenStorageDirectoryCreationFails()
+        {
+            var tenantId = "tenant-create-fail";
+            var backingFileSystem = new MockFileSystem();
+            var metadataRoot = ".locus/tenants";
+            var expectedStoragePath = backingFileSystem.Path.Combine(".locus", "storage", tenantId);
+
+            var directory = new Mock<IDirectory>();
+            directory
+                .Setup(d => d.Exists(It.IsAny<string>()))
+                .Returns((string path) => backingFileSystem.Directory.Exists(path));
+            directory
+                .Setup(d => d.CreateDirectory(It.IsAny<string>()))
+                .Returns((string path) =>
+                {
+                    if (string.Equals(path, expectedStoragePath, StringComparison.Ordinal))
+                        throw new IOException("disk full");
+
+                    return backingFileSystem.Directory.CreateDirectory(path);
+                });
+
+            var file = new Mock<IFile>();
+            file
+                .Setup(f => f.Exists(It.IsAny<string>()))
+                .Returns((string path) => backingFileSystem.File.Exists(path));
+
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.SetupGet(fs => fs.Directory).Returns(directory.Object);
+            fileSystem.SetupGet(fs => fs.File).Returns(file.Object);
+            fileSystem.SetupGet(fs => fs.Path).Returns(backingFileSystem.Path);
+
+            var tenantManager = new TenantManager(
+                fileSystem.Object,
+                NullLogger<TenantManager>.Instance,
+                metadataRoot);
+
+            var exception = await Assert.ThrowsAsync<IOException>(() =>
+                tenantManager.CreateTenantAsync(tenantId, CancellationToken.None));
+
+            Assert.Equal("disk full", exception.Message);
+            Assert.False(backingFileSystem.File.Exists(backingFileSystem.Path.Combine(metadataRoot, $"{tenantId}.json")));
+            Assert.False(backingFileSystem.Directory.Exists(expectedStoragePath));
+        }
+
+        [Fact]
         public async Task GetTenantAsync_ThrowsException_WhenTenantNotFound()
         {
             // Arrange

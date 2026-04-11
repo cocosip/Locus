@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.IO;
 using Locus.Core.Models;
 using Locus.Storage.Data;
 using Microsoft.Extensions.Hosting;
@@ -1071,7 +1072,7 @@ namespace Locus.Storage
             using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 await JsonSerializer.SerializeAsync(stream, cursor, JsonOptions, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
+                await DurableFileWrite.FlushToDiskAsync(stream, ct).ConfigureAwait(false);
             }
 
             ReplaceFileAtomically(tempPath, path);
@@ -1269,7 +1270,7 @@ namespace Locus.Storage
             using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
+                await DurableFileWrite.FlushToDiskAsync(stream, ct).ConfigureAwait(false);
             }
 
             ReplaceFileAtomically(tempPath, snapshotPath);

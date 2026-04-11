@@ -661,50 +661,56 @@ namespace Locus.Storage
                         _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
                             metadata.FileKey, metadata.PhysicalPath);
 
+                        var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+                        var quotaApplied = false;
+
                         // Use default for the full cleanup sequence once a candidate orphan has
                         // been selected; otherwise a mid-flight cancellation could leave cleanup
                         // work half-applied.
-                        var removed = await _projectionStore.RemoveProjectedFileAsync(
-                            metadata.TenantId,
-                            metadata.FileKey,
-                            default).ConfigureAwait(false);
+                        if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
+                        {
+                            await ApplyOrphanedMetadataDeleteQuotaAsync(
+                                metadata.TenantId,
+                                metadata.FileKey,
+                                normalizedDirectoryPath).ConfigureAwait(false);
+                            quotaApplied = true;
+                        }
+
+                        bool removed;
+                        try
+                        {
+                            removed = await _projectionStore.RemoveProjectedFileAsync(
+                                metadata.TenantId,
+                                metadata.FileKey,
+                                default).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            if (quotaApplied)
+                            {
+                                await RollbackOrphanedMetadataDeleteQuotaAsync(
+                                    metadata.TenantId,
+                                    metadata.FileKey,
+                                    normalizedDirectoryPath).ConfigureAwait(false);
+                            }
+
+                            throw;
+                        }
+
                         if (!removed)
                         {
+                            if (quotaApplied)
+                            {
+                                await RollbackOrphanedMetadataDeleteQuotaAsync(
+                                    metadata.TenantId,
+                                    metadata.FileKey,
+                                    normalizedDirectoryPath).ConfigureAwait(false);
+                            }
+
                             _logger.LogDebug(
                                 "Skipped orphaned metadata cleanup for {FileKey} because the metadata row changed concurrently",
                                 metadata.FileKey);
                             continue;
-                        }
-
-                        if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
-                        {
-                            if (_tenantQuotaManager != null)
-                            {
-                                try
-                                {
-                                    await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default).ConfigureAwait(false);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex, "Failed to decrement tenant quota for orphaned file: {FileKey}", metadata.FileKey);
-                                }
-                            }
-
-                            if (_directoryQuotaManager != null)
-                            {
-                                try
-                                {
-                                    var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
-                                    await _directoryQuotaManager.DecrementFileCountAsync(
-                                        metadata.TenantId,
-                                        normalizedDirectoryPath,
-                                        default).ConfigureAwait(false);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex, "Failed to decrement directory quota for orphaned file: {FileKey}", metadata.FileKey);
-                                }
-                            }
                         }
 
                         removedCount++;
@@ -718,6 +724,133 @@ namespace Locus.Storage
             }
 
             return removedCount;
+        }
+
+        private async Task ApplyOrphanedMetadataDeleteQuotaAsync(
+            string tenantId,
+            string fileKey,
+            string normalizedDirectoryPath)
+        {
+            var tenantQuotaApplied = false;
+
+            try
+            {
+                if (_tenantQuotaManager != null)
+                {
+                    await ApplyDeleteSucceededTenantProjectionAsync(tenantId).ConfigureAwait(false);
+                    tenantQuotaApplied = true;
+                }
+
+                if (_directoryQuotaManager != null)
+                {
+                    try
+                    {
+                        await ApplyDeleteSucceededDirectoryProjectionAsync(tenantId, normalizedDirectoryPath).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        if (tenantQuotaApplied)
+                        {
+                            await RollbackDeleteSucceededTenantProjectionAsync(tenantId).ConfigureAwait(false);
+                        }
+
+                        throw;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to apply orphaned metadata quota cleanup for tenant {TenantId}, file {FileKey}",
+                    tenantId,
+                    fileKey);
+                throw;
+            }
+        }
+
+        private async Task RollbackOrphanedMetadataDeleteQuotaAsync(
+            string tenantId,
+            string fileKey,
+            string normalizedDirectoryPath)
+        {
+            Exception? firstException = null;
+
+            if (_directoryQuotaManager != null)
+            {
+                try
+                {
+                    await RollbackDeleteSucceededDirectoryProjectionAsync(tenantId, normalizedDirectoryPath).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    firstException = ex;
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback orphaned directory quota cleanup for tenant {TenantId}, file {FileKey}, directory {DirectoryPath}",
+                        tenantId,
+                        fileKey,
+                        normalizedDirectoryPath);
+                }
+            }
+
+            if (_tenantQuotaManager != null)
+            {
+                try
+                {
+                    await RollbackDeleteSucceededTenantProjectionAsync(tenantId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    if (firstException == null)
+                        firstException = ex;
+
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback orphaned tenant quota cleanup for tenant {TenantId}, file {FileKey}",
+                        tenantId,
+                        fileKey);
+                }
+            }
+
+            if (firstException != null)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to rollback orphaned metadata quota cleanup for tenant '{tenantId}', file '{fileKey}'.",
+                    firstException);
+            }
+        }
+
+        private async Task ApplyDeleteSucceededTenantProjectionAsync(string tenantId)
+        {
+            await _tenantQuotaManager!.DecrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+        }
+
+        private async Task ApplyDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath)
+        {
+            await _directoryQuotaManager!.DecrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+        }
+
+        private async Task RollbackDeleteSucceededTenantProjectionAsync(string tenantId)
+        {
+            if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
+            {
+                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+                return;
+            }
+
+            await _tenantQuotaManager!.IncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+        }
+
+        private async Task RollbackDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath)
+        {
+            if (_directoryQuotaManager is IDirectoryQuotaCompensationManager directoryQuotaCompensationManager)
+            {
+                await directoryQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+                return;
+            }
+
+            await _directoryQuotaManager!.IncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
         }
 
         private bool TryConfirmPhysicalFileMissing(

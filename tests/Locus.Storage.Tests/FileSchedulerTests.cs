@@ -386,6 +386,112 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupOrphanedMetadataAsync_ThrowsAndKeepsMetadataWhenTenantQuotaDecrementFails()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            var fileKey = "orphan-quota-failure";
+            var physicalPath = Path.Combine(_metadataDir, "missing-quota-failure.txt");
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("quota db busy"));
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var exception = await Assert.ThrowsAsync<IOException>(() =>
+                scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None));
+
+            Assert.Equal("quota db busy", exception.Message);
+            Assert.NotNull(await _repository.GetAsync("tenant-001", fileKey, CancellationToken.None));
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_RollsBackQuotaWhenMetadataRemovalChangesConcurrently()
+        {
+            var missingPath = Path.Combine(_metadataDir, "projection-remove-false.dat");
+            var projected = new FileMetadata
+            {
+                FileKey = "projection-remove-false",
+                TenantId = "tenant-001",
+                PhysicalPath = missingPath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(m => m.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { "tenant-001" });
+            projectionStore
+                .Setup(m => m.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { projected });
+            projectionStore
+                .Setup(m => m.RemoveProjectedFileAsync("tenant-001", "projection-remove-false", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(false);
+
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            tenantQuotaManager
+                .Setup(m => m.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.IncrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                projectionStore.Object,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(0, removed);
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            tenantQuotaManager.Verify(
+                m => m.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.IncrementFileCountAsync("tenant-001", "/", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task CleanupOrphanedMetadataAsync_NormalizesMissingDirectoryPathToRootQuota()
         {
             var tenantQuotaManager = new Mock<ITenantQuotaManager>();

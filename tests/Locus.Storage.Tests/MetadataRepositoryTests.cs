@@ -609,11 +609,9 @@ namespace Locus.Storage.Tests
             _fileSystem.Directory.CreateDirectory(tenantDir);
             var dbPath = Path.Combine(tenantDir, "metadata.db");
 
-            Stream? lockStream = null;
-
             try
             {
-                lockStream = _fileSystem.File.Open(dbPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                _fileSystem.Directory.CreateDirectory(dbPath);
                 var metadata = CreateMetadata("retry-file", FileProcessingStatus.Pending, tenantId);
                 await blockedRepo.AddOrUpdateAsync(metadata, CancellationToken.None);
 
@@ -625,7 +623,6 @@ namespace Locus.Storage.Tests
             }
             finally
             {
-                lockStream?.Dispose();
                 blockedRepo.Dispose();
                 SqliteConnection.ClearAllPools();
                 if (_fileSystem.Directory.Exists(blockedDir))
