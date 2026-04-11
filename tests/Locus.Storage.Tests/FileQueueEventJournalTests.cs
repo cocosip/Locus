@@ -107,6 +107,23 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AppendAsync_TenantIdWithTraversal_ThrowsArgumentException()
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() => _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "../tenant-evil",
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task ReadBatchAsync_TenantIdWithPathSeparator_ThrowsArgumentException()
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() => _journal.ReadBatchAsync("tenant/evil", 0, 10, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task AppendAsync_PersistsJournalFormatAsStringInStateFile()
         {
             var journal = new FileQueueEventJournal(

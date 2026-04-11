@@ -169,6 +169,8 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
+            ValidateTenantIdForPath(tenantId, nameof(tenantId));
+
             if (offset < 0)
                 throw new ArgumentOutOfRangeException(nameof(offset), "Offset cannot be negative.");
 
@@ -214,6 +216,8 @@ namespace Locus.Storage
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            ValidateTenantIdForPath(tenantId, nameof(tenantId));
 
             if (processedOffset < 0)
                 throw new ArgumentOutOfRangeException(nameof(processedOffset), "Processed offset cannot be negative.");
@@ -276,6 +280,8 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
+            ValidateTenantIdForPath(tenantId, nameof(tenantId));
+
             ct.ThrowIfCancellationRequested();
             var state = LoadJournalState(tenantId);
             return Task.FromResult(state.TailOffset);
@@ -286,6 +292,8 @@ namespace Locus.Storage
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            ValidateTenantIdForPath(tenantId, nameof(tenantId));
 
             ct.ThrowIfCancellationRequested();
             var state = LoadJournalState(tenantId);
@@ -622,11 +630,15 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(records));
 
+            ValidateTenantIdForPath(tenantId, nameof(records));
+
             for (var i = 0; i < records.Count; i++)
             {
                 var record = records[i] ?? throw new ArgumentException("Queue event record cannot be null.", nameof(records));
                 if (string.IsNullOrWhiteSpace(record.TenantId))
                     throw new ArgumentException("TenantId cannot be empty", nameof(records));
+
+                ValidateTenantIdForPath(record.TenantId, nameof(records));
 
                 if (string.IsNullOrWhiteSpace(record.FileKey))
                     throw new ArgumentException("FileKey cannot be empty", nameof(records));
@@ -636,6 +648,16 @@ namespace Locus.Storage
             }
 
             return tenantId!;
+        }
+
+        private static void ValidateTenantIdForPath(string? tenantId, string paramName)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", paramName);
+
+            var validatedTenantId = tenantId!;
+            if (validatedTenantId.IndexOf('/') >= 0 || validatedTenantId.IndexOf('\\') >= 0 || validatedTenantId.Contains(".."))
+                throw new ArgumentException($"TenantId contains invalid path characters: '{validatedTenantId}'", paramName);
         }
 
         private IReadOnlyList<QueueEventRecord> CloneRecords(IReadOnlyList<QueueEventRecord> records)
@@ -730,6 +752,7 @@ namespace Locus.Storage
 
         private string GetTenantDirectory(string tenantId)
         {
+            ValidateTenantIdForPath(tenantId, nameof(tenantId));
             return _fileSystem.Path.Combine(_queueDirectory, tenantId);
         }
 

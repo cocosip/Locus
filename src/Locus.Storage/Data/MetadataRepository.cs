@@ -3088,7 +3088,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             // When disabled, persist inline and skip queueing/task signaling.
             if (!_enableBackgroundPersistence)
             {
-                ExecuteBatch(op.TenantId, new List<PersistenceOperation> { op });
+                _ = ExecuteBatch(op.TenantId, new List<PersistenceOperation> { op });
                 return;
             }
 
@@ -3292,8 +3292,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (drainedCount == 0)
                 return false;
 
+            var encounteredFailure = false;
             foreach (var kvp in byTenant)
-                ExecuteBatch(kvp.Key, kvp.Value);
+            {
+                if (!ExecuteBatch(kvp.Key, kvp.Value))
+                    encounteredFailure = true;
+            }
 
             _logger.LogDebug(
                 "Flushed persistence batch: {Drained} operations, {TenantBuckets} tenant bucket(s), RemainingQueue={QueueDepth}, RemainingCoalesced={CoalescedDepth}",
@@ -3302,7 +3306,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 Volatile.Read(ref _persistenceChannelDepth),
                 Volatile.Read(ref _coalescedDepth));
 
-            return true;
+            return !encounteredFailure;
         }
 
         private static void AddOperationToTenantBucket(
@@ -3320,7 +3324,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
         // Writes a batch of operations for a single tenant inside one SQLite transaction.
         // Errors are logged but never propagated -- SQLite unavailability must never fail writes.
-        private void ExecuteBatch(string tenantId, List<PersistenceOperation> ops)
+        private bool ExecuteBatch(string tenantId, List<PersistenceOperation> ops)
         {
             try
             {
@@ -3359,6 +3363,8 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                         throw;
                     }
                 }
+
+                return true;
             }
             catch (Exception ex)
             {
@@ -3366,6 +3372,49 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     "SQLite batch write failed for tenant {TenantId} ({Count} operations). " +
                     "Physical files are safe on disk; metadata may be lost if process restarts before SQLite recovers.",
                     tenantId, ops.Count);
+
+                RequeueFailedPersistenceBatch(ops);
+                return false;
+            }
+        }
+
+        private void RequeueFailedPersistenceBatch(List<PersistenceOperation> ops)
+        {
+            if (!_enableBackgroundPersistence || _disposed || ops.Count == 0)
+                return;
+
+            var coalescedAdded = 0;
+            var coalescedSkipped = 0;
+
+            foreach (var op in ops)
+            {
+                var compositeKey = $"{op.TenantId}\u001F{op.FileKey}";
+                if (_coalescedPersistenceOps.TryAdd(compositeKey, op))
+                {
+                    Interlocked.Increment(ref _coalescedDepth);
+                    coalescedAdded++;
+                }
+                else
+                {
+                    // Keep the already coalesced latest state if one exists.
+                    coalescedSkipped++;
+                }
+            }
+
+            if (coalescedAdded > 0)
+            {
+                _logger.LogWarning(
+                    "Requeued failed SQLite batch by coalescing {CoalescedAdded} operation(s) (skipped {CoalescedSkipped} newer coalesced state(s)). QueueDepth={QueueDepth}, CoalescedDepth={CoalescedDepth}",
+                    coalescedAdded,
+                    coalescedSkipped,
+                    Volatile.Read(ref _persistenceChannelDepth),
+                    Volatile.Read(ref _coalescedDepth));
+            }
+            else if (coalescedSkipped > 0)
+            {
+                _logger.LogDebug(
+                    "Skipped requeue for {CoalescedSkipped} failed SQLite operation(s) because newer coalesced state already exists.",
+                    coalescedSkipped);
             }
         }
 

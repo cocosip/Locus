@@ -590,6 +590,50 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AddOrUpdateAsync_WhenSqliteWriteFails_RequeuesFailedBatchForRetry()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var blockedDir = Path.Combine(_metadataDir, $"blocked-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(blockedDir);
+
+            var blockedRepo = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                blockedDir,
+                enableBackgroundPersistence: true,
+                maxDrainBatchSize: 1,
+                persistenceIntervalSeconds: 1);
+
+            var tenantId = "tenant-blocked";
+            var tenantDir = Path.Combine(blockedDir, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantDir);
+            var dbPath = Path.Combine(tenantDir, "metadata.db");
+
+            Stream? lockStream = null;
+
+            try
+            {
+                lockStream = _fileSystem.File.Open(dbPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                var metadata = CreateMetadata("retry-file", FileProcessingStatus.Pending, tenantId);
+                await blockedRepo.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+                var observedRequeue = SpinWait.SpinUntil(
+                    () => GetPrivateIntField(blockedRepo, "_coalescedDepth") > 0,
+                    TimeSpan.FromSeconds(3));
+
+                Assert.True(observedRequeue);
+            }
+            finally
+            {
+                lockStream?.Dispose();
+                blockedRepo.Dispose();
+                SqliteConnection.ClearAllPools();
+                if (_fileSystem.Directory.Exists(blockedDir))
+                    _fileSystem.Directory.Delete(blockedDir, recursive: true);
+            }
+        }
+
+        [Fact]
         public async Task StartupLoad_BatchedPendingLoad_PreservesCreatedAtOrder()
         {
             var logger = new Mock<ILogger<MetadataRepository>>();
