@@ -426,6 +426,32 @@ namespace Locus.Storage
                                     if (existingMetadata != null
                                         && !PathsEqual(existingMetadata.PhysicalPath, metadata.PhysicalPath))
                                     {
+                                        if (ShouldRepairExistingMetadataPath(existingMetadata.PhysicalPath, metadata.PhysicalPath))
+                                        {
+                                            var correctedMetadata = CreatePathCorrectedMetadata(existingMetadata, metadata);
+                                            await _projectionStore.UpsertProjectedFileAsync(correctedMetadata, ct).ConfigureAwait(false);
+
+                                            if (normalizedPhysical != null && existenceCache != null)
+                                            {
+                                                if (existenceCache.Count < _orphanRebuildLookupCacheSize
+                                                    || existenceCache.ContainsKey(normalizedPhysical))
+                                                {
+                                                    existenceCache[normalizedPhysical] = true;
+                                                }
+                                            }
+
+                                            if (normalizedPhysical != null)
+                                                knownPhysicalPaths.Add(normalizedPhysical);
+
+                                            _logger.LogInformation(
+                                                "Corrected metadata path casing for file key {FileKey} in tenant {TenantId}: {ExistingPath} -> {CorrectedPath}",
+                                                correctedMetadata.FileKey,
+                                                correctedMetadata.TenantId,
+                                                existingMetadata.PhysicalPath,
+                                                correctedMetadata.PhysicalPath);
+                                            continue;
+                                        }
+
                                         _logger.LogWarning(
                                             "Skipping orphaned file rebuild because file key {FileKey} for tenant {TenantId} already points to {ExistingPath}; orphan path was {OrphanPath}",
                                             metadata.FileKey,
@@ -2024,6 +2050,36 @@ namespace Locus.Storage
             var normalizedLeft = _fileSystem.Path.GetFullPath(left);
             var normalizedRight = _fileSystem.Path.GetFullPath(right);
             return string.Equals(normalizedLeft, normalizedRight, _pathComparison);
+        }
+
+        private bool ShouldRepairExistingMetadataPath(string existingPath, string discoveredPath)
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return false;
+
+            var normalizedExistingPath = NormalizePath(existingPath);
+            var normalizedDiscoveredPath = NormalizePath(discoveredPath);
+            if (normalizedExistingPath == null || normalizedDiscoveredPath == null)
+                return false;
+
+            if (!string.Equals(normalizedExistingPath, normalizedDiscoveredPath, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (string.Equals(normalizedExistingPath, normalizedDiscoveredPath, StringComparison.Ordinal))
+                return false;
+
+            return !_fileSystem.File.Exists(existingPath) && _fileSystem.File.Exists(discoveredPath);
+        }
+
+        private static FileMetadata CreatePathCorrectedMetadata(FileMetadata existingMetadata, FileMetadata recoveredMetadata)
+        {
+            var correctedMetadata = existingMetadata.Clone();
+            correctedMetadata.VolumeId = recoveredMetadata.VolumeId;
+            correctedMetadata.PhysicalPath = recoveredMetadata.PhysicalPath;
+            correctedMetadata.DirectoryPath = recoveredMetadata.DirectoryPath;
+            correctedMetadata.FileSize = recoveredMetadata.FileSize;
+            correctedMetadata.FileExtension = recoveredMetadata.FileExtension;
+            return correctedMetadata;
         }
 
         private async Task<bool> WasMetadataDeadLetteredConcurrentlyAsync(

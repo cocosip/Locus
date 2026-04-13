@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Models;
@@ -308,6 +309,24 @@ namespace Locus.Storage.Tests
             await _repository.RemoveAsync(_tenantId, metadata.FileKey, CancellationToken.None);
             var existsAfterRemove = await _repository.ExistsByPhysicalPathAsync(_tenantId, newPath, CancellationToken.None);
             Assert.False(existsAfterRemove);
+        }
+
+        [Fact]
+        public async Task ExistsByPhysicalPathAsync_RespectsPlatformCaseSensitivity()
+        {
+            var metadata = CreateMetadata("file-case", FileProcessingStatus.Pending);
+            var actualPath = Path.Combine(_metadataDir, "tenant-001", "CaseFile.dat");
+            var mismatchedCasePath = Path.Combine(_metadataDir, "tenant-001", "casefile.dat");
+
+            metadata.PhysicalPath = actualPath;
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var exists = await _repository.ExistsByPhysicalPathAsync(_tenantId, mismatchedCasePath, CancellationToken.None);
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                Assert.True(exists);
+            else
+                Assert.False(exists);
         }
 
         [Fact]

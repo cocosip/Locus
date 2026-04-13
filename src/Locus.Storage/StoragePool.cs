@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -502,11 +503,69 @@ namespace Locus.Storage
                 throw new StorageVolumeUnavailableException($"Volume {metadata.VolumeId} is not mounted");
 
             // 5. Read file from volume
-            var stream = await volume.ReadAsync(metadata.PhysicalPath, ct);
+            var stream = await ReadFileFromVolumeAsync(metadata, volume, ct).ConfigureAwait(false);
 
             _logger.LogDebug("File read successfully: {FileKey} for tenant {TenantId}", fileKey, tenant.TenantId);
 
             return stream;
+        }
+
+        private async Task<Stream> ReadFileFromVolumeAsync(FileMetadata metadata, IStorageVolume volume, CancellationToken ct)
+        {
+            try
+            {
+                return await volume.ReadAsync(metadata.PhysicalPath, ct).ConfigureAwait(false);
+            }
+            catch (FileNotFoundException)
+            {
+                if (await TryCorrectMetadataPhysicalPathAsync(metadata, volume, ct).ConfigureAwait(false))
+                    return await volume.ReadAsync(metadata.PhysicalPath, ct).ConfigureAwait(false);
+
+                throw;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                if (await TryCorrectMetadataPhysicalPathAsync(metadata, volume, ct).ConfigureAwait(false))
+                    return await volume.ReadAsync(metadata.PhysicalPath, ct).ConfigureAwait(false);
+
+                throw;
+            }
+        }
+
+        private async Task<bool> TryCorrectMetadataPhysicalPathAsync(FileMetadata metadata, IStorageVolume volume, CancellationToken ct)
+        {
+            var correctedPath = volume.BuildPhysicalPath(metadata.TenantId, metadata.FileKey, metadata.FileExtension);
+            if (PathsEqual(metadata.PhysicalPath, correctedPath))
+                return false;
+
+            try
+            {
+                using (await volume.ReadAsync(correctedPath, ct).ConfigureAwait(false))
+                {
+                }
+            }
+            catch (FileNotFoundException)
+            {
+                return false;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return false;
+            }
+
+            metadata.PhysicalPath = correctedPath;
+            await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
+            return true;
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            return string.Equals(
+                Path.GetFullPath(left),
+                Path.GetFullPath(right),
+                RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal);
         }
 
         /// <inheritdoc/>

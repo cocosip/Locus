@@ -1007,6 +1007,49 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RecoverOrphanedFilesAsync_CorrectsMetadataPathCasingWithoutRebuildingQuota()
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            var actualFile = Path.Combine(tenantPath, "CaseOnly.dat");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            _fileSystem.File.WriteAllText(actualFile, "case content");
+
+            var mismatchedCasePath = Path.Combine(tenantPath, "caseonly.dat");
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "CaseOnly",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = mismatchedCasePath,
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            await SeedProjectedCountsAsync("tenant-001", "/");
+
+            await _cleanupService.RecoverOrphanedFilesAsync(_tenant.Object, CancellationToken.None);
+
+            var after = await _metadataRepository.GetAsync("tenant-001", "CaseOnly", CancellationToken.None);
+            Assert.NotNull(after);
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                Assert.Equal(mismatchedCasePath, after!.PhysicalPath);
+            }
+            else
+            {
+                Assert.Equal(actualFile, after!.PhysicalPath);
+            }
+
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/", CancellationToken.None)).CurrentCount);
+
+            var stats = await _cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(0, stats.OrphanedFilesRecovered);
+        }
+
+        [Fact]
         public async Task RecoverOrphanedFilesAsync_WithSmallLookupCache_RebuildsAllOrphans()
         {
             var cleanupWithSmallCache = new StorageCleanupService(

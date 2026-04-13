@@ -653,7 +653,11 @@ namespace Locus.Storage
                     if (string.IsNullOrWhiteSpace(metadata.PhysicalPath))
                         continue;
 
-                    if (!TryConfirmPhysicalFileMissing(metadata, physicalPathExistsCache, out var physicalFileMissing))
+                    var (shouldContinue, physicalFileMissing) = await TryConfirmPhysicalFileMissingAsync(
+                        metadata,
+                        physicalPathExistsCache,
+                        ct).ConfigureAwait(false);
+                    if (!shouldContinue)
                         continue;
 
                     if (physicalFileMissing)
@@ -853,12 +857,12 @@ namespace Locus.Storage
             await _directoryQuotaManager!.IncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
         }
 
-        private bool TryConfirmPhysicalFileMissing(
+        private async Task<(bool ShouldContinue, bool PhysicalFileMissing)> TryConfirmPhysicalFileMissingAsync(
             FileMetadata metadata,
             IDictionary<string, bool> physicalPathExistsCache,
-            out bool physicalFileMissing)
+            CancellationToken ct)
         {
-            physicalFileMissing = false;
+            ct.ThrowIfCancellationRequested();
 
             if (_volumeRegistry != null && !string.IsNullOrWhiteSpace(metadata.VolumeId))
             {
@@ -868,7 +872,7 @@ namespace Locus.Storage
                         "Skipping orphaned metadata cleanup because volume {VolumeId} is unavailable for file {FileKey}",
                         metadata.VolumeId,
                         metadata.FileKey);
-                    return false;
+                    return (false, false);
                 }
 
                 if (!volume.IsHealthy)
@@ -877,21 +881,40 @@ namespace Locus.Storage
                         "Skipping orphaned metadata cleanup because volume {VolumeId} is unhealthy for file {FileKey}",
                         metadata.VolumeId,
                         metadata.FileKey);
-                    return false;
+                    return (false, false);
                 }
             }
 
             if (physicalPathExistsCache.TryGetValue(metadata.PhysicalPath, out var physicalFileExists))
             {
-                physicalFileMissing = !physicalFileExists;
-                return true;
+                return (true, !physicalFileExists);
             }
 
             physicalFileExists = _fileSystem.File.Exists(metadata.PhysicalPath);
             if (physicalFileExists)
             {
                 physicalPathExistsCache[metadata.PhysicalPath] = true;
-                return true;
+                return (true, false);
+            }
+
+            if (_volumeRegistry != null
+                && !string.IsNullOrWhiteSpace(metadata.VolumeId)
+                && _volumeRegistry.TryGetVolume(metadata.VolumeId, out var correctionVolume))
+            {
+                var correctedPath = correctionVolume.BuildPhysicalPath(
+                    metadata.TenantId,
+                    metadata.FileKey,
+                    metadata.FileExtension);
+                if (!PathsEqual(metadata.PhysicalPath, correctedPath) && _fileSystem.File.Exists(correctedPath))
+                {
+                    var correctedMetadata = metadata.Clone();
+                    correctedMetadata.PhysicalPath = correctedPath;
+                    await _projectionStore.UpsertProjectedFileAsync(correctedMetadata, ct).ConfigureAwait(false);
+
+                    physicalPathExistsCache[metadata.PhysicalPath] = false;
+                    physicalPathExistsCache[correctedPath] = true;
+                    return (false, false);
+                }
             }
 
             try
@@ -905,19 +928,17 @@ namespace Locus.Storage
                 }
 
                 physicalPathExistsCache[metadata.PhysicalPath] = true;
-                return true;
+                return (true, false);
             }
             catch (System.IO.FileNotFoundException)
             {
                 physicalPathExistsCache[metadata.PhysicalPath] = false;
-                physicalFileMissing = true;
-                return true;
+                return (true, true);
             }
             catch (System.IO.DirectoryNotFoundException)
             {
                 physicalPathExistsCache[metadata.PhysicalPath] = false;
-                physicalFileMissing = true;
-                return true;
+                return (true, true);
             }
             catch (UnauthorizedAccessException ex)
             {
@@ -925,7 +946,7 @@ namespace Locus.Storage
                     ex,
                     "Skipping orphaned metadata cleanup because physical-path access could not be verified for {FileKey}",
                     metadata.FileKey);
-                return false;
+                return (false, false);
             }
             catch (IOException ex)
             {
@@ -933,8 +954,17 @@ namespace Locus.Storage
                     ex,
                     "Skipping orphaned metadata cleanup because physical-path access could not be verified for {FileKey}",
                     metadata.FileKey);
-                return false;
+                return (false, false);
             }
+        }
+
+        private bool PathsEqual(string left, string right)
+        {
+            var normalizedLeft = _fileSystem.Path.GetFullPath(left);
+            var normalizedRight = _fileSystem.Path.GetFullPath(right);
+            return string.Equals(normalizedLeft, normalizedRight, RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal);
         }
 
         /// <summary>

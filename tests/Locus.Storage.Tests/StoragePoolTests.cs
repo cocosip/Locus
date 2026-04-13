@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.IO.Abstractions.TestingHelpers;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -490,6 +491,40 @@ namespace Locus.Storage.Tests
             // Act & Assert
             await Assert.ThrowsAsync<FileNotFoundException>(() =>
                 _storagePool.ReadFileAsync(_tenant.Object, "nonexistent-key", default));
+        }
+
+        [Fact]
+        public async Task ReadFileAsync_CorrectsMetadataPathCasingWhenCanonicalPathExists()
+        {
+            var actualPath = Path.Combine(_volume1Path, "tenant-001", "CaseRead.dat");
+            var mismatchedCasePath = Path.Combine(_volume1Path, "tenant-001", "caseread.dat");
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(actualPath)!);
+            _fileSystem.File.WriteAllText(actualPath, "case read content");
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "CaseRead",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = mismatchedCasePath,
+                DirectoryPath = "/",
+                FileExtension = ".dat",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            using var readStream = await _storagePool.ReadFileAsync(_tenant.Object, "CaseRead", CancellationToken.None);
+            using var reader = new StreamReader(readStream);
+            var content = await reader.ReadToEndAsync();
+
+            var updated = await _metadataRepository.GetAsync("tenant-001", "CaseRead", CancellationToken.None);
+            Assert.NotNull(updated);
+            Assert.Equal("case read content", content);
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                Assert.Equal(mismatchedCasePath, updated!.PhysicalPath);
+            else
+                Assert.Equal(actualPath, updated!.PhysicalPath);
         }
 
         [Fact]

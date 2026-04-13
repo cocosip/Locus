@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -1396,6 +1397,63 @@ namespace Locus.Storage.Tests
             Assert.Null(await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None));
             Assert.NotNull(await _repository.GetAsync("tenant-001", "file-002", CancellationToken.None)); // Should exist
             Assert.Null(await _repository.GetAsync("tenant-001", "file-003", CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_CorrectsPhysicalPathCasingInsteadOfRemovingMetadata()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+            var volumeRegistry = new StorageVolumeRegistry();
+            var volume = new Mock<IStorageVolume>(MockBehavior.Strict);
+            var tenantRoot = Path.Combine(_metadataDir, "tenant-001");
+            var actualPath = Path.Combine(tenantRoot, "CaseScheduler.dat");
+            var mismatchedCasePath = Path.Combine(tenantRoot, "casescheduler.dat");
+
+            _fileSystem.Directory.CreateDirectory(tenantRoot);
+            _fileSystem.File.WriteAllText(actualPath, "content");
+
+            volume.SetupGet(v => v.VolumeId).Returns("vol-001");
+            volume.SetupGet(v => v.IsHealthy).Returns(true);
+            volume.SetupGet(v => v.MountPath).Returns(_metadataDir);
+            volume.SetupGet(v => v.ShardingDepth).Returns(0);
+            volume.Setup(v => v.BuildPhysicalPath("tenant-001", "CaseScheduler", ".dat")).Returns(actualPath);
+            volumeRegistry.Register(volume.Object);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "CaseScheduler",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = mismatchedCasePath,
+                DirectoryPath = "/",
+                FileExtension = ".dat",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                volumeRegistry: volumeRegistry,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            var updated = await _repository.GetAsync("tenant-001", "CaseScheduler", CancellationToken.None);
+            Assert.NotNull(updated);
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                Assert.Equal(mismatchedCasePath, updated!.PhysicalPath);
+            else
+                Assert.Equal(actualPath, updated!.PhysicalPath);
+
+            Assert.Equal(0, removedCount);
+            tenantQuotaManager.VerifyNoOtherCalls();
+            directoryQuotaManager.VerifyNoOtherCalls();
         }
 
         [Fact]
