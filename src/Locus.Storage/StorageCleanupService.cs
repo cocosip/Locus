@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Exceptions;
 using Locus.Core.Models;
+using Locus.FileSystem;
 using Locus.Storage.Data;
 using Microsoft.Extensions.Logging;
 
@@ -416,6 +417,21 @@ namespace Locus.Storage
                                         _logger.LogWarning(
                                             "Skipping orphaned file whose path does not match the expected storage layout: {PhysicalPath}",
                                             physicalPath);
+                                        continue;
+                                    }
+
+                                    var existingMetadata = await _projectionStore
+                                        .GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct)
+                                        .ConfigureAwait(false);
+                                    if (existingMetadata != null
+                                        && !PathsEqual(existingMetadata.PhysicalPath, metadata.PhysicalPath))
+                                    {
+                                        _logger.LogWarning(
+                                            "Skipping orphaned file rebuild because file key {FileKey} for tenant {TenantId} already points to {ExistingPath}; orphan path was {OrphanPath}",
+                                            metadata.FileKey,
+                                            metadata.TenantId,
+                                            existingMetadata.PhysicalPath,
+                                            metadata.PhysicalPath);
                                         continue;
                                     }
 
@@ -1902,6 +1918,8 @@ namespace Locus.Storage
             if (PathsEqual(sourcePath, destinationPath))
                 return;
 
+            EnsureFileMoveStaysWithinRegisteredVolumeBoundary(sourcePath, destinationPath);
+
             var destinationDirectory = _fileSystem.Path.GetDirectoryName(destinationPath);
             if (!string.IsNullOrWhiteSpace(destinationDirectory) && !_fileSystem.Directory.Exists(destinationDirectory))
             {
@@ -1933,12 +1951,16 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(rootPath))
                 rootPath = ".deadletter";
 
-            var parts = new List<string>
+            if (_fileSystem.Path.IsPathRooted(rootPath))
             {
-                _fileSystem.Path.IsPathRooted(rootPath)
-                    ? _fileSystem.Path.GetFullPath(rootPath)
-                    : _fileSystem.Path.GetFullPath(_fileSystem.Path.Combine(volume.MountPath, rootPath))
-            };
+                throw new InvalidOperationException(
+                    $"Dead-letter root path '{rootPath}' must be relative to the storage volume mount path.");
+            }
+
+            var deadLetterRoot = _fileSystem.Path.GetFullPath(_fileSystem.Path.Combine(volume.MountPath, rootPath));
+            EnsurePathWithinVolumeMountPath(volume, deadLetterRoot, "dead-letter root");
+
+            var parts = new List<string> { deadLetterRoot };
 
             if (_deadLetterOptions.IncludeTenantInPath)
                 parts.Add(metadata.TenantId);
@@ -1958,7 +1980,43 @@ namespace Locus.Storage
 
             var fileExtension = metadata.FileExtension ?? string.Empty;
             parts.Add(metadata.FileKey + fileExtension);
-            return _fileSystem.Path.Combine(parts.ToArray());
+            var deadLetterPath = _fileSystem.Path.Combine(parts.ToArray());
+            EnsurePathWithinVolumeMountPath(volume, deadLetterPath, "dead-letter path");
+            return deadLetterPath;
+        }
+
+        private void EnsureFileMoveStaysWithinRegisteredVolumeBoundary(string sourcePath, string destinationPath)
+        {
+            var sourceVolume = FindVolumeContainingPath(sourcePath);
+            if (sourceVolume == null)
+                return;
+
+            EnsurePathWithinVolumeMountPath(sourceVolume, destinationPath, "file move destination");
+        }
+
+        private IStorageVolume? FindVolumeContainingPath(string path)
+        {
+            foreach (var volume in _volumes.Values)
+            {
+                if (IsPathWithinVolumeMountPath(volume, path))
+                    return volume;
+            }
+
+            return null;
+        }
+
+        private bool IsPathWithinVolumeMountPath(IStorageVolume volume, string path)
+        {
+            return FileSystemPathSanitizer.IsPathWithinBase(volume.MountPath, path);
+        }
+
+        private void EnsurePathWithinVolumeMountPath(IStorageVolume volume, string path, string pathRole)
+        {
+            if (IsPathWithinVolumeMountPath(volume, path))
+                return;
+
+            throw new InvalidOperationException(
+                $"The {pathRole} '{path}' must stay within the mount path '{volume.MountPath}' for volume '{volume.VolumeId}'.");
         }
 
         private bool PathsEqual(string left, string right)

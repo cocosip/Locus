@@ -7,7 +7,20 @@ namespace Locus.Storage
     {
         public static bool CountsTowardActiveQuota(FileMetadata metadata)
         {
-            return metadata.Status != FileProcessingStatus.DeadLettered;
+            switch (metadata.Status)
+            {
+                case FileProcessingStatus.Pending:
+                case FileProcessingStatus.Processing:
+                case FileProcessingStatus.Completed:
+                case FileProcessingStatus.Failed:
+                case FileProcessingStatus.PermanentlyFailed:
+                case FileProcessingStatus.DeleteRequested:
+                    return true;
+                case FileProcessingStatus.DeleteSucceeded:
+                case FileProcessingStatus.DeadLettered:
+                default:
+                    return false;
+            }
         }
     }
 }
