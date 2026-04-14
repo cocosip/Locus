@@ -439,8 +439,8 @@ namespace Locus.Storage
                 var directoryReservationConsumed = false;
                 try
                 {
-                    tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(record.TenantId).ConfigureAwait(false);
-                    directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(record.TenantId, existing.DirectoryPath).ConfigureAwait(false);
+                    tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(record.TenantId, ct).ConfigureAwait(false);
+                    directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(record.TenantId, existing.DirectoryPath, ct).ConfigureAwait(false);
 
                     var updated = existing.Clone();
                     QueueProjectionMetadataState.MarkAcceptedProjectionApplied(updated);
@@ -613,10 +613,10 @@ namespace Locus.Storage
 
             try
             {
-                await ApplyDeleteSucceededDirectoryProjectionAsync(existing.TenantId, directoryPath).ConfigureAwait(false);
+                await ApplyDeleteSucceededDirectoryProjectionAsync(existing.TenantId, directoryPath, ct).ConfigureAwait(false);
                 directoryQuotaDecremented = true;
 
-                await ApplyDeleteSucceededTenantProjectionAsync(existing.TenantId).ConfigureAwait(false);
+                await ApplyDeleteSucceededTenantProjectionAsync(existing.TenantId, ct).ConfigureAwait(false);
                 tenantQuotaDecremented = true;
 
                 var metadataRemoved = await _projectionStore.RemoveProjectedFileAsync(existing.TenantId, existing.FileKey, ct).ConfigureAwait(false);
@@ -693,8 +693,8 @@ namespace Locus.Storage
             var directoryReservationConsumed = false;
             try
             {
-                tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(record.TenantId).ConfigureAwait(false);
-                directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(record.TenantId, metadata.DirectoryPath).ConfigureAwait(false);
+                tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(record.TenantId, ct).ConfigureAwait(false);
+                directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(record.TenantId, metadata.DirectoryPath, ct).ConfigureAwait(false);
 
                 QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
                 await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
@@ -735,10 +735,10 @@ namespace Locus.Storage
 
             try
             {
-                await ApplyDeleteSucceededDirectoryProjectionAsync(existing.TenantId, directoryPath).ConfigureAwait(false);
+                await ApplyDeleteSucceededDirectoryProjectionAsync(existing.TenantId, directoryPath, ct).ConfigureAwait(false);
                 directoryQuotaDecremented = true;
 
-                await ApplyDeleteSucceededTenantProjectionAsync(existing.TenantId).ConfigureAwait(false);
+                await ApplyDeleteSucceededTenantProjectionAsync(existing.TenantId, ct).ConfigureAwait(false);
                 tenantQuotaDecremented = true;
 
                 var updated = existing.Clone();
@@ -1466,64 +1466,64 @@ namespace Locus.Storage
             _fileSystem.File.Move(tempPath, destinationPath);
         }
 
-        private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId)
+        private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId, CancellationToken ct)
         {
             if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
             {
-                return await tenantQuotaProjectionManager.ApplyAcceptedProjectionAsync(tenantId, default).ConfigureAwait(false);
+                return await tenantQuotaProjectionManager.ApplyAcceptedProjectionAsync(tenantId, ct).ConfigureAwait(false);
             }
 
             if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
             {
-                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+                await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, ct).ConfigureAwait(false);
                 return false;
             }
 
-            await _tenantQuotaManager.IncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+            await _tenantQuotaManager.IncrementFileCountAsync(tenantId, ct).ConfigureAwait(false);
             return false;
         }
 
-        private async Task<bool> ApplyAcceptedDirectoryProjectionAsync(string tenantId, string directoryPath)
+        private async Task<bool> ApplyAcceptedDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
             if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
             {
                 return await directoryQuotaProjectionManager
-                    .ApplyAcceptedProjectionAsync(tenantId, directoryPath, default)
+                    .ApplyAcceptedProjectionAsync(tenantId, directoryPath, ct)
                     .ConfigureAwait(false);
             }
 
             if (_directoryQuotaManager is IDirectoryQuotaCompensationManager directoryQuotaCompensationManager)
             {
-                await directoryQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+                await directoryQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
                 return false;
             }
 
-            await _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+            await _directoryQuotaManager.IncrementFileCountAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
             return false;
         }
 
-        private async Task ApplyDeleteSucceededTenantProjectionAsync(string tenantId)
+        private async Task ApplyDeleteSucceededTenantProjectionAsync(string tenantId, CancellationToken ct)
         {
             if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
             {
-                await tenantQuotaProjectionManager.ApplyDeleteSucceededProjectionAsync(tenantId, default).ConfigureAwait(false);
+                await tenantQuotaProjectionManager.ApplyDeleteSucceededProjectionAsync(tenantId, ct).ConfigureAwait(false);
                 return;
             }
 
-            await _tenantQuotaManager.DecrementFileCountAsync(tenantId, default).ConfigureAwait(false);
+            await _tenantQuotaManager.DecrementFileCountAsync(tenantId, ct).ConfigureAwait(false);
         }
 
-        private async Task ApplyDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath)
+        private async Task ApplyDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
             if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
             {
                 await directoryQuotaProjectionManager
-                    .ApplyDeleteSucceededProjectionAsync(tenantId, directoryPath, default)
+                    .ApplyDeleteSucceededProjectionAsync(tenantId, directoryPath, ct)
                     .ConfigureAwait(false);
                 return;
             }
 
-            await _directoryQuotaManager.DecrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+            await _directoryQuotaManager.DecrementFileCountAsync(tenantId, directoryPath, ct).ConfigureAwait(false);
         }
 
         private async Task RollbackDeleteSucceededTenantProjectionAsync(string tenantId)

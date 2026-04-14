@@ -350,7 +350,7 @@ namespace Locus.Storage
                 if (_queueEventJournal != null)
                 {
                     QueueProjectionMetadataState.MarkAcceptedProjectionPending(metadata);
-                    await AppendAcceptedQueueEventAsync(metadata).ConfigureAwait(false);
+                    await AppendAcceptedQueueEventAsync(metadata, ct).ConfigureAwait(false);
                     acceptanceCompleted = true;
                 }
                 else
@@ -1078,7 +1078,7 @@ namespace Locus.Storage
             }
         }
 
-        private async Task AppendAcceptedQueueEventAsync(FileMetadata metadata)
+        private async Task AppendAcceptedQueueEventAsync(FileMetadata metadata, CancellationToken ct)
         {
             if (_queueEventJournal == null)
                 return;
@@ -1099,7 +1099,7 @@ namespace Locus.Storage
                     OriginalFileName = metadata.OriginalFileName,
                     FileExtension = metadata.FileExtension
                 },
-                default).ConfigureAwait(false);
+                ct).ConfigureAwait(false);
         }
 
         private bool ShouldAppendQueueEventsInStoragePool()
