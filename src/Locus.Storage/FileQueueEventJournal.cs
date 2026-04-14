@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Buffers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -487,23 +488,54 @@ namespace Locus.Storage
             {
                 var state = LoadJournalState(writer.TenantId);
                 await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
-                var serializedRecords = SerializeBatch(state, batch);
-                if (serializedRecords.Count == 0)
+                var serializedBatch = SerializeBatch(state, batch);
+                if (serializedBatch.TotalBytes == 0)
                     return;
 
                 var stream = EnsureAppendStream(writer);
-                foreach (var serializedRecord in serializedRecords)
-                    await stream.WriteAsync(serializedRecord.Bytes, 0, serializedRecord.Bytes.Length, writer.Cancellation.Token).ConfigureAwait(false);
+                if (serializedBatch.Records.Count == 1)
+                {
+                    var singleRecord = serializedBatch.Records[0].Bytes;
+                    await stream.WriteAsync(singleRecord, 0, singleRecord.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
-                state.TailOffset = state.BaseOffset + stream.Length;
-                MarkJournalStateDirty(writer.TenantId);
+                    state.TailOffset += singleRecord.Length;
+                    MarkJournalStateDirty(writer.TenantId);
 
-                if (ShouldFlushBeforeAck(writer))
-                    await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
-                else
-                    writer.HasUnflushedData = true;
+                    if (ShouldFlushBeforeAck(writer))
+                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                    else
+                        writer.HasUnflushedData = true;
 
-                CompleteRequests(batch);
+                    CompleteRequests(batch);
+                    return;
+                }
+
+                var writeBuffer = ArrayPool<byte>.Shared.Rent(serializedBatch.TotalBytes);
+                try
+                {
+                    var writeOffset = 0;
+                    foreach (var serializedRecord in serializedBatch.Records)
+                    {
+                        Buffer.BlockCopy(serializedRecord.Bytes, 0, writeBuffer, writeOffset, serializedRecord.Bytes.Length);
+                        writeOffset += serializedRecord.Bytes.Length;
+                    }
+
+                    await stream.WriteAsync(writeBuffer, 0, serializedBatch.TotalBytes, writer.Cancellation.Token).ConfigureAwait(false);
+
+                    state.TailOffset += serializedBatch.TotalBytes;
+                    MarkJournalStateDirty(writer.TenantId);
+
+                    if (ShouldFlushBeforeAck(writer))
+                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                    else
+                        writer.HasUnflushedData = true;
+
+                    CompleteRequests(batch);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(writeBuffer);
+                }
             }
             finally
             {
@@ -511,23 +543,30 @@ namespace Locus.Storage
             }
         }
 
-        private List<SerializedRecord> SerializeBatch(JournalState state, IReadOnlyList<PendingAppendRequest> batch)
+        private SerializedBatch SerializeBatch(JournalState state, IReadOnlyList<PendingAppendRequest> batch)
         {
-            var serializedRecords = new List<SerializedRecord>();
+            var totalRecordCount = 0;
+            foreach (var request in batch)
+                totalRecordCount += request.RecordCount;
+
+            var serializedRecords = new List<SerializedRecord>(totalRecordCount);
             var nextSequence = state.LastSequenceNumber;
             var codec = GetCodec(state.Format);
+            var totalBytes = 0;
 
             foreach (var request in batch)
             {
                 foreach (var record in request.Records)
                 {
                     nextSequence++;
-                    serializedRecords.Add(new SerializedRecord(codec.SerializeRecord(record, nextSequence)));
+                    var bytes = codec.SerializeRecord(record, nextSequence);
+                    serializedRecords.Add(new SerializedRecord(bytes));
+                    totalBytes += bytes.Length;
                 }
             }
 
             state.LastSequenceNumber = nextSequence;
-            return serializedRecords;
+            return new SerializedBatch(serializedRecords, totalBytes);
         }
 
         private Stream EnsureAppendStream(TenantWriterState writer)
@@ -601,7 +640,7 @@ namespace Locus.Storage
         private async Task FlushAppendStreamCoreAsync(TenantWriterState writer)
         {
             if (writer.AppendStream != null)
-                await writer.AppendStream.FlushAsync(writer.Cancellation.Token).ConfigureAwait(false);
+                await DurableFileWrite.FlushToDiskAsync(writer.AppendStream, writer.Cancellation.Token).ConfigureAwait(false);
 
             writer.HasUnflushedData = false;
             writer.LastFlushUtc = DateTime.UtcNow;
@@ -1187,6 +1226,19 @@ namespace Locus.Storage
             }
 
             public byte[] Bytes { get; }
+        }
+
+        private sealed class SerializedBatch
+        {
+            public SerializedBatch(IReadOnlyList<SerializedRecord> records, int totalBytes)
+            {
+                Records = records ?? throw new ArgumentNullException(nameof(records));
+                TotalBytes = totalBytes;
+            }
+
+            public IReadOnlyList<SerializedRecord> Records { get; }
+
+            public int TotalBytes { get; }
         }
 
         private sealed class JournalState

@@ -1,5 +1,6 @@
 #nullable enable
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -285,6 +286,8 @@ namespace Locus.Benchmarks
             try
             {
                 var stream = EnsureAppendStream(writer);
+                var serializedRecords = new List<byte[]>(batch.Count);
+                var totalBytes = 0;
                 foreach (var request in batch)
                 {
                     writer.LastSequenceNumber++;
@@ -293,8 +296,25 @@ namespace Locus.Benchmarks
                     var bytes = _format == QueueLogEncodingFormat.Json
                         ? SerializeJsonRecord(request.Record)
                         : SerializeBinaryRecord(request.Record);
+                    serializedRecords.Add(bytes);
+                    totalBytes += bytes.Length;
+                }
 
-                    await stream.WriteAsync(bytes, 0, bytes.Length, writer.Cancellation.Token).ConfigureAwait(false);
+                var writeBuffer = ArrayPool<byte>.Shared.Rent(totalBytes);
+                try
+                {
+                    var writeOffset = 0;
+                    foreach (var bytes in serializedRecords)
+                    {
+                        Buffer.BlockCopy(bytes, 0, writeBuffer, writeOffset, bytes.Length);
+                        writeOffset += bytes.Length;
+                    }
+
+                    await stream.WriteAsync(writeBuffer, 0, totalBytes, writer.Cancellation.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(writeBuffer);
                 }
 
                 if (ShouldFlushBeforeAck(writer))
@@ -387,7 +407,11 @@ namespace Locus.Benchmarks
         private async Task FlushAppendStreamCoreAsync(TenantWriterState writer)
         {
             if (writer.AppendStream != null)
+            {
                 await writer.AppendStream.FlushAsync(writer.Cancellation.Token).ConfigureAwait(false);
+                if (writer.AppendStream is FileStream fileStream)
+                    fileStream.Flush(true);
+            }
 
             writer.HasUnflushedData = false;
             writer.LastFlushUtc = DateTime.UtcNow;

@@ -66,6 +66,7 @@ namespace Locus.Storage
         private const int MaxImportedHistoryChannelSize = 20_000;
         private const int MinImportQueueCapacity = 64;
         private const int MaxImportQueueCapacity = 1024;
+        private const int ImportStreamBufferSize = 256 * 1024;
         private const string ImportedFileFingerprintPrefix = "fp:v2:";
         private const string LegacyImportedFileFingerprintPrefix = "fp:v1:";
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
@@ -1991,6 +1992,17 @@ namespace Locus.Storage
         {
             try
             {
+                if (_fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    return new FileStream(
+                        filePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.None,
+                        ImportStreamBufferSize,
+                        FileOptions.SequentialScan);
+                }
+
                 return _fileSystem.File.Open(
                     filePath,
                     FileMode.Open,

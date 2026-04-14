@@ -24,24 +24,23 @@ namespace Locus.Storage
                 throw new ArgumentNullException(nameof(record));
 
             record.SequenceNumber = sequenceNumber;
+            var payloadLength = GetPayloadSize(record);
+            var buffer = new byte[HeaderSize + payloadLength];
+            var payloadOffset = HeaderSize;
+            WritePayload(record, buffer, ref payloadOffset);
 
-            var payload = BuildPayload(record);
-            var checksum = QueueEventCrc32.Compute(payload, 0, payload.Length);
+            var checksum = QueueEventCrc32.Compute(buffer, HeaderSize, payloadLength);
             record.PayloadCrc32 = checksum;
 
-            using (var stream = new MemoryStream(payload.Length + HeaderSize))
-            using (var writer = new BinaryWriter(stream, Utf8NoBom, leaveOpen: true))
-            {
-                writer.Write(RecordMagic);
-                writer.Write(RecordVersion);
-                writer.Write(RecordFlags);
-                writer.Write(payload.Length);
-                writer.Write(sequenceNumber);
-                writer.Write(checksum);
-                writer.Write(payload);
-                writer.Flush();
-                return stream.ToArray();
-            }
+            var headerOffset = 0;
+            WriteInt32(buffer, ref headerOffset, RecordMagic);
+            WriteInt16(buffer, ref headerOffset, RecordVersion);
+            WriteInt16(buffer, ref headerOffset, RecordFlags);
+            WriteInt32(buffer, ref headerOffset, payloadLength);
+            WriteInt64(buffer, ref headerOffset, sequenceNumber);
+            WriteUInt32(buffer, ref headerOffset, checksum);
+
+            return buffer;
         }
 
         public Task<QueueEventJournalCodecReadResult> ReadBatchAsync(Stream stream, long startOffset, int maxRecords, CancellationToken ct)
@@ -206,31 +205,49 @@ namespace Locus.Storage
             return magic == RecordMagic;
         }
 
-        private static byte[] BuildPayload(QueueEventRecord record)
+        private static int GetPayloadSize(QueueEventRecord record)
         {
-            using (var stream = new MemoryStream(512))
-            using (var writer = new BinaryWriter(stream, Utf8NoBom, leaveOpen: true))
-            {
-                writer.Write(record.SchemaVersion);
-                writer.Write((int)record.EventType);
-                writer.Write(record.OccurredAtUtc.Ticks);
-                writer.Write(record.FileSize ?? -1L);
-                writer.Write(record.Status.HasValue ? (int)record.Status.Value : int.MinValue);
-                writer.Write(record.RetryCount ?? int.MinValue);
-                writer.Write(record.ProcessingStartTimeUtc?.Ticks ?? long.MinValue);
-                writer.Write(record.AvailableForProcessingAtUtc?.Ticks ?? long.MinValue);
-                WriteNullableString(writer, record.EventId);
-                WriteNullableString(writer, record.TenantId);
-                WriteNullableString(writer, record.FileKey);
-                WriteNullableString(writer, record.VolumeId);
-                WriteNullableString(writer, record.PhysicalPath);
-                WriteNullableString(writer, record.DirectoryPath);
-                WriteNullableString(writer, record.ErrorMessage);
-                WriteNullableString(writer, record.OriginalFileName);
-                WriteNullableString(writer, record.FileExtension);
-                writer.Flush();
-                return stream.ToArray();
-            }
+            var total =
+                sizeof(int) +
+                sizeof(int) +
+                sizeof(long) +
+                sizeof(long) +
+                sizeof(int) +
+                sizeof(int) +
+                sizeof(long) +
+                sizeof(long);
+
+            total += GetNullableStringSize(record.EventId);
+            total += GetNullableStringSize(record.TenantId);
+            total += GetNullableStringSize(record.FileKey);
+            total += GetNullableStringSize(record.VolumeId);
+            total += GetNullableStringSize(record.PhysicalPath);
+            total += GetNullableStringSize(record.DirectoryPath);
+            total += GetNullableStringSize(record.ErrorMessage);
+            total += GetNullableStringSize(record.OriginalFileName);
+            total += GetNullableStringSize(record.FileExtension);
+            return total;
+        }
+
+        private static void WritePayload(QueueEventRecord record, byte[] buffer, ref int offset)
+        {
+            WriteInt32(buffer, ref offset, record.SchemaVersion);
+            WriteInt32(buffer, ref offset, (int)record.EventType);
+            WriteInt64(buffer, ref offset, record.OccurredAtUtc.Ticks);
+            WriteInt64(buffer, ref offset, record.FileSize ?? -1L);
+            WriteInt32(buffer, ref offset, record.Status.HasValue ? (int)record.Status.Value : int.MinValue);
+            WriteInt32(buffer, ref offset, record.RetryCount ?? int.MinValue);
+            WriteInt64(buffer, ref offset, record.ProcessingStartTimeUtc?.Ticks ?? long.MinValue);
+            WriteInt64(buffer, ref offset, record.AvailableForProcessingAtUtc?.Ticks ?? long.MinValue);
+            WriteNullableString(buffer, ref offset, record.EventId);
+            WriteNullableString(buffer, ref offset, record.TenantId);
+            WriteNullableString(buffer, ref offset, record.FileKey);
+            WriteNullableString(buffer, ref offset, record.VolumeId);
+            WriteNullableString(buffer, ref offset, record.PhysicalPath);
+            WriteNullableString(buffer, ref offset, record.DirectoryPath);
+            WriteNullableString(buffer, ref offset, record.ErrorMessage);
+            WriteNullableString(buffer, ref offset, record.OriginalFileName);
+            WriteNullableString(buffer, ref offset, record.FileExtension);
         }
 
         private static QueueEventRecord ReadPayload(byte[] payload, long sequenceNumber, uint payloadChecksum)
@@ -268,11 +285,95 @@ namespace Locus.Storage
             }
         }
 
-        private static void WriteNullableString(BinaryWriter writer, string? value)
+        private static int GetNullableStringSize(string? value)
         {
-            writer.Write(value != null);
-            if (value != null)
-                writer.Write(value);
+            if (value == null)
+                return 1;
+
+            var byteCount = Utf8NoBom.GetByteCount(value);
+            return 1 + Get7BitEncodedIntSize(byteCount) + byteCount;
+        }
+
+        private static void WriteNullableString(byte[] buffer, ref int offset, string? value)
+        {
+            buffer[offset++] = value != null ? (byte)1 : (byte)0;
+            if (value == null)
+                return;
+
+            var byteCount = Utf8NoBom.GetByteCount(value);
+            Write7BitEncodedInt(buffer, ref offset, byteCount);
+            offset += Utf8NoBom.GetBytes(value, 0, value.Length, buffer, offset);
+        }
+
+        private static int Get7BitEncodedIntSize(int value)
+        {
+            var size = 1;
+            uint remaining = (uint)value;
+            while (remaining >= 0x80)
+            {
+                remaining >>= 7;
+                size++;
+            }
+
+            return size;
+        }
+
+        private static void Write7BitEncodedInt(byte[] buffer, ref int offset, int value)
+        {
+            uint remaining = (uint)value;
+            while (remaining >= 0x80)
+            {
+                buffer[offset++] = (byte)(remaining | 0x80);
+                remaining >>= 7;
+            }
+
+            buffer[offset++] = (byte)remaining;
+        }
+
+        private static void WriteInt16(byte[] buffer, ref int offset, short value)
+        {
+            unchecked
+            {
+                buffer[offset++] = (byte)value;
+                buffer[offset++] = (byte)(value >> 8);
+            }
+        }
+
+        private static void WriteInt32(byte[] buffer, ref int offset, int value)
+        {
+            unchecked
+            {
+                buffer[offset++] = (byte)value;
+                buffer[offset++] = (byte)(value >> 8);
+                buffer[offset++] = (byte)(value >> 16);
+                buffer[offset++] = (byte)(value >> 24);
+            }
+        }
+
+        private static void WriteUInt32(byte[] buffer, ref int offset, uint value)
+        {
+            unchecked
+            {
+                buffer[offset++] = (byte)value;
+                buffer[offset++] = (byte)(value >> 8);
+                buffer[offset++] = (byte)(value >> 16);
+                buffer[offset++] = (byte)(value >> 24);
+            }
+        }
+
+        private static void WriteInt64(byte[] buffer, ref int offset, long value)
+        {
+            unchecked
+            {
+                buffer[offset++] = (byte)value;
+                buffer[offset++] = (byte)(value >> 8);
+                buffer[offset++] = (byte)(value >> 16);
+                buffer[offset++] = (byte)(value >> 24);
+                buffer[offset++] = (byte)(value >> 32);
+                buffer[offset++] = (byte)(value >> 40);
+                buffer[offset++] = (byte)(value >> 48);
+                buffer[offset++] = (byte)(value >> 56);
+            }
         }
 
         private static string? ReadNullableString(BinaryReader reader)

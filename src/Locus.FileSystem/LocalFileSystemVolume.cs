@@ -54,8 +54,9 @@ namespace Locus.FileSystem
         private int _knownDirectoryCount;
 
         private const int DefaultWriteBufferSize = 128 * 1024;
-        private const int DefaultCopyBufferSize = 80 * 1024;
+        private const int DefaultCopyBufferSize = 256 * 1024;
         private const int DefaultKnownDirectoryCacheMaxEntries = 200_000;
+        private const int DefaultSynchronousSmallWriteThresholdBytes = 1024 * 1024;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="LocalFileSystemVolume"/> class.
@@ -458,17 +459,31 @@ namespace Locus.FileSystem
 
             try
             {
+                var remainingBytes = TryGetRemainingLength(content);
+
                 // Optimization 4: skip Directory.Exists() for directories we already know exist.
                 // Shard directories are created once and never deleted during normal operation.
                 var directory = _fileSystem.Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory!))
                     EnsureDirectoryTracked(directory!);
 
-                using (var fileStream = CreateWriteStream(path))
+                if (ShouldUseSynchronousSmallWritePath(content, remainingBytes))
                 {
-                    await CopyStreamAsync(content, fileStream, ct).ConfigureAwait(false);
-                    if (_forceFlushAfterWrite)
-                        await fileStream.FlushAsync(ct).ConfigureAwait(false);
+                    using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
+                    {
+                        CopySmallSeekableStreamSynchronously(content, fileStream, checked((int)remainingBytes!.Value), ct);
+                        if (_forceFlushAfterWrite)
+                            fileStream.Flush();
+                    }
+                }
+                else
+                {
+                    using (var fileStream = CreateWriteStream(path, remainingBytes))
+                    {
+                        await CopyStreamAsync(content, fileStream, ct).ConfigureAwait(false);
+                        if (_forceFlushAfterWrite)
+                            await fileStream.FlushAsync(ct).ConfigureAwait(false);
+                    }
                 }
 
                 // content.Length throws NotSupportedException on non-seekable streams (e.g. NetworkStream).
@@ -712,23 +727,71 @@ namespace Locus.FileSystem
                 Interlocked.Increment(ref _knownDirectoryCount);
         }
 
-        private Stream CreateWriteStream(string path)
+        private Stream CreateWriteStream(string path, long? expectedBytes)
         {
             // MockFileSystem does not map to OS file handles; keep using abstraction in tests.
             if (_fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0)
                 return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
 
+            var bufferSize = ResolveWriteBufferSize(expectedBytes);
             return new FileStream(
                 path,
                 FileMode.Create,
                 FileAccess.Write,
                 FileShare.None,
-                _writeBufferSize,
+                bufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
+        }
+
+        private Stream CreateSynchronousWriteStream(string path, long? expectedBytes)
+        {
+            if (_fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0)
+                return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
+
+            var bufferSize = ResolveWriteBufferSize(expectedBytes);
+            return new FileStream(
+                path,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize,
+                FileOptions.None);
         }
 
         private async Task CopyStreamAsync(Stream source, Stream destination, CancellationToken ct = default)
         {
+            if (TryGetRemainingLength(source) is long remainingBytes
+                && remainingBytes >= 0
+                && remainingBytes <= _copyBufferSize)
+            {
+                var exactLength = (int)remainingBytes;
+                if (exactLength == 0)
+                    return;
+
+                var singleBuffer = ArrayPool<byte>.Shared.Rent(exactLength);
+                try
+                {
+                    var totalRead = 0;
+                    while (totalRead < exactLength)
+                    {
+                        var bytesRead = await source.ReadAsync(singleBuffer, totalRead, exactLength - totalRead, ct).ConfigureAwait(false);
+                        if (bytesRead <= 0)
+                            break;
+
+                        totalRead += bytesRead;
+                    }
+
+                    if (totalRead > 0)
+                        await destination.WriteAsync(singleBuffer, 0, totalRead, ct).ConfigureAwait(false);
+
+                    return;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(singleBuffer);
+                }
+            }
+
             var rented = ArrayPool<byte>.Shared.Rent(_copyBufferSize);
             try
             {
@@ -745,6 +808,74 @@ namespace Locus.FileSystem
             {
                 ArrayPool<byte>.Shared.Return(rented);
             }
+        }
+
+        private int ResolveWriteBufferSize(long? expectedBytes)
+        {
+            if (!expectedBytes.HasValue || expectedBytes.Value <= 0)
+                return _writeBufferSize;
+
+            var candidate = expectedBytes.Value > int.MaxValue
+                ? _writeBufferSize
+                : (int)expectedBytes.Value;
+
+            if (candidate <= 0)
+                return _writeBufferSize;
+
+            if (candidate < 4096)
+                candidate = 4096;
+
+            return candidate < _writeBufferSize ? candidate : _writeBufferSize;
+        }
+
+        private bool ShouldUseSynchronousSmallWritePath(Stream content, long? remainingBytes)
+        {
+            return content.CanSeek
+                && remainingBytes.HasValue
+                && remainingBytes.Value > 0
+                && remainingBytes.Value <= DefaultSynchronousSmallWriteThresholdBytes;
+        }
+
+        private static void CopySmallSeekableStreamSynchronously(
+            Stream source,
+            Stream destination,
+            int exactLength,
+            CancellationToken ct)
+        {
+            if (exactLength <= 0)
+                return;
+
+            ct.ThrowIfCancellationRequested();
+
+            var buffer = ArrayPool<byte>.Shared.Rent(exactLength);
+            try
+            {
+                var totalRead = 0;
+                while (totalRead < exactLength)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var bytesRead = source.Read(buffer, totalRead, exactLength - totalRead);
+                    if (bytesRead <= 0)
+                        break;
+
+                    totalRead += bytesRead;
+                }
+
+                if (totalRead > 0)
+                    destination.Write(buffer, 0, totalRead);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private static long? TryGetRemainingLength(Stream stream)
+        {
+            if (!stream.CanSeek)
+                return null;
+
+            return stream.Length - stream.Position;
         }
     }
 }

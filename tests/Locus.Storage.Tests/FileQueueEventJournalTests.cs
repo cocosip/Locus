@@ -80,6 +80,46 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AppendBatchAsync_AssignsSequentialSequenceNumbersAndPreservesOrder()
+        {
+            await _journal.AppendBatchAsync(new[]
+            {
+                new QueueEventRecord
+                {
+                    TenantId = "tenant-batch",
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                    DirectoryPath = "/inbox",
+                },
+                new QueueEventRecord
+                {
+                    TenantId = "tenant-batch",
+                    FileKey = "file-002",
+                    EventType = QueueEventType.ProcessingStarted,
+                    DirectoryPath = "/inbox",
+                    ProcessingStartTimeUtc = DateTime.UtcNow,
+                },
+                new QueueEventRecord
+                {
+                    TenantId = "tenant-batch",
+                    FileKey = "file-003",
+                    EventType = QueueEventType.ProcessingCompleted,
+                    DirectoryPath = "/inbox",
+                }
+            }, CancellationToken.None);
+
+            var batch = await _journal.ReadBatchAsync("tenant-batch", 0, 10, CancellationToken.None);
+
+            Assert.Equal(3, batch.Records.Count);
+            Assert.Equal("file-001", batch.Records[0].FileKey);
+            Assert.Equal("file-002", batch.Records[1].FileKey);
+            Assert.Equal("file-003", batch.Records[2].FileKey);
+            Assert.Equal(1L, batch.Records[0].SequenceNumber);
+            Assert.Equal(2L, batch.Records[1].SequenceNumber);
+            Assert.Equal(3L, batch.Records[2].SequenceNumber);
+        }
+
+        [Fact]
         public async Task AppendAsync_ConcurrentRequests_AssignsMonotonicSequenceNumbers()
         {
             var appendTasks = new Task[24];
