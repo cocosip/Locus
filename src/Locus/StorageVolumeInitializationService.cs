@@ -4,6 +4,7 @@ using System.Linq;
 using System.IO.Abstractions;
 using System.Threading;
 using System.Threading.Tasks;
+using Locus.Core.Abstractions;
 using Locus.Storage;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -66,7 +67,11 @@ namespace Locus
             {
                 await _pool.AddVolumeAsync(volume, config.InitialDelayMs, config.HealthCheckDelayMs, cancellationToken)
                     .ConfigureAwait(false);
+
                 _cleanupService.RegisterVolume(volume);
+
+                if (volume is IStorageVolumeWritePathWarmup writePathWarmup)
+                    StartWritePathWarmup(volume, writePathWarmup, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -77,6 +82,31 @@ namespace Locus
                     config.MountPath);
                 throw;
             }
+        }
+
+        private void StartWritePathWarmup(
+            IStorageVolume volume,
+            IStorageVolumeWritePathWarmup writePathWarmup,
+            CancellationToken cancellationToken)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await writePathWarmup.WarmWritePathCacheAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Write-path cache warmup failed for volume {VolumeId} at {MountPath}",
+                        volume.VolumeId,
+                        volume.MountPath);
+                }
+            }, CancellationToken.None);
         }
     }
 }

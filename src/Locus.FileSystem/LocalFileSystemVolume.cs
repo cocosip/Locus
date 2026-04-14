@@ -16,7 +16,7 @@ namespace Locus.FileSystem
     /// <summary>
     /// Local file system implementation of IStorageVolume.
     /// </summary>
-    public class LocalFileSystemVolume : IStorageVolume, IStorageVolumeHealthProbe
+    public class LocalFileSystemVolume : IStorageVolume, IStorageVolumeHealthProbe, IStorageVolumeWritePathWarmup
     {
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<LocalFileSystemVolume> _logger;
@@ -55,7 +55,7 @@ namespace Locus.FileSystem
 
         private const int DefaultWriteBufferSize = 128 * 1024;
         private const int DefaultCopyBufferSize = 80 * 1024;
-        private const int DefaultKnownDirectoryCacheMaxEntries = 50_000;
+        private const int DefaultKnownDirectoryCacheMaxEntries = 200_000;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="LocalFileSystemVolume"/> class.
@@ -77,7 +77,7 @@ namespace Locus.FileSystem
         /// Default: true.
         /// </param>
         /// <param name="knownDirectoryCacheMaxEntries">
-        /// Maximum number of cached directory entries before trimming. Default 50,000.
+        /// Maximum number of cached directory entries before trimming. Default 200,000.
         /// </param>
         public LocalFileSystemVolume(
             IFileSystem fileSystem,
@@ -251,6 +251,49 @@ namespace Locus.FileSystem
             return result;
         }
 
+        /// <inheritdoc/>
+        public Task WarmWritePathCacheAsync(CancellationToken ct = default)
+        {
+            var directoriesScanned = 0;
+            var pending = new Stack<string>();
+            pending.Push(_mountPath);
+
+            while (pending.Count > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var current = pending.Pop();
+                TrackKnownDirectoryWithoutTrim(current);
+                directoriesScanned++;
+
+                IEnumerable<string> childDirectories;
+                try
+                {
+                    childDirectories = _fileSystem.Directory.EnumerateDirectories(current);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Skipping directory cache warmup subtree for volume {VolumeId} because {Directory} could not be enumerated",
+                        _volumeId,
+                        current);
+                    continue;
+                }
+
+                foreach (var childDirectory in childDirectories)
+                    pending.Push(childDirectory);
+            }
+
+            _logger.LogInformation(
+                "Warmed write-path directory cache for volume {VolumeId}: scanned {ScannedCount} directories, cached {CachedCount}",
+                _volumeId,
+                directoriesScanned,
+                Volatile.Read(ref _knownDirectoryCount));
+
+            return Task.CompletedTask;
+        }
+
         // ---------------------------------------------------------------------------
         // Private helpers
         // ---------------------------------------------------------------------------
@@ -419,12 +462,7 @@ namespace Locus.FileSystem
                 // Shard directories are created once and never deleted during normal operation.
                 var directory = _fileSystem.Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory!))
-                {
-                    if (!_fileSystem.Directory.Exists(directory))
-                        _fileSystem.Directory.CreateDirectory(directory!);
-
-                    TrackKnownDirectory(directory!);
-                }
+                    EnsureDirectoryTracked(directory!);
 
                 using (var fileStream = CreateWriteStream(path))
                 {
@@ -660,6 +698,18 @@ namespace Locus.FileSystem
             {
                 Volatile.Write(ref _knownDirectoryTrimInProgress, 0);
             }
+        }
+
+        private void EnsureDirectoryTracked(string directory)
+        {
+            _fileSystem.Directory.CreateDirectory(directory);
+            TrackKnownDirectory(directory);
+        }
+
+        private void TrackKnownDirectoryWithoutTrim(string directory)
+        {
+            if (_knownDirectories.TryAdd(directory, 0))
+                Interlocked.Increment(ref _knownDirectoryCount);
         }
 
         private Stream CreateWriteStream(string path)

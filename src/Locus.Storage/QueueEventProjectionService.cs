@@ -25,6 +25,7 @@ namespace Locus.Storage
     {
         private static readonly EventId SequenceGapDetectedEventId = new EventId(4201, nameof(SequenceGapDetectedEventId));
         private static readonly EventId SequenceGapRecoveryFailedEventId = new EventId(4202, nameof(SequenceGapRecoveryFailedEventId));
+        private static readonly TimeSpan CursorPersistenceDebounce = TimeSpan.FromSeconds(1);
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -41,6 +42,7 @@ namespace Locus.Storage
         private readonly IStorageCleanupService? _storageCleanupService;
         private readonly IQuotaProjectionMaintenanceStore? _quotaMaintenanceStore;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantProjectionLocks;
+        private readonly ConcurrentDictionary<string, CachedProjectionCursor> _cursorCache;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="QueueEventProjectionService"/> class.
@@ -70,6 +72,7 @@ namespace Locus.Storage
             _storageCleanupService = storageCleanupService;
             _quotaMaintenanceStore = quotaMaintenanceStore;
             _tenantProjectionLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+            _cursorCache = new ConcurrentDictionary<string, CachedProjectionCursor>(StringComparer.Ordinal);
         }
 
         /// <inheritdoc/>
@@ -123,6 +126,24 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
+        public override async Task StopAsync(CancellationToken cancellationToken)
+        {
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+
+            try
+            {
+                await FlushDirtyCursorStatesAsync(force: true, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to flush debounced projection cursor state during shutdown");
+            }
+        }
+
+        /// <inheritdoc/>
         public async Task<QueueProjectionTenantState> GetTenantStateAsync(string tenantId, CancellationToken ct = default)
         {
             ValidateTenantId(tenantId);
@@ -157,6 +178,8 @@ namespace Locus.Storage
                         "Deferred queue projection replay for tenant {TenantId} because the physical file could not be verified",
                         tenantId);
                 }
+
+                await FlushDirtyCursorStateIfNeededAsync(tenantId, force: true, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
@@ -236,6 +259,8 @@ namespace Locus.Storage
                     await TryReconcileQuotaCountsAfterFailedRebuildAsync(tenantId).ConfigureAwait(false);
                     throw;
                 }
+
+                await FlushDirtyCursorStateIfNeededAsync(tenantId, force: true, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
@@ -288,10 +313,11 @@ namespace Locus.Storage
             var batch = await _journal.ReadBatchAsync(tenantId, offset, _options.MaxRecordsPerTenantPerCycle, ct).ConfigureAwait(false);
             if (batch.Records.Count == 0)
             {
+                await FlushDirtyCursorStateIfNeededAsync(tenantId, force: false, CancellationToken.None).ConfigureAwait(false);
                 if (batch.NextOffset > offset)
                 {
                     cursor.Offset = batch.NextOffset;
-                    await SaveCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
+                    await QueueCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
                     return new ProjectionCycleResult(batch.NextOffset, maintenanceWork: null);
                 }
 
@@ -324,7 +350,7 @@ namespace Locus.Storage
             }
 
             cursor.Offset = cursorOffset;
-            await SaveCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
+            await QueueCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
             return new ProjectionCycleResult(cursorOffset, maintenanceWork);
         }
 
@@ -1036,15 +1062,27 @@ namespace Locus.Storage
 
         private async Task<ProjectionCursor> LoadCursorStateAsync(string tenantId, CancellationToken ct)
         {
-            var path = GetCursorPath(tenantId);
-            if (!_fileSystem.File.Exists(path))
-                return new ProjectionCursor();
+            if (_cursorCache.TryGetValue(tenantId, out var cached))
+                return CloneCursor(cached.Cursor);
 
-            using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            var path = GetCursorPath(tenantId);
+            ProjectionCursor cursor;
+            if (!_fileSystem.File.Exists(path))
             {
-                var cursor = await JsonSerializer.DeserializeAsync<ProjectionCursor>(stream, JsonOptions, ct).ConfigureAwait(false);
-                return cursor ?? new ProjectionCursor();
+                cursor = new ProjectionCursor();
             }
+            else
+            {
+                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    cursor = await JsonSerializer.DeserializeAsync<ProjectionCursor>(stream, JsonOptions, ct).ConfigureAwait(false)
+                        ?? new ProjectionCursor();
+                }
+            }
+
+            var cachedCursor = new CachedProjectionCursor(CloneCursor(cursor), DateTime.UtcNow, dirty: false);
+            _cursorCache.TryAdd(tenantId, cachedCursor);
+            return CloneCursor(cachedCursor.Cursor);
         }
 
         private async Task<long> LoadCursorAsync(string tenantId, CancellationToken ct)
@@ -1055,10 +1093,36 @@ namespace Locus.Storage
 
         private Task SaveCursorAsync(string tenantId, long offset, CancellationToken ct)
         {
-            return SaveCursorStateAsync(tenantId, new ProjectionCursor { Offset = offset }, ct);
+            return PersistCursorStateAsync(tenantId, new ProjectionCursor { Offset = offset }, ct);
         }
 
-        private async Task SaveCursorStateAsync(string tenantId, ProjectionCursor cursor, CancellationToken ct)
+        private async Task QueueCursorStateAsync(string tenantId, ProjectionCursor cursor, CancellationToken ct)
+        {
+            CacheCursorState(tenantId, cursor, markPersisted: false);
+            await FlushDirtyCursorStateIfNeededAsync(tenantId, force: false, ct).ConfigureAwait(false);
+        }
+
+        private async Task FlushDirtyCursorStatesAsync(bool force, CancellationToken ct)
+        {
+            foreach (var tenantId in _cursorCache.Keys)
+            {
+                ct.ThrowIfCancellationRequested();
+                await FlushDirtyCursorStateIfNeededAsync(tenantId, force, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task FlushDirtyCursorStateIfNeededAsync(string tenantId, bool force, CancellationToken ct)
+        {
+            if (!_cursorCache.TryGetValue(tenantId, out var cached) || !cached.Dirty)
+                return;
+
+            if (!force && DateTime.UtcNow - cached.LastPersistedAtUtc < CursorPersistenceDebounce)
+                return;
+
+            await PersistCursorStateAsync(tenantId, cached.Cursor, ct).ConfigureAwait(false);
+        }
+
+        private async Task PersistCursorStateAsync(string tenantId, ProjectionCursor cursor, CancellationToken ct)
         {
             var path = GetCursorPath(tenantId);
             var directory = _fileSystem.Path.GetDirectoryName(path);
@@ -1076,6 +1140,7 @@ namespace Locus.Storage
             }
 
             ReplaceFileAtomically(tempPath, path);
+            CacheCursorState(tenantId, cursor, markPersisted: true);
         }
 
         private SemaphoreSlim GetTenantProjectionLock(string tenantId)
@@ -1483,6 +1548,34 @@ namespace Locus.Storage
             return false;
         }
 
+        private void CacheCursorState(string tenantId, ProjectionCursor cursor, bool markPersisted)
+        {
+            var timestampUtc = DateTime.UtcNow;
+            _cursorCache.AddOrUpdate(
+                tenantId,
+                _ => new CachedProjectionCursor(
+                    CloneCursor(cursor),
+                    markPersisted ? timestampUtc : DateTime.MinValue,
+                    dirty: !markPersisted),
+                (_, existing) => new CachedProjectionCursor(
+                    CloneCursor(cursor),
+                    markPersisted ? timestampUtc : existing.LastPersistedAtUtc,
+                    dirty: !markPersisted));
+        }
+
+        private static ProjectionCursor CloneCursor(ProjectionCursor cursor)
+        {
+            return new ProjectionCursor
+            {
+                Offset = cursor.Offset,
+                LastSequenceNumber = cursor.LastSequenceNumber,
+                GapDetected = cursor.GapDetected,
+                LastGapDetectedAtUtc = cursor.LastGapDetectedAtUtc,
+                GapExpectedSequenceNumber = cursor.GapExpectedSequenceNumber,
+                GapObservedSequenceNumber = cursor.GapObservedSequenceNumber,
+            };
+        }
+
         private async Task<bool> ApplyAcceptedDirectoryProjectionAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
             if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
@@ -1646,6 +1739,22 @@ namespace Locus.Storage
             public long? GapExpectedSequenceNumber { get; set; }
 
             public long? GapObservedSequenceNumber { get; set; }
+        }
+
+        private sealed class CachedProjectionCursor
+        {
+            public CachedProjectionCursor(ProjectionCursor cursor, DateTime lastPersistedAtUtc, bool dirty)
+            {
+                Cursor = cursor ?? throw new ArgumentNullException(nameof(cursor));
+                LastPersistedAtUtc = lastPersistedAtUtc;
+                Dirty = dirty;
+            }
+
+            public ProjectionCursor Cursor { get; }
+
+            public DateTime LastPersistedAtUtc { get; }
+
+            public bool Dirty { get; }
         }
 
         private sealed class ProjectionSnapshot
