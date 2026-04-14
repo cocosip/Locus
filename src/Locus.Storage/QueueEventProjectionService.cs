@@ -34,6 +34,7 @@ namespace Locus.Storage
 
         private readonly IQueueEventJournal _journal;
         private readonly IQueueProjectionStore _projectionStore;
+        private readonly IQueueProjectionBatchStore? _projectionBatchStore;
         private readonly ITenantQuotaManager _tenantQuotaManager;
         private readonly IDirectoryQuotaManager _directoryQuotaManager;
         private readonly IFileSystem _fileSystem;
@@ -43,6 +44,7 @@ namespace Locus.Storage
         private readonly IQuotaProjectionMaintenanceStore? _quotaMaintenanceStore;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantProjectionLocks;
         private readonly ConcurrentDictionary<string, CachedProjectionCursor> _cursorCache;
+        private readonly AsyncLocal<IQueueProjectionBatch?> _currentProjectionBatch;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="QueueEventProjectionService"/> class.
@@ -64,6 +66,7 @@ namespace Locus.Storage
                 ?? (metadataRepository != null
                     ? new MetadataRepositoryQueueProjectionStore(metadataRepository)
                     : throw new ArgumentNullException(nameof(metadataRepository)));
+            _projectionBatchStore = _projectionStore as IQueueProjectionBatchStore;
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
             _directoryQuotaManager = directoryQuotaManager ?? throw new ArgumentNullException(nameof(directoryQuotaManager));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -73,6 +76,7 @@ namespace Locus.Storage
             _quotaMaintenanceStore = quotaMaintenanceStore;
             _tenantProjectionLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
             _cursorCache = new ConcurrentDictionary<string, CachedProjectionCursor>(StringComparer.Ordinal);
+            _currentProjectionBatch = new AsyncLocal<IQueueProjectionBatch?>();
         }
 
         /// <inheritdoc/>
@@ -324,11 +328,22 @@ namespace Locus.Storage
                 return new ProjectionCycleResult(null, maintenanceWork: null);
             }
 
-            foreach (var record in batch.Records)
+            var projectionBatch = BeginProjectionBatch(tenantId);
+            try
             {
-                ct.ThrowIfCancellationRequested();
-                await ApplySequenceTrackingAsync(tenantId, cursor, record, ct).ConfigureAwait(false);
-                await ProjectRecordAsync(record, ct).ConfigureAwait(false);
+                foreach (var record in batch.Records)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await ApplySequenceTrackingAsync(tenantId, cursor, record, ct).ConfigureAwait(false);
+                    await ProjectRecordAsync(record, ct).ConfigureAwait(false);
+                }
+
+                if (projectionBatch != null)
+                    await projectionBatch.FlushAsync(ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                EndProjectionBatch(projectionBatch);
             }
 
             var cursorOffset = batch.NextOffset;
@@ -352,6 +367,50 @@ namespace Locus.Storage
             cursor.Offset = cursorOffset;
             await QueueCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
             return new ProjectionCycleResult(cursorOffset, maintenanceWork);
+        }
+
+        private IQueueProjectionBatch? BeginProjectionBatch(string tenantId)
+        {
+            if (_projectionBatchStore == null)
+                return null;
+
+            if (_currentProjectionBatch.Value != null)
+                throw new InvalidOperationException("Nested projection batches are not supported.");
+
+            var batch = _projectionBatchStore.BeginBatch(tenantId);
+            _currentProjectionBatch.Value = batch;
+            return batch;
+        }
+
+        private void EndProjectionBatch(IQueueProjectionBatch? batch)
+        {
+            if (batch == null)
+                return;
+
+            _currentProjectionBatch.Value = null;
+        }
+
+        private Task UpsertProjectedFileAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            var currentBatch = _currentProjectionBatch.Value;
+            if (currentBatch != null)
+                return currentBatch.UpsertProjectedFileAsync(metadata, ct);
+
+            return _projectionStore.UpsertProjectedFileAsync(metadata, ct);
+        }
+
+        private Task<bool> RemoveProjectedFileAsync(string tenantId, string fileKey, CancellationToken ct)
+        {
+            var currentBatch = _currentProjectionBatch.Value;
+            if (currentBatch != null)
+            {
+                if (!string.Equals(currentBatch.TenantId, tenantId, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Projection batch tenant does not match the projected mutation.");
+
+                return currentBatch.RemoveProjectedFileAsync(fileKey, ct);
+            }
+
+            return _projectionStore.RemoveProjectedFileAsync(tenantId, fileKey, ct);
         }
 
         private async Task ApplySequenceTrackingAsync(
@@ -470,7 +529,7 @@ namespace Locus.Storage
 
                     var updated = existing.Clone();
                     QueueProjectionMetadataState.MarkAcceptedProjectionApplied(updated);
-                    await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+                    await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
                     return;
                 }
                 catch
@@ -511,7 +570,7 @@ namespace Locus.Storage
             updated.LastError = record.ErrorMessage ?? updated.LastError;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
-            await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+            await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
 
         private async Task ProjectProcessingFailedAsync(QueueEventRecord record, CancellationToken ct)
@@ -542,7 +601,7 @@ namespace Locus.Storage
                 : null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
-            await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+            await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
 
         private async Task ProjectProcessingTimedOutAsync(QueueEventRecord record, CancellationToken ct)
@@ -567,7 +626,7 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = record.AvailableForProcessingAtUtc ?? record.OccurredAtUtc;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
-            await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+            await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
 
         private async Task ProjectProcessingCompletedAsync(QueueEventRecord record, CancellationToken ct)
@@ -593,7 +652,7 @@ namespace Locus.Storage
             updated.LastError = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
-            await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+            await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
 
         private async Task ProjectDeleteRequestedAsync(QueueEventRecord record, CancellationToken ct)
@@ -624,7 +683,7 @@ namespace Locus.Storage
             updated.LastError = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
 
-            await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+            await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
 
         private async Task ProjectDeleteSucceededAsync(QueueEventRecord record, CancellationToken ct)
@@ -645,7 +704,7 @@ namespace Locus.Storage
                 await ApplyDeleteSucceededTenantProjectionAsync(existing.TenantId, ct).ConfigureAwait(false);
                 tenantQuotaDecremented = true;
 
-                var metadataRemoved = await _projectionStore.RemoveProjectedFileAsync(existing.TenantId, existing.FileKey, ct).ConfigureAwait(false);
+                var metadataRemoved = await RemoveProjectedFileAsync(existing.TenantId, existing.FileKey, ct).ConfigureAwait(false);
                 if (!metadataRemoved)
                     throw new InvalidOperationException($"Failed to remove projected metadata for deleted file {existing.FileKey}.");
             }
@@ -723,7 +782,7 @@ namespace Locus.Storage
                 directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(record.TenantId, metadata.DirectoryPath, ct).ConfigureAwait(false);
 
                 QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
-                await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
+                await UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
                 return metadata;
             }
             catch
@@ -778,7 +837,7 @@ namespace Locus.Storage
                 updated.VolumeId = record.VolumeId ?? existing.VolumeId;
                 QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(updated);
 
-                await _projectionStore.UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+                await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
             }
             catch
             {
@@ -1347,10 +1406,21 @@ namespace Locus.Storage
             if (snapshot == null)
                 return null;
 
-            foreach (var file in snapshot.Files)
+            var projectionBatch = BeginProjectionBatch(tenantId);
+            try
             {
-                ct.ThrowIfCancellationRequested();
-                await _projectionStore.UpsertProjectedFileAsync(file, ct).ConfigureAwait(false);
+                foreach (var file in snapshot.Files)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await UpsertProjectedFileAsync(file, ct).ConfigureAwait(false);
+                }
+
+                if (projectionBatch != null)
+                    await projectionBatch.FlushAsync(ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                EndProjectionBatch(projectionBatch);
             }
 
             return snapshot.CursorOffset;
@@ -1384,10 +1454,21 @@ namespace Locus.Storage
         private async Task ClearTenantProjectionAsync(string tenantId, CancellationToken ct)
         {
             var metadataEntries = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
-            foreach (var metadata in metadataEntries)
+            var projectionBatch = BeginProjectionBatch(tenantId);
+            try
             {
-                ct.ThrowIfCancellationRequested();
-                await _projectionStore.RemoveProjectedFileAsync(tenantId, metadata.FileKey, ct).ConfigureAwait(false);
+                foreach (var metadata in metadataEntries)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await RemoveProjectedFileAsync(tenantId, metadata.FileKey, ct).ConfigureAwait(false);
+                }
+
+                if (projectionBatch != null)
+                    await projectionBatch.FlushAsync(ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                EndProjectionBatch(projectionBatch);
             }
         }
 

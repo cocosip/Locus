@@ -842,14 +842,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (_disposed)
                 throw new ObjectDisposedException(nameof(MetadataRepository));
 
-            if (metadata == null)
-                throw new ArgumentNullException(nameof(metadata));
-
-            if (string.IsNullOrWhiteSpace(metadata.FileKey))
-                throw new ArgumentException("FileKey cannot be empty", nameof(metadata));
-
-            if (string.IsNullOrWhiteSpace(metadata.TenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
+            ValidateUpsertMetadata(metadata);
 
             // 1. Update in-memory cache FIRST -- always succeeds, immediately visible to readers.
             UpdateCacheAndIndices(metadata);
@@ -864,11 +857,42 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         }
 
         /// <summary>
+        /// Begins a tenant-scoped direct projection batch that updates memory immediately
+        /// and flushes staged SQLite mutations in one durable transaction.
+        /// </summary>
+        internal IQueueProjectionBatch BeginProjectionBatch(string tenantId)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MetadataRepository));
+
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            return new DirectProjectionBatch(this, tenantId);
+        }
+
+        /// <summary>
         /// Adds or updates file metadata with immediate synchronous SQLite write.
         /// Bypasses the Write-Behind queue -- use only for maintenance operations such as
         /// database rebuild where the caller needs the data persisted before returning.
         /// </summary>
         internal Task AddOrUpdateDirectAsync(FileMetadata metadata, CancellationToken ct = default)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MetadataRepository));
+
+            ValidateUpsertMetadata(metadata);
+
+            // Update in-memory cache (same logic as AddOrUpdateAsync).
+            UpdateCacheAndIndices(metadata);
+
+            // Write directly to SQLite (synchronous -- required for rebuild correctness)
+            ExecuteDirectBatch(metadata.TenantId, new List<PersistenceOperation> { new PersistenceOperation(metadata) });
+
+            return Task.CompletedTask;
+        }
+
+        private static void ValidateUpsertMetadata(FileMetadata metadata)
         {
             if (metadata == null)
                 throw new ArgumentNullException(nameof(metadata));
@@ -878,18 +902,6 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
-
-            // Update in-memory cache (same logic as AddOrUpdateAsync).
-            UpdateCacheAndIndices(metadata);
-
-            // Write directly to SQLite (synchronous -- required for rebuild correctness)
-            lock (GetDatabaseLock(metadata.TenantId))
-            {
-                var conn = GetDatabase(metadata.TenantId);
-                UpsertFile(conn, metadata);
-            }
-
-            return Task.CompletedTask;
         }
 
         /// <summary>
@@ -1007,33 +1019,101 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            var cache = GetCache(tenantId);
-            var removed = cache.TryRemove(fileKey, out var removedMetadata);
-
-            if (removed)
+            if (TryRemoveFromCacheAndIndices(tenantId, fileKey, out _))
             {
-                _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                RemovePhysicalPathCandidate(tenantId, fileKey, removedMetadata?.PhysicalPath);
-
-                if (removedMetadata?.Status == FileProcessingStatus.Pending)
-                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
-
-                InvalidatePendingGeneration(tenantId, fileKey);
-
-                lock (GetDatabaseLock(tenantId))
-                {
-                    var conn = GetDatabase(tenantId);
-                    using (var txn = conn.BeginTransaction())
-                    {
-                        DeleteFile(conn, txn, fileKey);
-                        txn.Commit();
-                    }
-                }
+                ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { new PersistenceOperation(tenantId, fileKey) });
 
                 _logger.LogDebug("Directly removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                return Task.FromResult(true);
             }
 
-            return Task.FromResult(removed);
+            return Task.FromResult(false);
+        }
+
+        private bool TryRemoveFromCacheAndIndices(string tenantId, string fileKey, out FileMetadata? removedMetadata)
+        {
+            var cache = GetCache(tenantId);
+            var removed = cache.TryRemove(fileKey, out removedMetadata);
+            if (!removed)
+                return false;
+
+            _fileKeyTenantIndex.TryRemove(fileKey, out _);
+            RemovePhysicalPathCandidate(tenantId, fileKey, removedMetadata?.PhysicalPath);
+
+            if (removedMetadata?.Status == FileProcessingStatus.Pending)
+                _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+
+            InvalidatePendingGeneration(tenantId, fileKey);
+            return true;
+        }
+
+        private sealed class DirectProjectionBatch : IQueueProjectionBatch
+        {
+            private readonly MetadataRepository _repository;
+            private readonly string _tenantId;
+            private readonly List<PersistenceOperation> _operations;
+            private bool _flushed;
+
+            public DirectProjectionBatch(MetadataRepository repository, string tenantId)
+            {
+                _repository = repository;
+                _tenantId = tenantId;
+                _operations = new List<PersistenceOperation>();
+            }
+
+            public string TenantId => _tenantId;
+
+            public Task UpsertProjectedFileAsync(FileMetadata metadata, CancellationToken ct = default)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (_repository._disposed)
+                    throw new ObjectDisposedException(nameof(MetadataRepository));
+
+                if (_flushed)
+                    throw new InvalidOperationException("Projection batch has already been flushed.");
+
+                ValidateUpsertMetadata(metadata);
+
+                if (!string.Equals(metadata.TenantId, _tenantId, StringComparison.Ordinal))
+                    throw new ArgumentException("Metadata tenant does not match the active projection batch.", nameof(metadata));
+
+                _repository.UpdateCacheAndIndices(metadata);
+                _operations.Add(new PersistenceOperation(metadata));
+                return Task.CompletedTask;
+            }
+
+            public Task<bool> RemoveProjectedFileAsync(string fileKey, CancellationToken ct = default)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (_repository._disposed)
+                    throw new ObjectDisposedException(nameof(MetadataRepository));
+
+                if (_flushed)
+                    throw new InvalidOperationException("Projection batch has already been flushed.");
+
+                if (string.IsNullOrWhiteSpace(fileKey))
+                    throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+                var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
+                if (removed)
+                    _operations.Add(new PersistenceOperation(_tenantId, fileKey));
+
+                return Task.FromResult(removed);
+            }
+
+            public Task FlushAsync(CancellationToken ct = default)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (_flushed)
+                    return Task.CompletedTask;
+
+                _flushed = true;
+                _repository.ExecuteDirectBatch(_tenantId, _operations);
+                return Task.CompletedTask;
+            }
         }
 
         /// <summary>
@@ -3322,48 +3402,60 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             bucket.Add(op);
         }
 
+        private void ExecuteDirectBatch(string tenantId, IReadOnlyList<PersistenceOperation> ops)
+        {
+            if (ops == null)
+                throw new ArgumentNullException(nameof(ops));
+
+            if (ops.Count == 0)
+                return;
+
+            ExecuteBatchCore(tenantId, ops);
+        }
+
+        private void ExecuteBatchCore(string tenantId, IReadOnlyList<PersistenceOperation> ops)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+
+                using var txn = conn.BeginTransaction();
+                try
+                {
+                    foreach (var op in ops)
+                    {
+                        if (op.IsDelete)
+                            DeleteFile(conn, txn, op.FileKey);
+                        else
+                            UpsertFile(conn, txn, op.Metadata!);
+                    }
+
+                    txn.Commit();
+
+                    if (_sqliteOptions.CheckpointAfterBatch)
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
+                }
+                catch
+                {
+                    txn.Rollback();
+                    throw;
+                }
+            }
+        }
+
         // Writes a batch of operations for a single tenant inside one SQLite transaction.
         // Errors are logged but never propagated -- SQLite unavailability must never fail writes.
         private bool ExecuteBatch(string tenantId, List<PersistenceOperation> ops)
         {
             try
             {
-                lock (GetDatabaseLock(tenantId))
-                {
-                    var conn = GetDatabase(tenantId);
-
-                    using var txn = conn.BeginTransaction();
-                    try
-                    {
-                        foreach (var op in ops)
-                        {
-                            if (op.IsDelete)
-                                DeleteFile(conn, txn, op.FileKey);
-                            else
-                                UpsertFile(conn, txn, op.Metadata!);
-                        }
-
-                        txn.Commit();
-
-                        // Explicitly checkpoint after every commit so the WAL is merged into the main
-                        // database file promptly. This reduces the risk of data loss on a crash during
-                        // a later automatic checkpoint and keeps the WAL file small.
-                        if (_sqliteOptions.CheckpointAfterBatch)
-                        {
-                            using var cmd = conn.CreateCommand();
-                            cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
-                            cmd.ExecuteNonQuery();
-                        }
-
-                        _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
-                    }
-                    catch
-                    {
-                        txn.Rollback();
-                        throw;
-                    }
-                }
-
+                ExecuteBatchCore(tenantId, ops);
                 return true;
             }
             catch (Exception ex)

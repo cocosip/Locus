@@ -10,7 +10,7 @@ namespace Locus.Storage
     /// <summary>
     /// Adapts <see cref="MetadataRepository"/> to the scheduler-facing projection store contract.
     /// </summary>
-    public sealed class MetadataRepositoryQueueProjectionStore : IQueueProjectionStore, IProjectionSnapshotSource
+    public sealed class MetadataRepositoryQueueProjectionStore : IQueueProjectionStore, IProjectionSnapshotSource, IQueueProjectionBatchStore
     {
         private readonly MetadataRepository _repository;
 
@@ -94,6 +94,12 @@ namespace Locus.Storage
         public Task<bool> RemoveProjectedFileAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
             return _repository.RemoveDirectAsync(tenantId, fileKey, ct);
+        }
+
+        /// <inheritdoc/>
+        IQueueProjectionBatch IQueueProjectionBatchStore.BeginBatch(string tenantId)
+        {
+            return _repository.BeginProjectionBatch(tenantId);
         }
 
         /// <inheritdoc/>
