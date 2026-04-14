@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -482,6 +483,7 @@ namespace Locus.Storage
 
         private async Task WriteBatchAsync(TenantWriterState writer, IReadOnlyList<PendingAppendRequest> batch)
         {
+            var batchStartedAt = Stopwatch.GetTimestamp();
             var appendLock = _appendLocks.GetOrAdd(writer.TenantId, _ => new SemaphoreSlim(1, 1));
             await appendLock.WaitAsync(writer.Cancellation.Token).ConfigureAwait(false);
             try
@@ -493,6 +495,7 @@ namespace Locus.Storage
                     return;
 
                 var stream = EnsureAppendStream(writer);
+                var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
                 if (serializedBatch.Records.Count == 1)
                 {
                     var singleRecord = serializedBatch.Records[0].Bytes;
@@ -501,11 +504,20 @@ namespace Locus.Storage
                     state.TailOffset += singleRecord.Length;
                     MarkJournalStateDirty(writer.TenantId);
 
-                    if (ShouldFlushBeforeAck(writer))
-                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                    if (shouldFlushBeforeAck)
+                        await FlushAppendStreamCoreAsync(writer, "before_ack").ConfigureAwait(false);
                     else
                         writer.HasUnflushedData = true;
 
+                    QueueJournalOperationMetrics.RecordAppendBatch(
+                        state.Format,
+                        _ackMode,
+                        batch.Count,
+                        serializedBatch.Records.Count,
+                        singleRecord.Length,
+                        shouldFlushBeforeAck,
+                        "single_record",
+                        Stopwatch.GetTimestamp() - batchStartedAt);
                     CompleteRequests(batch);
                     return;
                 }
@@ -525,11 +537,20 @@ namespace Locus.Storage
                     state.TailOffset += serializedBatch.TotalBytes;
                     MarkJournalStateDirty(writer.TenantId);
 
-                    if (ShouldFlushBeforeAck(writer))
-                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                    if (shouldFlushBeforeAck)
+                        await FlushAppendStreamCoreAsync(writer, "before_ack").ConfigureAwait(false);
                     else
                         writer.HasUnflushedData = true;
 
+                    QueueJournalOperationMetrics.RecordAppendBatch(
+                        state.Format,
+                        _ackMode,
+                        batch.Count,
+                        serializedBatch.Records.Count,
+                        serializedBatch.TotalBytes,
+                        shouldFlushBeforeAck,
+                        "buffered_batch",
+                        Stopwatch.GetTimestamp() - batchStartedAt);
                     CompleteRequests(batch);
                 }
                 finally
@@ -629,7 +650,7 @@ namespace Locus.Storage
             await appendLock.WaitAsync(writer.Cancellation.Token).ConfigureAwait(false);
             try
             {
-                await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                await FlushAppendStreamCoreAsync(writer, "deferred").ConfigureAwait(false);
             }
             finally
             {
@@ -637,13 +658,20 @@ namespace Locus.Storage
             }
         }
 
-        private async Task FlushAppendStreamCoreAsync(TenantWriterState writer)
+        private async Task FlushAppendStreamCoreAsync(TenantWriterState writer, string reason)
         {
+            var format = LoadJournalState(writer.TenantId).Format;
+            var flushStartedAt = Stopwatch.GetTimestamp();
             if (writer.AppendStream != null)
                 await DurableFileWrite.FlushToDiskAsync(writer.AppendStream, writer.Cancellation.Token).ConfigureAwait(false);
 
             writer.HasUnflushedData = false;
             writer.LastFlushUtc = DateTime.UtcNow;
+            QueueJournalOperationMetrics.RecordFlush(
+                format,
+                _ackMode,
+                reason,
+                Stopwatch.GetTimestamp() - flushStartedAt);
         }
 
         private void CompleteRequests(IReadOnlyList<PendingAppendRequest> batch)

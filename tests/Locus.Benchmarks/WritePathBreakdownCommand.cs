@@ -57,7 +57,7 @@ namespace Locus.Benchmarks
             }
 
             Console.WriteLine(
-                $"Running {ScenarioName}: writes={options.WriteCount}, warmup={options.WarmupCount}, sizes=[{string.Join(", ", options.FileSizes)}], format={options.JournalFormat}, includeNoFlush={options.IncludeNoFlushScenario}, source={options.SourceKind}");
+                $"Running {ScenarioName}: writes={options.WriteCount}, warmup={options.WarmupCount}, sizes=[{string.Join(", ", options.FileSizes)}], format={options.JournalFormat}, includeNoFlush={options.IncludeNoFlushScenario}, source={options.SourceKind}, volumeWriteBufferSize={options.VolumeWriteBufferSize}, volumeCopyBufferSize={options.VolumeCopyBufferSize}");
             Console.WriteLine();
 
             var scenarios = BuildScenarios(options);
@@ -66,7 +66,7 @@ namespace Locus.Benchmarks
                 Console.WriteLine($"=== File Size: {FormatBytes(fileSize)} ({fileSize} bytes) ===");
                 foreach (var scenario in scenarios)
                 {
-                    using var context = await CreateContextAsync(fileSize, scenario, options.SourceKind).ConfigureAwait(false);
+                    using var context = await CreateContextAsync(fileSize, scenario, options).ConfigureAwait(false);
                     await WarmupAsync(context, options.WarmupCount).ConfigureAwait(false);
 
                     context.Measurements.Reset();
@@ -111,7 +111,7 @@ namespace Locus.Benchmarks
             return scenarios.ToArray();
         }
 
-        private static async Task<ScenarioContext> CreateContextAsync(int fileSize, ScenarioDefinition scenario, SourceKind sourceKind)
+        private static async Task<ScenarioContext> CreateContextAsync(int fileSize, ScenarioDefinition scenario, WritePathBreakdownOptions options)
         {
             var fileSystem = new System.IO.Abstractions.FileSystem();
             var rootDirectory = Path.Combine(
@@ -193,6 +193,8 @@ namespace Locus.Benchmarks
                     NullLogger<LocalFileSystemVolume>.Instance,
                     "vol-001",
                     volumeDirectory,
+                    writeBufferSize: options.VolumeWriteBufferSize,
+                    copyBufferSize: options.VolumeCopyBufferSize,
                     forceFlushAfterWrite: scenario.ForceFlushAfterWrite),
                 measurements.VolumeWrite);
 
@@ -213,7 +215,7 @@ namespace Locus.Benchmarks
                 storagePool,
                 tenant,
                 sourceFilePath,
-                sourceKind,
+                options.SourceKind,
                 measurements,
                 metadataRepository,
                 quotaRepository,
@@ -298,6 +300,8 @@ namespace Locus.Benchmarks
                 FileSizes = new[] { 4 * 1024, 16 * 1024, 64 * 1024 },
                 JournalFormat = JournalFormat.BinaryV1,
                 IncludeNoFlushScenario = true,
+                VolumeWriteBufferSize = 128 * 1024,
+                VolumeCopyBufferSize = 256 * 1024,
             };
             error = null;
 
@@ -420,6 +424,30 @@ namespace Locus.Benchmarks
 
                     continue;
                 }
+
+                if (string.Equals(arg, "--volume-write-buffer-size", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadInt(args, ref i, out var volumeWriteBufferSize) || volumeWriteBufferSize <= 0)
+                    {
+                        error = "Missing or invalid value for --volume-write-buffer-size.";
+                        return false;
+                    }
+
+                    options.VolumeWriteBufferSize = volumeWriteBufferSize;
+                    continue;
+                }
+
+                if (string.Equals(arg, "--volume-copy-buffer-size", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadInt(args, ref i, out var volumeCopyBufferSize) || volumeCopyBufferSize <= 0)
+                    {
+                        error = "Missing or invalid value for --volume-copy-buffer-size.";
+                        return false;
+                    }
+
+                    options.VolumeCopyBufferSize = volumeCopyBufferSize;
+                    continue;
+                }
             }
 
             if (options.WriteCount <= 0)
@@ -477,6 +505,8 @@ namespace Locus.Benchmarks
             Console.WriteLine("  --format <binary|json>        Queue journal format. Default: binary");
             Console.WriteLine("  --include-no-flush <bool>     Also run forceFlushAfterWrite=false scenario. Default: true");
             Console.WriteLine("  --source <memory|file>        Benchmark input stream type. Default: memory");
+            Console.WriteLine("  --volume-write-buffer-size <bytes>  LocalFileSystemVolume write stream buffer size. Default: 131072");
+            Console.WriteLine("  --volume-copy-buffer-size <bytes>   LocalFileSystemVolume pooled copy buffer size. Default: 262144");
         }
 
         private sealed class WritePathBreakdownOptions
@@ -492,6 +522,10 @@ namespace Locus.Benchmarks
             public bool IncludeNoFlushScenario { get; set; }
 
             public SourceKind SourceKind { get; set; } = SourceKind.Memory;
+
+            public int VolumeWriteBufferSize { get; set; }
+
+            public int VolumeCopyBufferSize { get; set; }
         }
 
         private enum SourceKind

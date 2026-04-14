@@ -52,7 +52,7 @@ namespace Locus.Benchmarks
             }
 
             Console.WriteLine(
-                $"Running {ScenarioName}: writes={options.WriteCount}, warmup={options.WarmupCount}, sizes=[{string.Join(", ", options.FileSizes)}], includeNoFlush={options.IncludeNoFlushScenario}");
+                $"Running {ScenarioName}: writes={options.WriteCount}, warmup={options.WarmupCount}, sizes=[{string.Join(", ", options.FileSizes)}], includeNoFlush={options.IncludeNoFlushScenario}, streamModes=[{string.Join(", ", options.StreamModes.Select(mode => mode.Name))}]");
             Console.WriteLine();
 
             foreach (var fileSize in options.FileSizes)
@@ -61,19 +61,23 @@ namespace Locus.Benchmarks
                 foreach (var flushMode in BuildFlushModes(options))
                 {
                     Console.WriteLine($"FlushMode={(flushMode ? "durable-flush" : "no-volume-flush")}");
-                    foreach (var scenario in BuildDistributionScenarios())
+                    foreach (var streamMode in options.StreamModes)
                     {
-                        using var context = CreateContext(fileSize, flushMode, scenario);
-                        await WarmupAsync(context, options.WarmupCount).ConfigureAwait(false);
+                        Console.WriteLine($"  StreamMode={streamMode.Name}");
+                        foreach (var scenario in BuildDistributionScenarios())
+                        {
+                            using var context = CreateContext(fileSize, flushMode, scenario, streamMode);
+                            await WarmupAsync(context, options.WarmupCount).ConfigureAwait(false);
 
-                        context.Reset();
+                            context.Reset();
 
-                        var stopwatch = Stopwatch.StartNew();
-                        for (var i = 0; i < options.WriteCount; i++)
-                            await context.WriteOnceAsync().ConfigureAwait(false);
-                        stopwatch.Stop();
+                            var stopwatch = Stopwatch.StartNew();
+                            for (var i = 0; i < options.WriteCount; i++)
+                                await context.WriteOnceAsync().ConfigureAwait(false);
+                            stopwatch.Stop();
 
-                        PrintResult(fileSize, options.WriteCount, flushMode, scenario, stopwatch.Elapsed);
+                            PrintResult(fileSize, options.WriteCount, flushMode, scenario, streamMode, stopwatch.Elapsed);
+                        }
                     }
 
                     Console.WriteLine();
@@ -126,12 +130,16 @@ namespace Locus.Benchmarks
             context.Reset();
         }
 
-        private static ScenarioContext CreateContext(int fileSize, bool forceFlushAfterWrite, DistributionScenario scenario)
+        private static ScenarioContext CreateContext(
+            int fileSize,
+            bool forceFlushAfterWrite,
+            DistributionScenario scenario,
+            StreamMode streamMode)
         {
             var fileSystem = new System.IO.Abstractions.FileSystem();
             var rootDirectory = Path.Combine(
                 Path.GetTempPath(),
-                $"locus-direct-volume-{scenario.Name}-{fileSize}-{Guid.NewGuid():N}");
+                $"locus-direct-volume-{scenario.Name}-{streamMode.Name}-{fileSize}-{Guid.NewGuid():N}");
             fileSystem.Directory.CreateDirectory(rootDirectory);
 
             var mountPath = Path.Combine(rootDirectory, "volume");
@@ -161,7 +169,7 @@ namespace Locus.Benchmarks
                 }
             }
 
-            return new ScenarioContext(fileSystem, rootDirectory, volume, payload, keys, scenario);
+            return new ScenarioContext(fileSystem, rootDirectory, volume, payload, keys, scenario, streamMode);
         }
 
         private static byte[] CreatePayload(int fileSize)
@@ -178,6 +186,7 @@ namespace Locus.Benchmarks
             int writeCount,
             bool forceFlushAfterWrite,
             DistributionScenario scenario,
+            StreamMode streamMode,
             TimeSpan elapsed)
         {
             var avgTicks = elapsed.Ticks / (double)writeCount;
@@ -186,7 +195,7 @@ namespace Locus.Benchmarks
                 : 0;
 
             Console.WriteLine(
-                $"  Scenario={scenario.Name,-24} avg={FormatTime(avgTicks),10}  total={elapsed.TotalMilliseconds,10:F2} ms  throughput={throughput,8:F2} MiB/s  flush={forceFlushAfterWrite,-5}  uniqueDirs={scenario.LastUniqueDirectoryCount,5}");
+                $"    Scenario={scenario.Name,-24} avg={FormatTime(avgTicks),10}  total={elapsed.TotalMilliseconds,10:F2} ms  throughput={throughput,8:F2} MiB/s  flush={forceFlushAfterWrite,-5}  stream={streamMode.Name,-16}  uniqueDirs={scenario.LastUniqueDirectoryCount,5}");
         }
 
         private static string FormatTime(double ticks)
@@ -226,6 +235,7 @@ namespace Locus.Benchmarks
                 WarmupCount = 50,
                 FileSizes = new[] { 4 * 1024, 16 * 1024 },
                 IncludeNoFlushScenario = true,
+                StreamModes = BuildDefaultStreamModes(),
             };
             error = null;
 
@@ -298,6 +308,32 @@ namespace Locus.Benchmarks
                     options.IncludeNoFlushScenario = includeNoFlush;
                     continue;
                 }
+
+                if (string.Equals(arg, "--stream-modes", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadValue(args, ref i, out var streamModesValue))
+                    {
+                        error = "Missing value for --stream-modes.";
+                        return false;
+                    }
+
+                    var parsedModes = streamModesValue
+                        .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(part => part.Trim())
+                        .Where(part => !string.IsNullOrWhiteSpace(part))
+                        .Select(TryParseStreamMode)
+                        .ToArray();
+                    if (parsedModes.Length == 0 || parsedModes.Any(mode => mode == null))
+                    {
+                        error = "Invalid value for --stream-modes. Use hidden-memory, visible-direct, visible-wrapped.";
+                        return false;
+                    }
+
+                    options.StreamModes = parsedModes!
+                        .Cast<StreamMode>()
+                        .ToArray();
+                    continue;
+                }
             }
 
             if (options.WriteCount <= 0)
@@ -312,7 +348,37 @@ namespace Locus.Benchmarks
                 return false;
             }
 
+            if (options.StreamModes == null || options.StreamModes.Length == 0)
+            {
+                error = "--stream-modes must contain at least one mode.";
+                return false;
+            }
+
             return true;
+        }
+
+        private static StreamMode[] BuildDefaultStreamModes()
+        {
+            return new[]
+            {
+                StreamMode.HiddenMemory,
+                StreamMode.VisibleDirect,
+                StreamMode.VisibleWrapped,
+            };
+        }
+
+        private static StreamMode? TryParseStreamMode(string value)
+        {
+            if (string.Equals(value, StreamMode.HiddenMemory.Name, StringComparison.OrdinalIgnoreCase))
+                return StreamMode.HiddenMemory;
+
+            if (string.Equals(value, StreamMode.VisibleDirect.Name, StringComparison.OrdinalIgnoreCase))
+                return StreamMode.VisibleDirect;
+
+            if (string.Equals(value, StreamMode.VisibleWrapped.Name, StringComparison.OrdinalIgnoreCase))
+                return StreamMode.VisibleWrapped;
+
+            return null;
         }
 
         private static bool TryReadInt(string[] args, ref int index, out int value)
@@ -353,6 +419,7 @@ namespace Locus.Benchmarks
             Console.WriteLine("  --warmup <n>               Number of warmup writes. Default: 50");
             Console.WriteLine("  --sizes <csv>              Comma-separated file sizes in bytes. Default: 4096,16384");
             Console.WriteLine("  --include-no-flush <bool>  Also run forceFlushAfterWrite=false. Default: true");
+            Console.WriteLine("  --stream-modes <csv>       hidden-memory,visible-direct,visible-wrapped. Default: all");
         }
 
         private sealed class ScenarioContext : IDisposable
@@ -361,6 +428,7 @@ namespace Locus.Benchmarks
             private readonly byte[] _payload;
             private readonly string[] _keys;
             private readonly DistributionScenario _scenario;
+            private readonly StreamMode _streamMode;
             private int _writeIndex;
 
             public ScenarioContext(
@@ -369,7 +437,8 @@ namespace Locus.Benchmarks
                 LocalFileSystemVolume volume,
                 byte[] payload,
                 string[] keys,
-                DistributionScenario scenario)
+                DistributionScenario scenario,
+                StreamMode streamMode)
             {
                 _fileSystem = fileSystem;
                 RootDirectory = rootDirectory;
@@ -377,6 +446,7 @@ namespace Locus.Benchmarks
                 _payload = payload;
                 _keys = keys;
                 _scenario = scenario;
+                _streamMode = streamMode;
             }
 
             public string RootDirectory { get; }
@@ -392,7 +462,7 @@ namespace Locus.Benchmarks
                 if (!string.IsNullOrWhiteSpace(directory))
                     _scenario.RecordDirectory(directory!);
 
-                using var stream = new MemoryStream(_payload, writable: false);
+                using var stream = _streamMode.CreateStream(_payload);
                 await Volume.WriteAsync(physicalPath, stream, CancellationToken.None).ConfigureAwait(false);
             }
 
@@ -452,6 +522,83 @@ namespace Locus.Benchmarks
             }
         }
 
+        private sealed class StreamMode
+        {
+            public static readonly StreamMode HiddenMemory = new StreamMode(
+                "hidden-memory",
+                payload => new MemoryStream(payload, writable: false));
+
+            public static readonly StreamMode VisibleDirect = new StreamMode(
+                "visible-direct",
+                payload => new MemoryStream(payload, 0, payload.Length, writable: false, publiclyVisible: true));
+
+            public static readonly StreamMode VisibleWrapped = new StreamMode(
+                "visible-wrapped",
+                payload => new NonMemoryStreamWrapper(new MemoryStream(payload, 0, payload.Length, writable: false, publiclyVisible: true)));
+
+            private readonly Func<byte[], Stream> _streamFactory;
+
+            private StreamMode(string name, Func<byte[], Stream> streamFactory)
+            {
+                Name = name;
+                _streamFactory = streamFactory;
+            }
+
+            public string Name { get; }
+
+            public Stream CreateStream(byte[] payload) => _streamFactory(payload);
+        }
+
+        private sealed class NonMemoryStreamWrapper : Stream
+        {
+            private readonly Stream _inner;
+
+            public NonMemoryStreamWrapper(Stream inner)
+            {
+                _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+            }
+
+            public override bool CanRead => _inner.CanRead;
+
+            public override bool CanSeek => _inner.CanSeek;
+
+            public override bool CanWrite => _inner.CanWrite;
+
+            public override long Length => _inner.Length;
+
+            public override long Position
+            {
+                get => _inner.Position;
+                set => _inner.Position = value;
+            }
+
+            public override void Flush() => _inner.Flush();
+
+            public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+
+            public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
+
+            public override void SetLength(long value) => _inner.SetLength(value);
+
+            public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
+
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                => _inner.ReadAsync(buffer, offset, count, cancellationToken);
+
+            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                => _inner.WriteAsync(buffer, offset, count, cancellationToken);
+
+            public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                    _inner.Dispose();
+
+                base.Dispose(disposing);
+            }
+        }
+
         private sealed class DirectVolumeBreakdownOptions
         {
             public int WriteCount { get; set; }
@@ -461,6 +608,8 @@ namespace Locus.Benchmarks
             public int[] FileSizes { get; set; } = Array.Empty<int>();
 
             public bool IncludeNoFlushScenario { get; set; }
+
+            public StreamMode[] StreamModes { get; set; } = Array.Empty<StreamMode>();
         }
     }
 }

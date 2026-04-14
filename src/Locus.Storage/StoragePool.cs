@@ -232,11 +232,25 @@ namespace Locus.Storage
             if (content == null)
                 throw new ArgumentNullException(nameof(content));
 
+            var sourceKind = GetWriteSourceKind(content);
+            var acceptancePath = _queueEventJournal != null ? "queue_journal" : "projection_fallback";
+            var requestStartedAt = Stopwatch.GetTimestamp();
+            long tenantQuotaTicks = 0;
+            long directoryQuotaTicks = 0;
+            long volumeWriteTicks = 0;
+            long acceptanceTicks = 0;
+            long projectionEnqueueTicks = 0;
+            var retryCount = 0;
+            var currentStage = "validate_tenant";
+
             // 1. Validate tenant status
             await ValidateTenantAsync(tenant.TenantId, ct);
 
+            currentStage = "tenant_quota";
+            var phaseStartedAt = Stopwatch.GetTimestamp();
             // 2. Check tenant quota
             await _tenantQuotaManager.IncrementFileCountAsync(tenant.TenantId, ct);
+            tenantQuotaTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
             var tenantQuotaIncremented = true;
             var normalizedLogicalDirectoryPath = DirectoryPathNormalizer.Normalize(logicalDirectoryPath);
 
@@ -248,6 +262,7 @@ namespace Locus.Storage
             CountingReadStream? countingStream = null;
             var initialContentPosition = content.CanSeek ? content.Position : 0;
             var expectedFileSize = content.CanSeek ? content.Length - content.Position : (long?)null;
+            StoragePoolMetrics.RecordWriteStarted(sourceKind, acceptancePath, expectedFileSize);
 
             try
             {
@@ -262,7 +277,10 @@ namespace Locus.Storage
                 }
 
                 // 6. Reserve directory quota after tenant quota succeeds.
+                currentStage = "directory_quota";
+                phaseStartedAt = Stopwatch.GetTimestamp();
                 await _directoryQuotaManager.IncrementFileCountAsync(tenant.TenantId, normalizedLogicalDirectoryPath, ct);
+                directoryQuotaTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
                 directoryQuotaIncremented = true;
 
                 // 7. Capture the bytes that will be written: from current position to end.
@@ -291,7 +309,10 @@ namespace Locus.Storage
 
                     try
                     {
+                        currentStage = "volume_write";
+                        phaseStartedAt = Stopwatch.GetTimestamp();
                         await volume.WriteAsync(physicalPath, contentToWrite, ct).ConfigureAwait(false);
+                        volumeWriteTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
                         fileWritten = true;
                         lastWriteException = null;
                         break;
@@ -300,6 +321,9 @@ namespace Locus.Storage
                         && attemptIndex + 1 < candidateVolumes.Length
                         && IsRetryableWriteFailure(ex))
                     {
+                        volumeWriteTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
+                        retryCount++;
+                        StoragePoolMetrics.RecordWriteRetry(volume.VolumeId, sourceKind, acceptancePath);
                         lastWriteException = ex;
                         await TryCleanupFailedWriteAsync(volume, physicalPath).ConfigureAwait(false);
                         InvalidateWritableVolumeSnapshot(volume);
@@ -350,7 +374,10 @@ namespace Locus.Storage
                 if (_queueEventJournal != null)
                 {
                     QueueProjectionMetadataState.MarkAcceptedProjectionPending(metadata);
+                    currentStage = "acceptance";
+                    phaseStartedAt = Stopwatch.GetTimestamp();
                     await AppendAcceptedQueueEventAsync(metadata, ct).ConfigureAwait(false);
+                    acceptanceTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
                     acceptanceCompleted = true;
                 }
                 else
@@ -359,8 +386,11 @@ namespace Locus.Storage
                     var directoryReservationConsumed = false;
                     try
                     {
+                        currentStage = "acceptance";
+                        phaseStartedAt = Stopwatch.GetTimestamp();
                         tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, ct).ConfigureAwait(false);
                         directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(metadata.TenantId, metadata.DirectoryPath, ct).ConfigureAwait(false);
+                        acceptanceTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
                         QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
                         acceptanceCompleted = true;
                     }
@@ -375,7 +405,23 @@ namespace Locus.Storage
                     }
                 }
 
+                currentStage = "projection_enqueue";
+                phaseStartedAt = Stopwatch.GetTimestamp();
                 await _projectionWriteStore.QueueProjectedFileAsync(metadata, ct);
+                projectionEnqueueTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
+
+                StoragePoolMetrics.RecordWriteSucceeded(
+                    volume.VolumeId,
+                    sourceKind,
+                    acceptancePath,
+                    fileSize,
+                    retryCount,
+                    Stopwatch.GetTimestamp() - requestStartedAt,
+                    tenantQuotaTicks,
+                    directoryQuotaTicks,
+                    volumeWriteTicks,
+                    acceptanceTicks,
+                    projectionEnqueueTicks);
 
                 _logger.LogDebug("File written successfully: {FileKey} for tenant {TenantId} at {PhysicalPath}",
                     fileKey, tenant.TenantId, physicalPath);
@@ -384,6 +430,22 @@ namespace Locus.Storage
             }
             catch
             {
+                StoragePoolMetrics.RecordWriteFailed(
+                    volume?.VolumeId,
+                    sourceKind,
+                    acceptancePath,
+                    currentStage,
+                    expectedFileSize,
+                    retryCount,
+                    Stopwatch.GetTimestamp() - requestStartedAt,
+                    tenantQuotaTicks,
+                    directoryQuotaTicks,
+                    volumeWriteTicks,
+                    acceptanceTicks,
+                    projectionEnqueueTicks,
+                    fileWritten,
+                    acceptanceCompleted);
+
                 var physicalWriteSucceeded = fileWritten;
                 var rollbackQuota = !physicalWriteSucceeded;
 
@@ -411,6 +473,9 @@ namespace Locus.Storage
                     }
                     catch (Exception cleanupEx)
                     {
+                        StoragePoolMetrics.RecordCleanupFailure(
+                            physicalWriteSucceeded ? "post_acceptance_failure" : "residual_write_failure",
+                            volume?.VolumeId);
                         rollbackQuota = false;
                         _logger.LogError(
                             cleanupEx,
@@ -440,6 +505,7 @@ namespace Locus.Storage
                         }
                         catch (Exception rollbackEx)
                         {
+                            StoragePoolMetrics.RecordQuotaRollbackFailure("directory");
                             _logger.LogError(
                                 rollbackEx,
                                 "Failed to rollback directory quota after write failure: Tenant={TenantId}, Directory={DirectoryPath}",
@@ -450,7 +516,15 @@ namespace Locus.Storage
 
                     if (tenantQuotaIncremented)
                     {
-                        await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, default);
+                        try
+                        {
+                            await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, default);
+                        }
+                        catch
+                        {
+                            StoragePoolMetrics.RecordQuotaRollbackFailure("tenant");
+                            throw;
+                        }
                     }
                 }
 
@@ -980,6 +1054,7 @@ namespace Locus.Storage
             }
             catch (Exception cleanupEx)
             {
+                StoragePoolMetrics.RecordCleanupFailure("retry_cleanup", volume.VolumeId);
                 _logger.LogWarning(
                     cleanupEx,
                     "Failed to cleanup partial write at {PhysicalPath} on volume {VolumeId}",
@@ -993,6 +1068,14 @@ namespace Locus.Storage
             _cachedWritableVolumes = Array.Empty<IStorageVolume>();
             Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
             _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
+        }
+
+        private static string GetWriteSourceKind(Stream content)
+        {
+            if (content is MemoryStream)
+                return "memory";
+
+            return content.CanSeek ? "seekable_stream" : "non_seekable_stream";
         }
 
         private SemaphoreSlim GetCompletionGuard(string fileKey)

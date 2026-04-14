@@ -9,6 +9,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.Models;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.FileSystem
@@ -16,7 +17,7 @@ namespace Locus.FileSystem
     /// <summary>
     /// Local file system implementation of IStorageVolume.
     /// </summary>
-    public class LocalFileSystemVolume : IStorageVolume, IStorageVolumeHealthProbe, IStorageVolumeWritePathWarmup
+    public class LocalFileSystemVolume : IStorageVolume, IStorageVolumeHealthProbe, IStorageVolumeWritePathWarmup, IStorageVolumeWritePathDiagnostics
     {
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<LocalFileSystemVolume> _logger;
@@ -52,12 +53,24 @@ namespace Locus.FileSystem
         // Separate O(1) counter so TrackKnownDirectory can check the size without
         // calling ConcurrentDictionary.Count (which is O(N) due to segment locking).
         private int _knownDirectoryCount;
+        private long _observedWriteCount;
+        private long _observedMemoryStreamWriteCount;
+        private long _observedVisibleMemoryBufferWriteCount;
+        private long _observedDirectMemoryWriteCount;
+        private long _observedDirectMemoryWriteBytes;
+        private long _observedDirectMemorySyncWriteCount;
+        private long _observedDirectMemoryAsyncWriteCount;
+        private long _observedSynchronousSeekableFileWriteCount;
+        private long _observedHiddenMemoryStreamWriteCount;
+        private long _observedNonMemorySeekableWriteCount;
+        private long _observedNonSeekableWriteCount;
 
         private const int DefaultWriteBufferSize = 128 * 1024;
         private const int DefaultCopyBufferSize = 256 * 1024;
+        private const int LargeSeekableFileCopyBufferSize = 512 * 1024;
+        private const int LargeSeekableFileThresholdBytes = 8 * 1024 * 1024;
         private const int DefaultKnownDirectoryCacheMaxEntries = 200_000;
         private const int DefaultSynchronousSmallWriteThresholdBytes = 1024 * 1024;
-
         /// <summary>
         /// Initializes a new instance of the <see cref="LocalFileSystemVolume"/> class.
         /// </summary>
@@ -295,6 +308,25 @@ namespace Locus.FileSystem
             return Task.CompletedTask;
         }
 
+        /// <inheritdoc/>
+        public StorageVolumeWritePathStatistics GetWritePathStatisticsSnapshot()
+        {
+            return new StorageVolumeWritePathStatistics
+            {
+                TotalWrites = Interlocked.Read(ref _observedWriteCount),
+                MemoryStreamWrites = Interlocked.Read(ref _observedMemoryStreamWriteCount),
+                VisibleBufferWrites = Interlocked.Read(ref _observedVisibleMemoryBufferWriteCount),
+                DirectFastPathWrites = Interlocked.Read(ref _observedDirectMemoryWriteCount),
+                DirectFastPathBytes = Interlocked.Read(ref _observedDirectMemoryWriteBytes),
+                DirectFastPathSyncWrites = Interlocked.Read(ref _observedDirectMemorySyncWriteCount),
+                DirectFastPathAsyncWrites = Interlocked.Read(ref _observedDirectMemoryAsyncWriteCount),
+                SynchronousSeekableFileWrites = Interlocked.Read(ref _observedSynchronousSeekableFileWriteCount),
+                HiddenMemoryStreamWrites = Interlocked.Read(ref _observedHiddenMemoryStreamWriteCount),
+                NonMemorySeekableWrites = Interlocked.Read(ref _observedNonMemorySeekableWriteCount),
+                NonSeekableWrites = Interlocked.Read(ref _observedNonSeekableWriteCount),
+            };
+        }
+
         // ---------------------------------------------------------------------------
         // Private helpers
         // ---------------------------------------------------------------------------
@@ -460,6 +492,24 @@ namespace Locus.FileSystem
             try
             {
                 var remainingBytes = TryGetRemainingLength(content);
+                var useSynchronousSeekableFileWritePath = ShouldUseSynchronousSeekableFileWritePath(content, remainingBytes);
+                var useSynchronousSmallWritePath = !useSynchronousSeekableFileWritePath
+                    && ShouldUseSynchronousSmallWritePath(content, remainingBytes);
+                var memoryStream = content as MemoryStream;
+                var hasDirectWriteBuffer = TryGetMemoryStreamWriteBuffer(
+                    content,
+                    remainingBytes,
+                    out var directBuffer,
+                    out var directMemoryStream,
+                    out var hasVisibleMemoryBuffer);
+                ObserveWriteSource(
+                    content,
+                    remainingBytes,
+                    useSynchronousSmallWritePath,
+                    useSynchronousSeekableFileWritePath,
+                    memoryStream != null,
+                    hasVisibleMemoryBuffer,
+                    hasDirectWriteBuffer);
 
                 // Optimization 4: skip Directory.Exists() for directories we already know exist.
                 // Shard directories are created once and never deleted during normal operation.
@@ -467,11 +517,44 @@ namespace Locus.FileSystem
                 if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory!))
                     EnsureDirectoryTracked(directory!);
 
-                if (ShouldUseSynchronousSmallWritePath(content, remainingBytes))
+                if (hasDirectWriteBuffer)
+                {
+                    var directSource = directMemoryStream!;
+                    if (useSynchronousSmallWritePath)
+                    {
+                        using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            directSource.Position += directBuffer.Count;
+                            fileStream.Write(directBuffer.Array!, directBuffer.Offset, directBuffer.Count);
+                            if (_forceFlushAfterWrite)
+                                fileStream.Flush();
+                        }
+                    }
+                    else
+                    {
+                        using (var fileStream = CreateWriteStream(path, remainingBytes))
+                        {
+                            await WriteBufferDirectAsync(fileStream, directSource, directBuffer, ct).ConfigureAwait(false);
+                            if (_forceFlushAfterWrite)
+                                await fileStream.FlushAsync(ct).ConfigureAwait(false);
+                        }
+                    }
+                }
+                else if (useSynchronousSmallWritePath)
                 {
                     using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
                     {
                         CopySmallSeekableStreamSynchronously(content, fileStream, checked((int)remainingBytes!.Value), ct);
+                        if (_forceFlushAfterWrite)
+                            fileStream.Flush();
+                    }
+                }
+                else if (useSynchronousSeekableFileWritePath)
+                {
+                    using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
+                    {
+                        CopySeekableStreamSynchronously(content, fileStream, remainingBytes, ct);
                         if (_forceFlushAfterWrite)
                             fileStream.Flush();
                     }
@@ -715,6 +798,84 @@ namespace Locus.FileSystem
             }
         }
 
+        private async Task WriteBufferDirectAsync(
+            Stream destination,
+            MemoryStream source,
+            ArraySegment<byte> buffer,
+            CancellationToken ct)
+        {
+            var remaining = buffer.Count;
+            var offset = buffer.Offset;
+            while (remaining > 0)
+            {
+                var bytesToWrite = remaining <= _copyBufferSize
+                    ? remaining
+                    : _copyBufferSize;
+                ct.ThrowIfCancellationRequested();
+                source.Position += bytesToWrite;
+                await destination.WriteAsync(buffer.Array!, offset, bytesToWrite, ct).ConfigureAwait(false);
+                offset += bytesToWrite;
+                remaining -= bytesToWrite;
+            }
+        }
+
+        private void ObserveWriteSource(
+            Stream content,
+            long? remainingBytes,
+            bool usesSynchronousSmallWritePath,
+            bool usesSynchronousSeekableFileWritePath,
+            bool isMemoryStream,
+            bool hasVisibleMemoryBuffer,
+            bool usesDirectMemoryWritePath)
+        {
+            Interlocked.Increment(ref _observedWriteCount);
+
+            if (isMemoryStream)
+                Interlocked.Increment(ref _observedMemoryStreamWriteCount);
+            else if (content.CanSeek)
+                Interlocked.Increment(ref _observedNonMemorySeekableWriteCount);
+            else
+                Interlocked.Increment(ref _observedNonSeekableWriteCount);
+
+            if (isMemoryStream && !hasVisibleMemoryBuffer)
+                Interlocked.Increment(ref _observedHiddenMemoryStreamWriteCount);
+
+            if (hasVisibleMemoryBuffer)
+                Interlocked.Increment(ref _observedVisibleMemoryBufferWriteCount);
+
+            if (usesDirectMemoryWritePath)
+            {
+                Interlocked.Increment(ref _observedDirectMemoryWriteCount);
+                if (remainingBytes.HasValue && remainingBytes.Value > 0)
+                    Interlocked.Add(ref _observedDirectMemoryWriteBytes, remainingBytes.Value);
+
+                if (usesSynchronousSmallWritePath)
+                    Interlocked.Increment(ref _observedDirectMemorySyncWriteCount);
+                else
+                    Interlocked.Increment(ref _observedDirectMemoryAsyncWriteCount);
+            }
+
+            if (usesSynchronousSeekableFileWritePath)
+                Interlocked.Increment(ref _observedSynchronousSeekableFileWriteCount);
+
+            LocalFileSystemVolumeMetrics.RecordWrite(
+                _volumeId,
+                GetWriteSourceKind(isMemoryStream, hasVisibleMemoryBuffer, content.CanSeek),
+                hasVisibleMemoryBuffer,
+                usesDirectMemoryWritePath,
+                usesSynchronousSmallWritePath,
+                usesSynchronousSeekableFileWritePath,
+                remainingBytes);
+        }
+
+        private static string GetWriteSourceKind(bool isMemoryStream, bool hasVisibleMemoryBuffer, bool canSeek)
+        {
+            if (isMemoryStream)
+                return hasVisibleMemoryBuffer ? "memory_visible" : "memory_hidden";
+
+            return canSeek ? "seekable_stream" : "non_seekable_stream";
+        }
+
         private void EnsureDirectoryTracked(string directory)
         {
             _fileSystem.Directory.CreateDirectory(directory);
@@ -836,6 +997,54 @@ namespace Locus.FileSystem
                 && remainingBytes.Value <= DefaultSynchronousSmallWriteThresholdBytes;
         }
 
+        private bool ShouldUseSynchronousSeekableFileWritePath(Stream content, long? remainingBytes)
+        {
+            return content is FileStream
+                && remainingBytes.HasValue
+                && remainingBytes.Value >= DefaultSynchronousSmallWriteThresholdBytes;
+        }
+
+        private static bool TryGetMemoryStreamWriteBuffer(
+            Stream content,
+            long? remainingBytes,
+            out ArraySegment<byte> buffer,
+            out MemoryStream? memoryStream,
+            out bool hasVisibleMemoryBuffer)
+        {
+            buffer = default;
+            memoryStream = content as MemoryStream;
+            hasVisibleMemoryBuffer = false;
+
+            if (memoryStream == null)
+            {
+                return false;
+            }
+
+            hasVisibleMemoryBuffer = memoryStream.TryGetBuffer(out var segment);
+            if (!hasVisibleMemoryBuffer
+                || !remainingBytes.HasValue
+                || remainingBytes.Value <= 0
+                || remainingBytes.Value > int.MaxValue)
+            {
+                return false;
+            }
+
+            var position = memoryStream.Position;
+            if (position < 0 || position > int.MaxValue)
+                return false;
+
+            var remaining = checked((int)remainingBytes.Value);
+            var available = segment.Count - checked((int)position);
+            if (available < remaining)
+                return false;
+
+            buffer = new ArraySegment<byte>(
+                segment.Array!,
+                segment.Offset + checked((int)position),
+                remaining);
+            return true;
+        }
+
         private static void CopySmallSeekableStreamSynchronously(
             Stream source,
             Stream destination,
@@ -868,6 +1077,40 @@ namespace Locus.FileSystem
             {
                 ArrayPool<byte>.Shared.Return(buffer);
             }
+        }
+
+        private void CopySeekableStreamSynchronously(
+            Stream source,
+            Stream destination,
+            long? remainingBytes,
+            CancellationToken ct)
+        {
+            var copyBufferSize = ResolveSeekableFileCopyBufferSize(remainingBytes);
+            var rented = ArrayPool<byte>.Shared.Rent(copyBufferSize);
+            try
+            {
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var bytesRead = source.Read(rented, 0, copyBufferSize);
+                    if (bytesRead <= 0)
+                        break;
+
+                    destination.Write(rented, 0, bytesRead);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        private int ResolveSeekableFileCopyBufferSize(long? remainingBytes)
+        {
+            if (remainingBytes.HasValue && remainingBytes.Value >= LargeSeekableFileThresholdBytes)
+                return LargeSeekableFileCopyBufferSize;
+
+            return _copyBufferSize;
         }
 
         private static long? TryGetRemainingLength(Stream stream)

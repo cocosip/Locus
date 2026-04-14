@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.FileSystem;
+using Locus.Core.Abstractions;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -103,6 +104,127 @@ namespace Locus.FileSystem.Tests
             // Assert
             Assert.True(_fileSystem.File.Exists(filePath));
             Assert.True(_fileSystem.Directory.Exists(Path.Combine(_mountPath, "subdir")));
+        }
+
+        [Fact]
+        public async Task WriteAsync_MemoryStreamWithOffset_WritesRemainingBytesViaSynchronousFastPath()
+        {
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+            var filePath = Path.Combine(_mountPath, "sync-offset.txt");
+            var payload = Encoding.UTF8.GetBytes("prefix-saved-content");
+            using var content = new MemoryStream(payload, 0, payload.Length, writable: false, publiclyVisible: true);
+            content.Position = "prefix-".Length;
+
+            await volume.WriteAsync(filePath, content, CancellationToken.None);
+
+            Assert.True(_fileSystem.File.Exists(filePath));
+            Assert.Equal("saved-content", _fileSystem.File.ReadAllText(filePath));
+        }
+
+        [Fact]
+        public async Task WriteAsync_LargeMemoryStreamWithOffset_WritesRemainingBytesViaAsynchronousPath()
+        {
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+            var filePath = Path.Combine(_mountPath, "async-offset.bin");
+            var prefixLength = 257;
+            var payloadLength = (1024 * 1024) + 321;
+            var payload = new byte[prefixLength + payloadLength];
+            for (var i = 0; i < payload.Length; i++)
+                payload[i] = (byte)(i % 251);
+
+            using var content = new MemoryStream(payload, 0, payload.Length, writable: false, publiclyVisible: true);
+            content.Position = prefixLength;
+
+            await volume.WriteAsync(filePath, content, CancellationToken.None);
+
+            Assert.True(_fileSystem.File.Exists(filePath));
+            var savedContent = _fileSystem.File.ReadAllBytes(filePath);
+            Assert.Equal(payloadLength, savedContent.Length);
+
+            for (var i = 0; i < savedContent.Length; i++)
+                Assert.Equal(payload[prefixLength + i], savedContent[i]);
+        }
+
+        [Fact]
+        public async Task GetWritePathStatisticsSnapshot_TracksDirectMemoryFastPathUsage()
+        {
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+            var diagnostics = Assert.IsAssignableFrom<IStorageVolumeWritePathDiagnostics>(volume);
+
+            var directPath = Path.Combine(_mountPath, "direct.bin");
+            var hiddenPath = Path.Combine(_mountPath, "hidden.bin");
+
+            var visiblePayload = Encoding.UTF8.GetBytes("visible-buffer");
+            using (var visibleStream = new MemoryStream(visiblePayload, 0, visiblePayload.Length, writable: false, publiclyVisible: true))
+            {
+                await volume.WriteAsync(directPath, visibleStream, CancellationToken.None);
+            }
+
+            var hiddenPayload = Encoding.UTF8.GetBytes("hidden-buffer");
+            using (var hiddenStream = new MemoryStream(hiddenPayload, writable: false))
+            {
+                await volume.WriteAsync(hiddenPath, hiddenStream, CancellationToken.None);
+            }
+
+            var snapshot = diagnostics.GetWritePathStatisticsSnapshot();
+            Assert.Equal(2, snapshot.TotalWrites);
+            Assert.Equal(2, snapshot.MemoryStreamWrites);
+            Assert.Equal(1, snapshot.VisibleBufferWrites);
+            Assert.Equal(1, snapshot.DirectFastPathWrites);
+            Assert.Equal(visiblePayload.Length, snapshot.DirectFastPathBytes);
+            Assert.Equal(1, snapshot.DirectFastPathSyncWrites);
+            Assert.Equal(0, snapshot.DirectFastPathAsyncWrites);
+            Assert.Equal(0, snapshot.SynchronousSeekableFileWrites);
+            Assert.Equal(1, snapshot.HiddenMemoryStreamWrites);
+            Assert.Equal(0, snapshot.NonMemorySeekableWrites);
+            Assert.Equal(0, snapshot.NonSeekableWrites);
+        }
+
+        [Fact]
+        public async Task GetWritePathStatisticsSnapshot_TracksSynchronousSeekableFileWrites()
+        {
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+            var diagnostics = Assert.IsAssignableFrom<IStorageVolumeWritePathDiagnostics>(volume);
+            var destinationPath = Path.Combine(_mountPath, "file-stream.bin");
+
+            var tempSourcePath = Path.Combine(Path.GetTempPath(), $"locus-seekable-source-{Guid.NewGuid():N}.bin");
+            try
+            {
+                var payload = new byte[1024 * 1024];
+                for (var i = 0; i < payload.Length; i++)
+                    payload[i] = (byte)(i % 251);
+
+                File.WriteAllBytes(tempSourcePath, payload);
+
+                using (var source = new FileStream(
+                    tempSourcePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    64 * 1024,
+                    FileOptions.SequentialScan))
+                {
+                    await volume.WriteAsync(destinationPath, source, CancellationToken.None);
+                }
+
+                var snapshot = diagnostics.GetWritePathStatisticsSnapshot();
+                Assert.Equal(1, snapshot.TotalWrites);
+                Assert.Equal(0, snapshot.MemoryStreamWrites);
+                Assert.Equal(0, snapshot.DirectFastPathWrites);
+                Assert.Equal(1, snapshot.SynchronousSeekableFileWrites);
+                Assert.Equal(1, snapshot.NonMemorySeekableWrites);
+                Assert.Equal(0, snapshot.NonSeekableWrites);
+
+                var savedContent = _fileSystem.File.ReadAllBytes(destinationPath);
+                Assert.Equal(payload.Length, savedContent.Length);
+                for (var i = 0; i < savedContent.Length; i++)
+                    Assert.Equal(payload[i], savedContent[i]);
+            }
+            finally
+            {
+                if (File.Exists(tempSourcePath))
+                    File.Delete(tempSourcePath);
+            }
         }
 
         [Fact]

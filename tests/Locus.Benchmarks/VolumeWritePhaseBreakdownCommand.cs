@@ -118,6 +118,20 @@ namespace Locus.Benchmarks
                     useAsyncFlush: false,
                     copyBufferSize: 256 * 1024,
                     sourceFileOptions: FileOptions.SequentialScan),
+                new WriteStrategy(
+                    "sync-default-512k",
+                    fileOptions: FileOptions.None,
+                    useAsyncWrite: false,
+                    useAsyncFlush: false,
+                    copyBufferSize: 512 * 1024,
+                    sourceFileOptions: FileOptions.SequentialScan),
+                new WriteStrategy(
+                    "sync-default-1m",
+                    fileOptions: FileOptions.None,
+                    useAsyncWrite: false,
+                    useAsyncFlush: false,
+                    copyBufferSize: 1024 * 1024,
+                    sourceFileOptions: FileOptions.SequentialScan),
             };
         }
 
