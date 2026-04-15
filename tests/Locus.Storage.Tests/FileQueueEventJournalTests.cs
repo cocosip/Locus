@@ -3,6 +3,7 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Threading;
 using System.Threading.Tasks;
+using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Microsoft.Extensions.Logging;
@@ -144,6 +145,45 @@ namespace Locus.Storage.Tests
                 Assert.Equal(i + 1, batch.Records[i].SequenceNumber);
                 Assert.True(batch.Records[i].PayloadCrc32.HasValue);
             }
+        }
+
+        [Fact]
+        public async Task GetWritePathStatisticsSnapshot_TracksSingleAndMultiRecordAppendBatches()
+        {
+            var diagnostics = Assert.IsAssignableFrom<IQueueEventJournalWritePathDiagnostics>(_journal);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-stats",
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await _journal.AppendBatchAsync(new[]
+            {
+                new QueueEventRecord
+                {
+                    TenantId = "tenant-stats",
+                    FileKey = "file-002",
+                    EventType = QueueEventType.ProcessingStarted,
+                },
+                new QueueEventRecord
+                {
+                    TenantId = "tenant-stats",
+                    FileKey = "file-003",
+                    EventType = QueueEventType.ProcessingCompleted,
+                }
+            }, CancellationToken.None);
+
+            var snapshot = diagnostics.GetWritePathStatisticsSnapshot();
+            Assert.Equal(2, snapshot.AppendBatchCount);
+            Assert.Equal(1, snapshot.SingleRecordAppendBatchCount);
+            Assert.Equal(1, snapshot.MultiRecordAppendBatchCount);
+            Assert.Equal(3, snapshot.AppendedRecordCount);
+            Assert.True(snapshot.AppendedBytes > 0);
+            Assert.Equal(2, snapshot.FlushCount);
+            Assert.True(snapshot.AppendTicks >= 0);
+            Assert.True(snapshot.FlushTicks >= 0);
         }
 
         [Fact]

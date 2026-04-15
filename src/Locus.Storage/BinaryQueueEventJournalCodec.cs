@@ -24,10 +24,11 @@ namespace Locus.Storage
                 throw new ArgumentNullException(nameof(record));
 
             record.SequenceNumber = sequenceNumber;
-            var payloadLength = GetPayloadSize(record);
+            var layout = new RecordSerializationLayout(record);
+            var payloadLength = layout.PayloadLength;
             var buffer = new byte[HeaderSize + payloadLength];
             var payloadOffset = HeaderSize;
-            WritePayload(record, buffer, ref payloadOffset);
+            WritePayload(record, layout, buffer, ref payloadOffset);
 
             var checksum = QueueEventCrc32.Compute(buffer, HeaderSize, payloadLength);
             record.PayloadCrc32 = checksum;
@@ -205,31 +206,7 @@ namespace Locus.Storage
             return magic == RecordMagic;
         }
 
-        private static int GetPayloadSize(QueueEventRecord record)
-        {
-            var total =
-                sizeof(int) +
-                sizeof(int) +
-                sizeof(long) +
-                sizeof(long) +
-                sizeof(int) +
-                sizeof(int) +
-                sizeof(long) +
-                sizeof(long);
-
-            total += GetNullableStringSize(record.EventId);
-            total += GetNullableStringSize(record.TenantId);
-            total += GetNullableStringSize(record.FileKey);
-            total += GetNullableStringSize(record.VolumeId);
-            total += GetNullableStringSize(record.PhysicalPath);
-            total += GetNullableStringSize(record.DirectoryPath);
-            total += GetNullableStringSize(record.ErrorMessage);
-            total += GetNullableStringSize(record.OriginalFileName);
-            total += GetNullableStringSize(record.FileExtension);
-            return total;
-        }
-
-        private static void WritePayload(QueueEventRecord record, byte[] buffer, ref int offset)
+        private static void WritePayload(QueueEventRecord record, RecordSerializationLayout layout, byte[] buffer, ref int offset)
         {
             WriteInt32(buffer, ref offset, record.SchemaVersion);
             WriteInt32(buffer, ref offset, (int)record.EventType);
@@ -239,15 +216,15 @@ namespace Locus.Storage
             WriteInt32(buffer, ref offset, record.RetryCount ?? int.MinValue);
             WriteInt64(buffer, ref offset, record.ProcessingStartTimeUtc?.Ticks ?? long.MinValue);
             WriteInt64(buffer, ref offset, record.AvailableForProcessingAtUtc?.Ticks ?? long.MinValue);
-            WriteNullableString(buffer, ref offset, record.EventId);
-            WriteNullableString(buffer, ref offset, record.TenantId);
-            WriteNullableString(buffer, ref offset, record.FileKey);
-            WriteNullableString(buffer, ref offset, record.VolumeId);
-            WriteNullableString(buffer, ref offset, record.PhysicalPath);
-            WriteNullableString(buffer, ref offset, record.DirectoryPath);
-            WriteNullableString(buffer, ref offset, record.ErrorMessage);
-            WriteNullableString(buffer, ref offset, record.OriginalFileName);
-            WriteNullableString(buffer, ref offset, record.FileExtension);
+            WriteNullableString(buffer, ref offset, layout.EventId);
+            WriteNullableString(buffer, ref offset, layout.TenantId);
+            WriteNullableString(buffer, ref offset, layout.FileKey);
+            WriteNullableString(buffer, ref offset, layout.VolumeId);
+            WriteNullableString(buffer, ref offset, layout.PhysicalPath);
+            WriteNullableString(buffer, ref offset, layout.DirectoryPath);
+            WriteNullableString(buffer, ref offset, layout.ErrorMessage);
+            WriteNullableString(buffer, ref offset, layout.OriginalFileName);
+            WriteNullableString(buffer, ref offset, layout.FileExtension);
         }
 
         private static QueueEventRecord ReadPayload(byte[] payload, long sequenceNumber, uint payloadChecksum)
@@ -285,24 +262,14 @@ namespace Locus.Storage
             }
         }
 
-        private static int GetNullableStringSize(string? value)
+        private static void WriteNullableString(byte[] buffer, ref int offset, NullableStringEncodingInfo value)
         {
-            if (value == null)
-                return 1;
-
-            var byteCount = Utf8NoBom.GetByteCount(value);
-            return 1 + Get7BitEncodedIntSize(byteCount) + byteCount;
-        }
-
-        private static void WriteNullableString(byte[] buffer, ref int offset, string? value)
-        {
-            buffer[offset++] = value != null ? (byte)1 : (byte)0;
-            if (value == null)
+            buffer[offset++] = value.HasValue ? (byte)1 : (byte)0;
+            if (!value.HasValue)
                 return;
 
-            var byteCount = Utf8NoBom.GetByteCount(value);
-            Write7BitEncodedInt(buffer, ref offset, byteCount);
-            offset += Utf8NoBom.GetBytes(value, 0, value.Length, buffer, offset);
+            Write7BitEncodedInt(buffer, ref offset, value.ByteCount);
+            offset += Utf8NoBom.GetBytes(value.Value!, 0, value.Value!.Length, buffer, offset);
         }
 
         private static int Get7BitEncodedIntSize(int value)
@@ -411,6 +378,88 @@ namespace Locus.Storage
         private static bool IsPayloadReadFailure()
         {
             return true;
+        }
+
+        private readonly struct RecordSerializationLayout
+        {
+            private const int FixedPayloadSize =
+                sizeof(int) +
+                sizeof(int) +
+                sizeof(long) +
+                sizeof(long) +
+                sizeof(int) +
+                sizeof(int) +
+                sizeof(long) +
+                sizeof(long);
+
+            public RecordSerializationLayout(QueueEventRecord record)
+            {
+                EventId = new NullableStringEncodingInfo(record.EventId);
+                TenantId = new NullableStringEncodingInfo(record.TenantId);
+                FileKey = new NullableStringEncodingInfo(record.FileKey);
+                VolumeId = new NullableStringEncodingInfo(record.VolumeId);
+                PhysicalPath = new NullableStringEncodingInfo(record.PhysicalPath);
+                DirectoryPath = new NullableStringEncodingInfo(record.DirectoryPath);
+                ErrorMessage = new NullableStringEncodingInfo(record.ErrorMessage);
+                OriginalFileName = new NullableStringEncodingInfo(record.OriginalFileName);
+                FileExtension = new NullableStringEncodingInfo(record.FileExtension);
+                PayloadLength =
+                    FixedPayloadSize +
+                    EventId.EncodedSize +
+                    TenantId.EncodedSize +
+                    FileKey.EncodedSize +
+                    VolumeId.EncodedSize +
+                    PhysicalPath.EncodedSize +
+                    DirectoryPath.EncodedSize +
+                    ErrorMessage.EncodedSize +
+                    OriginalFileName.EncodedSize +
+                    FileExtension.EncodedSize;
+            }
+
+            public NullableStringEncodingInfo EventId { get; }
+
+            public NullableStringEncodingInfo TenantId { get; }
+
+            public NullableStringEncodingInfo FileKey { get; }
+
+            public NullableStringEncodingInfo VolumeId { get; }
+
+            public NullableStringEncodingInfo PhysicalPath { get; }
+
+            public NullableStringEncodingInfo DirectoryPath { get; }
+
+            public NullableStringEncodingInfo ErrorMessage { get; }
+
+            public NullableStringEncodingInfo OriginalFileName { get; }
+
+            public NullableStringEncodingInfo FileExtension { get; }
+
+            public int PayloadLength { get; }
+        }
+
+        private readonly struct NullableStringEncodingInfo
+        {
+            public NullableStringEncodingInfo(string? value)
+            {
+                Value = value;
+                if (value == null)
+                {
+                    ByteCount = 0;
+                    EncodedSize = 1;
+                    return;
+                }
+
+                ByteCount = Utf8NoBom.GetByteCount(value);
+                EncodedSize = 1 + Get7BitEncodedIntSize(ByteCount) + ByteCount;
+            }
+
+            public string? Value { get; }
+
+            public bool HasValue => Value != null;
+
+            public int ByteCount { get; }
+
+            public int EncodedSize { get; }
         }
     }
 }

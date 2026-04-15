@@ -30,6 +30,7 @@ namespace Locus.FileSystem
         private readonly int _copyBufferSize;
         private readonly bool _forceFlushAfterWrite;
         private readonly int _knownDirectoryCacheMaxEntries;
+        private readonly bool _usesMockFileSystem;
 
         // --- Optimization 1: IsHealthy TTL cache ---
         // Avoid file write+delete on every WriteFileAsync call.
@@ -49,6 +50,7 @@ namespace Locus.FileSystem
         // Avoid Directory.Exists() stat on every write for already-created shard directories.
         // Cache is bounded to keep long-running memory usage predictable.
         private readonly ConcurrentDictionary<string, byte> _knownDirectories;
+        private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pendingDirectoryCreations;
         private int _knownDirectoryTrimInProgress;
         // Separate O(1) counter so TrackKnownDirectory can check the size without
         // calling ConcurrentDictionary.Count (which is O(N) due to segment locking).
@@ -64,13 +66,27 @@ namespace Locus.FileSystem
         private long _observedHiddenMemoryStreamWriteCount;
         private long _observedNonMemorySeekableWriteCount;
         private long _observedNonSeekableWriteCount;
+        private long _observedDirectoryPreparationCount;
+        private long _observedDirectoryPreparationTicks;
+        private long _observedOpenStreamCount;
+        private long _observedOpenStreamTicks;
+        private long _observedCopyOperationCount;
+        private long _observedCopyTicks;
+        private long _observedSynchronousSeekableFileCopyToOperationCount;
+        private long _observedSynchronousSeekableFileCopyToTicks;
+        private long _observedSynchronousSeekableFileLoopOperationCount;
+        private long _observedSynchronousSeekableFileLoopTicks;
+        private long _observedFlushOperationCount;
+        private long _observedFlushTicks;
 
         private const int DefaultWriteBufferSize = 128 * 1024;
         private const int DefaultCopyBufferSize = 256 * 1024;
         private const int LargeSeekableFileCopyBufferSize = 512 * 1024;
         private const int LargeSeekableFileThresholdBytes = 8 * 1024 * 1024;
+        private const int LargeSeekableFileCopyToThresholdBytes = 16 * 1024 * 1024;
         private const int DefaultKnownDirectoryCacheMaxEntries = 200_000;
         private const int DefaultSynchronousSmallWriteThresholdBytes = 1024 * 1024;
+        private const int DefaultExactSeekableCopyThresholdBytes = 2 * 1024 * 1024;
         /// <summary>
         /// Initializes a new instance of the <see cref="LocalFileSystemVolume"/> class.
         /// </summary>
@@ -137,6 +153,7 @@ namespace Locus.FileSystem
             _copyBufferSize = copyBufferSize;
             _forceFlushAfterWrite = forceFlushAfterWrite;
             _knownDirectoryCacheMaxEntries = knownDirectoryCacheMaxEntries;
+            _usesMockFileSystem = _fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0;
 
             // Default TTL: 30 seconds
             var cacheDuration = healthCheckCacheDuration == default
@@ -152,6 +169,10 @@ namespace Locus.FileSystem
             // Use the same case-sensitivity as _pathComparison so that cache hits on Linux
             // (case-sensitive FS) are never falsely triggered by differently-cased paths.
             _knownDirectories = new ConcurrentDictionary<string, byte>(
+                _pathComparison == StringComparison.Ordinal
+                    ? StringComparer.Ordinal
+                    : StringComparer.OrdinalIgnoreCase);
+            _pendingDirectoryCreations = new ConcurrentDictionary<string, TaskCompletionSource<bool>>(
                 _pathComparison == StringComparison.Ordinal
                     ? StringComparer.Ordinal
                     : StringComparer.OrdinalIgnoreCase);
@@ -324,6 +345,18 @@ namespace Locus.FileSystem
                 HiddenMemoryStreamWrites = Interlocked.Read(ref _observedHiddenMemoryStreamWriteCount),
                 NonMemorySeekableWrites = Interlocked.Read(ref _observedNonMemorySeekableWriteCount),
                 NonSeekableWrites = Interlocked.Read(ref _observedNonSeekableWriteCount),
+                DirectoryPreparationCount = Interlocked.Read(ref _observedDirectoryPreparationCount),
+                DirectoryPreparationTicks = Interlocked.Read(ref _observedDirectoryPreparationTicks),
+                OpenStreamCount = Interlocked.Read(ref _observedOpenStreamCount),
+                OpenStreamTicks = Interlocked.Read(ref _observedOpenStreamTicks),
+                CopyOperationCount = Interlocked.Read(ref _observedCopyOperationCount),
+                CopyTicks = Interlocked.Read(ref _observedCopyTicks),
+                SynchronousSeekableFileCopyToOperationCount = Interlocked.Read(ref _observedSynchronousSeekableFileCopyToOperationCount),
+                SynchronousSeekableFileCopyToTicks = Interlocked.Read(ref _observedSynchronousSeekableFileCopyToTicks),
+                SynchronousSeekableFileLoopOperationCount = Interlocked.Read(ref _observedSynchronousSeekableFileLoopOperationCount),
+                SynchronousSeekableFileLoopTicks = Interlocked.Read(ref _observedSynchronousSeekableFileLoopTicks),
+                FlushOperationCount = Interlocked.Read(ref _observedFlushOperationCount),
+                FlushTicks = Interlocked.Read(ref _observedFlushTicks),
             };
         }
 
@@ -492,9 +525,6 @@ namespace Locus.FileSystem
             try
             {
                 var remainingBytes = TryGetRemainingLength(content);
-                var useSynchronousSeekableFileWritePath = ShouldUseSynchronousSeekableFileWritePath(content, remainingBytes);
-                var useSynchronousSmallWritePath = !useSynchronousSeekableFileWritePath
-                    && ShouldUseSynchronousSmallWritePath(content, remainingBytes);
                 var memoryStream = content as MemoryStream;
                 var hasDirectWriteBuffer = TryGetMemoryStreamWriteBuffer(
                     content,
@@ -502,6 +532,9 @@ namespace Locus.FileSystem
                     out var directBuffer,
                     out var directMemoryStream,
                     out var hasVisibleMemoryBuffer);
+                var useSynchronousSeekableFileWritePath = ShouldUseSynchronousSeekableFileWritePath(content, remainingBytes);
+                var useSynchronousSmallWritePath = !useSynchronousSeekableFileWritePath
+                    && ShouldUseSynchronousSmallWritePath(content, remainingBytes, hasDirectWriteBuffer);
                 ObserveWriteSource(
                     content,
                     remainingBytes,
@@ -514,58 +547,67 @@ namespace Locus.FileSystem
                 // Optimization 4: skip Directory.Exists() for directories we already know exist.
                 // Shard directories are created once and never deleted during normal operation.
                 var directory = _fileSystem.Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(directory) && !_knownDirectories.ContainsKey(directory!))
-                    EnsureDirectoryTracked(directory!);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    await MeasureDirectoryPreparationAsync(
+                            () => EnsureDirectoryTrackedAsync(directory!, ct))
+                        .ConfigureAwait(false);
+                }
 
                 if (hasDirectWriteBuffer)
                 {
                     var directSource = directMemoryStream!;
                     if (useSynchronousSmallWritePath)
                     {
-                        using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
+                        using (var fileStream = MeasureOpenStream(() => CreateSynchronousWriteStream(path, remainingBytes)))
                         {
                             ct.ThrowIfCancellationRequested();
+                            MeasureCopy(() => fileStream.Write(directBuffer.Array!, directBuffer.Offset, directBuffer.Count));
                             directSource.Position += directBuffer.Count;
-                            fileStream.Write(directBuffer.Array!, directBuffer.Offset, directBuffer.Count);
                             if (_forceFlushAfterWrite)
-                                fileStream.Flush();
+                                MeasureFlush(fileStream.Flush);
                         }
                     }
                     else
                     {
-                        using (var fileStream = CreateWriteStream(path, remainingBytes))
+                        using (var fileStream = MeasureOpenStream(() => CreateWriteStream(path, remainingBytes)))
                         {
-                            await WriteBufferDirectAsync(fileStream, directSource, directBuffer, ct).ConfigureAwait(false);
+                            await MeasureCopyAsync(
+                                () => WriteBufferDirectAsync(fileStream, directBuffer, ct))
+                                .ConfigureAwait(false);
+                            directSource.Position += directBuffer.Count;
                             if (_forceFlushAfterWrite)
-                                await fileStream.FlushAsync(ct).ConfigureAwait(false);
+                                await MeasureFlushAsync(
+                                    () => fileStream.FlushAsync(ct))
+                                    .ConfigureAwait(false);
                         }
                     }
                 }
                 else if (useSynchronousSmallWritePath)
                 {
-                    using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
+                    using (var fileStream = MeasureOpenStream(() => CreateSynchronousWriteStream(path, remainingBytes)))
                     {
-                        CopySmallSeekableStreamSynchronously(content, fileStream, checked((int)remainingBytes!.Value), ct);
+                        MeasureCopy(() => CopySmallSeekableStreamSynchronously(content, fileStream, checked((int)remainingBytes!.Value), ct));
                         if (_forceFlushAfterWrite)
-                            fileStream.Flush();
+                            MeasureFlush(fileStream.Flush);
                     }
                 }
                 else if (useSynchronousSeekableFileWritePath)
                 {
-                    using (var fileStream = CreateSynchronousWriteStream(path, remainingBytes))
+                    using (var fileStream = MeasureOpenStream(() => CreateSynchronousWriteStream(path, remainingBytes)))
                     {
-                        CopySeekableStreamSynchronously(content, fileStream, remainingBytes, ct);
+                        MeasureCopy(() => CopySeekableStreamSynchronously(content, fileStream, remainingBytes, ct));
                         if (_forceFlushAfterWrite)
-                            fileStream.Flush();
+                            MeasureFlush(fileStream.Flush);
                     }
                 }
                 else
                 {
-                    using (var fileStream = CreateWriteStream(path, remainingBytes))
+                    using (var fileStream = MeasureOpenStream(() => CreateWriteStream(path, remainingBytes)))
                     {
-                        await CopyStreamAsync(content, fileStream, ct).ConfigureAwait(false);
+                        await MeasureCopyAsync(() => CopyStreamAsync(content, fileStream, ct)).ConfigureAwait(false);
                         if (_forceFlushAfterWrite)
-                            await fileStream.FlushAsync(ct).ConfigureAwait(false);
+                            await MeasureFlushAsync(() => fileStream.FlushAsync(ct)).ConfigureAwait(false);
                     }
                 }
 
@@ -667,7 +709,7 @@ namespace Locus.FileSystem
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // fileKey is always produced by Guid.NewGuid().ToString("N") which is lowercase hex,
+            // Storage-generated file keys remain lowercase 32-character hex strings,
             // so ToLowerInvariant() is redundant and avoided here to reduce hot-path allocations.
             // Path.Combine with fixed argument counts avoids the List<string> + ToArray overhead.
             var fileName = string.IsNullOrEmpty(fileExtension) ? fileKey : fileKey + fileExtension;
@@ -798,25 +840,127 @@ namespace Locus.FileSystem
             }
         }
 
+        private void MeasureCopy(Action copyAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                copyAction();
+            }
+            finally
+            {
+                Interlocked.Increment(ref _observedCopyOperationCount);
+                Interlocked.Add(ref _observedCopyTicks, Stopwatch.GetTimestamp() - started);
+            }
+        }
+
+        private async Task MeasureDirectoryPreparationAsync(Func<Task> directoryAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                await directoryAction().ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Increment(ref _observedDirectoryPreparationCount);
+                Interlocked.Add(ref _observedDirectoryPreparationTicks, Stopwatch.GetTimestamp() - started);
+            }
+        }
+
+        private Stream MeasureOpenStream(Func<Stream> openStream)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                return openStream();
+            }
+            finally
+            {
+                Interlocked.Increment(ref _observedOpenStreamCount);
+                Interlocked.Add(ref _observedOpenStreamTicks, Stopwatch.GetTimestamp() - started);
+            }
+        }
+
+        private async Task MeasureCopyAsync(Func<Task> copyAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                await copyAction().ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Increment(ref _observedCopyOperationCount);
+                Interlocked.Add(ref _observedCopyTicks, Stopwatch.GetTimestamp() - started);
+            }
+        }
+
+        private void MeasureSeekableCopyTo(Action copyAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                copyAction();
+            }
+            finally
+            {
+                var elapsed = Stopwatch.GetTimestamp() - started;
+                Interlocked.Increment(ref _observedSynchronousSeekableFileCopyToOperationCount);
+                Interlocked.Add(ref _observedSynchronousSeekableFileCopyToTicks, elapsed);
+            }
+        }
+
+        private void MeasureSeekableLoopCopy(Action copyAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                copyAction();
+            }
+            finally
+            {
+                var elapsed = Stopwatch.GetTimestamp() - started;
+                Interlocked.Increment(ref _observedSynchronousSeekableFileLoopOperationCount);
+                Interlocked.Add(ref _observedSynchronousSeekableFileLoopTicks, elapsed);
+            }
+        }
+
+        private void MeasureFlush(Action flushAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                flushAction();
+            }
+            finally
+            {
+                Interlocked.Increment(ref _observedFlushOperationCount);
+                Interlocked.Add(ref _observedFlushTicks, Stopwatch.GetTimestamp() - started);
+            }
+        }
+
+        private async Task MeasureFlushAsync(Func<Task> flushAction)
+        {
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                await flushAction().ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Increment(ref _observedFlushOperationCount);
+                Interlocked.Add(ref _observedFlushTicks, Stopwatch.GetTimestamp() - started);
+            }
+        }
+
         private async Task WriteBufferDirectAsync(
             Stream destination,
-            MemoryStream source,
             ArraySegment<byte> buffer,
             CancellationToken ct)
         {
-            var remaining = buffer.Count;
-            var offset = buffer.Offset;
-            while (remaining > 0)
-            {
-                var bytesToWrite = remaining <= _copyBufferSize
-                    ? remaining
-                    : _copyBufferSize;
-                ct.ThrowIfCancellationRequested();
-                source.Position += bytesToWrite;
-                await destination.WriteAsync(buffer.Array!, offset, bytesToWrite, ct).ConfigureAwait(false);
-                offset += bytesToWrite;
-                remaining -= bytesToWrite;
-            }
+            ct.ThrowIfCancellationRequested();
+            await destination.WriteAsync(buffer.Array!, buffer.Offset, buffer.Count, ct).ConfigureAwait(false);
         }
 
         private void ObserveWriteSource(
@@ -860,26 +1004,38 @@ namespace Locus.FileSystem
 
             LocalFileSystemVolumeMetrics.RecordWrite(
                 _volumeId,
-                GetWriteSourceKind(isMemoryStream, hasVisibleMemoryBuffer, content.CanSeek),
-                hasVisibleMemoryBuffer,
-                usesDirectMemoryWritePath,
-                usesSynchronousSmallWritePath,
-                usesSynchronousSeekableFileWritePath,
                 remainingBytes);
         }
 
-        private static string GetWriteSourceKind(bool isMemoryStream, bool hasVisibleMemoryBuffer, bool canSeek)
+        private async Task EnsureDirectoryTrackedAsync(string directory, CancellationToken ct)
         {
-            if (isMemoryStream)
-                return hasVisibleMemoryBuffer ? "memory_visible" : "memory_hidden";
+            if (_knownDirectories.ContainsKey(directory))
+                return;
 
-            return canSeek ? "seekable_stream" : "non_seekable_stream";
-        }
+            var pendingCreation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var activeCreation = _pendingDirectoryCreations.GetOrAdd(directory, pendingCreation);
+            if (!ReferenceEquals(activeCreation, pendingCreation))
+            {
+                await WaitForDirectoryCreationAsync(activeCreation.Task, ct).ConfigureAwait(false);
+                return;
+            }
 
-        private void EnsureDirectoryTracked(string directory)
-        {
-            _fileSystem.Directory.CreateDirectory(directory);
-            TrackKnownDirectory(directory);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                _fileSystem.Directory.CreateDirectory(directory);
+                TrackKnownDirectoryHierarchy(directory);
+                pendingCreation.TrySetResult(true);
+            }
+            catch (Exception ex)
+            {
+                pendingCreation.TrySetException(ex);
+                throw;
+            }
+            finally
+            {
+                _pendingDirectoryCreations.TryRemove(directory, out _);
+            }
         }
 
         private void TrackKnownDirectoryWithoutTrim(string directory)
@@ -891,7 +1047,7 @@ namespace Locus.FileSystem
         private Stream CreateWriteStream(string path, long? expectedBytes)
         {
             // MockFileSystem does not map to OS file handles; keep using abstraction in tests.
-            if (_fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (_usesMockFileSystem)
                 return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
 
             var bufferSize = ResolveWriteBufferSize(expectedBytes);
@@ -906,7 +1062,7 @@ namespace Locus.FileSystem
 
         private Stream CreateSynchronousWriteStream(string path, long? expectedBytes)
         {
-            if (_fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (_usesMockFileSystem)
                 return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
 
             var bufferSize = ResolveWriteBufferSize(expectedBytes);
@@ -989,19 +1145,23 @@ namespace Locus.FileSystem
             return candidate < _writeBufferSize ? candidate : _writeBufferSize;
         }
 
-        private bool ShouldUseSynchronousSmallWritePath(Stream content, long? remainingBytes)
+        private bool ShouldUseSynchronousSmallWritePath(Stream content, long? remainingBytes, bool hasDirectWriteBuffer)
         {
+            var threshold = hasDirectWriteBuffer
+                ? DefaultSynchronousSmallWriteThresholdBytes
+                : DefaultExactSeekableCopyThresholdBytes;
+
             return content.CanSeek
                 && remainingBytes.HasValue
                 && remainingBytes.Value > 0
-                && remainingBytes.Value <= DefaultSynchronousSmallWriteThresholdBytes;
+                && remainingBytes.Value <= threshold;
         }
 
         private bool ShouldUseSynchronousSeekableFileWritePath(Stream content, long? remainingBytes)
         {
             return content is FileStream
                 && remainingBytes.HasValue
-                && remainingBytes.Value >= DefaultSynchronousSmallWriteThresholdBytes;
+                && remainingBytes.Value > DefaultExactSeekableCopyThresholdBytes;
         }
 
         private static bool TryGetMemoryStreamWriteBuffer(
@@ -1086,18 +1246,34 @@ namespace Locus.FileSystem
             CancellationToken ct)
         {
             var copyBufferSize = ResolveSeekableFileCopyBufferSize(remainingBytes);
+            if (remainingBytes.HasValue
+                && remainingBytes.Value >= LargeSeekableFileCopyToThresholdBytes
+                && source is FileStream
+                && destination is FileStream)
+            {
+                MeasureSeekableCopyTo(() =>
+                {
+                    ct.ThrowIfCancellationRequested();
+                    source.CopyTo(destination, copyBufferSize);
+                });
+                return;
+            }
+
             var rented = ArrayPool<byte>.Shared.Rent(copyBufferSize);
             try
             {
-                while (true)
+                MeasureSeekableLoopCopy(() =>
                 {
-                    ct.ThrowIfCancellationRequested();
-                    var bytesRead = source.Read(rented, 0, copyBufferSize);
-                    if (bytesRead <= 0)
-                        break;
+                    while (true)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var bytesRead = source.Read(rented, 0, copyBufferSize);
+                        if (bytesRead <= 0)
+                            break;
 
-                    destination.Write(rented, 0, bytesRead);
-                }
+                        destination.Write(rented, 0, bytesRead);
+                    }
+                });
             }
             finally
             {
@@ -1119,6 +1295,37 @@ namespace Locus.FileSystem
                 return null;
 
             return stream.Length - stream.Position;
+        }
+
+        private void TrackKnownDirectoryHierarchy(string directory)
+        {
+            string? current = directory;
+            while (!string.IsNullOrEmpty(current) && IsKnownSafeInternalPath(current!))
+            {
+                TrackKnownDirectory(current!);
+                if (current!.Equals(_mountPath, _pathComparison))
+                    break;
+
+                current = _fileSystem.Path.GetDirectoryName(current);
+            }
+        }
+
+        private static async Task WaitForDirectoryCreationAsync(Task creationTask, CancellationToken ct)
+        {
+            if (!ct.CanBeCanceled)
+            {
+                await creationTask.ConfigureAwait(false);
+                return;
+            }
+
+            var completedTask = await Task.WhenAny(
+                creationTask,
+                Task.Delay(Timeout.Infinite, ct)).ConfigureAwait(false);
+
+            if (!ReferenceEquals(completedTask, creationTask))
+                ct.ThrowIfCancellationRequested();
+
+            await creationTask.ConfigureAwait(false);
         }
     }
 }

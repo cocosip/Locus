@@ -49,6 +49,11 @@ namespace Locus.Storage
 
         // Serialize completion for the same file key to keep quota decrement idempotent.
         private readonly SemaphoreSlim[] _completionGuards;
+        private readonly ushort _fileKeyShardSeed;
+        private long _fileKeySequence;
+        private const int FileKeyShardReuseWindow = 32;
+        private const ulong FileKeyShardMixConstant = 0x9E3779B97F4A7C15UL;
+        private static readonly char[] LowerHexDigits = "0123456789abcdef".ToCharArray();
 
         /// <summary>
         /// Default number of completion-guard stripes used to reduce lock collisions.
@@ -123,6 +128,7 @@ namespace Locus.Storage
             _completionGuards = Enumerable.Range(0, completionGuardStripeCount)
                 .Select(_ => new SemaphoreSlim(1, 1))
                 .ToArray();
+            _fileKeyShardSeed = unchecked((ushort)Guid.NewGuid().GetHashCode());
             ValidateLegacyNonJournalMode();
         }
 
@@ -232,8 +238,6 @@ namespace Locus.Storage
             if (content == null)
                 throw new ArgumentNullException(nameof(content));
 
-            var sourceKind = GetWriteSourceKind(content);
-            var acceptancePath = _queueEventJournal != null ? "queue_journal" : "projection_fallback";
             var requestStartedAt = Stopwatch.GetTimestamp();
             long tenantQuotaTicks = 0;
             long directoryQuotaTicks = 0;
@@ -262,7 +266,7 @@ namespace Locus.Storage
             CountingReadStream? countingStream = null;
             var initialContentPosition = content.CanSeek ? content.Position : 0;
             var expectedFileSize = content.CanSeek ? content.Length - content.Position : (long?)null;
-            StoragePoolMetrics.RecordWriteStarted(sourceKind, acceptancePath, expectedFileSize);
+            StoragePoolMetrics.RecordWriteStarted(expectedFileSize);
 
             try
             {
@@ -323,7 +327,7 @@ namespace Locus.Storage
                     {
                         volumeWriteTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
                         retryCount++;
-                        StoragePoolMetrics.RecordWriteRetry(volume.VolumeId, sourceKind, acceptancePath);
+                        StoragePoolMetrics.RecordWriteRetry();
                         lastWriteException = ex;
                         await TryCleanupFailedWriteAsync(volume, physicalPath).ConfigureAwait(false);
                         InvalidateWritableVolumeSnapshot(volume);
@@ -377,7 +381,8 @@ namespace Locus.Storage
                     currentStage = "acceptance";
                     phaseStartedAt = Stopwatch.GetTimestamp();
                     await AppendAcceptedQueueEventAsync(metadata, ct).ConfigureAwait(false);
-                    acceptanceTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
+                    var queueJournalAppendTicks = Stopwatch.GetTimestamp() - phaseStartedAt;
+                    acceptanceTicks += queueJournalAppendTicks;
                     acceptanceCompleted = true;
                 }
                 else
@@ -389,8 +394,14 @@ namespace Locus.Storage
                         currentStage = "acceptance";
                         phaseStartedAt = Stopwatch.GetTimestamp();
                         tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, ct).ConfigureAwait(false);
+                        var fallbackTenantProjectionTicks = Stopwatch.GetTimestamp() - phaseStartedAt;
+                        acceptanceTicks += fallbackTenantProjectionTicks;
+
+                        currentStage = "acceptance";
+                        phaseStartedAt = Stopwatch.GetTimestamp();
                         directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(metadata.TenantId, metadata.DirectoryPath, ct).ConfigureAwait(false);
-                        acceptanceTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
+                        var fallbackDirectoryProjectionTicks = Stopwatch.GetTimestamp() - phaseStartedAt;
+                        acceptanceTicks += fallbackDirectoryProjectionTicks;
                         QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
                         acceptanceCompleted = true;
                     }
@@ -411,10 +422,6 @@ namespace Locus.Storage
                 projectionEnqueueTicks += Stopwatch.GetTimestamp() - phaseStartedAt;
 
                 StoragePoolMetrics.RecordWriteSucceeded(
-                    volume.VolumeId,
-                    sourceKind,
-                    acceptancePath,
-                    fileSize,
                     retryCount,
                     Stopwatch.GetTimestamp() - requestStartedAt,
                     tenantQuotaTicks,
@@ -431,20 +438,14 @@ namespace Locus.Storage
             catch
             {
                 StoragePoolMetrics.RecordWriteFailed(
-                    volume?.VolumeId,
-                    sourceKind,
-                    acceptancePath,
                     currentStage,
-                    expectedFileSize,
                     retryCount,
                     Stopwatch.GetTimestamp() - requestStartedAt,
                     tenantQuotaTicks,
                     directoryQuotaTicks,
                     volumeWriteTicks,
                     acceptanceTicks,
-                    projectionEnqueueTicks,
-                    fileWritten,
-                    acceptanceCompleted);
+                    projectionEnqueueTicks);
 
                 var physicalWriteSucceeded = fileWritten;
                 var rollbackQuota = !physicalWriteSucceeded;
@@ -474,8 +475,7 @@ namespace Locus.Storage
                     catch (Exception cleanupEx)
                     {
                         StoragePoolMetrics.RecordCleanupFailure(
-                            physicalWriteSucceeded ? "post_acceptance_failure" : "residual_write_failure",
-                            volume?.VolumeId);
+                            physicalWriteSucceeded ? "post_acceptance_failure" : "residual_write_failure");
                         rollbackQuota = false;
                         _logger.LogError(
                             cleanupEx,
@@ -1054,7 +1054,7 @@ namespace Locus.Storage
             }
             catch (Exception cleanupEx)
             {
-                StoragePoolMetrics.RecordCleanupFailure("retry_cleanup", volume.VolumeId);
+                StoragePoolMetrics.RecordCleanupFailure("retry_cleanup");
                 _logger.LogWarning(
                     cleanupEx,
                     "Failed to cleanup partial write at {PhysicalPath} on volume {VolumeId}",
@@ -1068,14 +1068,6 @@ namespace Locus.Storage
             _cachedWritableVolumes = Array.Empty<IStorageVolume>();
             Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
             _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
-        }
-
-        private static string GetWriteSourceKind(Stream content)
-        {
-            if (content is MemoryStream)
-                return "memory";
-
-            return content.CanSeek ? "seekable_stream" : "non_seekable_stream";
         }
 
         private SemaphoreSlim GetCompletionGuard(string fileKey)
@@ -1393,11 +1385,45 @@ namespace Locus.Storage
         }
 
         /// <summary>
-        /// Generates a unique file key using GUID.
+        /// Generates a unique storage key while keeping short write bursts in the same shard.
         /// </summary>
         private string GenerateFileKey()
         {
-            return Guid.NewGuid().ToString("N"); // 32-character hex string without dashes
+            var sequence = Interlocked.Increment(ref _fileKeySequence) - 1;
+            var batchOrdinal = sequence / FileKeyShardReuseWindow;
+            var shardPrefix = ComputeFileKeyShardPrefix(batchOrdinal);
+            var bytes = Guid.NewGuid().ToByteArray();
+            bytes[0] = (byte)(shardPrefix >> 8);
+            bytes[1] = (byte)shardPrefix;
+            return EncodeLowerHex(bytes);
+        }
+
+        private ushort ComputeFileKeyShardPrefix(long batchOrdinal)
+        {
+            unchecked
+            {
+                var mixed = ((ulong)_fileKeyShardSeed << 32) ^ (ulong)batchOrdinal ^ FileKeyShardMixConstant;
+                mixed ^= mixed >> 33;
+                mixed *= 0xff51afd7ed558ccdUL;
+                mixed ^= mixed >> 33;
+                mixed *= 0xc4ceb9fe1a85ec53UL;
+                mixed ^= mixed >> 33;
+                return (ushort)mixed;
+            }
+        }
+
+        private static string EncodeLowerHex(byte[] bytes)
+        {
+            var chars = new char[bytes.Length * 2];
+            for (var i = 0; i < bytes.Length; i++)
+            {
+                var value = bytes[i];
+                var charIndex = i * 2;
+                chars[charIndex] = LowerHexDigits[value >> 4];
+                chars[charIndex + 1] = LowerHexDigits[value & 0x0f];
+            }
+
+            return new string(chars);
         }
 
         private sealed class CountingReadStream : Stream

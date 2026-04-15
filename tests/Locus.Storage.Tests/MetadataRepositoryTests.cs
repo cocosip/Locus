@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
 using Microsoft.Data.Sqlite;
@@ -327,6 +328,29 @@ namespace Locus.Storage.Tests
                 Assert.True(exists);
             else
                 Assert.False(exists);
+        }
+
+        [Fact]
+        public async Task GetWritePathStatisticsSnapshot_TracksProjectionEnqueueSubphases()
+        {
+            var diagnostics = Assert.IsAssignableFrom<IQueueProjectionWritePathDiagnostics>(_repository);
+
+            var pending = CreateMetadata("diag-pending", FileProcessingStatus.Pending);
+            await _repository.AddOrUpdateAsync(pending, CancellationToken.None);
+
+            var processing = CreateMetadata("diag-processing", FileProcessingStatus.Processing);
+            processing.ProcessingStartTime = DateTime.UtcNow.AddMinutes(-2);
+            await _repository.AddOrUpdateAsync(processing, CancellationToken.None);
+
+            var snapshot = diagnostics.GetWritePathStatisticsSnapshot();
+            Assert.Equal(2, snapshot.ProjectedWriteCount);
+            Assert.Equal(2, snapshot.ValidationCount);
+            Assert.Equal(2, snapshot.CacheAndIndexCount);
+            Assert.Equal(2, snapshot.CacheMutationCount);
+            Assert.Equal(2, snapshot.PhysicalPathIndexCount);
+            Assert.Equal(2, snapshot.PendingQueueUpdateCount);
+            Assert.Equal(2, snapshot.StatusIndexUpdateCount);
+            Assert.Equal(2, snapshot.PersistenceEnqueueCount);
         }
 
         [Fact]

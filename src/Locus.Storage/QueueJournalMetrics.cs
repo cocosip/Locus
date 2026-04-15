@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using System.Diagnostics.Metrics;
 
 namespace Locus.Storage
@@ -42,19 +41,14 @@ namespace Locus.Storage
             SequenceGapRecoveryFailedCounter.Add(1);
         }
 
-        public static void RecordCorruptTailDetected(JournalFormat format, string stage)
+        public static void RecordCorruptTailDetected()
         {
-            CorruptTailDetectedCounter.Add(
-                1,
-                new KeyValuePair<string, object?>("format", format.ToString()),
-                new KeyValuePair<string, object?>("stage", stage));
+            CorruptTailDetectedCounter.Add(1);
         }
 
-        public static void RecordCorruptTailAutoRepaired(JournalFormat format)
+        public static void RecordCorruptTailAutoRepaired()
         {
-            CorruptTailAutoRepairedCounter.Add(
-                1,
-                new KeyValuePair<string, object?>("format", format.ToString()));
+            CorruptTailAutoRepairedCounter.Add(1);
         }
     }
 }

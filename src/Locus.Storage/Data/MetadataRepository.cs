@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Dapper;
+using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Microsoft.Data.Sqlite;
@@ -52,7 +53,7 @@ namespace Locus.Storage.Data
     ///
     /// Thread-safe for concurrent access.
     /// </summary>
-    public class MetadataRepository : IDisposable
+    public class MetadataRepository : IDisposable, IQueueProjectionWritePathDiagnostics
     {
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<MetadataRepository> _logger;
@@ -138,6 +139,21 @@ namespace Locus.Storage.Data
         private readonly int _startupLoadBatchSize;
         private readonly int _shutdownDrainTimeoutSeconds;
         private readonly int _persistenceIntervalSeconds;
+        private long _observedProjectionWriteCount;
+        private long _observedProjectionValidationCount;
+        private long _observedProjectionValidationTicks;
+        private long _observedProjectionCacheAndIndexCount;
+        private long _observedProjectionCacheAndIndexTicks;
+        private long _observedProjectionCacheMutationCount;
+        private long _observedProjectionCacheMutationTicks;
+        private long _observedProjectionPhysicalPathIndexCount;
+        private long _observedProjectionPhysicalPathIndexTicks;
+        private long _observedProjectionPendingQueueUpdateCount;
+        private long _observedProjectionPendingQueueTicks;
+        private long _observedProjectionStatusIndexUpdateCount;
+        private long _observedProjectionStatusIndexTicks;
+        private long _observedProjectionPersistenceEnqueueCount;
+        private long _observedProjectionPersistenceEnqueueTicks;
         private readonly ConcurrentDictionary<string, PersistenceOperation> _coalescedPersistenceOps;
         private int _coalescedLogCounter;
         private int _persistenceChannelDepth;
@@ -842,16 +858,27 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (_disposed)
                 throw new ObjectDisposedException(nameof(MetadataRepository));
 
+            var validationStarted = Stopwatch.GetTimestamp();
             ValidateUpsertMetadata(metadata);
+            RecordProjectionPhase(
+                ref _observedProjectionValidationCount,
+                ref _observedProjectionValidationTicks,
+                Stopwatch.GetTimestamp() - validationStarted);
 
             // 1. Update in-memory cache FIRST -- always succeeds, immediately visible to readers.
-            UpdateCacheAndIndices(metadata);
+            UpdateCacheAndIndices(metadata, observeProjectionWritePath: true);
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
 
             // 2. Queue SQLite persistence -- caller is not blocked; background loop drains the queue.
+            var persistenceEnqueueStarted = Stopwatch.GetTimestamp();
             EnqueuePersistence(new PersistenceOperation(metadata));
+            RecordProjectionPhase(
+                ref _observedProjectionPersistenceEnqueueCount,
+                ref _observedProjectionPersistenceEnqueueTicks,
+                Stopwatch.GetTimestamp() - persistenceEnqueueStarted);
+            Interlocked.Increment(ref _observedProjectionWriteCount);
 
             return Task.CompletedTask;
         }
@@ -914,20 +941,47 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         ///   <item>Updates the status-timestamp index for timed-out / permanently-failed queries.</item>
         /// </list>
         /// </summary>
-        private void UpdateCacheAndIndices(FileMetadata metadata)
+        private void UpdateCacheAndIndices(FileMetadata metadata, bool observeProjectionWritePath = false)
         {
+            var cacheAndIndexStarted = observeProjectionWritePath
+                ? Stopwatch.GetTimestamp()
+                : 0;
             var cache = _activeFiles.GetOrAdd(metadata.TenantId,
                 _ => new ConcurrentDictionary<string, FileMetadata>());
 
+            var cacheMutationStarted = observeProjectionWritePath
+                ? Stopwatch.GetTimestamp()
+                : 0;
             cache.TryGetValue(metadata.FileKey, out var previous);
             cache[metadata.FileKey] = metadata;
             _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
+            if (observeProjectionWritePath)
+            {
+                RecordProjectionPhase(
+                    ref _observedProjectionCacheMutationCount,
+                    ref _observedProjectionCacheMutationTicks,
+                    Stopwatch.GetTimestamp() - cacheMutationStarted);
+            }
+
+            var physicalPathIndexStarted = observeProjectionWritePath
+                ? Stopwatch.GetTimestamp()
+                : 0;
             IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
+            if (observeProjectionWritePath)
+            {
+                RecordProjectionPhase(
+                    ref _observedProjectionPhysicalPathIndexCount,
+                    ref _observedProjectionPhysicalPathIndexTicks,
+                    Stopwatch.GetTimestamp() - physicalPathIndexStarted);
+            }
 
             // Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
             // Keeps CompactPendingQueues O(1) instead of O(N).
             bool wasP = previous?.Status == FileProcessingStatus.Pending;
             bool isP  = metadata.Status  == FileProcessingStatus.Pending;
+            var pendingQueueStarted = observeProjectionWritePath
+                ? Stopwatch.GetTimestamp()
+                : 0;
             if (!wasP && isP)
                 _pendingFileCounts.AddOrUpdate(metadata.TenantId, 1, (_, c) => c + 1);
             else if (wasP && !isP)
@@ -940,9 +994,30 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             // Non-Pending transitions are not explicitly removed from the queue; stale entries
             // are validated and skipped when GetNextPendingFileAsync dequeues them.
             if (isP)
-                EnqueuePendingCandidate(metadata);
+                EnqueuePendingCandidate(metadata, refreshGeneration: wasP);
+            if (observeProjectionWritePath)
+            {
+                RecordProjectionPhase(
+                    ref _observedProjectionPendingQueueUpdateCount,
+                    ref _observedProjectionPendingQueueTicks,
+                    Stopwatch.GetTimestamp() - pendingQueueStarted);
+            }
 
+            var statusIndexStarted = observeProjectionWritePath
+                ? Stopwatch.GetTimestamp()
+                : 0;
             IndexStatusCandidate(previous, metadata);
+            if (observeProjectionWritePath)
+            {
+                RecordProjectionPhase(
+                    ref _observedProjectionStatusIndexUpdateCount,
+                    ref _observedProjectionStatusIndexTicks,
+                    Stopwatch.GetTimestamp() - statusIndexStarted);
+                RecordProjectionPhase(
+                    ref _observedProjectionCacheAndIndexCount,
+                    ref _observedProjectionCacheAndIndexTicks,
+                    Stopwatch.GetTimestamp() - cacheAndIndexStarted);
+            }
         }
 
         /// <summary>
@@ -1159,7 +1234,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
                 IndexStatusCandidate(current, updated);
                 EnqueuePersistence(new PersistenceOperation(updated));
-                EnqueuePendingCandidate(updated);
+                EnqueuePendingCandidate(updated, refreshGeneration: false);
                 return true;
             }
             finally
@@ -1559,7 +1634,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (updated.Status == FileProcessingStatus.Pending)
                 {
                     _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-                    EnqueuePendingCandidate(updated);
+                    EnqueuePendingCandidate(updated, refreshGeneration: false);
                 }
 
                 IndexStatusCandidate(current, updated);
@@ -1678,7 +1753,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
 
                 InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePendingCandidate(updated);
+                EnqueuePendingCandidate(updated, refreshGeneration: false);
                 IndexStatusCandidate(current, updated);
                 EnqueuePersistence(new PersistenceOperation(updated));
                 _logger.LogDebug(
@@ -1935,19 +2010,53 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
         }
 
-        private void EnqueuePendingCandidate(FileMetadata metadata)
+        private void EnqueuePendingCandidate(FileMetadata metadata, bool refreshGeneration = true)
         {
-            var generation = IncrementPendingGeneration(metadata.TenantId, metadata.FileKey);
+            var generation = refreshGeneration
+                ? IncrementPendingGeneration(metadata.TenantId, metadata.FileKey)
+                : GetOrCreatePendingGeneration(metadata.TenantId, metadata.FileKey);
             var entry = new PendingQueueEntry(metadata.FileKey, generation);
-            var now = DateTime.UtcNow;
-            if (metadata.AvailableForProcessingAt.HasValue && metadata.AvailableForProcessingAt.Value > now)
+            if (metadata.AvailableForProcessingAt.HasValue)
             {
-                EnqueueDelayed(metadata.TenantId, entry, metadata.AvailableForProcessingAt.Value);
-                return;
+                var availableAt = metadata.AvailableForProcessingAt.Value;
+                if (availableAt > DateTime.UtcNow)
+                {
+                    EnqueueDelayed(metadata.TenantId, entry, availableAt);
+                    return;
+                }
             }
 
             var pendingQueue = _pendingKeys.GetOrAdd(metadata.TenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
             pendingQueue.Enqueue(entry);
+        }
+
+        /// <inheritdoc/>
+        public QueueProjectionWritePathStatistics GetWritePathStatisticsSnapshot()
+        {
+            return new QueueProjectionWritePathStatistics
+            {
+                ProjectedWriteCount = Interlocked.Read(ref _observedProjectionWriteCount),
+                ValidationCount = Interlocked.Read(ref _observedProjectionValidationCount),
+                ValidationTicks = Interlocked.Read(ref _observedProjectionValidationTicks),
+                CacheAndIndexCount = Interlocked.Read(ref _observedProjectionCacheAndIndexCount),
+                CacheAndIndexTicks = Interlocked.Read(ref _observedProjectionCacheAndIndexTicks),
+                CacheMutationCount = Interlocked.Read(ref _observedProjectionCacheMutationCount),
+                CacheMutationTicks = Interlocked.Read(ref _observedProjectionCacheMutationTicks),
+                PhysicalPathIndexCount = Interlocked.Read(ref _observedProjectionPhysicalPathIndexCount),
+                PhysicalPathIndexTicks = Interlocked.Read(ref _observedProjectionPhysicalPathIndexTicks),
+                PendingQueueUpdateCount = Interlocked.Read(ref _observedProjectionPendingQueueUpdateCount),
+                PendingQueueTicks = Interlocked.Read(ref _observedProjectionPendingQueueTicks),
+                StatusIndexUpdateCount = Interlocked.Read(ref _observedProjectionStatusIndexUpdateCount),
+                StatusIndexTicks = Interlocked.Read(ref _observedProjectionStatusIndexTicks),
+                PersistenceEnqueueCount = Interlocked.Read(ref _observedProjectionPersistenceEnqueueCount),
+                PersistenceEnqueueTicks = Interlocked.Read(ref _observedProjectionPersistenceEnqueueTicks)
+            };
+        }
+
+        private static void RecordProjectionPhase(ref long count, ref long ticks, long elapsedTicks)
+        {
+            Interlocked.Increment(ref count);
+            Interlocked.Add(ref ticks, elapsedTicks);
         }
 
         private long GetOrCreatePendingGeneration(string tenantId, string fileKey)
@@ -2694,7 +2803,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     EnqueuePersistence(new PersistenceOperation(updated));
 
                     // Re-enqueue in the pending queue so the allocator can find it immediately.
-                    EnqueuePendingCandidate(updated);
+                    EnqueuePendingCandidate(updated, refreshGeneration: false);
 
                     count++;
                     _logger.LogWarning("Reset timed-out file: {FileKey}, Tenant: {TenantId}, was processing for {Duration}",

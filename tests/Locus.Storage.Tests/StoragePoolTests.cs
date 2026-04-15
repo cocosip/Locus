@@ -284,6 +284,22 @@ namespace Locus.Storage.Tests
             };
         }
 
+        private static bool IsLowerHexString(string value, int expectedLength)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length != expectedLength)
+                return false;
+
+            foreach (var ch in value)
+            {
+                var isLowerHex = (ch >= '0' && ch <= '9')
+                    || (ch >= 'a' && ch <= 'f');
+                if (!isLowerHex)
+                    return false;
+            }
+
+            return true;
+        }
+
         [Fact]
         public async Task WriteFileAsync_CreatesFileSuccessfully()
         {
@@ -295,12 +311,30 @@ namespace Locus.Storage.Tests
 
             // Assert
             Assert.False(string.IsNullOrEmpty(fileKey));
+            Assert.True(IsLowerHexString(fileKey, 32));
 
             // Verify file was written
             var location = await _storagePool.GetFileLocationAsync(_tenant.Object, fileKey, default);
             Assert.NotNull(location);
             Assert.Equal(fileKey, location.FileKey);
             Assert.Equal("tenant-001", location.TenantId);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_ReusesShardPrefixWithinSmallSequentialBurst()
+        {
+            var fileKeys = new List<string>();
+
+            for (var i = 0; i < 8; i++)
+            {
+                using var content = new MemoryStream(Encoding.UTF8.GetBytes("burst-" + i));
+                var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+                fileKeys.Add(fileKey);
+            }
+
+            Assert.Equal(fileKeys.Count, fileKeys.Distinct(StringComparer.Ordinal).Count());
+            Assert.All(fileKeys, fileKey => Assert.True(IsLowerHexString(fileKey, 32)));
+            Assert.Single(fileKeys.Select(fileKey => fileKey.Substring(0, 4)).Distinct(StringComparer.Ordinal));
         }
 
         [Fact]
@@ -323,6 +357,92 @@ namespace Locus.Storage.Tests
                         && record.OriginalFileName == "image.dcm"
                         && record.FileExtension == ".dcm"),
                     It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_WithJournal_RecordsAcceptanceDurationMetric()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("metric-journal"));
+            _queueEventJournal
+                .Setup(m => m.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()))
+                .Returns(async (QueueEventRecord _, CancellationToken ct) => await Task.Delay(2, ct));
+
+            using (var metrics = new StoragePoolMetricCapture())
+            {
+                await _storagePool.WriteFileAsync(_tenant.Object, content, "metric-journal.dcm", CancellationToken.None);
+
+                Assert.Equal(1, metrics.GetMeasurementCount("locus.storage_pool.write.acceptance.duration"));
+                Assert.Equal(1, metrics.GetMeasurementCount("locus.storage_pool.write.duration"));
+            }
+        }
+
+        [Fact]
+        public async Task WriteFileAsync_WithoutJournal_RecordsAcceptanceDurationMetric()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>();
+            var tenantQuotaProjectionManager = tenantQuotaManager.As<ITenantQuotaProjectionManager>();
+            tenantQuotaManager.Setup(m => m.CanAddFileAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+            tenantQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            tenantQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            tenantQuotaProjectionManager
+                .Setup(m => m.ApplyAcceptedProjectionAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(async (string _, CancellationToken ct) =>
+                {
+                    await Task.Delay(2, ct);
+                    return true;
+                });
+            tenantQuotaProjectionManager
+                .Setup(m => m.RollbackAcceptedProjectionAsync("tenant-001", It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            var directoryQuotaProjectionManager = directoryQuotaManager.As<IDirectoryQuotaProjectionManager>();
+            directoryQuotaManager.Setup(m => m.CanAddFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+            directoryQuotaManager.Setup(m => m.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager.Setup(m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaProjectionManager
+                .Setup(m => m.ApplyAcceptedProjectionAsync("tenant-001", "/", It.IsAny<CancellationToken>()))
+                .Returns(async (string _, string __, CancellationToken ct) =>
+                {
+                    await Task.Delay(2, ct);
+                    return true;
+                });
+            directoryQuotaProjectionManager
+                .Setup(m => m.RollbackAcceptedProjectionAsync("tenant-001", "/", It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var fallbackStoragePool = new StoragePool(
+                _metadataRepository,
+                tenantQuotaManager.Object,
+                directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                allowLegacyNonJournalMode: true);
+            await fallbackStoragePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0, ct: CancellationToken.None);
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("metric-fallback"));
+
+            using (var metrics = new StoragePoolMetricCapture())
+            {
+                await fallbackStoragePool.WriteFileAsync(_tenant.Object, content, "metric-fallback.dcm", CancellationToken.None);
+
+                Assert.Equal(1, metrics.GetMeasurementCount("locus.storage_pool.write.acceptance.duration"));
+                Assert.Equal(1, metrics.GetMeasurementCount("locus.storage_pool.write.duration"));
+            }
+
+            tenantQuotaProjectionManager.Verify(
+                m => m.ApplyAcceptedProjectionAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaProjectionManager.Verify(
+                m => m.ApplyAcceptedProjectionAsync("tenant-001", "/", It.IsAny<CancellationToken>()),
                 Times.Once);
         }
 

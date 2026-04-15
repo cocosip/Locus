@@ -20,7 +20,7 @@ namespace Locus.Storage
     /// <summary>
     /// Stores durable queue events as per-tenant journals with configurable codecs.
     /// </summary>
-    public class FileQueueEventJournal : IQueueEventJournal, IDisposable
+    public class FileQueueEventJournal : IQueueEventJournal, IQueueEventJournalWritePathDiagnostics, IDisposable
     {
         private static readonly EventId CorruptTailReadEventId = new EventId(4101, nameof(CorruptTailReadEventId));
         private static readonly EventId CorruptTailTruncatedEventId = new EventId(4102, nameof(CorruptTailTruncatedEventId));
@@ -31,8 +31,6 @@ namespace Locus.Storage
             WriteIndented = false,
         };
         private static readonly TimeSpan DefaultStateFlushDebounce = TimeSpan.FromSeconds(1);
-        private static readonly TimeSpan QueuePollInterval = TimeSpan.FromMilliseconds(1);
-
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<FileQueueEventJournal> _logger;
         private readonly string _queueDirectory;
@@ -51,6 +49,14 @@ namespace Locus.Storage
         private readonly JournalFormat _defaultFormat;
         private readonly IQueueEventJournalCodec _jsonCodec;
         private readonly IQueueEventJournalCodec _binaryCodec;
+        private long _observedAppendBatchCount;
+        private long _observedSingleRecordAppendBatchCount;
+        private long _observedMultiRecordAppendBatchCount;
+        private long _observedAppendedRecordCount;
+        private long _observedAppendedBytes;
+        private long _observedAppendTicks;
+        private long _observedFlushCount;
+        private long _observedFlushTicks;
         private int _stateFlushInProgress;
         private bool _disposed;
 
@@ -114,10 +120,21 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
         {
+            ThrowIfDisposed();
+
             if (record == null)
                 throw new ArgumentNullException(nameof(record));
 
-            return AppendBatchAsync(new[] { record }, ct);
+            ct.ThrowIfCancellationRequested();
+
+            var tenantId = ValidateAppendRecord(record, nameof(record));
+            var request = new PendingAppendRequest(CloneRecord(record), EstimateRecordSize(record));
+            GetOrCreateTenantWriter(tenantId).Enqueue(request);
+
+            if (_ackMode == QueueEventJournalAckMode.Async)
+                return Task.CompletedTask;
+
+            return request.Completion.Task;
         }
 
         /// <inheritdoc/>
@@ -130,6 +147,12 @@ namespace Locus.Storage
 
             if (records.Count == 0)
                 return;
+
+            if (records.Count == 1 && records[0] != null)
+            {
+                await AppendAsync(records[0], ct).ConfigureAwait(false);
+                return;
+            }
 
             ct.ThrowIfCancellationRequested();
 
@@ -198,7 +221,7 @@ namespace Locus.Storage
                 var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
                 if (result.EncounteredCorruptTail)
                 {
-                    QueueJournalMetrics.RecordCorruptTailDetected(codec.Format, "read");
+                    QueueJournalMetrics.RecordCorruptTailDetected();
                     _logger.LogWarning(
                         CorruptTailReadEventId,
                         "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
@@ -301,6 +324,22 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
             var state = LoadJournalState(tenantId);
             return Task.FromResult(state.BaseOffset);
+        }
+
+        /// <inheritdoc/>
+        public QueueJournalWritePathStatistics GetWritePathStatisticsSnapshot()
+        {
+            return new QueueJournalWritePathStatistics
+            {
+                AppendBatchCount = Interlocked.Read(ref _observedAppendBatchCount),
+                SingleRecordAppendBatchCount = Interlocked.Read(ref _observedSingleRecordAppendBatchCount),
+                MultiRecordAppendBatchCount = Interlocked.Read(ref _observedMultiRecordAppendBatchCount),
+                AppendedRecordCount = Interlocked.Read(ref _observedAppendedRecordCount),
+                AppendedBytes = Interlocked.Read(ref _observedAppendedBytes),
+                AppendTicks = Interlocked.Read(ref _observedAppendTicks),
+                FlushCount = Interlocked.Read(ref _observedFlushCount),
+                FlushTicks = Interlocked.Read(ref _observedFlushTicks),
+            };
         }
 
         private TenantWriterState GetOrCreateTenantWriter(string tenantId)
@@ -442,8 +481,17 @@ namespace Locus.Storage
                 if (remaining <= TimeSpan.Zero)
                     break;
 
-                var delay = remaining < QueuePollInterval ? remaining : QueuePollInterval;
-                await Task.Delay(delay, writer.Cancellation.Token).ConfigureAwait(false);
+                var signaled = await writer.Signal.WaitAsync(remaining, writer.Cancellation.Token).ConfigureAwait(false);
+                if (!signaled)
+                    break;
+
+                if (writer.PendingRequests.TryDequeue(out var nextRequest))
+                {
+                    batch.Add(nextRequest);
+                    totalRecords += nextRequest.RecordCount;
+                    totalBytes += nextRequest.EstimatedBytes;
+                    sawBacklog = true;
+                }
             }
 
             return batch;
@@ -490,37 +538,34 @@ namespace Locus.Storage
             {
                 var state = LoadJournalState(writer.TenantId);
                 await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
-                var serializedBatch = SerializeBatch(state, batch);
-                if (serializedBatch.TotalBytes == 0)
-                    return;
-
                 var stream = EnsureAppendStream(writer);
                 var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
-                if (serializedBatch.Records.Count == 1)
+                if (batch.Count == 1 && batch[0].TryGetSingleRecord(out var singleAppendRecord))
                 {
-                    var singleRecord = serializedBatch.Records[0].Bytes;
+                    var singleRecord = SerializeSingleRecord(state, singleAppendRecord);
                     await stream.WriteAsync(singleRecord, 0, singleRecord.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
                     state.TailOffset += singleRecord.Length;
                     MarkJournalStateDirty(writer.TenantId);
+                    var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
                     if (shouldFlushBeforeAck)
-                        await FlushAppendStreamCoreAsync(writer, "before_ack").ConfigureAwait(false);
+                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
                     else
                         writer.HasUnflushedData = true;
 
+                    var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(
-                        state.Format,
-                        _ackMode,
-                        batch.Count,
-                        serializedBatch.Records.Count,
                         singleRecord.Length,
-                        shouldFlushBeforeAck,
-                        "single_record",
-                        Stopwatch.GetTimestamp() - batchStartedAt);
+                        durationTicks);
+                    RecordObservedAppendBatch(recordCount: 1, totalBytes: singleRecord.Length, durationTicks: appendDurationTicks);
                     CompleteRequests(batch);
                     return;
                 }
+
+                var serializedBatch = SerializeBatch(state, batch);
+                if (serializedBatch.TotalBytes == 0)
+                    return;
 
                 var writeBuffer = ArrayPool<byte>.Shared.Rent(serializedBatch.TotalBytes);
                 try
@@ -536,21 +581,21 @@ namespace Locus.Storage
 
                     state.TailOffset += serializedBatch.TotalBytes;
                     MarkJournalStateDirty(writer.TenantId);
+                    var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
                     if (shouldFlushBeforeAck)
-                        await FlushAppendStreamCoreAsync(writer, "before_ack").ConfigureAwait(false);
+                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
                     else
                         writer.HasUnflushedData = true;
 
+                    var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(
-                        state.Format,
-                        _ackMode,
-                        batch.Count,
-                        serializedBatch.Records.Count,
                         serializedBatch.TotalBytes,
-                        shouldFlushBeforeAck,
-                        "buffered_batch",
-                        Stopwatch.GetTimestamp() - batchStartedAt);
+                        durationTicks);
+                    RecordObservedAppendBatch(
+                        recordCount: serializedBatch.Records.Count,
+                        totalBytes: serializedBatch.TotalBytes,
+                        durationTicks: appendDurationTicks);
                     CompleteRequests(batch);
                 }
                 finally
@@ -562,6 +607,14 @@ namespace Locus.Storage
             {
                 appendLock.Release();
             }
+        }
+
+        private byte[] SerializeSingleRecord(JournalState state, QueueEventRecord record)
+        {
+            var nextSequence = state.LastSequenceNumber + 1;
+            var bytes = GetCodec(state.Format).SerializeRecord(record, nextSequence);
+            state.LastSequenceNumber = nextSequence;
+            return bytes;
         }
 
         private SerializedBatch SerializeBatch(JournalState state, IReadOnlyList<PendingAppendRequest> batch)
@@ -577,6 +630,15 @@ namespace Locus.Storage
 
             foreach (var request in batch)
             {
+                if (request.TryGetSingleRecord(out var singleRecord))
+                {
+                    nextSequence++;
+                    var bytes = codec.SerializeRecord(singleRecord, nextSequence);
+                    serializedRecords.Add(new SerializedRecord(bytes));
+                    totalBytes += bytes.Length;
+                    continue;
+                }
+
                 foreach (var record in request.Records)
                 {
                     nextSequence++;
@@ -650,7 +712,7 @@ namespace Locus.Storage
             await appendLock.WaitAsync(writer.Cancellation.Token).ConfigureAwait(false);
             try
             {
-                await FlushAppendStreamCoreAsync(writer, "deferred").ConfigureAwait(false);
+                await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
             }
             finally
             {
@@ -658,20 +720,31 @@ namespace Locus.Storage
             }
         }
 
-        private async Task FlushAppendStreamCoreAsync(TenantWriterState writer, string reason)
+        private async Task FlushAppendStreamCoreAsync(TenantWriterState writer)
         {
-            var format = LoadJournalState(writer.TenantId).Format;
             var flushStartedAt = Stopwatch.GetTimestamp();
             if (writer.AppendStream != null)
                 await DurableFileWrite.FlushToDiskAsync(writer.AppendStream, writer.Cancellation.Token).ConfigureAwait(false);
 
             writer.HasUnflushedData = false;
             writer.LastFlushUtc = DateTime.UtcNow;
-            QueueJournalOperationMetrics.RecordFlush(
-                format,
-                _ackMode,
-                reason,
-                Stopwatch.GetTimestamp() - flushStartedAt);
+            var durationTicks = Stopwatch.GetTimestamp() - flushStartedAt;
+            QueueJournalOperationMetrics.RecordFlush(durationTicks);
+            Interlocked.Increment(ref _observedFlushCount);
+            Interlocked.Add(ref _observedFlushTicks, durationTicks);
+        }
+
+        private void RecordObservedAppendBatch(int recordCount, int totalBytes, long durationTicks)
+        {
+            Interlocked.Increment(ref _observedAppendBatchCount);
+            if (recordCount == 1)
+                Interlocked.Increment(ref _observedSingleRecordAppendBatchCount);
+            else
+                Interlocked.Increment(ref _observedMultiRecordAppendBatchCount);
+
+            Interlocked.Add(ref _observedAppendedRecordCount, recordCount);
+            Interlocked.Add(ref _observedAppendedBytes, totalBytes);
+            Interlocked.Add(ref _observedAppendTicks, durationTicks);
         }
 
         private void CompleteRequests(IReadOnlyList<PendingAppendRequest> batch)
@@ -694,28 +767,34 @@ namespace Locus.Storage
 
         private string ValidateAppendBatch(IReadOnlyList<QueueEventRecord> records)
         {
-            var tenantId = records[0]?.TenantId;
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(records));
-
-            ValidateTenantIdForPath(tenantId, nameof(records));
+            var tenantId = ValidateAppendRecord(records[0], nameof(records));
 
             for (var i = 0; i < records.Count; i++)
             {
-                var record = records[i] ?? throw new ArgumentException("Queue event record cannot be null.", nameof(records));
-                if (string.IsNullOrWhiteSpace(record.TenantId))
-                    throw new ArgumentException("TenantId cannot be empty", nameof(records));
-
-                ValidateTenantIdForPath(record.TenantId, nameof(records));
-
-                if (string.IsNullOrWhiteSpace(record.FileKey))
-                    throw new ArgumentException("FileKey cannot be empty", nameof(records));
+                var record = records[i];
+                ValidateAppendRecord(record, nameof(records));
 
                 if (!string.Equals(record.TenantId, tenantId, StringComparison.Ordinal))
                     throw new ArgumentException("All queue event records in a batch must belong to the same tenant.", nameof(records));
             }
 
             return tenantId!;
+        }
+
+        private static string ValidateAppendRecord(QueueEventRecord record, string paramName)
+        {
+            if (record == null)
+                throw new ArgumentException("Queue event record cannot be null.", paramName);
+
+            if (string.IsNullOrWhiteSpace(record.TenantId))
+                throw new ArgumentException("TenantId cannot be empty", paramName);
+
+            ValidateTenantIdForPath(record.TenantId, paramName);
+
+            if (string.IsNullOrWhiteSpace(record.FileKey))
+                throw new ArgumentException("FileKey cannot be empty", paramName);
+
+            return record.TenantId;
         }
 
         private static void ValidateTenantIdForPath(string? tenantId, string paramName)
@@ -917,7 +996,7 @@ namespace Locus.Storage
                 state.LastCorruptTailDetectedAtUtc = DateTime.UtcNow;
                 state.LastCorruptTailOffset = state.BaseOffset + expectedLength;
                 state.AutoRepairCount++;
-                QueueJournalMetrics.RecordCorruptTailAutoRepaired(state.Format);
+                QueueJournalMetrics.RecordCorruptTailAutoRepaired();
 
                 _logger.LogWarning(
                     CorruptTailTruncatedEventId,
@@ -1030,8 +1109,11 @@ namespace Locus.Storage
                 return;
             }
 
-            _dirtyStateTenants[tenantId] = 0;
+            var newlyDirty = _dirtyStateTenants.TryAdd(tenantId, 0);
             if (_disposed || _stateFlushTimer == null)
+                return;
+
+            if (!newlyDirty)
                 return;
 
             try
@@ -1165,7 +1247,7 @@ namespace Locus.Storage
                         state.CorruptTailDetected = true;
                         state.LastCorruptTailDetectedAtUtc = DateTime.UtcNow;
                         state.LastCorruptTailOffset = state.TailOffset;
-                        QueueJournalMetrics.RecordCorruptTailDetected(state.Format, "state_scan");
+                        QueueJournalMetrics.RecordCorruptTailDetected();
                         _logger.LogWarning(
                             CorruptTailStateScanEventId,
                             "Queue journal corrupt tail detected for tenant {TenantId} while loading state. Using recovered tail offset {TailOffset} for format {Format}.",
@@ -1188,20 +1270,55 @@ namespace Locus.Storage
 
         private sealed class PendingAppendRequest
         {
-            public PendingAppendRequest(IReadOnlyList<QueueEventRecord> records, int estimatedBytes)
+            private readonly IReadOnlyList<QueueEventRecord>? _records;
+            private readonly QueueEventRecord? _singleRecord;
+            private IReadOnlyList<QueueEventRecord>? _singleRecordWrapper;
+
+            public PendingAppendRequest(QueueEventRecord record, int estimatedBytes)
             {
-                Records = records ?? throw new ArgumentNullException(nameof(records));
+                _singleRecord = record ?? throw new ArgumentNullException(nameof(record));
                 EstimatedBytes = estimatedBytes;
                 Completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
             }
 
-            public IReadOnlyList<QueueEventRecord> Records { get; }
+            public PendingAppendRequest(IReadOnlyList<QueueEventRecord> records, int estimatedBytes)
+            {
+                _records = records ?? throw new ArgumentNullException(nameof(records));
+                EstimatedBytes = estimatedBytes;
+                Completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
 
-            public int RecordCount => Records.Count;
+            public IReadOnlyList<QueueEventRecord> Records
+            {
+                get
+                {
+                    if (_records != null)
+                        return _records;
+
+                    if (_singleRecordWrapper == null)
+                        _singleRecordWrapper = new[] { _singleRecord! };
+
+                    return _singleRecordWrapper;
+                }
+            }
+
+            public int RecordCount => _singleRecord != null ? 1 : _records!.Count;
 
             public int EstimatedBytes { get; }
 
             public TaskCompletionSource<object?> Completion { get; }
+
+            public bool TryGetSingleRecord(out QueueEventRecord record)
+            {
+                if (_singleRecord != null)
+                {
+                    record = _singleRecord;
+                    return true;
+                }
+
+                record = null!;
+                return false;
+            }
         }
 
         private sealed class TenantWriterState

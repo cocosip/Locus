@@ -64,35 +64,19 @@ namespace Locus.Storage
             unit: "{retry}",
             description: "Retry attempts used by successful or failed StoragePool writes.");
 
-        public static void RecordWriteStarted(string sourceKind, string acceptancePath, long? bytes)
+        public static void RecordWriteStarted(long? bytes)
         {
-            var tags = CreateCommonTags(
-                volumeId: null,
-                sourceKind,
-                acceptancePath,
-                retried: false);
-
-            WriteRequestCounter.Add(1, tags);
+            WriteRequestCounter.Add(1);
             if (bytes.HasValue && bytes.Value >= 0)
-                WriteBytesHistogram.Record(bytes.Value, tags);
+                WriteBytesHistogram.Record(bytes.Value);
         }
 
-        public static void RecordWriteRetry(string? volumeId, string sourceKind, string acceptancePath)
+        public static void RecordWriteRetry()
         {
-            WriteRetryCounter.Add(
-                1,
-                CreateCommonTags(
-                    volumeId,
-                    sourceKind,
-                    acceptancePath,
-                    retried: true));
+            WriteRetryCounter.Add(1);
         }
 
         public static void RecordWriteSucceeded(
-            string? volumeId,
-            string sourceKind,
-            string acceptancePath,
-            long? bytes,
             int retryCount,
             long totalDurationTicks,
             long tenantQuotaTicks,
@@ -101,11 +85,8 @@ namespace Locus.Storage
             long acceptanceTicks,
             long projectionEnqueueTicks)
         {
-            var tags = CreateCommonTags(volumeId, sourceKind, acceptancePath, retryCount > 0);
-
-            WriteSuccessCounter.Add(1, tags);
+            WriteSuccessCounter.Add(1);
             RecordDurations(
-                tags,
                 totalDurationTicks,
                 tenantQuotaTicks,
                 directoryQuotaTicks,
@@ -113,37 +94,26 @@ namespace Locus.Storage
                 acceptanceTicks,
                 projectionEnqueueTicks);
 
-            RetryCountHistogram.Record(retryCount, tags);
+            RetryCountHistogram.Record(retryCount);
         }
 
         public static void RecordWriteFailed(
-            string? volumeId,
-            string sourceKind,
-            string acceptancePath,
             string failureStage,
-            long? bytes,
             int retryCount,
             long totalDurationTicks,
             long tenantQuotaTicks,
             long directoryQuotaTicks,
             long volumeWriteTicks,
             long acceptanceTicks,
-            long projectionEnqueueTicks,
-            bool fileWritten,
-            bool acceptanceCompleted)
+            long projectionEnqueueTicks)
         {
-            var tags = CreateFailureTags(
-                volumeId,
-                sourceKind,
-                acceptancePath,
-                retryCount > 0,
-                failureStage,
-                fileWritten,
-                acceptanceCompleted);
-
-            WriteFailureCounter.Add(1, tags);
+            WriteFailureCounter.Add(
+                1,
+                new[]
+                {
+                    new KeyValuePair<string, object?>("failure_stage", failureStage),
+                });
             RecordDurations(
-                tags,
                 totalDurationTicks,
                 tenantQuotaTicks,
                 directoryQuotaTicks,
@@ -151,26 +121,30 @@ namespace Locus.Storage
                 acceptanceTicks,
                 projectionEnqueueTicks);
 
-            RetryCountHistogram.Record(retryCount, tags);
+            RetryCountHistogram.Record(retryCount);
         }
 
-        public static void RecordCleanupFailure(string stage, string? volumeId)
+        public static void RecordCleanupFailure(string stage)
         {
             CleanupFailureCounter.Add(
                 1,
-                new KeyValuePair<string, object?>("stage", stage),
-                new KeyValuePair<string, object?>("volume_id", volumeId ?? "unknown"));
+                new[]
+                {
+                    new KeyValuePair<string, object?>("stage", stage),
+                });
         }
 
         public static void RecordQuotaRollbackFailure(string scope)
         {
             QuotaRollbackFailureCounter.Add(
                 1,
-                new KeyValuePair<string, object?>("scope", scope));
+                new[]
+                {
+                    new KeyValuePair<string, object?>("scope", scope),
+                });
         }
 
         private static void RecordDurations(
-            KeyValuePair<string, object?>[] tags,
             long totalDurationTicks,
             long tenantQuotaTicks,
             long directoryQuotaTicks,
@@ -178,58 +152,22 @@ namespace Locus.Storage
             long acceptanceTicks,
             long projectionEnqueueTicks)
         {
-            WriteDurationHistogram.Record(ToMilliseconds(totalDurationTicks), tags);
+            WriteDurationHistogram.Record(ToMilliseconds(totalDurationTicks));
 
             if (tenantQuotaTicks > 0)
-                TenantQuotaDurationHistogram.Record(ToMilliseconds(tenantQuotaTicks), tags);
+                TenantQuotaDurationHistogram.Record(ToMilliseconds(tenantQuotaTicks));
 
             if (directoryQuotaTicks > 0)
-                DirectoryQuotaDurationHistogram.Record(ToMilliseconds(directoryQuotaTicks), tags);
+                DirectoryQuotaDurationHistogram.Record(ToMilliseconds(directoryQuotaTicks));
 
             if (volumeWriteTicks > 0)
-                VolumeWriteDurationHistogram.Record(ToMilliseconds(volumeWriteTicks), tags);
+                VolumeWriteDurationHistogram.Record(ToMilliseconds(volumeWriteTicks));
 
             if (acceptanceTicks > 0)
-                AcceptanceDurationHistogram.Record(ToMilliseconds(acceptanceTicks), tags);
+                AcceptanceDurationHistogram.Record(ToMilliseconds(acceptanceTicks));
 
             if (projectionEnqueueTicks > 0)
-                ProjectionEnqueueDurationHistogram.Record(ToMilliseconds(projectionEnqueueTicks), tags);
-        }
-
-        private static KeyValuePair<string, object?>[] CreateCommonTags(
-            string? volumeId,
-            string sourceKind,
-            string acceptancePath,
-            bool retried)
-        {
-            return new[]
-            {
-                new KeyValuePair<string, object?>("volume_id", volumeId ?? "unknown"),
-                new KeyValuePair<string, object?>("source_kind", sourceKind),
-                new KeyValuePair<string, object?>("acceptance_path", acceptancePath),
-                new KeyValuePair<string, object?>("retried", retried),
-            };
-        }
-
-        private static KeyValuePair<string, object?>[] CreateFailureTags(
-            string? volumeId,
-            string sourceKind,
-            string acceptancePath,
-            bool retried,
-            string failureStage,
-            bool fileWritten,
-            bool acceptanceCompleted)
-        {
-            return new[]
-            {
-                new KeyValuePair<string, object?>("volume_id", volumeId ?? "unknown"),
-                new KeyValuePair<string, object?>("source_kind", sourceKind),
-                new KeyValuePair<string, object?>("acceptance_path", acceptancePath),
-                new KeyValuePair<string, object?>("retried", retried),
-                new KeyValuePair<string, object?>("failure_stage", failureStage),
-                new KeyValuePair<string, object?>("file_written", fileWritten),
-                new KeyValuePair<string, object?>("acceptance_completed", acceptanceCompleted),
-            };
+                ProjectionEnqueueDurationHistogram.Record(ToMilliseconds(projectionEnqueueTicks));
         }
 
         private static double ToMilliseconds(long ticks)

@@ -57,7 +57,7 @@ namespace Locus.Benchmarks
             }
 
             Console.WriteLine(
-                $"Running {ScenarioName}: writes={options.WriteCount}, warmup={options.WarmupCount}, sizes=[{string.Join(", ", options.FileSizes)}], format={options.JournalFormat}, includeNoFlush={options.IncludeNoFlushScenario}, source={options.SourceKind}, volumeWriteBufferSize={options.VolumeWriteBufferSize}, volumeCopyBufferSize={options.VolumeCopyBufferSize}");
+                $"Running {ScenarioName}: writes={options.WriteCount}, warmup={options.WarmupCount}, sizes=[{string.Join(", ", options.FileSizes)}], format={options.JournalFormat}, ackModes=[{string.Join(", ", options.AckModes)}], includeNoFlush={options.IncludeNoFlushScenario}, source={options.SourceKind}, lingerMs={options.Linger.TotalMilliseconds:F0}, balancedFlushWindowMs={options.BalancedFlushWindow.TotalMilliseconds:F0}, maxBatchRecords={options.MaxBatchRecords}, maxBatchBytes={options.MaxBatchBytes}, volumeWriteBufferSize={options.VolumeWriteBufferSize}, volumeCopyBufferSize={options.VolumeCopyBufferSize}");
             Console.WriteLine();
 
             var scenarios = BuildScenarios(options);
@@ -92,20 +92,23 @@ namespace Locus.Benchmarks
 
         private static ScenarioDefinition[] BuildScenarios(WritePathBreakdownOptions options)
         {
-            var scenarios = new List<ScenarioDefinition>
-            {
-                new ScenarioDefinition(
-                    "durable-flush",
-                    forceFlushAfterWrite: true,
-                    journalFormat: options.JournalFormat),
-            };
-
-            if (options.IncludeNoFlushScenario)
+            var scenarios = new List<ScenarioDefinition>();
+            foreach (var ackMode in options.AckModes)
             {
                 scenarios.Add(new ScenarioDefinition(
-                    "no-volume-flush",
-                    forceFlushAfterWrite: false,
-                    journalFormat: options.JournalFormat));
+                    $"{ackMode.ToString().ToLowerInvariant()}-flush",
+                    forceFlushAfterWrite: true,
+                    journalFormat: options.JournalFormat,
+                    ackMode: ackMode));
+
+                if (options.IncludeNoFlushScenario)
+                {
+                    scenarios.Add(new ScenarioDefinition(
+                        $"{ackMode.ToString().ToLowerInvariant()}-no-volume-flush",
+                        forceFlushAfterWrite: false,
+                        journalFormat: options.JournalFormat,
+                        ackMode: ackMode));
+                }
             }
 
             return scenarios.ToArray();
@@ -155,7 +158,7 @@ namespace Locus.Benchmarks
 
             var projectionWriteStore = new MeasuringProjectionWriteStore(
                 new MetadataRepositoryQueueProjectionWriteStore(metadataRepository),
-                measurements.ProjectionEnqueue);
+                measurements);
 
             var queueJournal = new MeasuringQueueEventJournal(
                 new FileQueueEventJournal(
@@ -165,15 +168,17 @@ namespace Locus.Benchmarks
                     {
                         QueueDirectory = queueDirectory,
                         JournalFormat = scenario.JournalFormat,
-                        AckMode = QueueEventJournalAckMode.Durable,
+                        AckMode = scenario.AckMode,
                         StateFlushDebounce = TimeSpan.FromSeconds(1),
-                        Linger = TimeSpan.FromMilliseconds(1),
-                        MaxBatchRecords = 16,
-                        MaxBatchBytes = 256 * 1024,
+                        Linger = options.Linger,
+                        MaxBatchRecords = options.MaxBatchRecords,
+                        MaxBatchBytes = options.MaxBatchBytes,
                         WriterIdleTimeout = TimeSpan.FromSeconds(30),
-                        BalancedFlushWindow = TimeSpan.FromMilliseconds(5),
+                        BalancedFlushWindow = options.BalancedFlushWindow,
                     }),
-                measurements.QueueJournal);
+                measurements.QueueJournal,
+                measurements.QueueJournalAppend,
+                measurements.QueueJournalFlush);
 
             var fileScheduler = new Mock<IFileScheduler>();
             var storagePool = new StoragePool(
@@ -196,7 +201,13 @@ namespace Locus.Benchmarks
                     writeBufferSize: options.VolumeWriteBufferSize,
                     copyBufferSize: options.VolumeCopyBufferSize,
                     forceFlushAfterWrite: scenario.ForceFlushAfterWrite),
-                measurements.VolumeWrite);
+                measurements.VolumeWrite,
+                measurements.VolumeWriteDirectoryPrepare,
+                measurements.VolumeWriteOpenStream,
+                measurements.VolumeWriteCopy,
+                measurements.VolumeWriteCopyTo,
+                measurements.VolumeWriteCopyLoop,
+                measurements.VolumeWriteFlush);
 
             await storagePool.AddVolumeAsync(volume, initialDelayMs: 0, healthCheckDelayMs: 0, ct: CancellationToken.None)
                 .ConfigureAwait(false);
@@ -247,7 +258,7 @@ namespace Locus.Benchmarks
                 : 0;
 
             Console.WriteLine(
-                $"Scenario={scenario.Name}, forceFlushAfterWrite={scenario.ForceFlushAfterWrite}, journalFormat={scenario.JournalFormat}");
+                $"Scenario={scenario.Name}, forceFlushAfterWrite={scenario.ForceFlushAfterWrite}, journalFormat={scenario.JournalFormat}, ackMode={scenario.AckMode}");
             Console.WriteLine(
                 $"  Total:            avg={FormatTime(totalStopwatchTicks / (double)writeCount),10}  total={elapsed.TotalMilliseconds,10:F2} ms  throughput={throughput,8:F2} MiB/s");
 
@@ -255,8 +266,23 @@ namespace Locus.Benchmarks
             PrintPhase("Tenant quota", measurements.TenantQuota.TotalTicks, writeCount, totalTicks);
             PrintPhase("Directory quota", measurements.DirectoryQuota.TotalTicks, writeCount, totalTicks);
             PrintPhase("Volume write", measurements.VolumeWrite.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Volume dir prep", measurements.VolumeWriteDirectoryPrepare.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Volume open", measurements.VolumeWriteOpenStream.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Volume copy", measurements.VolumeWriteCopy.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Volume CopyTo", measurements.VolumeWriteCopyTo.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Volume loop", measurements.VolumeWriteCopyLoop.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Volume flush", measurements.VolumeWriteFlush.TotalTicks, writeCount, totalTicks);
             PrintPhase("Queue journal", measurements.QueueJournal.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Queue append", measurements.QueueJournalAppend.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Queue flush", measurements.QueueJournalFlush.TotalTicks, writeCount, totalTicks);
             PrintPhase("Projection enqueue", measurements.ProjectionEnqueue.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection validate", measurements.ProjectionValidation.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection cache/index", measurements.ProjectionCacheAndIndex.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection cache mutate", measurements.ProjectionCacheMutation.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection path index", measurements.ProjectionPhysicalPathIndex.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection pending", measurements.ProjectionPendingQueue.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection status index", measurements.ProjectionStatusIndex.TotalTicks, writeCount, totalTicks);
+            PrintPhase("Projection enqueue persistence", measurements.ProjectionPersistenceEnqueue.TotalTicks, writeCount, totalTicks);
             PrintPhase("Untracked", untrackedTicks, writeCount, totalTicks);
         }
 
@@ -300,6 +326,11 @@ namespace Locus.Benchmarks
                 FileSizes = new[] { 4 * 1024, 16 * 1024, 64 * 1024 },
                 JournalFormat = JournalFormat.BinaryV1,
                 IncludeNoFlushScenario = true,
+                AckModes = new[] { QueueEventJournalAckMode.Durable },
+                Linger = TimeSpan.FromMilliseconds(1),
+                BalancedFlushWindow = TimeSpan.FromMilliseconds(5),
+                MaxBatchRecords = 16,
+                MaxBatchBytes = 256 * 1024,
                 VolumeWriteBufferSize = 128 * 1024,
                 VolumeCopyBufferSize = 256 * 1024,
             };
@@ -388,6 +419,25 @@ namespace Locus.Benchmarks
                     continue;
                 }
 
+                if (string.Equals(arg, "--ack-mode", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(arg, "--ack-modes", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadValue(args, ref i, out var rawAckModes))
+                    {
+                        error = "Missing value for --ack-mode.";
+                        return false;
+                    }
+
+                    if (!TryParseAckModes(rawAckModes, out var ackModes))
+                    {
+                        error = "Invalid value for --ack-mode. Supported values: durable, balanced, async.";
+                        return false;
+                    }
+
+                    options.AckModes = ackModes;
+                    continue;
+                }
+
                 if (string.Equals(arg, "--include-no-flush", StringComparison.OrdinalIgnoreCase))
                 {
                     if (!TryReadBool(args, ref i, out var includeNoFlush))
@@ -422,6 +472,54 @@ namespace Locus.Benchmarks
                         return false;
                     }
 
+                    continue;
+                }
+
+                if (string.Equals(arg, "--linger-ms", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadInt(args, ref i, out var lingerMs) || lingerMs < 0)
+                    {
+                        error = "Missing or invalid value for --linger-ms.";
+                        return false;
+                    }
+
+                    options.Linger = TimeSpan.FromMilliseconds(lingerMs);
+                    continue;
+                }
+
+                if (string.Equals(arg, "--balanced-flush-window-ms", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadInt(args, ref i, out var balancedFlushWindowMs) || balancedFlushWindowMs < 0)
+                    {
+                        error = "Missing or invalid value for --balanced-flush-window-ms.";
+                        return false;
+                    }
+
+                    options.BalancedFlushWindow = TimeSpan.FromMilliseconds(balancedFlushWindowMs);
+                    continue;
+                }
+
+                if (string.Equals(arg, "--max-batch-records", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadInt(args, ref i, out var maxBatchRecords) || maxBatchRecords <= 0)
+                    {
+                        error = "Missing or invalid value for --max-batch-records.";
+                        return false;
+                    }
+
+                    options.MaxBatchRecords = maxBatchRecords;
+                    continue;
+                }
+
+                if (string.Equals(arg, "--max-batch-bytes", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryReadInt(args, ref i, out var maxBatchBytes) || maxBatchBytes <= 0)
+                    {
+                        error = "Missing or invalid value for --max-batch-bytes.";
+                        return false;
+                    }
+
+                    options.MaxBatchBytes = maxBatchBytes;
                     continue;
                 }
 
@@ -462,6 +560,12 @@ namespace Locus.Benchmarks
                 return false;
             }
 
+            if (options.AckModes.Length == 0)
+            {
+                error = "--ack-mode must contain at least one mode.";
+                return false;
+            }
+
             return true;
         }
 
@@ -494,6 +598,42 @@ namespace Locus.Benchmarks
             return true;
         }
 
+        private static bool TryParseAckModes(string rawValue, out QueueEventJournalAckMode[] ackModes)
+        {
+            var parsedModes = rawValue
+                .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => value.Trim())
+                .Where(value => value.Length > 0)
+                .Select(ParseAckMode)
+                .ToArray();
+
+            if (parsedModes.Length == 0 || parsedModes.Any(mode => !mode.HasValue))
+            {
+                ackModes = Array.Empty<QueueEventJournalAckMode>();
+                return false;
+            }
+
+            ackModes = parsedModes
+                .Select(mode => mode!.Value)
+                .Distinct()
+                .ToArray();
+            return true;
+        }
+
+        private static QueueEventJournalAckMode? ParseAckMode(string value)
+        {
+            if (string.Equals(value, "durable", StringComparison.OrdinalIgnoreCase))
+                return QueueEventJournalAckMode.Durable;
+
+            if (string.Equals(value, "balanced", StringComparison.OrdinalIgnoreCase))
+                return QueueEventJournalAckMode.Balanced;
+
+            if (string.Equals(value, "async", StringComparison.OrdinalIgnoreCase))
+                return QueueEventJournalAckMode.Async;
+
+            return null;
+        }
+
         private static void PrintUsage()
         {
             Console.WriteLine("Usage:");
@@ -503,8 +643,13 @@ namespace Locus.Benchmarks
             Console.WriteLine("  --warmup <count>              Number of warmup writes before measurement. Default: 30");
             Console.WriteLine("  --sizes <csv>                 Comma-separated file sizes in bytes. Default: 4096,16384,65536");
             Console.WriteLine("  --format <binary|json>        Queue journal format. Default: binary");
+            Console.WriteLine("  --ack-mode <csv>              Queue journal ack mode(s): durable,balanced,async. Default: durable");
             Console.WriteLine("  --include-no-flush <bool>     Also run forceFlushAfterWrite=false scenario. Default: true");
             Console.WriteLine("  --source <memory|file>        Benchmark input stream type. Default: memory");
+            Console.WriteLine("  --linger-ms <ms>              Queue journal linger window in milliseconds. Default: 1");
+            Console.WriteLine("  --balanced-flush-window-ms <ms>  Balanced ack flush window in milliseconds. Default: 5");
+            Console.WriteLine("  --max-batch-records <count>   Queue journal max coalesced records per batch. Default: 16");
+            Console.WriteLine("  --max-batch-bytes <bytes>     Queue journal max coalesced bytes per batch. Default: 262144");
             Console.WriteLine("  --volume-write-buffer-size <bytes>  LocalFileSystemVolume write stream buffer size. Default: 131072");
             Console.WriteLine("  --volume-copy-buffer-size <bytes>   LocalFileSystemVolume pooled copy buffer size. Default: 262144");
         }
@@ -521,7 +666,17 @@ namespace Locus.Benchmarks
 
             public bool IncludeNoFlushScenario { get; set; }
 
+            public QueueEventJournalAckMode[] AckModes { get; set; } = Array.Empty<QueueEventJournalAckMode>();
+
             public SourceKind SourceKind { get; set; } = SourceKind.Memory;
+
+            public TimeSpan Linger { get; set; }
+
+            public TimeSpan BalancedFlushWindow { get; set; }
+
+            public int MaxBatchRecords { get; set; }
+
+            public int MaxBatchBytes { get; set; }
 
             public int VolumeWriteBufferSize { get; set; }
 
@@ -536,11 +691,12 @@ namespace Locus.Benchmarks
 
         private sealed class ScenarioDefinition
         {
-            public ScenarioDefinition(string name, bool forceFlushAfterWrite, JournalFormat journalFormat)
+            public ScenarioDefinition(string name, bool forceFlushAfterWrite, JournalFormat journalFormat, QueueEventJournalAckMode ackMode)
             {
                 Name = name;
                 ForceFlushAfterWrite = forceFlushAfterWrite;
                 JournalFormat = journalFormat;
+                AckMode = ackMode;
             }
 
             public string Name { get; }
@@ -548,6 +704,8 @@ namespace Locus.Benchmarks
             public bool ForceFlushAfterWrite { get; }
 
             public JournalFormat JournalFormat { get; }
+
+            public QueueEventJournalAckMode AckMode { get; }
         }
 
         private sealed class ScenarioContext : IDisposable
@@ -639,8 +797,23 @@ namespace Locus.Benchmarks
                 TenantQuota = new Measurement();
                 DirectoryQuota = new Measurement();
                 VolumeWrite = new Measurement();
+                VolumeWriteDirectoryPrepare = new Measurement();
+                VolumeWriteOpenStream = new Measurement();
+                VolumeWriteCopy = new Measurement();
+                VolumeWriteCopyTo = new Measurement();
+                VolumeWriteCopyLoop = new Measurement();
+                VolumeWriteFlush = new Measurement();
                 QueueJournal = new Measurement();
+                QueueJournalAppend = new Measurement();
+                QueueJournalFlush = new Measurement();
                 ProjectionEnqueue = new Measurement();
+                ProjectionValidation = new Measurement();
+                ProjectionCacheAndIndex = new Measurement();
+                ProjectionCacheMutation = new Measurement();
+                ProjectionPhysicalPathIndex = new Measurement();
+                ProjectionPendingQueue = new Measurement();
+                ProjectionStatusIndex = new Measurement();
+                ProjectionPersistenceEnqueue = new Measurement();
             }
 
             public Measurement TenantValidation { get; }
@@ -651,9 +824,39 @@ namespace Locus.Benchmarks
 
             public Measurement VolumeWrite { get; }
 
+            public Measurement VolumeWriteDirectoryPrepare { get; }
+
+            public Measurement VolumeWriteOpenStream { get; }
+
+            public Measurement VolumeWriteCopy { get; }
+
+            public Measurement VolumeWriteCopyTo { get; }
+
+            public Measurement VolumeWriteCopyLoop { get; }
+
+            public Measurement VolumeWriteFlush { get; }
+
             public Measurement QueueJournal { get; }
 
+            public Measurement QueueJournalAppend { get; }
+
+            public Measurement QueueJournalFlush { get; }
+
             public Measurement ProjectionEnqueue { get; }
+
+            public Measurement ProjectionValidation { get; }
+
+            public Measurement ProjectionCacheAndIndex { get; }
+
+            public Measurement ProjectionCacheMutation { get; }
+
+            public Measurement ProjectionPhysicalPathIndex { get; }
+
+            public Measurement ProjectionPendingQueue { get; }
+
+            public Measurement ProjectionStatusIndex { get; }
+
+            public Measurement ProjectionPersistenceEnqueue { get; }
 
             public long TotalTrackedTicks =>
                 TenantValidation.TotalTicks
@@ -669,8 +872,23 @@ namespace Locus.Benchmarks
                 TenantQuota.Reset();
                 DirectoryQuota.Reset();
                 VolumeWrite.Reset();
+                VolumeWriteDirectoryPrepare.Reset();
+                VolumeWriteOpenStream.Reset();
+                VolumeWriteCopy.Reset();
+                VolumeWriteCopyTo.Reset();
+                VolumeWriteCopyLoop.Reset();
+                VolumeWriteFlush.Reset();
                 QueueJournal.Reset();
+                QueueJournalAppend.Reset();
+                QueueJournalFlush.Reset();
                 ProjectionEnqueue.Reset();
+                ProjectionValidation.Reset();
+                ProjectionCacheAndIndex.Reset();
+                ProjectionCacheMutation.Reset();
+                ProjectionPhysicalPathIndex.Reset();
+                ProjectionPendingQueue.Reset();
+                ProjectionStatusIndex.Reset();
+                ProjectionPersistenceEnqueue.Reset();
             }
         }
 
@@ -880,11 +1098,31 @@ namespace Locus.Benchmarks
         {
             private readonly IStorageVolume _inner;
             private readonly Measurement _measurement;
+            private readonly Measurement _directoryPrepareMeasurement;
+            private readonly Measurement _openStreamMeasurement;
+            private readonly Measurement _copyMeasurement;
+            private readonly Measurement _copyToMeasurement;
+            private readonly Measurement _copyLoopMeasurement;
+            private readonly Measurement _flushMeasurement;
 
-            public MeasuringStorageVolume(IStorageVolume inner, Measurement measurement)
+            public MeasuringStorageVolume(
+                IStorageVolume inner,
+                Measurement measurement,
+                Measurement directoryPrepareMeasurement,
+                Measurement openStreamMeasurement,
+                Measurement copyMeasurement,
+                Measurement copyToMeasurement,
+                Measurement copyLoopMeasurement,
+                Measurement flushMeasurement)
             {
                 _inner = inner;
                 _measurement = measurement;
+                _directoryPrepareMeasurement = directoryPrepareMeasurement;
+                _openStreamMeasurement = openStreamMeasurement;
+                _copyMeasurement = copyMeasurement;
+                _copyToMeasurement = copyToMeasurement;
+                _copyLoopMeasurement = copyLoopMeasurement;
+                _flushMeasurement = flushMeasurement;
             }
 
             public string VolumeId => _inner.VolumeId;
@@ -906,6 +1144,7 @@ namespace Locus.Benchmarks
 
             public async Task WriteAsync(string path, Stream content, CancellationToken ct = default)
             {
+                var beforeSnapshot = (_inner as IStorageVolumeWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
                 var started = Stopwatch.GetTimestamp();
                 try
                 {
@@ -914,6 +1153,16 @@ namespace Locus.Benchmarks
                 finally
                 {
                     _measurement.Add(Stopwatch.GetTimestamp() - started);
+                    var afterSnapshot = (_inner as IStorageVolumeWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
+                    if (beforeSnapshot != null && afterSnapshot != null)
+                    {
+                        _directoryPrepareMeasurement.Add(Math.Max(0L, afterSnapshot.DirectoryPreparationTicks - beforeSnapshot.DirectoryPreparationTicks));
+                        _openStreamMeasurement.Add(Math.Max(0L, afterSnapshot.OpenStreamTicks - beforeSnapshot.OpenStreamTicks));
+                        _copyMeasurement.Add(Math.Max(0L, afterSnapshot.CopyTicks - beforeSnapshot.CopyTicks));
+                        _copyToMeasurement.Add(Math.Max(0L, afterSnapshot.SynchronousSeekableFileCopyToTicks - beforeSnapshot.SynchronousSeekableFileCopyToTicks));
+                        _copyLoopMeasurement.Add(Math.Max(0L, afterSnapshot.SynchronousSeekableFileLoopTicks - beforeSnapshot.SynchronousSeekableFileLoopTicks));
+                        _flushMeasurement.Add(Math.Max(0L, afterSnapshot.FlushTicks - beforeSnapshot.FlushTicks));
+                    }
                 }
             }
 
@@ -947,15 +1196,24 @@ namespace Locus.Benchmarks
         {
             private readonly IQueueEventJournal _inner;
             private readonly Measurement _measurement;
+            private readonly Measurement _appendMeasurement;
+            private readonly Measurement _flushMeasurement;
 
-            public MeasuringQueueEventJournal(IQueueEventJournal inner, Measurement measurement)
+            public MeasuringQueueEventJournal(
+                IQueueEventJournal inner,
+                Measurement measurement,
+                Measurement appendMeasurement,
+                Measurement flushMeasurement)
             {
                 _inner = inner;
                 _measurement = measurement;
+                _appendMeasurement = appendMeasurement;
+                _flushMeasurement = flushMeasurement;
             }
 
             public async Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
             {
+                var beforeSnapshot = (_inner as IQueueEventJournalWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
                 var started = Stopwatch.GetTimestamp();
                 try
                 {
@@ -964,11 +1222,13 @@ namespace Locus.Benchmarks
                 finally
                 {
                     _measurement.Add(Stopwatch.GetTimestamp() - started);
+                    RecordSubphases(beforeSnapshot);
                 }
             }
 
             public async Task AppendBatchAsync(IReadOnlyList<QueueEventRecord> records, CancellationToken ct = default)
             {
+                var beforeSnapshot = (_inner as IQueueEventJournalWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
                 var started = Stopwatch.GetTimestamp();
                 try
                 {
@@ -977,6 +1237,7 @@ namespace Locus.Benchmarks
                 finally
                 {
                     _measurement.Add(Stopwatch.GetTimestamp() - started);
+                    RecordSubphases(beforeSnapshot);
                 }
             }
 
@@ -1010,21 +1271,32 @@ namespace Locus.Benchmarks
                 if (_inner is IDisposable disposable)
                     disposable.Dispose();
             }
+
+            private void RecordSubphases(QueueJournalWritePathStatistics? beforeSnapshot)
+            {
+                var afterSnapshot = (_inner as IQueueEventJournalWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
+                if (beforeSnapshot == null || afterSnapshot == null)
+                    return;
+
+                _appendMeasurement.Add(Math.Max(0L, afterSnapshot.AppendTicks - beforeSnapshot.AppendTicks));
+                _flushMeasurement.Add(Math.Max(0L, afterSnapshot.FlushTicks - beforeSnapshot.FlushTicks));
+            }
         }
 
         private sealed class MeasuringProjectionWriteStore : IQueueProjectionWriteStore
         {
             private readonly IQueueProjectionWriteStore _inner;
-            private readonly Measurement _measurement;
+            private readonly MeasurementSet _measurements;
 
-            public MeasuringProjectionWriteStore(IQueueProjectionWriteStore inner, Measurement measurement)
+            public MeasuringProjectionWriteStore(IQueueProjectionWriteStore inner, MeasurementSet measurements)
             {
                 _inner = inner;
-                _measurement = measurement;
+                _measurements = measurements;
             }
 
             public async Task QueueProjectedFileAsync(FileMetadata metadata, CancellationToken ct = default)
             {
+                var beforeSnapshot = (_inner as IQueueProjectionWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
                 var started = Stopwatch.GetTimestamp();
                 try
                 {
@@ -1032,8 +1304,24 @@ namespace Locus.Benchmarks
                 }
                 finally
                 {
-                    _measurement.Add(Stopwatch.GetTimestamp() - started);
+                    _measurements.ProjectionEnqueue.Add(Stopwatch.GetTimestamp() - started);
+                    RecordSubphases(beforeSnapshot);
                 }
+            }
+
+            private void RecordSubphases(QueueProjectionWritePathStatistics? beforeSnapshot)
+            {
+                var afterSnapshot = (_inner as IQueueProjectionWritePathDiagnostics)?.GetWritePathStatisticsSnapshot();
+                if (beforeSnapshot == null || afterSnapshot == null)
+                    return;
+
+                _measurements.ProjectionValidation.Add(Math.Max(0L, afterSnapshot.ValidationTicks - beforeSnapshot.ValidationTicks));
+                _measurements.ProjectionCacheAndIndex.Add(Math.Max(0L, afterSnapshot.CacheAndIndexTicks - beforeSnapshot.CacheAndIndexTicks));
+                _measurements.ProjectionCacheMutation.Add(Math.Max(0L, afterSnapshot.CacheMutationTicks - beforeSnapshot.CacheMutationTicks));
+                _measurements.ProjectionPhysicalPathIndex.Add(Math.Max(0L, afterSnapshot.PhysicalPathIndexTicks - beforeSnapshot.PhysicalPathIndexTicks));
+                _measurements.ProjectionPendingQueue.Add(Math.Max(0L, afterSnapshot.PendingQueueTicks - beforeSnapshot.PendingQueueTicks));
+                _measurements.ProjectionStatusIndex.Add(Math.Max(0L, afterSnapshot.StatusIndexTicks - beforeSnapshot.StatusIndexTicks));
+                _measurements.ProjectionPersistenceEnqueue.Add(Math.Max(0L, afterSnapshot.PersistenceEnqueueTicks - beforeSnapshot.PersistenceEnqueueTicks));
             }
         }
     }

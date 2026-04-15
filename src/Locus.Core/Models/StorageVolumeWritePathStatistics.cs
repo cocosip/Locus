@@ -59,5 +59,65 @@ namespace Locus.Core.Models
         /// Gets or sets the number of non-seekable source writes.
         /// </summary>
         public long NonSeekableWrites { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of observed directory-preparation phases.
+        /// </summary>
+        public long DirectoryPreparationCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total stopwatch ticks spent preparing destination directories.
+        /// </summary>
+        public long DirectoryPreparationTicks { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of observed destination-stream open phases.
+        /// </summary>
+        public long OpenStreamCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total stopwatch ticks spent opening destination streams.
+        /// </summary>
+        public long OpenStreamTicks { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of observed write copy operations.
+        /// </summary>
+        public long CopyOperationCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total stopwatch ticks spent in copy operations.
+        /// </summary>
+        public long CopyTicks { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of seekable FileStream copy operations that used Stream.CopyTo.
+        /// </summary>
+        public long SynchronousSeekableFileCopyToOperationCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total stopwatch ticks spent in seekable FileStream CopyTo operations.
+        /// </summary>
+        public long SynchronousSeekableFileCopyToTicks { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of seekable copy operations that used the manual buffer loop.
+        /// </summary>
+        public long SynchronousSeekableFileLoopOperationCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total stopwatch ticks spent in seekable manual buffer-loop copies.
+        /// </summary>
+        public long SynchronousSeekableFileLoopTicks { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of observed flush operations.
+        /// </summary>
+        public long FlushOperationCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total stopwatch ticks spent in flush operations.
+        /// </summary>
+        public long FlushTicks { get; set; }
     }
 }

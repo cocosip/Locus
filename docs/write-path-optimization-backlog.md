@@ -68,14 +68,65 @@
 - flush 触发频率是否过高
 - 单 tenant 写入是否形成小 batch、频繁 flush
 
+建议优先使用下面这条 benchmark 命令做本地对比：
+
+```powershell
+dotnet run -c Release --project tests/Locus.Benchmarks -- write-path-breakdown --writes 60 --warmup 10 --sizes 262144,1048576,8388608 --ack-mode durable,balanced --include-no-flush false --source file
+```
+
+补充一轮 `LocalFileSystemVolume` 写入路径优化后的本地样本（2026-04-15，`BinaryV1`，`file source`，`forceFlushAfterWrite=true`）：
+
+- `write-path-breakdown --writes 120 --warmup 20 --sizes 262144,1048576 --ack-mode durable --include-no-flush false --source file`
+- `256KiB`：`Durable` 约 `1.329 ms`，其中 `volume_write` 约 `1.091 ms`，`queue journal` 约 `130.2 us`
+- `1MiB`：`Durable` 约 `1.936 ms`，其中 `volume_write` 约 `1.667 ms`，`queue journal` 约 `151.2 us`
+- 相比上一轮 queue journal hot path 优化后的样本，`256KiB` 再次明显下降，说明 `volume_write` 侧仍有可收割的固定成本
+- `1MiB` 基本持平，说明当前主热点已更偏向真实 `FileStream` copy / 目录创建，而不是 accepted path 或 queue journal
+
+这轮 `LocalFileSystemVolume` 的有效改动点：
+
+- 可见 `MemoryStream` 的异步直写路径不再按 `_copyBufferSize` 分段循环，而是改成单次 `WriteAsync`
+- 直写路径只在写入成功后推进 `MemoryStream.Position`，避免异常时源流位置提前漂移
+- `FileStream` 只有在 `> 1MiB` 时才走 synchronous seekable file path，`= 1MiB` 会回到 exact-copy 小文件路径
+- `MockFileSystem` 检测改为构造期缓存，减少每次创建写入流时的重复类型检查
+
+建议配合下面这条命令单独观察异步直写内存流收益：
+
+```powershell
+dotnet run -c Release --project tests/Locus.Benchmarks -- direct-volume-breakdown --writes 120 --warmup 20 --sizes 1048897 --include-no-flush false --stream-modes visible-direct,visible-wrapped
+```
+
+当前本地样本显示：
+
+- 在 `1048897 bytes`（略大于 `1MiB`）时，`visible-direct` 已稳定优于 `visible-wrapped`
+- 例如 `depth2-random-precreated` 下，`visible-direct` 约 `761.1 us`，`visible-wrapped` 约 `1.989 ms`
+- 这说明“大块连续内存被拆成多次 `WriteAsync`”原本确实是一个真实热点
+- 但对主链路 `file source` 来说，后续若继续推进，应优先盯住 `FileStream` copy 与 cold directory 成本，而不是回到更激进的 buffer 调参
+
+补充一轮 seekable copy 分界细化后的本地样本（2026-04-15，同样基于 `BinaryV1` + `file source` + `forceFlushAfterWrite=true`）：
+
+- 非 direct-memory 的 seekable stream 在 `<= 2MiB` 时改走 exact-copy path，只有 direct-memory 继续保持 `<= 1MiB` 同步、`> 1MiB` 异步直写
+- `write-path-breakdown --writes 120 --warmup 20 --sizes 262144,1048576,2097152 --ack-mode durable --include-no-flush false --source file`
+- `256KiB`：约 `1.467 ms`，`volume_write` 约 `1.201 ms`
+- `1MiB`：约 `1.864 ms`，`volume_write` 约 `1.561 ms`
+- `2MiB`：约 `2.176 ms`，`volume_write` 约 `1.901 ms`
+- 对比上一轮样本，`1MiB` 的 file-source 主链路继续下降，说明 `FileStream` / seekable copy 路径仍然存在可收割收益
+- `direct-volume-breakdown --sizes 1048897,2097152 --stream-modes visible-direct,visible-wrapped` 也显示 `visible-wrapped` 在 `1MiB~2MiB` 区间明显改善，例如 `1048897 bytes` 的 `depth2-random-precreated` 从约 `1.989 ms` 降到约 `1.185 ms`
+- 当前剩余的更稳定热点仍是 cold directory 创建成本，以及更大文件下的真实 `FileStream` copy 成本
+
+完成单条 append hot path 优化后的本地刷新样本（2026-04-15，`BinaryV1`，`file source`，`forceFlushAfterWrite=true`）：
+
+- `256KiB`：`Durable` 约 `1.513 ms`，`Balanced` 约 `1.626 ms`
+- `1MiB`：`Durable` 约 `1.900 ms`，`Balanced` 约 `1.870 ms`
+- `8MiB`：`Durable` 约 `5.567 ms`，`Balanced` 约 `5.928 ms`
+- 相比优化前，这说明 queue journal 单条 append 的固定成本已经明显下降，`Durable` 与 `Balanced` 的差距被大幅缩小
+- 在这组更新后的样本里，`volume_write` 又重新回到主导位置，`Queue journal` 已经不再是最突出的单段瓶颈
+- 在当前这组更新后的本地样本里，`Balanced` 已经不再呈现稳定优势，因此仍然不建议仅凭本地 benchmark 就切换默认生产 `AckMode`
+
 建议先看这些指标：
 
 - `locus.queue_journal.append.batch.count`
-- `locus.queue_journal.append.record.count`
-- `locus.queue_journal.append.request_batch_size`
 - `locus.queue_journal.append.bytes`
 - `locus.queue_journal.append.duration`
-- `locus.queue_journal.append.deferred_ack.count`
 - `locus.queue_journal.flush.count`
 - `locus.queue_journal.flush.duration`
 
@@ -91,6 +142,13 @@
 - 调整 `MaxBatchRecords`
 - 调整 `MaxBatchBytes`
 - 评估特定场景下是否允许 `Balanced` 作为可选模式
+
+现有本地窗口扫描样本（2026-04-15，`Balanced`，`file source`，`forceFlushAfterWrite=true`）：
+
+- `BalancedFlushWindow=5ms` 在已扫描的 `0ms / 1ms / 5ms / 10ms` 中更稳
+- `0ms` 明显退化，尤其在 `256KiB` 下会把 `Queue journal` 开销抬得更高
+- 这说明 `Balanced` 的收益并不是“窗口越小越好”，后续应继续按 workload 做窗口扫描
+- 由于后面又做了单条 append hot path 优化，若要决定默认值，建议基于当前代码再补一轮窗口复测
 
 ### 2. `StoragePool.WriteFileAsync` 的 accepted path
 
@@ -112,6 +170,9 @@
 - `locus.storage_pool.write.volume_write.duration`
 - `locus.storage_pool.write.acceptance.duration`
 - `locus.storage_pool.write.projection_enqueue.duration`
+
+如果需要继续拆开 `acceptance` 内部阶段，优先再看这些更细的子阶段指标：
+
 
 如果 `acceptance.duration` 长期偏高，应优先判断：
 
