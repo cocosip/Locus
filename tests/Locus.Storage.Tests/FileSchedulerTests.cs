@@ -85,10 +85,7 @@ namespace Locus.Storage.Tests
             TimeSpan? cooldown = null,
             IProcessingTimeoutRecoveryCoordinator? coordinator = null)
         {
-            var recoveryService = new ProcessingTimeoutRecoveryService(
-                new MetadataRepositoryQueueProjectionCleanupStore(_repository),
-                coordinator ?? new ProcessingTimeoutRecoveryCoordinator(),
-                new Mock<ILogger<ProcessingTimeoutRecoveryService>>().Object);
+            var recoveryService = CreateRecoveryService(coordinator);
 
             return new FileScheduler(
                 _repository,
@@ -101,6 +98,15 @@ namespace Locus.Storage.Tests
                 backgroundTimedOutReclaimBatchSize: backgroundBatchSize,
                 timedOutReclaimCooldown: cooldown ?? TimeSpan.Zero,
                 enableBackgroundTimedOutReclaim: backgroundBatchSize > 0);
+        }
+
+        private IProcessingTimeoutRecoveryService CreateRecoveryService(
+            IProcessingTimeoutRecoveryCoordinator? coordinator = null)
+        {
+            return new ProcessingTimeoutRecoveryService(
+                new MetadataRepositoryQueueProjectionCleanupStore(_repository),
+                coordinator ?? new ProcessingTimeoutRecoveryCoordinator(),
+                new Mock<ILogger<ProcessingTimeoutRecoveryService>>().Object);
         }
 
         [Fact]
@@ -430,6 +436,98 @@ namespace Locus.Storage.Tests
             Assert.NotNull(recovered);
             Assert.Equal(FileProcessingStatus.Pending, recovered!.Status);
             Assert.Null(recovered.ProcessingStartTime);
+        }
+
+        [Fact]
+        public async Task GetNextFileForProcessingAsync_RespectsBackgroundTimedOutReclaimCooldown()
+        {
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "pending-cooldown-001",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-3)
+            }, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "pending-cooldown-002",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-2)
+            }, CancellationToken.None);
+
+            var recoveryService = new CountingRecoveryService();
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                allowLegacyNonJournalMode: true,
+                processingTimeoutRecoveryService: recoveryService,
+                processingTimeout: TimeSpan.FromMinutes(30),
+                emptyQueueTimedOutReclaimBatchSize: 0,
+                backgroundTimedOutReclaimBatchSize: 1,
+                timedOutReclaimCooldown: TimeSpan.FromMinutes(5),
+                enableBackgroundTimedOutReclaim: true);
+
+            var first = await scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+            var second = await scheduler.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+
+            Assert.NotNull(first);
+            Assert.NotNull(second);
+
+            for (var attempt = 0; attempt < 20 && recoveryService.CallCount == 0; attempt++)
+                await Task.Delay(25);
+
+            Assert.Equal(1, recoveryService.CallCount);
+        }
+
+        [Fact]
+        public async Task GetNextBatchForProcessingAsync_ReclaimsTimedOutProcessingFilesWhenPendingQueueIsEmpty()
+        {
+            var firstProcessingStart = DateTime.UtcNow.AddMinutes(-90);
+            var secondProcessingStart = DateTime.UtcNow.AddMinutes(-80);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "timedout-batch-001",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = firstProcessingStart,
+                CreatedAt = DateTime.UtcNow.AddHours(-3)
+            }, CancellationToken.None);
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "timedout-batch-002",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = secondProcessingStart,
+                CreatedAt = DateTime.UtcNow.AddHours(-2)
+            }, CancellationToken.None);
+
+            var scheduler = CreateSchedulerWithTimedOutRecovery(
+                processingTimeout: TimeSpan.FromMinutes(30),
+                emptyQueueBatchSize: 2,
+                backgroundBatchSize: 0);
+
+            var locations = (await scheduler.GetNextBatchForProcessingAsync(_tenant.Object, 2, CancellationToken.None)).ToList();
+
+            Assert.Equal(2, locations.Count);
+            Assert.Contains(locations, item => item.FileKey == "timedout-batch-001");
+            Assert.Contains(locations, item => item.FileKey == "timedout-batch-002");
+            Assert.All(locations, item =>
+            {
+                Assert.Equal(FileProcessingStatus.Processing, item.Status);
+                Assert.NotNull(item.Lease);
+            });
+
+            var firstMetadata = await _repository.GetAsync("tenant-001", "timedout-batch-001", CancellationToken.None);
+            var secondMetadata = await _repository.GetAsync("tenant-001", "timedout-batch-002", CancellationToken.None);
+            Assert.NotNull(firstMetadata);
+            Assert.NotNull(secondMetadata);
+            Assert.Equal(FileProcessingStatus.Processing, firstMetadata!.Status);
+            Assert.Equal(FileProcessingStatus.Processing, secondMetadata!.Status);
+            Assert.NotEqual(firstProcessingStart, firstMetadata.ProcessingStartTime);
+            Assert.NotEqual(secondProcessingStart, secondMetadata.ProcessingStartTime);
         }
 
         [Fact]
@@ -1523,6 +1621,24 @@ namespace Locus.Storage.Tests
             Assert.Null(await _repository.GetAsync("tenant-001", "file-001", CancellationToken.None));
             Assert.NotNull(await _repository.GetAsync("tenant-001", "file-002", CancellationToken.None)); // Should exist
             Assert.Null(await _repository.GetAsync("tenant-001", "file-003", CancellationToken.None));
+        }
+
+        private sealed class CountingRecoveryService : IProcessingTimeoutRecoveryService
+        {
+            private int _callCount;
+
+            public int CallCount => Volatile.Read(ref _callCount);
+
+            public Task<ProcessingTimeoutRecoveryResult> RecoverTimedOutFilesAsync(
+                string tenantId,
+                int batchSize,
+                DateTime nowUtc,
+                TimeSpan timeout,
+                CancellationToken ct = default)
+            {
+                Interlocked.Increment(ref _callCount);
+                return Task.FromResult(new ProcessingTimeoutRecoveryResult(true, 0, 0));
+            }
         }
 
         [Fact]
