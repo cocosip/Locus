@@ -160,7 +160,19 @@
 
     "StoragePool": {
       // 完成态防重与并发保护的分片数
-      "CompletionGuardStripeCount": 4096
+      "CompletionGuardStripeCount": 4096,
+
+      // 当取件时发现没有 Pending 文件可用，允许同步回收多少个已超时的 Processing
+      "EmptyQueueTimedOutReclaimBatchSize": 32,
+
+      // 正常取件仍然成功时，低频后台渐进回收每次最多处理多少个已超时的 Processing
+      "BackgroundTimedOutReclaimBatchSize": 8,
+
+      // 同一租户两次渐进回收之间的最小冷却时间
+      "TimedOutReclaimCooldown": "00:00:30",
+
+      // 是否启用低频渐进式超时回收
+      "EnableBackgroundTimedOutReclaim": true
     },
 
     "QueueEventJournal": {

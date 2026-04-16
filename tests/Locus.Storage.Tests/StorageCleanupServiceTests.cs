@@ -169,6 +169,17 @@ namespace Locus.Storage.Tests
             await _directoryQuotaManager.ApplyAcceptedProjectionAsync(tenantId, directoryPath, CancellationToken.None);
         }
 
+        private IProcessingTimeoutRecoveryService CreateProcessingTimeoutRecoveryService(
+            IProcessingTimeoutRecoveryCoordinator? coordinator = null,
+            IQueueEventJournal? queueEventJournal = null)
+        {
+            return new ProcessingTimeoutRecoveryService(
+                new MetadataRepositoryQueueProjectionCleanupStore(_metadataRepository),
+                coordinator ?? new ProcessingTimeoutRecoveryCoordinator(),
+                new Mock<ILogger<ProcessingTimeoutRecoveryService>>().Object,
+                queueEventJournal);
+        }
+
         private string GetExpectedDeadLetterPrefix(string tenantId)
         {
             return Path.Combine(
@@ -390,6 +401,55 @@ namespace Locus.Storage.Tests
             Assert.Equal(1, stats.TimedOutFilesReset);
 
             queueEventJournal.VerifyAll();
+        }
+
+        [Fact]
+        public async Task CleanupTimedOutProcessingFilesAsync_SkipsTenantWhenRecoveryGateIsAlreadyHeld()
+        {
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "gate-held-timeout",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volumePath, "gate-held-timeout.dat"),
+                DirectoryPath = "/",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = DateTime.UtcNow.AddMinutes(-60),
+                CreatedAt = DateTime.UtcNow.AddHours(-1)
+            }, default);
+
+            var coordinator = new ProcessingTimeoutRecoveryCoordinator();
+            Assert.True(coordinator.TryEnter("tenant-001", out var releaser));
+
+            try
+            {
+                var cleanupService = new StorageCleanupService(
+                    _metadataRepository,
+                    _quotaRepository,
+                    _tenantQuotaManager,
+                    _fileSystem,
+                    _logger.Object,
+                    _metadataDir,
+                    _quotaDir,
+                    tenantManager: _tenantManager.Object,
+                    directoryQuotaManager: _directoryQuotaManager,
+                    allowLegacyNonJournalMode: true,
+                    processingTimeoutRecoveryService: CreateProcessingTimeoutRecoveryService(coordinator));
+                cleanupService.RegisterVolume(_volume.Object);
+
+                await cleanupService.CleanupTimedOutProcessingFilesAsync(TimeSpan.FromMinutes(30), default);
+
+                var metadata = await _metadataRepository.GetAsync("tenant-001", "gate-held-timeout", default);
+                Assert.NotNull(metadata);
+                Assert.Equal(FileProcessingStatus.Processing, metadata!.Status);
+
+                var stats = await cleanupService.GetCleanupStatisticsAsync(default);
+                Assert.Equal(0, stats.TimedOutFilesReset);
+            }
+            finally
+            {
+                releaser!.Dispose();
+            }
         }
 
         [Fact]

@@ -144,6 +144,20 @@ namespace Locus
                 return new MetadataRepositoryQueueProjectionCleanupStore(repository);
             });
 
+            services.AddSingleton<IProcessingTimeoutRecoveryCoordinator, ProcessingTimeoutRecoveryCoordinator>();
+            services.AddSingleton<IProcessingTimeoutRecoveryService>(sp =>
+            {
+                var projectionCleanupStore = sp.GetRequiredService<IQueueProjectionCleanupStore>();
+                var coordinator = sp.GetRequiredService<IProcessingTimeoutRecoveryCoordinator>();
+                var logger = sp.GetRequiredService<ILogger<ProcessingTimeoutRecoveryService>>();
+                var queueEventJournal = sp.GetService<IQueueEventJournal>();
+                return new ProcessingTimeoutRecoveryService(
+                    projectionCleanupStore,
+                    coordinator,
+                    logger,
+                    queueEventJournal);
+            });
+
             services.AddSingleton<IMetadataProjectionMaintenanceStore>(sp =>
             {
                 var repository = sp.GetRequiredService<MetadataRepository>();
@@ -213,6 +227,7 @@ namespace Locus
                 var directoryQuotaManager = sp.GetRequiredService<IDirectoryQuotaManager>();
                 var queueEventJournal = sp.GetService<IQueueEventJournal>();
                 var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
+                var processingTimeoutRecoveryService = sp.GetRequiredService<IProcessingTimeoutRecoveryService>();
                 return new FileScheduler(
                     projectionStore,
                     fileSystem,
@@ -222,7 +237,13 @@ namespace Locus
                     tenantQuotaManager,
                     directoryQuotaManager,
                     queueEventJournal,
-                    options.QueueEventJournal.AllowLegacyNonJournalMode);
+                    options.QueueEventJournal.AllowLegacyNonJournalMode,
+                    processingTimeoutRecoveryService,
+                    options.CleanupOptions.ProcessingTimeout,
+                    options.StoragePool.EmptyQueueTimedOutReclaimBatchSize,
+                    options.StoragePool.BackgroundTimedOutReclaimBatchSize,
+                    options.StoragePool.TimedOutReclaimCooldown,
+                    options.StoragePool.EnableBackgroundTimedOutReclaim);
             });
 
             // Register StoragePool as its concrete type so StorageVolumeInitializationService
@@ -275,6 +296,7 @@ namespace Locus
                 var logger = sp.GetRequiredService<ILogger<StorageCleanupService>>();
                 var volumeRegistry = sp.GetRequiredService<StorageVolumeRegistry>();
                 var queueEventJournal = sp.GetService<IQueueEventJournal>();
+                var processingTimeoutRecoveryService = sp.GetRequiredService<IProcessingTimeoutRecoveryService>();
 
                 // Volumes are registered by StorageVolumeInitializationService after async mount.
                 return new StorageCleanupService(
@@ -294,7 +316,8 @@ namespace Locus
                     projectionCleanupStore,
                     metadataMaintenanceStore,
                     quotaMaintenanceStore,
-                    options.QueueEventJournal.AllowLegacyNonJournalMode);
+                    options.QueueEventJournal.AllowLegacyNonJournalMode,
+                    processingTimeoutRecoveryService);
             });
             services.AddSingleton<IStorageCleanupService>(sp => sp.GetRequiredService<StorageCleanupService>());
 

@@ -13,6 +13,7 @@ using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.FileSystem;
 using Locus.Storage.Data;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.Storage
@@ -30,6 +31,7 @@ namespace Locus.Storage
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly ITenantManager? _tenantManager;
         private readonly IQueueEventJournal? _queueEventJournal;
+        private readonly IProcessingTimeoutRecoveryService _processingTimeoutRecoveryService;
         private readonly bool _allowLegacyNonJournalMode;
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<StorageCleanupService> _logger;
@@ -91,7 +93,8 @@ namespace Locus.Storage
             IQueueProjectionCleanupStore? projectionCleanupStore = null,
             IMetadataProjectionMaintenanceStore? metadataMaintenanceStore = null,
             IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null,
-            bool allowLegacyNonJournalMode = false)
+            bool allowLegacyNonJournalMode = false,
+            IProcessingTimeoutRecoveryService? processingTimeoutRecoveryService = null)
         {
             if (metadataRepository == null)
                 throw new ArgumentNullException(nameof(metadataRepository));
@@ -148,6 +151,12 @@ namespace Locus.Storage
             _pathComparison = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparison.OrdinalIgnoreCase
                 : StringComparison.Ordinal;
+            _processingTimeoutRecoveryService = processingTimeoutRecoveryService
+                ?? new ProcessingTimeoutRecoveryService(
+                    _projectionCleanupStore,
+                    new ProcessingTimeoutRecoveryCoordinator(),
+                    NullLogger<ProcessingTimeoutRecoveryService>.Instance,
+                    _queueEventJournal);
             ValidateLegacyNonJournalMode();
         }
 
@@ -1038,14 +1047,14 @@ namespace Locus.Storage
         {
             _logger.LogInformation("Starting cleanup of timed-out processing files (timeout: {Timeout})", timeout);
 
-            var cutoffTime = DateTime.UtcNow - timeout;
             var resetCount = 0;
             var tenantIds = await GetMetadataTenantIdsSnapshotAsync(ct);
+            var nowUtc = DateTime.UtcNow;
 
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
-                resetCount += await ResetTimedOutForTenantAsync(tenantId, cutoffTime, DateTime.UtcNow, ct);
+                resetCount += await ResetTimedOutForTenantAsync(tenantId, timeout, nowUtc, ct);
             }
 
             Interlocked.Add(ref _timedOutFilesReset, resetCount);
@@ -1066,7 +1075,6 @@ namespace Locus.Storage
                 processingTimeout, failedRetentionPeriod);
 
             var now = DateTime.UtcNow;
-            var timeoutCutoff = processingTimeout.HasValue ? now - processingTimeout.Value : (DateTime?)null;
             var failedCutoff = failedRetentionPeriod.HasValue && _permanentlyFailedDisposition != PermanentlyFailedDisposition.Keep
                 ? now - failedRetentionPeriod.Value
                 : (DateTime?)null;
@@ -1078,8 +1086,8 @@ namespace Locus.Storage
             foreach (var tenantId in tenantIds)
             {
                 ct.ThrowIfCancellationRequested();
-                if (timeoutCutoff.HasValue)
-                    resetCount += await ResetTimedOutForTenantAsync(tenantId, timeoutCutoff.Value, now, ct);
+                if (processingTimeout.HasValue)
+                    resetCount += await ResetTimedOutForTenantAsync(tenantId, processingTimeout.Value, now, ct);
 
                 if (failedCutoff.HasValue)
                 {
@@ -1100,7 +1108,7 @@ namespace Locus.Storage
 
         private async Task<int> ResetTimedOutForTenantAsync(
             string tenantId,
-            DateTime timeoutCutoffUtc,
+            TimeSpan timeout,
             DateTime nowUtc,
             CancellationToken ct = default)
         {
@@ -1109,61 +1117,16 @@ namespace Locus.Storage
             while (true)
             {
                 var iterationStartedAt = Stopwatch.GetTimestamp();
-                var batch = await _projectionCleanupStore.GetTimedOutProcessingFilesAsync(
+                var result = await _processingTimeoutRecoveryService.RecoverTimedOutFilesAsync(
                     tenantId,
-                    timeoutCutoffUtc,
                     _statusCleanupBatchSizePerTenant,
-                    ct);
-                if (batch.Count == 0)
-                {
-                    RecordStatusCleanupIteration("timeout_reset", tenantId, 0, iterationStartedAt);
-                    break;
-                }
+                    nowUtc,
+                    timeout,
+                    ct).ConfigureAwait(false);
+                RecordStatusCleanupIteration("timeout_reset", tenantId, result.CandidateCount, iterationStartedAt);
+                resetCount += result.RecoveredCount;
 
-                foreach (var metadata in batch)
-                {
-                    if (!metadata.ProcessingStartTime.HasValue)
-                        continue;
-
-                    try
-                    {
-                        if (_queueEventJournal != null)
-                        {
-                            await _queueEventJournal.AppendAsync(
-                                CreateProcessingTimedOutEvent(metadata, nowUtc),
-                                default).ConfigureAwait(false);
-                        }
-
-                        var reset = await _projectionCleanupStore.TryResetTimedOutFileAsync(
-                            tenantId,
-                            metadata.FileKey,
-                            metadata.ProcessingStartTime.Value,
-                            nowUtc,
-                            ct);
-                        if (!reset)
-                        {
-                            _logger.LogDebug(
-                                "Skipped timed-out reset for file {FileKey} because the processing lease changed concurrently",
-                                metadata.FileKey);
-                            continue;
-                        }
-
-                        resetCount++;
-                        _logger.LogDebug("Reset timed-out file {FileKey} from Processing to Pending", metadata.FileKey);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(
-                            ex,
-                            "Failed to reset timed-out file. Tenant={TenantId}, FileKey={FileKey}",
-                            tenantId,
-                            metadata.FileKey);
-                    }
-                }
-
-                RecordStatusCleanupIteration("timeout_reset", tenantId, batch.Count, iterationStartedAt);
-
-                if (batch.Count < _statusCleanupBatchSizePerTenant)
+                if (!result.GateAcquired || result.CandidateCount < _statusCleanupBatchSizePerTenant)
                     break;
             }
 
@@ -1692,27 +1655,6 @@ namespace Locus.Storage
                 Status = FileProcessingStatus.DeadLettered,
                 RetryCount = metadata.RetryCount,
                 ErrorMessage = metadata.LastError,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
-            };
-        }
-
-        private static QueueEventRecord CreateProcessingTimedOutEvent(FileMetadata metadata, DateTime availableForProcessingAtUtc)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.ProcessingTimedOut,
-                OccurredAtUtc = availableForProcessingAtUtc,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Pending,
-                ProcessingStartTimeUtc = metadata.ProcessingStartTime,
-                RetryCount = metadata.RetryCount,
-                AvailableForProcessingAtUtc = availableForProcessingAtUtc,
                 OriginalFileName = metadata.OriginalFileName,
                 FileExtension = metadata.FileExtension
             };

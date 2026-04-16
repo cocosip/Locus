@@ -11,6 +11,7 @@ using Locus.Core.Abstractions;
 using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.Storage
@@ -34,7 +35,30 @@ namespace Locus.Storage
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly IQueueEventJournal? _queueEventJournal;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _transitionGuards;
+        private readonly IProcessingTimeoutRecoveryService? _processingTimeoutRecoveryService;
+        private readonly TimeSpan? _processingTimeout;
+        private readonly int _emptyQueueTimedOutReclaimBatchSize;
+        private readonly int _backgroundTimedOutReclaimBatchSize;
+        private readonly TimeSpan _timedOutReclaimCooldown;
+        private readonly bool _enableBackgroundTimedOutReclaim;
+        private readonly ConcurrentDictionary<string, long> _nextBackgroundTimedOutReclaimTicks;
+        private readonly ConcurrentDictionary<string, byte> _scheduledBackgroundTimedOutReclaims;
         private readonly bool _allowLegacyNonJournalMode;
+
+        /// <summary>
+        /// Default batch size used when reclaiming timed-out Processing files after an empty lease attempt.
+        /// </summary>
+        public const int DefaultEmptyQueueTimedOutReclaimBatchSize = 32;
+
+        /// <summary>
+        /// Default batch size used for low-frequency background reclaim while normal leasing succeeds.
+        /// </summary>
+        public const int DefaultBackgroundTimedOutReclaimBatchSize = 8;
+
+        /// <summary>
+        /// Default cooldown between background timed-out reclaim attempts for the same tenant.
+        /// </summary>
+        public static readonly TimeSpan DefaultTimedOutReclaimCooldown = TimeSpan.FromSeconds(30);
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FileScheduler"/> class.
@@ -48,7 +72,13 @@ namespace Locus.Storage
             ITenantQuotaManager? tenantQuotaManager = null,
             IDirectoryQuotaManager? directoryQuotaManager = null,
             IQueueEventJournal? queueEventJournal = null,
-            bool allowLegacyNonJournalMode = false)
+            bool allowLegacyNonJournalMode = false,
+            IProcessingTimeoutRecoveryService? processingTimeoutRecoveryService = null,
+            TimeSpan? processingTimeout = null,
+            int emptyQueueTimedOutReclaimBatchSize = DefaultEmptyQueueTimedOutReclaimBatchSize,
+            int backgroundTimedOutReclaimBatchSize = DefaultBackgroundTimedOutReclaimBatchSize,
+            TimeSpan? timedOutReclaimCooldown = null,
+            bool enableBackgroundTimedOutReclaim = true)
         {
             _projectionStore = projectionStore ?? throw new ArgumentNullException(nameof(projectionStore));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -60,7 +90,16 @@ namespace Locus.Storage
             _queueEventJournal = queueEventJournal;
             _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
             _transitionGuards = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+            _processingTimeoutRecoveryService = processingTimeoutRecoveryService;
+            _processingTimeout = processingTimeout;
+            _emptyQueueTimedOutReclaimBatchSize = Math.Max(0, emptyQueueTimedOutReclaimBatchSize);
+            _backgroundTimedOutReclaimBatchSize = Math.Max(0, backgroundTimedOutReclaimBatchSize);
+            _timedOutReclaimCooldown = timedOutReclaimCooldown ?? DefaultTimedOutReclaimCooldown;
+            _enableBackgroundTimedOutReclaim = enableBackgroundTimedOutReclaim;
+            _nextBackgroundTimedOutReclaimTicks = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
+            _scheduledBackgroundTimedOutReclaims = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             ValidateLegacyNonJournalMode();
+            ValidateTimedOutReclaimOptions();
         }
 
         /// <summary>
@@ -76,7 +115,13 @@ namespace Locus.Storage
             IDirectoryQuotaManager? directoryQuotaManager = null,
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
-            bool allowLegacyNonJournalMode = false)
+            bool allowLegacyNonJournalMode = false,
+            IProcessingTimeoutRecoveryService? processingTimeoutRecoveryService = null,
+            TimeSpan? processingTimeout = null,
+            int emptyQueueTimedOutReclaimBatchSize = DefaultEmptyQueueTimedOutReclaimBatchSize,
+            int backgroundTimedOutReclaimBatchSize = DefaultBackgroundTimedOutReclaimBatchSize,
+            TimeSpan? timedOutReclaimCooldown = null,
+            bool enableBackgroundTimedOutReclaim = true)
             : this(
                 projectionStore ?? new MetadataRepositoryQueueProjectionStore(repository ?? throw new ArgumentNullException(nameof(repository))),
                 fileSystem,
@@ -86,7 +131,13 @@ namespace Locus.Storage
                 tenantQuotaManager,
                 directoryQuotaManager,
                 queueEventJournal,
-                allowLegacyNonJournalMode)
+                allowLegacyNonJournalMode,
+                processingTimeoutRecoveryService ?? CreateDefaultProcessingTimeoutRecoveryService(repository, queueEventJournal, processingTimeout),
+                processingTimeout,
+                emptyQueueTimedOutReclaimBatchSize,
+                backgroundTimedOutReclaimBatchSize,
+                timedOutReclaimCooldown,
+                enableBackgroundTimedOutReclaim)
         {
         }
 
@@ -108,13 +159,30 @@ namespace Locus.Storage
                 "FileScheduler is running without IQueueEventJournal. This legacy non-journal mode should only be used for explicit compatibility or tests.");
         }
 
+        private void ValidateTimedOutReclaimOptions()
+        {
+            if (_processingTimeout.HasValue && _processingTimeout.Value <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(_processingTimeout),
+                    "Processing timeout must be greater than zero when timed-out reclaim is enabled.");
+            }
+
+            if (_timedOutReclaimCooldown < TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(_timedOutReclaimCooldown),
+                    "Timed-out reclaim cooldown must be zero or greater.");
+            }
+        }
+
         /// <inheritdoc/>
         public async Task<FileLocation?> GetNextFileForProcessingAsync(ITenantContext tenant, CancellationToken ct = default)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
 
-            var metadata = await _projectionStore.LeaseNextPendingFileAsync(tenant.TenantId, ct).ConfigureAwait(false);
+            var metadata = await LeaseNextPendingFileWithRecoveryAsync(tenant.TenantId, ct).ConfigureAwait(false);
 
             if (metadata == null)
                 return null;
@@ -137,6 +205,7 @@ namespace Locus.Storage
             // for any orphaned physical files, so the in-memory cache stays consistent.
             // Doing a syscall on every allocation would add latency proportional to inode
             // lookup cost (significant on network volumes) and is not necessary at runtime.
+            TryScheduleBackgroundTimedOutReclaim(tenant.TenantId);
             return MapToFileLocation(metadata);
         }
 
@@ -152,7 +221,7 @@ namespace Locus.Storage
             if (batchSize <= 0)
                 throw new ArgumentException("Batch size must be greater than zero", nameof(batchSize));
 
-            var metadataList = (await _projectionStore.LeaseNextPendingBatchAsync(tenant.TenantId, batchSize, ct).ConfigureAwait(false)).ToList();
+            var metadataList = (await LeaseNextPendingBatchWithRecoveryAsync(tenant.TenantId, batchSize, ct).ConfigureAwait(false)).ToList();
 
             if (_queueEventJournal != null && metadataList.Count > 0)
             {
@@ -175,6 +244,8 @@ namespace Locus.Storage
 
             if (locations.Count == 0)
                 _logger.LogDebug("No pending files available for tenant: {TenantId}", tenant.TenantId);
+            else
+                TryScheduleBackgroundTimedOutReclaim(tenant.TenantId);
 
             return locations;
         }
@@ -474,6 +545,121 @@ namespace Locus.Storage
         private SemaphoreSlim GetTransitionGuard(string fileKey)
         {
             return _transitionGuards.GetOrAdd(fileKey, _ => new SemaphoreSlim(1, 1));
+        }
+
+        private async Task<FileMetadata?> LeaseNextPendingFileWithRecoveryAsync(string tenantId, CancellationToken ct)
+        {
+            var metadata = await _projectionStore.LeaseNextPendingFileAsync(tenantId, ct).ConfigureAwait(false);
+            if (metadata != null)
+                return metadata;
+
+            await TryRecoverTimedOutFilesImmediatelyAsync(tenantId, ct).ConfigureAwait(false);
+            return await _projectionStore.LeaseNextPendingFileAsync(tenantId, ct).ConfigureAwait(false);
+        }
+
+        private async Task<IReadOnlyList<FileMetadata>> LeaseNextPendingBatchWithRecoveryAsync(
+            string tenantId,
+            int batchSize,
+            CancellationToken ct)
+        {
+            var metadataList = await _projectionStore.LeaseNextPendingBatchAsync(tenantId, batchSize, ct).ConfigureAwait(false);
+            if (metadataList.Count > 0)
+                return metadataList;
+
+            await TryRecoverTimedOutFilesImmediatelyAsync(tenantId, ct).ConfigureAwait(false);
+            return await _projectionStore.LeaseNextPendingBatchAsync(tenantId, batchSize, ct).ConfigureAwait(false);
+        }
+
+        private async Task TryRecoverTimedOutFilesImmediatelyAsync(string tenantId, CancellationToken ct)
+        {
+            if (_processingTimeoutRecoveryService == null
+                || !_processingTimeout.HasValue
+                || _emptyQueueTimedOutReclaimBatchSize <= 0)
+            {
+                return;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            NoteTimedOutReclaimAttempt(tenantId, nowUtc);
+            await _processingTimeoutRecoveryService.RecoverTimedOutFilesAsync(
+                tenantId,
+                _emptyQueueTimedOutReclaimBatchSize,
+                nowUtc,
+                _processingTimeout.Value,
+                ct).ConfigureAwait(false);
+        }
+
+        private void TryScheduleBackgroundTimedOutReclaim(string tenantId)
+        {
+            if (!_enableBackgroundTimedOutReclaim
+                || _processingTimeoutRecoveryService == null
+                || !_processingTimeout.HasValue
+                || _backgroundTimedOutReclaimBatchSize <= 0)
+            {
+                return;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (!TryReserveBackgroundTimedOutReclaim(tenantId, nowUtc))
+                return;
+
+            if (!_scheduledBackgroundTimedOutReclaims.TryAdd(tenantId, 0))
+                return;
+
+            _ = ExecuteBackgroundTimedOutReclaimAsync(tenantId);
+        }
+
+        private async Task ExecuteBackgroundTimedOutReclaimAsync(string tenantId)
+        {
+            try
+            {
+                await _processingTimeoutRecoveryService!.RecoverTimedOutFilesAsync(
+                    tenantId,
+                    _backgroundTimedOutReclaimBatchSize,
+                    DateTime.UtcNow,
+                    _processingTimeout!.Value,
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Background timed-out Processing reclaim failed for tenant {TenantId}",
+                    tenantId);
+            }
+            finally
+            {
+                _scheduledBackgroundTimedOutReclaims.TryRemove(tenantId, out _);
+            }
+        }
+
+        private bool TryReserveBackgroundTimedOutReclaim(string tenantId, DateTime nowUtc)
+        {
+            var nextAllowedTicks = unchecked(nowUtc.Add(_timedOutReclaimCooldown).Ticks + 1);
+            var nowTicks = nowUtc.Ticks;
+
+            while (true)
+            {
+                if (!_nextBackgroundTimedOutReclaimTicks.TryGetValue(tenantId, out var current))
+                {
+                    if (_nextBackgroundTimedOutReclaimTicks.TryAdd(tenantId, nextAllowedTicks))
+                        return true;
+
+                    continue;
+                }
+
+                if (current > nowTicks)
+                    return false;
+
+                if (_nextBackgroundTimedOutReclaimTicks.TryUpdate(tenantId, nextAllowedTicks, current))
+                    return true;
+            }
+        }
+
+        private void NoteTimedOutReclaimAttempt(string tenantId, DateTime nowUtc)
+        {
+            var nextAllowedTicks = unchecked(nowUtc.Add(_timedOutReclaimCooldown).Ticks + 1);
+            _nextBackgroundTimedOutReclaimTicks.AddOrUpdate(tenantId, nextAllowedTicks, (_, __) => nextAllowedTicks);
         }
 
         private async Task TryRollbackLeasedFilesAsync(IEnumerable<FileMetadata> leasedFiles)
@@ -1022,6 +1208,21 @@ namespace Locus.Storage
                 currentMetadata?.Status == FileProcessingStatus.Processing
                     ? currentMetadata.ProcessingStartTime
                     : null);
+        }
+
+        private static IProcessingTimeoutRecoveryService? CreateDefaultProcessingTimeoutRecoveryService(
+            MetadataRepository repository,
+            IQueueEventJournal? queueEventJournal,
+            TimeSpan? processingTimeout)
+        {
+            if (!processingTimeout.HasValue)
+                return null;
+
+            return new ProcessingTimeoutRecoveryService(
+                new MetadataRepositoryQueueProjectionCleanupStore(repository),
+                new ProcessingTimeoutRecoveryCoordinator(),
+                NullLogger<ProcessingTimeoutRecoveryService>.Instance,
+                queueEventJournal);
         }
     }
 }
