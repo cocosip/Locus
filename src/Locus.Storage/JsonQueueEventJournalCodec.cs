@@ -31,6 +31,28 @@ namespace Locus.Storage
             return Utf8NoBom.GetBytes(line);
         }
 
+        public QueueEventJournalBatchBuffer SerializeBatch(IReadOnlyList<QueueEventRecord> records, long startingSequenceNumber)
+        {
+            if (records == null)
+                throw new ArgumentNullException(nameof(records));
+
+            if (records.Count == 0)
+                return new QueueEventJournalBatchBuffer(Array.Empty<byte>(), 0, pooled: false);
+
+            using (var writer = new PooledByteBufferWriter(GetInitialBatchCapacity(records.Count)))
+            {
+                var sequenceNumber = startingSequenceNumber;
+                for (var i = 0; i < records.Count; i++)
+                {
+                    var record = records[i] ?? throw new ArgumentNullException(nameof(records));
+                    sequenceNumber++;
+                    writer.Write(SerializeRecord(record, sequenceNumber));
+                }
+
+                return writer.DetachBuffer();
+            }
+        }
+
         public async Task<QueueEventJournalCodecReadResult> ReadBatchAsync(Stream stream, long startOffset, int maxRecords, CancellationToken ct)
         {
             if (stream == null)
@@ -160,6 +182,11 @@ namespace Locus.Storage
                 OriginalFileName = record.OriginalFileName,
                 FileExtension = record.FileExtension,
             };
+        }
+
+        private static int GetInitialBatchCapacity(int recordCount)
+        {
+            return Math.Max(256, recordCount * 256);
         }
     }
 }

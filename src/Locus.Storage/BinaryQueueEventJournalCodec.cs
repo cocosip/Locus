@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -23,25 +24,40 @@ namespace Locus.Storage
             if (record == null)
                 throw new ArgumentNullException(nameof(record));
 
-            record.SequenceNumber = sequenceNumber;
             var layout = new RecordSerializationLayout(record);
-            var payloadLength = layout.PayloadLength;
-            var buffer = new byte[HeaderSize + payloadLength];
-            var payloadOffset = HeaderSize;
-            WritePayload(record, layout, buffer, ref payloadOffset);
-
-            var checksum = QueueEventCrc32.Compute(buffer, HeaderSize, payloadLength);
-            record.PayloadCrc32 = checksum;
-
-            var headerOffset = 0;
-            WriteInt32(buffer, ref headerOffset, RecordMagic);
-            WriteInt16(buffer, ref headerOffset, RecordVersion);
-            WriteInt16(buffer, ref headerOffset, RecordFlags);
-            WriteInt32(buffer, ref headerOffset, payloadLength);
-            WriteInt64(buffer, ref headerOffset, sequenceNumber);
-            WriteUInt32(buffer, ref headerOffset, checksum);
-
+            var buffer = new byte[HeaderSize + layout.PayloadLength];
+            WriteRecord(record, sequenceNumber, layout, buffer, 0);
             return buffer;
+        }
+
+        public QueueEventJournalBatchBuffer SerializeBatch(IReadOnlyList<QueueEventRecord> records, long startingSequenceNumber)
+        {
+            if (records == null)
+                throw new ArgumentNullException(nameof(records));
+
+            if (records.Count == 0)
+                return new QueueEventJournalBatchBuffer(Array.Empty<byte>(), 0, pooled: false);
+
+            var layouts = new RecordSerializationLayout[records.Count];
+            var totalBytes = 0;
+            for (var i = 0; i < records.Count; i++)
+            {
+                var record = records[i] ?? throw new ArgumentNullException(nameof(records));
+                var layout = new RecordSerializationLayout(record);
+                layouts[i] = layout;
+                totalBytes = checked(totalBytes + HeaderSize + layout.PayloadLength);
+            }
+
+            var buffer = ArrayPool<byte>.Shared.Rent(totalBytes);
+            var offset = 0;
+            var sequenceNumber = startingSequenceNumber;
+            for (var i = 0; i < records.Count; i++)
+            {
+                sequenceNumber++;
+                offset += WriteRecord(records[i], sequenceNumber, layouts[i], buffer, offset);
+            }
+
+            return new QueueEventJournalBatchBuffer(buffer, totalBytes);
         }
 
         public Task<QueueEventJournalCodecReadResult> ReadBatchAsync(Stream stream, long startOffset, int maxRecords, CancellationToken ct)
@@ -204,6 +220,27 @@ namespace Locus.Storage
 
             var magic = BitConverter.ToInt32(prefix, 0);
             return magic == RecordMagic;
+        }
+
+        private static int WriteRecord(QueueEventRecord record, long sequenceNumber, RecordSerializationLayout layout, byte[] buffer, int recordOffset)
+        {
+            record.SequenceNumber = sequenceNumber;
+
+            var payloadLength = layout.PayloadLength;
+            var payloadOffset = recordOffset + HeaderSize;
+            WritePayload(record, layout, buffer, ref payloadOffset);
+
+            var checksum = QueueEventCrc32.Compute(buffer, recordOffset + HeaderSize, payloadLength);
+            record.PayloadCrc32 = checksum;
+
+            var headerOffset = recordOffset;
+            WriteInt32(buffer, ref headerOffset, RecordMagic);
+            WriteInt16(buffer, ref headerOffset, RecordVersion);
+            WriteInt16(buffer, ref headerOffset, RecordFlags);
+            WriteInt32(buffer, ref headerOffset, payloadLength);
+            WriteInt64(buffer, ref headerOffset, sequenceNumber);
+            WriteUInt32(buffer, ref headerOffset, checksum);
+            return HeaderSize + payloadLength;
         }
 
         private static void WritePayload(QueueEventRecord record, RecordSerializationLayout layout, byte[] buffer, ref int offset)

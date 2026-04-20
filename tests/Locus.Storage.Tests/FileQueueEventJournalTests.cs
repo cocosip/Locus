@@ -121,6 +121,63 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AppendBatchAsync_WithJsonJournal_AssignsSequentialSequenceNumbersAndPreservesOrder()
+        {
+            var queueDirectory = Path.Combine(_queueDirectory, "json-batch");
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.JsonLines,
+                });
+
+            try
+            {
+                await journal.AppendBatchAsync(new[]
+                {
+                    new QueueEventRecord
+                    {
+                        TenantId = "tenant-json-batch",
+                        FileKey = "file-001",
+                        EventType = QueueEventType.Accepted,
+                        DirectoryPath = "/json",
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = "tenant-json-batch",
+                        FileKey = "file-002",
+                        EventType = QueueEventType.ProcessingStarted,
+                        DirectoryPath = "/json",
+                        ProcessingStartTimeUtc = DateTime.UtcNow,
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = "tenant-json-batch",
+                        FileKey = "file-003",
+                        EventType = QueueEventType.ProcessingCompleted,
+                        DirectoryPath = "/json",
+                    }
+                }, CancellationToken.None);
+
+                var batch = await journal.ReadBatchAsync("tenant-json-batch", 0, 10, CancellationToken.None);
+
+                Assert.Equal(3, batch.Records.Count);
+                Assert.Equal("file-001", batch.Records[0].FileKey);
+                Assert.Equal("file-002", batch.Records[1].FileKey);
+                Assert.Equal("file-003", batch.Records[2].FileKey);
+                Assert.Equal(1L, batch.Records[0].SequenceNumber);
+                Assert.Equal(2L, batch.Records[1].SequenceNumber);
+                Assert.Equal(3L, batch.Records[2].SequenceNumber);
+            }
+            finally
+            {
+                journal.Dispose();
+            }
+        }
+
+        [Fact]
         public async Task AppendAsync_ConcurrentRequests_AssignsMonotonicSequenceNumbers()
         {
             var appendTasks = new Task[24];
@@ -184,6 +241,70 @@ namespace Locus.Storage.Tests
             Assert.Equal(2, snapshot.FlushCount);
             Assert.True(snapshot.AppendTicks >= 0);
             Assert.True(snapshot.FlushTicks >= 0);
+        }
+
+        [Fact]
+        public async Task AppendAsync_WithAsyncAckMode_ReturnsCompletedTaskAndStillPersistsRecords()
+        {
+            var queueDirectory = Path.Combine(_queueDirectory, "async-ack");
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                    StateFlushDebounce = TimeSpan.Zero,
+                });
+
+            try
+            {
+                var singleTask = journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-async",
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+                Assert.True(singleTask.IsCompletedSuccessfully);
+
+                var batchTask = journal.AppendBatchAsync(new[]
+                {
+                    new QueueEventRecord
+                    {
+                        TenantId = "tenant-async",
+                        FileKey = "file-002",
+                        EventType = QueueEventType.ProcessingStarted,
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = "tenant-async",
+                        FileKey = "file-003",
+                        EventType = QueueEventType.ProcessingCompleted,
+                    }
+                }, CancellationToken.None);
+                Assert.True(batchTask.IsCompletedSuccessfully);
+            }
+            finally
+            {
+                journal.Dispose();
+            }
+
+            using var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                });
+
+            var batch = await restartedJournal.ReadBatchAsync("tenant-async", 0, 10, CancellationToken.None);
+            Assert.Equal(3, batch.Records.Count);
+            Assert.Equal("file-001", batch.Records[0].FileKey);
+            Assert.Equal("file-002", batch.Records[1].FileKey);
+            Assert.Equal("file-003", batch.Records[2].FileKey);
         }
 
         [Fact]

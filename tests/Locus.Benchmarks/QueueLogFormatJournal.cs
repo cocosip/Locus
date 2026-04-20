@@ -85,13 +85,16 @@ namespace Locus.Benchmarks
             ValidateRecord(record);
             cancellationToken.ThrowIfCancellationRequested();
 
-            var request = new PendingAppendRequest(CloneRecord(record), EstimateRecordSize(record));
+            var request = new PendingAppendRequest(
+                CloneRecord(record),
+                EstimateRecordSize(record),
+                createCompletion: _ackMode != QueueEventJournalAckMode.Async);
             GetOrCreateTenantWriter(record.TenantId).Enqueue(request);
 
             if (_ackMode == QueueEventJournalAckMode.Async)
                 return;
 
-            await request.Completion.Task.ConfigureAwait(false);
+            await request.Completion!.Task.ConfigureAwait(false);
         }
 
         public void Dispose()
@@ -554,19 +557,19 @@ namespace Locus.Benchmarks
         private void CompleteRequests(IReadOnlyList<PendingAppendRequest> batch)
         {
             foreach (var request in batch)
-                request.Completion.TrySetResult(null);
+                request.TrySetCompleted();
         }
 
         private void FailRequests(IReadOnlyList<PendingAppendRequest> batch, Exception exception)
         {
             foreach (var request in batch)
-                request.Completion.TrySetException(exception);
+                request.TrySetException(exception);
         }
 
         private void FailPendingRequests(TenantWriterState writer, Exception exception)
         {
             while (writer.PendingRequests.TryDequeue(out var request))
-                request.Completion.TrySetException(exception);
+                request.TrySetException(exception);
         }
 
         private void ThrowIfDisposed()
@@ -577,18 +580,30 @@ namespace Locus.Benchmarks
 
         private sealed class PendingAppendRequest
         {
-            public PendingAppendRequest(QueueEventRecord record, int estimatedBytes)
+            public PendingAppendRequest(QueueEventRecord record, int estimatedBytes, bool createCompletion)
             {
                 Record = record ?? throw new ArgumentNullException(nameof(record));
                 EstimatedBytes = estimatedBytes;
-                Completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                Completion = createCompletion
+                    ? new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously)
+                    : null;
             }
 
             public QueueEventRecord Record { get; }
 
             public int EstimatedBytes { get; }
 
-            public TaskCompletionSource<object?> Completion { get; }
+            public TaskCompletionSource<object?>? Completion { get; }
+
+            public void TrySetCompleted()
+            {
+                Completion?.TrySetResult(null);
+            }
+
+            public void TrySetException(Exception exception)
+            {
+                Completion?.TrySetException(exception);
+            }
         }
 
         private sealed class TenantWriterState

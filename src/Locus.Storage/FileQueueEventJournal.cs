@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
-using System.Buffers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -128,13 +127,22 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
 
             var tenantId = ValidateAppendRecord(record, nameof(record));
-            var request = new PendingAppendRequest(CloneRecord(record), EstimateRecordSize(record));
-            GetOrCreateTenantWriter(tenantId).Enqueue(request);
+            if (_ackMode == QueueEventJournalAckMode.Durable)
+            {
+                var directWriter = GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: false);
+                return AppendDirectAsync(directWriter, CloneRecord(record), ct);
+            }
+
+            var request = new PendingAppendRequest(
+                CloneRecord(record),
+                EstimateRecordSize(record),
+                createCompletion: _ackMode != QueueEventJournalAckMode.Async);
+            GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: true).Enqueue(request);
 
             if (_ackMode == QueueEventJournalAckMode.Async)
                 return Task.CompletedTask;
 
-            return request.Completion.Task;
+            return request.Completion!.Task;
         }
 
         /// <inheritdoc/>
@@ -157,13 +165,23 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
 
             var tenantId = ValidateAppendBatch(records);
-            var request = new PendingAppendRequest(CloneRecords(records), EstimateBatchSize(records));
-            GetOrCreateTenantWriter(tenantId).Enqueue(request);
+            if (_ackMode == QueueEventJournalAckMode.Durable)
+            {
+                var directWriter = GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: false);
+                await AppendBatchDirectAsync(directWriter, CloneRecords(records), ct).ConfigureAwait(false);
+                return;
+            }
+
+            var request = new PendingAppendRequest(
+                CloneRecords(records),
+                EstimateBatchSize(records),
+                createCompletion: _ackMode != QueueEventJournalAckMode.Async);
+            GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: true).Enqueue(request);
 
             if (_ackMode == QueueEventJournalAckMode.Async)
                 return;
 
-            await request.Completion.Task.ConfigureAwait(false);
+            await request.Completion!.Task.ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -342,16 +360,21 @@ namespace Locus.Storage
             };
         }
 
-        private TenantWriterState GetOrCreateTenantWriter(string tenantId)
+        private TenantWriterState GetOrCreateTenantWriter(string tenantId, bool ensureWorkerStarted)
         {
-            return _tenantWriters.GetOrAdd(tenantId, CreateTenantWriter);
+            var writer = _tenantWriters.GetOrAdd(tenantId, id => new TenantWriterState(id));
+            if (ensureWorkerStarted)
+                EnsureTenantWriterStarted(writer);
+
+            return writer;
         }
 
-        private TenantWriterState CreateTenantWriter(string tenantId)
+        private void EnsureTenantWriterStarted(TenantWriterState writer)
         {
-            var writer = new TenantWriterState(tenantId);
+            if (Interlocked.CompareExchange(ref writer.WorkerStarted, 1, 0) != 0)
+                return;
+
             writer.WorkerTask = Task.Run(() => RunTenantWriterAsync(writer));
-            return writer;
         }
 
         private async Task RunTenantWriterAsync(TenantWriterState writer)
@@ -563,23 +586,14 @@ namespace Locus.Storage
                     return;
                 }
 
-                var serializedBatch = SerializeBatch(state, batch);
-                if (serializedBatch.TotalBytes == 0)
-                    return;
-
-                var writeBuffer = ArrayPool<byte>.Shared.Rent(serializedBatch.TotalBytes);
-                try
+                using (var serializedBatch = SerializeBatch(state, batch, out var batchRecords))
                 {
-                    var writeOffset = 0;
-                    foreach (var serializedRecord in serializedBatch.Records)
-                    {
-                        Buffer.BlockCopy(serializedRecord.Bytes, 0, writeBuffer, writeOffset, serializedRecord.Bytes.Length);
-                        writeOffset += serializedRecord.Bytes.Length;
-                    }
+                    if (serializedBatch.Length == 0)
+                        return;
 
-                    await stream.WriteAsync(writeBuffer, 0, serializedBatch.TotalBytes, writer.Cancellation.Token).ConfigureAwait(false);
+                    await stream.WriteAsync(serializedBatch.Buffer, 0, serializedBatch.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
-                    state.TailOffset += serializedBatch.TotalBytes;
+                    state.TailOffset += serializedBatch.Length;
                     MarkJournalStateDirty(writer.TenantId);
                     var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
@@ -590,17 +604,93 @@ namespace Locus.Storage
 
                     var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(
-                        serializedBatch.TotalBytes,
+                        serializedBatch.Length,
                         durationTicks);
                     RecordObservedAppendBatch(
-                        recordCount: serializedBatch.Records.Count,
-                        totalBytes: serializedBatch.TotalBytes,
+                        recordCount: batchRecords.Length,
+                        totalBytes: serializedBatch.Length,
                         durationTicks: appendDurationTicks);
                     CompleteRequests(batch);
                 }
-                finally
+            }
+            finally
+            {
+                appendLock.Release();
+            }
+        }
+
+        private async Task AppendDirectAsync(TenantWriterState writer, QueueEventRecord record, CancellationToken ct)
+        {
+            var appendStartedAt = Stopwatch.GetTimestamp();
+            var appendLock = _appendLocks.GetOrAdd(writer.TenantId, _ => new SemaphoreSlim(1, 1));
+            await appendLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var state = LoadJournalState(writer.TenantId);
+                await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
+                var stream = EnsureAppendStream(writer);
+                var serializedRecord = SerializeSingleRecord(state, record);
+                ct.ThrowIfCancellationRequested();
+                stream.Write(serializedRecord, 0, serializedRecord.Length);
+
+                state.TailOffset += serializedRecord.Length;
+                MarkJournalStateDirty(writer.TenantId);
+                var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                FlushAppendStreamCore(writer);
+
+                var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
+                RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
+            }
+            finally
+            {
+                appendLock.Release();
+            }
+        }
+
+        private async Task AppendBatchDirectAsync(TenantWriterState writer, IReadOnlyList<QueueEventRecord> records, CancellationToken ct)
+        {
+            var appendStartedAt = Stopwatch.GetTimestamp();
+            var appendLock = _appendLocks.GetOrAdd(writer.TenantId, _ => new SemaphoreSlim(1, 1));
+            await appendLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var state = LoadJournalState(writer.TenantId);
+                await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
+                var stream = EnsureAppendStream(writer);
+                if (records.Count == 1)
                 {
-                    ArrayPool<byte>.Shared.Return(writeBuffer);
+                    var serializedRecord = SerializeSingleRecord(state, records[0]);
+                    ct.ThrowIfCancellationRequested();
+                    stream.Write(serializedRecord, 0, serializedRecord.Length);
+
+                    state.TailOffset += serializedRecord.Length;
+                    MarkJournalStateDirty(writer.TenantId);
+                    var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                    FlushAppendStreamCore(writer);
+
+                    var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                    QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
+                    RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
+                    return;
+                }
+
+                using (var serializedBatch = SerializeBatch(state, records))
+                {
+                    if (serializedBatch.Length == 0)
+                        return;
+
+                    ct.ThrowIfCancellationRequested();
+                    stream.Write(serializedBatch.Buffer, 0, serializedBatch.Length);
+
+                    state.TailOffset += serializedBatch.Length;
+                    MarkJournalStateDirty(writer.TenantId);
+                    var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                    FlushAppendStreamCore(writer);
+
+                    var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                    QueueJournalOperationMetrics.RecordAppendBatch(serializedBatch.Length, durationTicks);
+                    RecordObservedAppendBatch(recordCount: records.Count, totalBytes: serializedBatch.Length, durationTicks: appendDurationTicks);
                 }
             }
             finally
@@ -617,39 +707,35 @@ namespace Locus.Storage
             return bytes;
         }
 
-        private SerializedBatch SerializeBatch(JournalState state, IReadOnlyList<PendingAppendRequest> batch)
+        private QueueEventJournalBatchBuffer SerializeBatch(JournalState state, IReadOnlyList<QueueEventRecord> records)
+        {
+            var serializedBatch = GetCodec(state.Format).SerializeBatch(records, state.LastSequenceNumber);
+            state.LastSequenceNumber += records.Count;
+            return serializedBatch;
+        }
+
+        private QueueEventJournalBatchBuffer SerializeBatch(JournalState state, IReadOnlyList<PendingAppendRequest> batch, out QueueEventRecord[] batchRecords)
         {
             var totalRecordCount = 0;
             foreach (var request in batch)
                 totalRecordCount += request.RecordCount;
 
-            var serializedRecords = new List<SerializedRecord>(totalRecordCount);
-            var nextSequence = state.LastSequenceNumber;
-            var codec = GetCodec(state.Format);
-            var totalBytes = 0;
+            batchRecords = new QueueEventRecord[totalRecordCount];
+            var recordIndex = 0;
 
             foreach (var request in batch)
             {
                 if (request.TryGetSingleRecord(out var singleRecord))
                 {
-                    nextSequence++;
-                    var bytes = codec.SerializeRecord(singleRecord, nextSequence);
-                    serializedRecords.Add(new SerializedRecord(bytes));
-                    totalBytes += bytes.Length;
+                    batchRecords[recordIndex++] = singleRecord;
                     continue;
                 }
 
                 foreach (var record in request.Records)
-                {
-                    nextSequence++;
-                    var bytes = codec.SerializeRecord(record, nextSequence);
-                    serializedRecords.Add(new SerializedRecord(bytes));
-                    totalBytes += bytes.Length;
-                }
+                    batchRecords[recordIndex++] = record;
             }
 
-            state.LastSequenceNumber = nextSequence;
-            return new SerializedBatch(serializedRecords, totalBytes);
+            return SerializeBatch(state, batchRecords);
         }
 
         private Stream EnsureAppendStream(TenantWriterState writer)
@@ -726,6 +812,20 @@ namespace Locus.Storage
             if (writer.AppendStream != null)
                 await DurableFileWrite.FlushToDiskAsync(writer.AppendStream, writer.Cancellation.Token).ConfigureAwait(false);
 
+            CompleteAppendFlush(writer, flushStartedAt);
+        }
+
+        private void FlushAppendStreamCore(TenantWriterState writer)
+        {
+            var flushStartedAt = Stopwatch.GetTimestamp();
+            if (writer.AppendStream != null)
+                DurableFileWrite.FlushToDisk(writer.AppendStream);
+
+            CompleteAppendFlush(writer, flushStartedAt);
+        }
+
+        private void CompleteAppendFlush(TenantWriterState writer, long flushStartedAt)
+        {
             writer.HasUnflushedData = false;
             writer.LastFlushUtc = DateTime.UtcNow;
             var durationTicks = Stopwatch.GetTimestamp() - flushStartedAt;
@@ -750,19 +850,19 @@ namespace Locus.Storage
         private void CompleteRequests(IReadOnlyList<PendingAppendRequest> batch)
         {
             foreach (var request in batch)
-                request.Completion.TrySetResult(null);
+                request.TrySetCompleted();
         }
 
         private void FailRequests(IReadOnlyList<PendingAppendRequest> batch, Exception exception)
         {
             foreach (var request in batch)
-                request.Completion.TrySetException(exception);
+                request.TrySetException(exception);
         }
 
         private void FailPendingRequests(TenantWriterState writer, Exception exception)
         {
             while (writer.PendingRequests.TryDequeue(out var request))
-                request.Completion.TrySetException(exception);
+                request.TrySetException(exception);
         }
 
         private string ValidateAppendBatch(IReadOnlyList<QueueEventRecord> records)
@@ -1274,18 +1374,22 @@ namespace Locus.Storage
             private readonly QueueEventRecord? _singleRecord;
             private IReadOnlyList<QueueEventRecord>? _singleRecordWrapper;
 
-            public PendingAppendRequest(QueueEventRecord record, int estimatedBytes)
+            public PendingAppendRequest(QueueEventRecord record, int estimatedBytes, bool createCompletion)
             {
                 _singleRecord = record ?? throw new ArgumentNullException(nameof(record));
                 EstimatedBytes = estimatedBytes;
-                Completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                Completion = createCompletion
+                    ? new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously)
+                    : null;
             }
 
-            public PendingAppendRequest(IReadOnlyList<QueueEventRecord> records, int estimatedBytes)
+            public PendingAppendRequest(IReadOnlyList<QueueEventRecord> records, int estimatedBytes, bool createCompletion)
             {
                 _records = records ?? throw new ArgumentNullException(nameof(records));
                 EstimatedBytes = estimatedBytes;
-                Completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                Completion = createCompletion
+                    ? new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously)
+                    : null;
             }
 
             public IReadOnlyList<QueueEventRecord> Records
@@ -1306,7 +1410,7 @@ namespace Locus.Storage
 
             public int EstimatedBytes { get; }
 
-            public TaskCompletionSource<object?> Completion { get; }
+            public TaskCompletionSource<object?>? Completion { get; }
 
             public bool TryGetSingleRecord(out QueueEventRecord record)
             {
@@ -1318,6 +1422,16 @@ namespace Locus.Storage
 
                 record = null!;
                 return false;
+            }
+
+            public void TrySetCompleted()
+            {
+                Completion?.TrySetResult(null);
+            }
+
+            public void TrySetException(Exception exception)
+            {
+                Completion?.TrySetException(exception);
             }
         }
 
@@ -1342,6 +1456,8 @@ namespace Locus.Storage
 
             public Task WorkerTask { get; set; } = Task.CompletedTask;
 
+            public int WorkerStarted;
+
             public Stream? AppendStream { get; set; }
 
             public bool HasUnflushedData { get; set; }
@@ -1361,29 +1477,6 @@ namespace Locus.Storage
                 ShutdownRequested = true;
                 Signal.Release();
             }
-        }
-
-        private sealed class SerializedRecord
-        {
-            public SerializedRecord(byte[] bytes)
-            {
-                Bytes = bytes ?? throw new ArgumentNullException(nameof(bytes));
-            }
-
-            public byte[] Bytes { get; }
-        }
-
-        private sealed class SerializedBatch
-        {
-            public SerializedBatch(IReadOnlyList<SerializedRecord> records, int totalBytes)
-            {
-                Records = records ?? throw new ArgumentNullException(nameof(records));
-                TotalBytes = totalBytes;
-            }
-
-            public IReadOnlyList<SerializedRecord> Records { get; }
-
-            public int TotalBytes { get; }
         }
 
         private sealed class JournalState
@@ -1441,6 +1534,9 @@ namespace Locus.Storage
                     _logger.LogWarning(ex, "Failed while draining queue journal writer for tenant {TenantId}", tenantWriter.TenantId);
                 }
             }
+
+            foreach (var tenantWriter in _tenantWriters.Values)
+                CloseTenantAppendStream(tenantWriter);
 
             if (!_dirtyStateTenants.IsEmpty)
             {
