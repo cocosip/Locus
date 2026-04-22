@@ -101,7 +101,7 @@ namespace Locus.FileSystem
         /// Default: 30 seconds. Pass <see cref="TimeSpan.Zero"/> to disable caching (original behavior).
         /// </param>
         /// <param name="writeBufferSize">Write stream buffer size in bytes. Default 128 KB.</param>
-        /// <param name="copyBufferSize">Pooled copy buffer size in bytes. Default 80 KB.</param>
+        /// <param name="copyBufferSize">Pooled copy buffer size in bytes. Default 256 KB.</param>
         /// <param name="forceFlushAfterWrite">
         /// Whether to force <see cref="Stream.FlushAsync(CancellationToken)"/> after each write.
         /// Default: true.
@@ -532,13 +532,22 @@ namespace Locus.FileSystem
                     out var directBuffer,
                     out var directMemoryStream,
                     out var hasVisibleMemoryBuffer);
-                var useSynchronousSeekableFileWritePath = ShouldUseSynchronousSeekableFileWritePath(content, remainingBytes);
+                var useHiddenMemoryStreamWritePath = ShouldUseHiddenMemoryStreamWritePath(
+                    memoryStream,
+                    remainingBytes,
+                    hasDirectWriteBuffer);
+                var directory = _fileSystem.Path.GetDirectoryName(path);
+                var useSynchronousSeekableFileWritePath = !useHiddenMemoryStreamWritePath
+                    && ShouldUseSynchronousSeekableFileWritePath(content, remainingBytes);
                 var useSynchronousSmallWritePath = !useSynchronousSeekableFileWritePath
+                    && !useHiddenMemoryStreamWritePath
                     && ShouldUseSynchronousSmallWritePath(content, remainingBytes, hasDirectWriteBuffer);
+                var useSynchronousDirectMemoryWritePath = hasDirectWriteBuffer
+                    && useSynchronousSmallWritePath;
                 ObserveWriteSource(
                     content,
                     remainingBytes,
-                    useSynchronousSmallWritePath,
+                    useSynchronousDirectMemoryWritePath,
                     useSynchronousSeekableFileWritePath,
                     memoryStream != null,
                     hasVisibleMemoryBuffer,
@@ -546,7 +555,6 @@ namespace Locus.FileSystem
 
                 // Optimization 4: skip Directory.Exists() for directories we already know exist.
                 // Shard directories are created once and never deleted during normal operation.
-                var directory = _fileSystem.Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory))
                 {
                     await MeasureDirectoryPreparationAsync(
@@ -557,7 +565,7 @@ namespace Locus.FileSystem
                 if (hasDirectWriteBuffer)
                 {
                     var directSource = directMemoryStream!;
-                    if (useSynchronousSmallWritePath)
+                    if (useSynchronousDirectMemoryWritePath)
                     {
                         using (var fileStream = MeasureOpenStream(() => CreateSynchronousWriteStream(path, remainingBytes)))
                         {
@@ -581,6 +589,16 @@ namespace Locus.FileSystem
                                     () => fileStream.FlushAsync(ct))
                                     .ConfigureAwait(false);
                         }
+                    }
+                }
+                else if (useHiddenMemoryStreamWritePath)
+                {
+                    using (var fileStream = MeasureOpenStream(() => CreateSynchronousWriteStream(path, remainingBytes)))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        MeasureCopy(() => WriteHiddenMemoryStreamSynchronously(memoryStream!, fileStream, ct));
+                        if (_forceFlushAfterWrite)
+                            MeasureFlush(fileStream.Flush);
                     }
                 }
                 else if (useSynchronousSmallWritePath)
@@ -1048,27 +1066,27 @@ namespace Locus.FileSystem
         {
             // MockFileSystem does not map to OS file handles; keep using abstraction in tests.
             if (_usesMockFileSystem)
-                return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
+                return _fileSystem.File.Open(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
 
             var bufferSize = ResolveWriteBufferSize(expectedBytes);
             return new FileStream(
                 path,
-                FileMode.Create,
+                FileMode.CreateNew,
                 FileAccess.Write,
                 FileShare.None,
                 bufferSize,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+                FileOptions.Asynchronous);
         }
 
         private Stream CreateSynchronousWriteStream(string path, long? expectedBytes)
         {
             if (_usesMockFileSystem)
-                return _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
+                return _fileSystem.File.Open(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
 
             var bufferSize = ResolveWriteBufferSize(expectedBytes);
             return new FileStream(
                 path,
-                FileMode.Create,
+                FileMode.CreateNew,
                 FileAccess.Write,
                 FileShare.None,
                 bufferSize,
@@ -1164,6 +1182,19 @@ namespace Locus.FileSystem
                 && remainingBytes.Value > DefaultExactSeekableCopyThresholdBytes;
         }
 
+        private static bool ShouldUseHiddenMemoryStreamWritePath(
+            MemoryStream? memoryStream,
+            long? remainingBytes,
+            bool hasDirectWriteBuffer)
+        {
+            return memoryStream != null
+                && !hasDirectWriteBuffer
+                && remainingBytes.HasValue
+                && remainingBytes.Value > 0
+                && memoryStream.Position == 0
+                && remainingBytes.Value == memoryStream.Length;
+        }
+
         private static bool TryGetMemoryStreamWriteBuffer(
             Stream content,
             long? remainingBytes,
@@ -1237,6 +1268,16 @@ namespace Locus.FileSystem
             {
                 ArrayPool<byte>.Shared.Return(buffer);
             }
+        }
+
+        private static void WriteHiddenMemoryStreamSynchronously(
+            MemoryStream source,
+            Stream destination,
+            CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            source.WriteTo(destination);
+            source.Position = source.Length;
         }
 
         private void CopySeekableStreamSynchronously(

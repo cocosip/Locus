@@ -468,7 +468,6 @@ namespace Locus.Benchmarks
 
             public void Reset()
             {
-                _writeIndex = 0;
                 _scenario.Reset();
             }
 

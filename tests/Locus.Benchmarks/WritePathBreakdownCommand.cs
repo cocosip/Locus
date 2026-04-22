@@ -226,6 +226,7 @@ namespace Locus.Benchmarks
                 storagePool,
                 tenant,
                 sourceFilePath,
+                payload,
                 options.SourceKind,
                 measurements,
                 metadataRepository,
@@ -458,9 +459,14 @@ namespace Locus.Benchmarks
                         return false;
                     }
 
-                    if (string.Equals(sourceValue, "memory", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(sourceValue, "memory", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(sourceValue, "memory-hidden", StringComparison.OrdinalIgnoreCase))
                     {
-                        options.SourceKind = SourceKind.Memory;
+                        options.SourceKind = SourceKind.HiddenMemory;
+                    }
+                    else if (string.Equals(sourceValue, "memory-visible", StringComparison.OrdinalIgnoreCase))
+                    {
+                        options.SourceKind = SourceKind.VisibleMemory;
                     }
                     else if (string.Equals(sourceValue, "file", StringComparison.OrdinalIgnoreCase))
                     {
@@ -468,7 +474,7 @@ namespace Locus.Benchmarks
                     }
                     else
                     {
-                        error = "Invalid value for --source. Supported values: memory, file.";
+                        error = "Invalid value for --source. Supported values: memory, memory-hidden, memory-visible, file.";
                         return false;
                     }
 
@@ -645,7 +651,7 @@ namespace Locus.Benchmarks
             Console.WriteLine("  --format <binary|json>        Queue journal format. Default: binary");
             Console.WriteLine("  --ack-mode <csv>              Queue journal ack mode(s): durable,balanced,async. Default: durable");
             Console.WriteLine("  --include-no-flush <bool>     Also run forceFlushAfterWrite=false scenario. Default: true");
-            Console.WriteLine("  --source <memory|file>        Benchmark input stream type. Default: memory");
+            Console.WriteLine("  --source <kind>               Benchmark input stream type: memory, memory-hidden, memory-visible, or file. Default: memory");
             Console.WriteLine("  --linger-ms <ms>              Queue journal linger window in milliseconds. Default: 1");
             Console.WriteLine("  --balanced-flush-window-ms <ms>  Balanced ack flush window in milliseconds. Default: 5");
             Console.WriteLine("  --max-batch-records <count>   Queue journal max coalesced records per batch. Default: 16");
@@ -668,7 +674,7 @@ namespace Locus.Benchmarks
 
             public QueueEventJournalAckMode[] AckModes { get; set; } = Array.Empty<QueueEventJournalAckMode>();
 
-            public SourceKind SourceKind { get; set; } = SourceKind.Memory;
+            public SourceKind SourceKind { get; set; } = SourceKind.HiddenMemory;
 
             public TimeSpan Linger { get; set; }
 
@@ -685,7 +691,8 @@ namespace Locus.Benchmarks
 
         private enum SourceKind
         {
-            Memory,
+            HiddenMemory,
+            VisibleMemory,
             File
         }
 
@@ -715,12 +722,14 @@ namespace Locus.Benchmarks
             private readonly MetadataRepository _metadataRepository;
             private readonly DirectoryQuotaRepository _quotaRepository;
             private readonly IDisposable _queueJournal;
+            private readonly byte[] _memoryPayload;
             public ScenarioContext(
                 IFileSystem fileSystem,
                 string rootDirectory,
                 StoragePool storagePool,
                 ITenantContext tenant,
                 string sourceFilePath,
+                byte[] memoryPayload,
                 SourceKind sourceKind,
                 MeasurementSet measurements,
                 MetadataRepository metadataRepository,
@@ -732,6 +741,7 @@ namespace Locus.Benchmarks
                 StoragePool = storagePool;
                 Tenant = tenant;
                 SourceFilePath = sourceFilePath;
+                _memoryPayload = memoryPayload;
                 Source = sourceKind;
                 Measurements = measurements;
                 _metadataRepository = metadataRepository;
@@ -768,7 +778,17 @@ namespace Locus.Benchmarks
                         FileOptions.SequentialScan);
                 }
 
-                return new MemoryStream(_fileSystem.File.ReadAllBytes(SourceFilePath), writable: false);
+                if (Source == SourceKind.VisibleMemory)
+                {
+                    return new MemoryStream(
+                        _memoryPayload,
+                        0,
+                        _memoryPayload.Length,
+                        writable: false,
+                        publiclyVisible: true);
+                }
+
+                return new MemoryStream(_memoryPayload, writable: false);
             }
 
             public void Dispose()

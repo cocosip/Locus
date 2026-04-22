@@ -208,6 +208,44 @@ namespace Locus.FileSystem.Tests
         }
 
         [Fact]
+        public async Task GetWritePathStatisticsSnapshot_TracksLargeVisibleMemoryStreamAsAsynchronousDirectWrite()
+        {
+            var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
+            var diagnostics = Assert.IsAssignableFrom<IStorageVolumeWritePathDiagnostics>(volume);
+            var largePath = Path.Combine(_mountPath, "large-visible.bin");
+
+            var payload = new byte[8 * 1024 * 1024];
+            for (var i = 0; i < payload.Length; i++)
+                payload[i] = (byte)(i % 251);
+
+            using (var visibleStream = new MemoryStream(payload, 0, payload.Length, writable: false, publiclyVisible: true))
+            {
+                await volume.WriteAsync(largePath, visibleStream, CancellationToken.None);
+            }
+
+            var snapshot = diagnostics.GetWritePathStatisticsSnapshot();
+            Assert.Equal(1, snapshot.TotalWrites);
+            Assert.Equal(1, snapshot.MemoryStreamWrites);
+            Assert.Equal(1, snapshot.VisibleBufferWrites);
+            Assert.Equal(1, snapshot.DirectFastPathWrites);
+            Assert.Equal(payload.Length, snapshot.DirectFastPathBytes);
+            Assert.Equal(0, snapshot.DirectFastPathSyncWrites);
+            Assert.Equal(1, snapshot.DirectFastPathAsyncWrites);
+            Assert.Equal(0, snapshot.HiddenMemoryStreamWrites);
+            Assert.Equal(0, snapshot.NonMemorySeekableWrites);
+            Assert.Equal(0, snapshot.NonSeekableWrites);
+            Assert.Equal(1, snapshot.DirectoryPreparationCount);
+            Assert.Equal(1, snapshot.OpenStreamCount);
+            Assert.Equal(1, snapshot.CopyOperationCount);
+            Assert.Equal(1, snapshot.FlushOperationCount);
+
+            var savedContent = _fileSystem.File.ReadAllBytes(largePath);
+            Assert.Equal(payload.Length, savedContent.Length);
+            for (var i = 0; i < savedContent.Length; i++)
+                Assert.Equal(payload[i], savedContent[i]);
+        }
+
+        [Fact]
         public async Task GetWritePathStatisticsSnapshot_TracksSynchronousSeekableFileWrites()
         {
             var volume = new LocalFileSystemVolume(_fileSystem, _logger.Object, "vol-001", _mountPath);
@@ -301,6 +339,7 @@ namespace Locus.FileSystem.Tests
             for (var i = 0; i < savedContent.Length; i++)
                 Assert.Equal(payload[i], savedContent[i]);
         }
+
 
         [Fact]
         public async Task WriteAsync_KnownDirectoryCacheTrim_KeepsMountPathAndBoundsSize()

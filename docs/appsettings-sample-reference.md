@@ -323,10 +323,11 @@
         "HealthCheckDelayMs": 1000,
 
         // 写入 buffer 大小
-        "WriteBufferSize": 524288,
+        // 当前样例与运行时默认值保持一致，适合作为顺序写入的保守起点
+        "WriteBufferSize": 131072,
 
         // 复制 buffer 大小
-        "CopyBufferSize": 524288,
+        "CopyBufferSize": 262144,
 
         // 每次写入后是否强制 flush 到磁盘
         "ForceFlushAfterWrite": true
@@ -338,8 +339,8 @@
         "ShardingDepth": 2,
         "InitialDelayMs": 1000,
         "HealthCheckDelayMs": 1000,
-        "WriteBufferSize": 524288,
-        "CopyBufferSize": 524288,
+        "WriteBufferSize": 131072,
+        "CopyBufferSize": 262144,
         "ForceFlushAfterWrite": true
       }
     ],

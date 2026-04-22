@@ -202,9 +202,9 @@ namespace Locus
 
         /// <summary>
         /// Gets or sets the pooled copy buffer size used while streaming content (bytes).
-        /// Default: 80 KB.
+        /// Default: 256 KB.
         /// </summary>
-        public int CopyBufferSize { get; set; } = 80 * 1024;
+        public int CopyBufferSize { get; set; } = 256 * 1024;
 
         /// <summary>
         /// Gets or sets whether each write should force a flush to disk.
