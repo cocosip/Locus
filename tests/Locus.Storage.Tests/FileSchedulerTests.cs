@@ -1021,6 +1021,32 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_FileAlreadyCompletedWithJournal_ReleasesTransitionGuard()
+        {
+            var processingStart = DateTime.UtcNow;
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "file-already-complete-journal",
+                TenantId = "tenant-001",
+                PhysicalPath = "/test/file-already-complete-journal.txt",
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = processingStart.AddSeconds(5)
+            }, CancellationToken.None);
+
+            var journal = new Mock<IQueueEventJournal>();
+            var scheduler = new FileScheduler(_repository, _fileSystem, _logger.Object, queueEventJournal: journal.Object);
+            var lease = CreateLease("tenant-001", "file-already-complete-journal", processingStart);
+
+            await scheduler.MarkAsCompletedAsync(lease, CancellationToken.None);
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            var ex = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                scheduler.MarkAsFailedAsync(lease, "stale worker", cts.Token));
+
+            Assert.Equal("file-already-complete-journal", ex.FileKey);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_ThrowsWhenProcessingLeaseChanged()
         {
             var originalLease = DateTime.UtcNow.AddMinutes(-2);

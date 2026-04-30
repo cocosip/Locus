@@ -306,7 +306,11 @@ namespace Locus.Storage
             {
                 transitionGuard = GetTransitionGuard(lease.FileKey);
                 await transitionGuard.WaitAsync(ct).ConfigureAwait(false);
-                try
+            }
+
+            try
+            {
+                if (_queueEventJournal != null)
                 {
                     var current = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
                     if (current == null)
@@ -322,24 +326,16 @@ namespace Locus.Storage
                         throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, current);
                     }
 
-                    var completedAtUtc = DateTime.UtcNow;
+                    var eventCompletedAtUtc = DateTime.UtcNow;
                     await _queueEventJournal.AppendBatchAsync(
                         new[]
                         {
-                            QueueEventRecordFactory.CreateProcessingCompleted(current, lease.ProcessingStartTimeUtc, completedAtUtc),
-                            QueueEventRecordFactory.CreateDeleteRequested(current, completedAtUtc),
+                            QueueEventRecordFactory.CreateProcessingCompleted(current, lease.ProcessingStartTimeUtc, eventCompletedAtUtc),
+                            QueueEventRecordFactory.CreateDeleteRequested(current, eventCompletedAtUtc),
                         },
                         ct).ConfigureAwait(false);
                 }
-                catch
-                {
-                    transitionGuard.Release();
-                    throw;
-                }
-            }
 
-            try
-            {
                 var completedAtUtc = DateTime.UtcNow;
                 var updated = await _projectionStore.TryUpdateProjectedProcessingFileAsync(
                     lease.TenantId,
