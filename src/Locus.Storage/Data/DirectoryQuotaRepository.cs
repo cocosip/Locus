@@ -1111,7 +1111,7 @@ ON CONFLICT(directory_path) DO UPDATE SET
 
                 if (cur <= 0)
                 {
-                    _logger.LogWarning(
+                    _logger.LogDebug(
                         "Attempted to decrement count for directory {DirectoryPath}, Tenant: {TenantId} but count is already 0",
                         directoryPath, tenantId);
                     return Task.CompletedTask;

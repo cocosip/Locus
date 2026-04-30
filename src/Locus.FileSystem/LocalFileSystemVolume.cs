@@ -650,7 +650,7 @@ namespace Locus.FileSystem
 
             if (!_fileSystem.File.Exists(path))
             {
-                _logger.LogWarning("Attempted to delete non-existent file: {Path}", path);
+                _logger.LogDebug("Attempted to delete non-existent file: {Path}", path);
                 return Task.CompletedTask;
             }
 

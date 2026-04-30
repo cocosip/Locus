@@ -21,6 +21,8 @@ namespace Locus.Storage
         private readonly IFileWatcherOptionsManager _optionsManager;
         private readonly ILogger<BackgroundFileWatcherService> _logger;
         private readonly ConcurrentDictionary<string, DateTime> _nextScanDueByWatcherId;
+        private readonly ConcurrentDictionary<string, byte> _warnedIntervalWatcherIds;
+        private readonly ConcurrentDictionary<string, int> _recentWatcherErrorHashes;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BackgroundFileWatcherService"/> class.
@@ -34,6 +36,8 @@ namespace Locus.Storage
             _optionsManager = optionsManager ?? throw new ArgumentNullException(nameof(optionsManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _nextScanDueByWatcherId = new ConcurrentDictionary<string, DateTime>(StringComparer.Ordinal);
+            _warnedIntervalWatcherIds = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            _recentWatcherErrorHashes = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         }
 
         /// <inheritdoc/>
@@ -95,7 +99,7 @@ namespace Locus.Storage
             if (!dueWatchers.Any())
                 return GetDelayUntilNextDue(enabledWatchers, options, now);
 
-            _logger.LogInformation("Scanning {DueCount} due watchers (enabled total: {EnabledCount})",
+            _logger.LogDebug("Scanning {DueCount} due watchers (enabled total: {EnabledCount})",
                 dueWatchers.Count, enabledWatchers.Count);
 
             var maxParallel = Math.Max(1, options.MaxParallelWatcherScans);
@@ -149,7 +153,11 @@ namespace Locus.Storage
             var staleIds = _nextScanDueByWatcherId.Keys.Where(id => !enabledIds.Contains(id)).ToList();
 
             foreach (var watcherId in staleIds)
+            {
                 _nextScanDueByWatcherId.TryRemove(watcherId, out _);
+                _recentWatcherErrorHashes.TryRemove(watcherId, out _);
+                _warnedIntervalWatcherIds.TryRemove(watcherId, out _);
+            }
         }
 
         private DateTime GetNextDueUtc(FileWatcherConfiguration watcher, FileWatcherOptions options, DateTime now)
@@ -189,17 +197,35 @@ namespace Locus.Storage
 
             if (interval < options.MinimumPollingInterval)
             {
-                _logger.LogWarning(
-                    "Watcher {WatcherId} polling interval {Interval} is below minimum {MinInterval}; using minimum",
-                    watcher.WatcherId, interval, options.MinimumPollingInterval);
+                if (_warnedIntervalWatcherIds.TryAdd(watcher.WatcherId, 0))
+                {
+                    _logger.LogWarning(
+                        "Watcher {WatcherId} polling interval {Interval} is below minimum {MinInterval}; using minimum",
+                        watcher.WatcherId, interval, options.MinimumPollingInterval);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Watcher {WatcherId} polling interval {Interval} is below minimum {MinInterval}; using minimum",
+                        watcher.WatcherId, interval, options.MinimumPollingInterval);
+                }
                 interval = options.MinimumPollingInterval;
             }
 
             if (interval > options.MaximumPollingInterval)
             {
-                _logger.LogWarning(
-                    "Watcher {WatcherId} polling interval {Interval} is above maximum {MaxInterval}; using maximum",
-                    watcher.WatcherId, interval, options.MaximumPollingInterval);
+                if (_warnedIntervalWatcherIds.TryAdd(watcher.WatcherId, 0))
+                {
+                    _logger.LogWarning(
+                        "Watcher {WatcherId} polling interval {Interval} is above maximum {MaxInterval}; using maximum",
+                        watcher.WatcherId, interval, options.MaximumPollingInterval);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Watcher {WatcherId} polling interval {Interval} is above maximum {MaxInterval}; using maximum",
+                        watcher.WatcherId, interval, options.MaximumPollingInterval);
+                }
                 interval = options.MaximumPollingInterval;
             }
 
@@ -233,14 +259,22 @@ namespace Locus.Storage
 
                     if (result.Errors.Any())
                     {
-                        foreach (var error in result.Errors.Take(5))
+                        var errorHash = GetErrorHash(result.Errors);
+                        var previousHash = _recentWatcherErrorHashes.GetOrAdd(watcher.WatcherId, 0);
+                        var isRepeat = previousHash == errorHash;
+                        if (!isRepeat)
+                            _recentWatcherErrorHashes[watcher.WatcherId] = errorHash;
+
+                        var level = isRepeat ? LogLevel.Debug : LogLevel.Warning;
+                        var distinctErrors = result.Errors.Distinct().Take(5).ToList();
+                        foreach (var error in distinctErrors)
                         {
-                            _logger.LogWarning("Watcher {WatcherId} error: {Error}", watcher.WatcherId, error);
+                            _logger.Log(level, "Watcher {WatcherId} error: {Error}", watcher.WatcherId, error);
                         }
 
                         if (result.Errors.Count > 5)
                         {
-                            _logger.LogWarning("Watcher {WatcherId} had {Count} more errors", watcher.WatcherId, result.Errors.Count - 5);
+                            _logger.Log(level, "Watcher {WatcherId} had {Count} more errors", watcher.WatcherId, result.Errors.Count - 5);
                         }
                     }
                 }
@@ -258,6 +292,16 @@ namespace Locus.Storage
                 var interval = NormalizePollingInterval(watcher, options);
                 _nextScanDueByWatcherId[watcher.WatcherId] = DateTime.UtcNow.Add(interval);
             }
+        }
+
+        private static int GetErrorHash(IList<string> errors)
+        {
+            var hash = 17;
+            foreach (var error in errors)
+            {
+                hash = hash * 31 + (error?.GetHashCode() ?? 0);
+            }
+            return hash;
         }
     }
 }

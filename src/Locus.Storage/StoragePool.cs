@@ -1067,7 +1067,7 @@ namespace Locus.Storage
         {
             _cachedWritableVolumes = Array.Empty<IStorageVolume>();
             Interlocked.Exchange(ref _lastVolumeSnapshotTicks, 0);
-            _logger.LogWarning("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
+            _logger.LogDebug("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
         }
 
         private SemaphoreSlim GetCompletionGuard(string fileKey)

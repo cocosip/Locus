@@ -453,7 +453,7 @@ namespace Locus.Storage
                 else
                 {
                     var delay = updated.AvailableForProcessingAt!.Value - DateTime.UtcNow;
-                    _logger.LogWarning("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
+                    _logger.LogInformation("File marked as failed (retry {RetryCount}/{MaxRetries}), will retry after {Delay}: {FileKey}, Error: {Error}",
                         updated.RetryCount, _retryPolicy.MaxRetryCount, delay, lease.FileKey, errorMessage);
                 }
             }
