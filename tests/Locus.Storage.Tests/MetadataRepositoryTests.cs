@@ -674,6 +674,98 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public void DrainPersistenceBatch_WhenQueuedOperationIsOlderThanCoalescedOperation_PersistsLatestOperation()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var orderedDir = Path.Combine(_metadataDir, $"ordered-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(orderedDir);
+            var tenantId = "tenant-ordered";
+            var fileKey = "ordered-file";
+
+            var repository = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                orderedDir,
+                enableBackgroundPersistence: false,
+                maxDrainBatchSize: 2,
+                maxPersistenceQueueSize: 2);
+
+            try
+            {
+                var older = CreateMetadata(fileKey, FileProcessingStatus.Pending, tenantId);
+                older.RetryCount = 1;
+
+                var newer = older.Clone();
+                newer.Status = FileProcessingStatus.Completed;
+                newer.RetryCount = 2;
+                newer.CompletedAt = DateTime.UtcNow;
+
+                Assert.True(InvokeTryWritePersistenceOperation(repository, older));
+                InvokeCoalescePersistenceOperation(repository, newer);
+
+                Assert.True(InvokeDrainPersistenceBatch(repository));
+
+                var persisted = ReadPersistedMetadata(orderedDir, tenantId, fileKey);
+                Assert.NotNull(persisted);
+                Assert.Equal(FileProcessingStatus.Completed, persisted!.Status);
+                Assert.Equal(2, persisted.RetryCount);
+            }
+            finally
+            {
+                repository.Dispose();
+                SqliteConnection.ClearAllPools();
+                if (_fileSystem.Directory.Exists(orderedDir))
+                    _fileSystem.Directory.Delete(orderedDir, recursive: true);
+            }
+        }
+
+        [Fact]
+        public void DrainPersistenceBatch_WhenCoalescedOperationIsOlderThanQueuedOperation_PersistsLatestOperation()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var orderedDir = Path.Combine(_metadataDir, $"ordered-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(orderedDir);
+            var tenantId = "tenant-ordered";
+            var fileKey = "ordered-file";
+
+            var repository = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                orderedDir,
+                enableBackgroundPersistence: false,
+                maxDrainBatchSize: 2,
+                maxPersistenceQueueSize: 2);
+
+            try
+            {
+                var older = CreateMetadata(fileKey, FileProcessingStatus.Pending, tenantId);
+                older.RetryCount = 1;
+
+                var newer = older.Clone();
+                newer.Status = FileProcessingStatus.Completed;
+                newer.RetryCount = 2;
+                newer.CompletedAt = DateTime.UtcNow;
+
+                InvokeCoalescePersistenceOperation(repository, older);
+                Assert.True(InvokeTryWritePersistenceOperation(repository, newer));
+
+                Assert.True(InvokeDrainPersistenceBatch(repository));
+
+                var persisted = ReadPersistedMetadata(orderedDir, tenantId, fileKey);
+                Assert.NotNull(persisted);
+                Assert.Equal(FileProcessingStatus.Completed, persisted!.Status);
+                Assert.Equal(2, persisted.RetryCount);
+            }
+            finally
+            {
+                repository.Dispose();
+                SqliteConnection.ClearAllPools();
+                if (_fileSystem.Directory.Exists(orderedDir))
+                    _fileSystem.Directory.Delete(orderedDir, recursive: true);
+            }
+        }
+
+        [Fact]
         public async Task StartupLoad_BatchedPendingLoad_PreservesCreatedAtOrder()
         {
             var logger = new Mock<ILogger<MetadataRepository>>();
@@ -801,6 +893,91 @@ namespace Locus.Storage.Tests
             Assert.NotNull(field);
 
             return (int)field!.GetValue(repository)!;
+        }
+
+        private static bool InvokeTryWritePersistenceOperation(MetadataRepository repository, FileMetadata metadata)
+        {
+            var operation = CreatePersistenceOperation(repository, metadata);
+            var method = typeof(MetadataRepository).GetMethod(
+                "TryWritePersistenceOperation",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            return (bool)method!.Invoke(repository, new[] { operation })!;
+        }
+
+        private static void InvokeCoalescePersistenceOperation(MetadataRepository repository, FileMetadata metadata)
+        {
+            var operation = CreatePersistenceOperation(repository, metadata);
+            var method = typeof(MetadataRepository).GetMethod(
+                "CoalescePersistenceOperation",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            method!.Invoke(repository, new[] { operation, 0, "test" });
+        }
+
+        private static bool InvokeDrainPersistenceBatch(MetadataRepository repository)
+        {
+            var method = typeof(MetadataRepository).GetMethod(
+                "DrainPersistenceBatch",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            return (bool)method!.Invoke(repository, Array.Empty<object>())!;
+        }
+
+        private static object CreatePersistenceOperation(MetadataRepository repository, FileMetadata metadata)
+        {
+            var method = typeof(MetadataRepository).GetMethod(
+                "CreatePersistenceUpsert",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            return method!.Invoke(repository, new object[] { metadata })!;
+        }
+
+        private static FileMetadata? ReadPersistedMetadata(string metadataDirectory, string tenantId, string fileKey)
+        {
+            var dbPath = Path.Combine(metadataDirectory, tenantId, "metadata.db");
+            using var connection = new SqliteConnection($"Data Source={dbPath}");
+            connection.Open();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+SELECT file_key, tenant_id, volume_id, physical_path, directory_path, file_size,
+       created_at, status, retry_count, last_failed_at, last_error,
+       processing_start_time, completed_at, delete_succeeded_at, dead_lettered_at,
+       available_for_processing_at, original_file_name, file_extension, metadata_json
+FROM files
+WHERE file_key = $file_key;";
+            command.Parameters.AddWithValue("$file_key", fileKey);
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+                return null;
+
+            return new FileMetadata
+            {
+                FileKey = reader.GetString(0),
+                TenantId = reader.GetString(1),
+                VolumeId = reader.GetString(2),
+                PhysicalPath = reader.GetString(3),
+                DirectoryPath = reader.GetString(4),
+                FileSize = reader.GetInt64(5),
+                CreatedAt = DateTime.Parse(reader.GetString(6), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                Status = (FileProcessingStatus)reader.GetInt32(7),
+                RetryCount = reader.GetInt32(8),
+                LastFailedAt = reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                LastError = reader.IsDBNull(10) ? null : reader.GetString(10),
+                ProcessingStartTime = reader.IsDBNull(11) ? null : DateTime.Parse(reader.GetString(11), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                CompletedAt = reader.IsDBNull(12) ? null : DateTime.Parse(reader.GetString(12), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                DeleteSucceededAt = reader.IsDBNull(13) ? null : DateTime.Parse(reader.GetString(13), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                DeadLetteredAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                AvailableForProcessingAt = reader.IsDBNull(15) ? null : DateTime.Parse(reader.GetString(15), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                OriginalFileName = reader.IsDBNull(16) ? null : reader.GetString(16),
+                FileExtension = reader.IsDBNull(17) ? null : reader.GetString(17),
+            };
         }
     }
 }

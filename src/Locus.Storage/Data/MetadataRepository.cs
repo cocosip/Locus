@@ -159,6 +159,7 @@ namespace Locus.Storage.Data
         private int _persistenceChannelDepth;
         private int _persistenceChannelPeakDepth;
         private int _coalescedDepth;
+        private long _persistenceOperationSequence;
 
         private volatile bool _disposed;
 
@@ -169,21 +170,24 @@ namespace Locus.Storage.Data
             public readonly FileMetadata? Metadata;  // set when IsDelete == false
             public readonly string TenantId;
             public readonly string FileKey;
+            public readonly long Sequence;
 
-            public PersistenceOperation(FileMetadata metadata)
+            public PersistenceOperation(FileMetadata metadata, long sequence)
             {
                 IsDelete = false;
                 Metadata = metadata;
                 TenantId = metadata.TenantId;
                 FileKey = metadata.FileKey;
+                Sequence = sequence;
             }
 
-            public PersistenceOperation(string tenantId, string fileKey)
+            public PersistenceOperation(string tenantId, string fileKey, long sequence)
             {
                 IsDelete = true;
                 Metadata = null;
                 TenantId = tenantId;
                 FileKey = fileKey;
+                Sequence = sequence;
             }
         }
 
@@ -873,7 +877,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             // 2. Queue SQLite persistence -- caller is not blocked; background loop drains the queue.
             var persistenceEnqueueStarted = Stopwatch.GetTimestamp();
-            EnqueuePersistence(new PersistenceOperation(metadata));
+            EnqueuePersistence(CreatePersistenceUpsert(metadata));
             RecordProjectionPhase(
                 ref _observedProjectionPersistenceEnqueueCount,
                 ref _observedProjectionPersistenceEnqueueTicks,
@@ -914,7 +918,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             UpdateCacheAndIndices(metadata);
 
             // Write directly to SQLite (synchronous -- required for rebuild correctness)
-            ExecuteDirectBatch(metadata.TenantId, new List<PersistenceOperation> { new PersistenceOperation(metadata) });
+            ExecuteDirectBatch(metadata.TenantId, new List<PersistenceOperation> { CreatePersistenceUpsert(metadata) });
 
             return Task.CompletedTask;
         }
@@ -1072,7 +1076,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 // dequeue-and-validate loop in GetNextPendingFileAsync.
 
                 // Queue SQLite deletion -- caller is not blocked by disk I/O
-                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
+                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
 
                 _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
             }
@@ -1096,7 +1100,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             if (TryRemoveFromCacheAndIndices(tenantId, fileKey, out _))
             {
-                ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { new PersistenceOperation(tenantId, fileKey) });
+                ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { CreatePersistenceDelete(tenantId, fileKey) });
 
                 _logger.LogDebug("Directly removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
                 return Task.FromResult(true);
@@ -1154,7 +1158,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     throw new ArgumentException("Metadata tenant does not match the active projection batch.", nameof(metadata));
 
                 _repository.UpdateCacheAndIndices(metadata);
-                _operations.Add(new PersistenceOperation(metadata));
+                _operations.Add(_repository.CreatePersistenceUpsert(metadata));
                 return Task.CompletedTask;
             }
 
@@ -1173,7 +1177,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
                 var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
                 if (removed)
-                    _operations.Add(new PersistenceOperation(_tenantId, fileKey));
+                    _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
 
                 return Task.FromResult(removed);
             }
@@ -1233,7 +1237,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
                 _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
                 IndexStatusCandidate(current, updated);
-                EnqueuePersistence(new PersistenceOperation(updated));
+                EnqueuePersistence(CreatePersistenceUpsert(updated));
                 EnqueuePendingCandidate(updated, refreshGeneration: false);
                 return true;
             }
@@ -1285,7 +1289,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 // PermanentlyFailed files are never in the Pending queue, so _pendingFileCounts
                 // does not need adjustment here. The guard is intentionally omitted.
                 InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
+                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
                 _logger.LogDebug("Conditionally removed permanently failed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
                 return true;
             }
@@ -1468,7 +1472,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _fileKeyTenantIndex.TryRemove(fileKey, out _);
                 RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
                 InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
+                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
                 _logger.LogDebug("Conditionally removed completed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
                 return true;
             }
@@ -1577,7 +1581,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _fileKeyTenantIndex.TryRemove(fileKey, out _);
                 RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
                 InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePersistence(new PersistenceOperation(tenantId, fileKey));
+                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
                 _logger.LogDebug(
                     "Conditionally removed processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
                     fileKey, tenantId, expectedProcessingStartTimeUtc);
@@ -1638,7 +1642,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 }
 
                 IndexStatusCandidate(current, updated);
-                EnqueuePersistence(new PersistenceOperation(updated));
+                EnqueuePersistence(CreatePersistenceUpsert(updated));
                 _logger.LogDebug(
                     "Conditionally updated processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}, NewStatus: {Status}",
                     fileKey, tenantId, expectedProcessingStartTimeUtc, updated.Status);
@@ -1696,7 +1700,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
                 InvalidatePendingGeneration(tenantId, fileKey);
                 IndexStatusCandidate(current, updated);
-                EnqueuePersistence(new PersistenceOperation(updated));
+                EnqueuePersistence(CreatePersistenceUpsert(updated));
                 _logger.LogDebug(
                     "Conditionally marked pending metadata as processing for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
                     fileKey, tenantId, processingStartTimeUtc);
@@ -1755,7 +1759,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 InvalidatePendingGeneration(tenantId, fileKey);
                 EnqueuePendingCandidate(updated, refreshGeneration: false);
                 IndexStatusCandidate(current, updated);
-                EnqueuePersistence(new PersistenceOperation(updated));
+                EnqueuePersistence(CreatePersistenceUpsert(updated));
                 _logger.LogDebug(
                     "Conditionally reset file metadata to pending for file: {FileKey}, Tenant: {TenantId}, PreviousStatus: {PreviousStatus}",
                     fileKey, tenantId, current.Status);
@@ -2589,7 +2593,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var transition = transitions[i];
                 IndexStatusCandidate(transition.Previous, transition.Updated);
-                EnqueuePersistence(new PersistenceOperation(transition.Updated));
+                EnqueuePersistence(CreatePersistenceUpsert(transition.Updated));
             }
 
             var selected = transitions[0].Updated;
@@ -2726,7 +2730,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var transition = transitions[i];
                 IndexStatusCandidate(transition.Previous, transition.Updated);
-                EnqueuePersistence(new PersistenceOperation(transition.Updated));
+                EnqueuePersistence(CreatePersistenceUpsert(transition.Updated));
                 results.Add(transition.Updated);
             }
 
@@ -2817,7 +2821,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
                     _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
                     IndexStatusCandidate(file, updated);
-                    EnqueuePersistence(new PersistenceOperation(updated));
+                    EnqueuePersistence(CreatePersistenceUpsert(updated));
 
                     // Re-enqueue in the pending queue so the allocator can find it immediately.
                     EnqueuePendingCandidate(updated, refreshGeneration: false);
@@ -3288,6 +3292,21 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         // If the queue is full (SQLite has been unavailable for a long time), the operation
         // is dropped with a warning - memory state is already correct, so data is not lost
         // within this process lifetime. On restart, the cleanup service reconciles disk vs metadata.
+        private PersistenceOperation CreatePersistenceUpsert(FileMetadata metadata)
+        {
+            return new PersistenceOperation(
+                metadata,
+                Interlocked.Increment(ref _persistenceOperationSequence));
+        }
+
+        private PersistenceOperation CreatePersistenceDelete(string tenantId, string fileKey)
+        {
+            return new PersistenceOperation(
+                tenantId,
+                fileKey,
+                Interlocked.Increment(ref _persistenceOperationSequence));
+        }
+
         private void EnqueuePersistence(PersistenceOperation op)
         {
             // Used by unit tests to avoid orphaned background workers.
@@ -3340,9 +3359,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         private void CoalescePersistenceOperation(PersistenceOperation op, int queueDepth, string reason)
         {
             var compositeKey = $"{op.TenantId}\u001F{op.FileKey}";
-            var added = _coalescedPersistenceOps.TryAdd(compositeKey, op);
-            if (!added)
-                _coalescedPersistenceOps[compositeKey] = op;
+            var added = CoalesceLatestPersistenceOperation(compositeKey, op);
 
             if (added)
                 Interlocked.Increment(ref _coalescedDepth);
@@ -3352,6 +3369,26 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _logger.LogWarning(
                     "Persistence queue {Reason} at {QueueDepth}/{QueueLimit}; coalescing latest state. CoalescedCount={CoalescedCount}",
                     reason, queueDepth, _maxPersistenceQueueSize, Volatile.Read(ref _coalescedDepth));
+            }
+        }
+
+        private bool CoalesceLatestPersistenceOperation(string compositeKey, PersistenceOperation op)
+        {
+            while (true)
+            {
+                if (_coalescedPersistenceOps.TryGetValue(compositeKey, out var existing))
+                {
+                    if (existing.Sequence >= op.Sequence)
+                        return false;
+
+                    if (_coalescedPersistenceOps.TryUpdate(compositeKey, op, existing))
+                        return false;
+
+                    continue;
+                }
+
+                if (_coalescedPersistenceOps.TryAdd(compositeKey, op))
+                    return true;
             }
         }
 
@@ -3459,7 +3496,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
         private bool DrainPersistenceBatch()
         {
-            var byTenant = new Dictionary<string, List<PersistenceOperation>>(StringComparer.Ordinal);
+            var byTenant = new Dictionary<string, Dictionary<string, PersistenceOperation>>(StringComparer.Ordinal);
             int drainedCount = 0;
 
             // Use IsEmpty (O(1)) rather than _coalescedDepth > 0 to decide whether coalesced
@@ -3476,7 +3513,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 drainedCount++;
                 Interlocked.Decrement(ref _persistenceChannelDepth);
-                AddOperationToTenantBucket(byTenant, queuedOp);
+                AddLatestOperationToTenantBucket(byTenant, queuedOp);
             }
 
             if (drainedCount < _maxDrainBatchSize && !_coalescedPersistenceOps.IsEmpty)
@@ -3491,7 +3528,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
                     drainedCount++;
                     Interlocked.Decrement(ref _coalescedDepth);
-                    AddOperationToTenantBucket(byTenant, coalescedOp);
+                    AddLatestOperationToTenantBucket(byTenant, coalescedOp);
                 }
             }
 
@@ -3501,7 +3538,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             var encounteredFailure = false;
             foreach (var kvp in byTenant)
             {
-                if (!ExecuteBatch(kvp.Key, kvp.Value))
+                if (!ExecuteBatch(kvp.Key, kvp.Value.Values.ToList()))
                     encounteredFailure = true;
             }
 
@@ -3515,17 +3552,18 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             return !encounteredFailure;
         }
 
-        private static void AddOperationToTenantBucket(
-            Dictionary<string, List<PersistenceOperation>> byTenant,
+        private static void AddLatestOperationToTenantBucket(
+            Dictionary<string, Dictionary<string, PersistenceOperation>> byTenant,
             PersistenceOperation op)
         {
             if (!byTenant.TryGetValue(op.TenantId, out var bucket))
             {
-                bucket = new List<PersistenceOperation>();
+                bucket = new Dictionary<string, PersistenceOperation>(StringComparer.Ordinal);
                 byTenant[op.TenantId] = bucket;
             }
 
-            bucket.Add(op);
+            if (!bucket.TryGetValue(op.FileKey, out var existing) || op.Sequence > existing.Sequence)
+                bucket[op.FileKey] = op;
         }
 
         private void ExecuteDirectBatch(string tenantId, IReadOnlyList<PersistenceOperation> ops)
@@ -3607,7 +3645,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             foreach (var op in ops)
             {
                 var compositeKey = $"{op.TenantId}\u001F{op.FileKey}";
-                if (_coalescedPersistenceOps.TryAdd(compositeKey, op))
+                if (CoalesceLatestPersistenceOperation(compositeKey, op))
                 {
                     Interlocked.Increment(ref _coalescedDepth);
                     coalescedAdded++;
