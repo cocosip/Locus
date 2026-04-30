@@ -137,6 +137,8 @@ namespace Locus.Storage
             {
                 state.Gate.Release();
             }
+
+            TryRemoveStateIfEmpty(tenantId, normalizedDirectoryPath, state);
         }
 
         /// <inheritdoc/>
@@ -288,6 +290,8 @@ namespace Locus.Storage
             {
                 state.Gate.Release();
             }
+
+            TryRemoveStateIfEmpty(tenantId, normalizedDirectoryPath, state);
         }
 
         /// <inheritdoc/>
@@ -376,6 +380,15 @@ namespace Locus.Storage
                 throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
 
             normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(directoryPath);
+        }
+
+        private void TryRemoveStateIfEmpty(string tenantId, string directoryPath, DirectoryQuotaState state)
+        {
+            if (state.ProjectedCount != 0 || state.ReservationCount != 0)
+                return;
+
+            if (_states.TryGetValue(tenantId, out var tenantStates))
+                tenantStates.TryRemove(directoryPath, out _);
         }
 
         private sealed class DirectoryQuotaState

@@ -1788,9 +1788,26 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         }
 
         /// <summary>
+        /// Gets a page of file metadata for a specific tenant.
+        /// </summary>
+        public Task<IReadOnlyList<FileMetadata>> GetByTenantAsync(string tenantId, int skip, int take, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            if (skip < 0)
+                throw new ArgumentOutOfRangeException(nameof(skip));
+            if (take <= 0)
+                throw new ArgumentOutOfRangeException(nameof(take));
+
+            var cache = GetCache(tenantId);
+            var results = cache.Values.Skip(skip).Take(take).Select(m => m.Clone()).ToList();
+            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
+        }
+
+        /// <summary>
         /// Returns a point-in-time reference snapshot of all metadata for a tenant without
         /// deep-cloning each entry.  Callers MUST NOT mutate the returned objects.
-        /// This is O(N) reference copy vs the O(N �� clone_cost) of <see cref="GetByTenantAsync"/>
+        /// This is O(N) reference copy vs the O(N) clone_cost of <see cref="GetByTenantAsync(string, CancellationToken)"/>
         /// and is intended for read-only, best-effort scans such as orphan cleanup.
         /// </summary>
         internal FileMetadata[] SnapshotTenantMetadataRaw(string tenantId)

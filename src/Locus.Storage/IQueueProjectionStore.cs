@@ -71,5 +71,10 @@ namespace Locus.Storage
         /// Lists projected metadata for a tenant.
         /// </summary>
         Task<IReadOnlyList<FileMetadata>> GetProjectedFilesAsync(string tenantId, CancellationToken ct = default);
+
+        /// <summary>
+        /// Lists a page of projected metadata for a tenant.
+        /// </summary>
+        Task<IReadOnlyList<FileMetadata>> GetProjectedFilesAsync(string tenantId, int skip, int take, CancellationToken ct = default);
     }
 }

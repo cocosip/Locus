@@ -20,7 +20,7 @@ namespace Locus.Storage
     /// File scheduler that manages concurrent file processing with retry logic.
     /// Ensures that different threads receive different files.
     /// </summary>
-    public class FileScheduler : IFileScheduler, IQueueEventManagedFileScheduler
+    public class FileScheduler : IFileScheduler, IQueueEventManagedFileScheduler, IDisposable
     {
         private static readonly StringComparer PhysicalPathComparer =
             RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -34,7 +34,8 @@ namespace Locus.Storage
         private readonly ITenantQuotaManager? _tenantQuotaManager;
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly IQueueEventJournal? _queueEventJournal;
-        private readonly ConcurrentDictionary<string, SemaphoreSlim> _transitionGuards;
+        private readonly SemaphoreSlim[] _transitionGuardStripes;
+        private const int TransitionGuardStripeCount = 256;
         private readonly IProcessingTimeoutRecoveryService? _processingTimeoutRecoveryService;
         private readonly TimeSpan? _processingTimeout;
         private readonly int _emptyQueueTimedOutReclaimBatchSize;
@@ -89,7 +90,9 @@ namespace Locus.Storage
             _directoryQuotaManager = directoryQuotaManager;
             _queueEventJournal = queueEventJournal;
             _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
-            _transitionGuards = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+            _transitionGuardStripes = Enumerable.Range(0, TransitionGuardStripeCount)
+                .Select(_ => new SemaphoreSlim(1, 1))
+                .ToArray();
             _processingTimeoutRecoveryService = processingTimeoutRecoveryService;
             _processingTimeout = processingTimeout;
             _emptyQueueTimedOutReclaimBatchSize = Math.Max(0, emptyQueueTimedOutReclaimBatchSize);
@@ -191,7 +194,7 @@ namespace Locus.Storage
             {
                 try
                 {
-                    await _queueEventJournal.AppendAsync(CreateProcessingStartedEvent(metadata), ct).ConfigureAwait(false);
+                    await _queueEventJournal.AppendAsync(QueueEventRecordFactory.CreateProcessingStarted(metadata), ct).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -228,7 +231,7 @@ namespace Locus.Storage
                 try
                 {
                     await _queueEventJournal.AppendBatchAsync(
-                        metadataList.Select(CreateProcessingStartedEvent).ToArray(),
+                        metadataList.Select(QueueEventRecordFactory.CreateProcessingStarted).ToArray(),
                         ct).ConfigureAwait(false);
                 }
                 catch
@@ -309,7 +312,7 @@ namespace Locus.Storage
                     if (current == null)
                         return;
 
-                    if (IsCompletionCommittedStatus(current.Status))
+                    if (QueueEventRecordFactory.IsCompletionCommittedStatus(current.Status))
                         return;
 
                     if (current.Status != FileProcessingStatus.Processing
@@ -323,8 +326,8 @@ namespace Locus.Storage
                     await _queueEventJournal.AppendBatchAsync(
                         new[]
                         {
-                            CreateProcessingCompletedEvent(current, lease.ProcessingStartTimeUtc, completedAtUtc),
-                            CreateDeleteRequestedEvent(current, completedAtUtc),
+                            QueueEventRecordFactory.CreateProcessingCompleted(current, lease.ProcessingStartTimeUtc, completedAtUtc),
+                            QueueEventRecordFactory.CreateDeleteRequested(current, completedAtUtc),
                         },
                         ct).ConfigureAwait(false);
                 }
@@ -362,7 +365,7 @@ namespace Locus.Storage
                 }
 
                 var metadata = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
-                if (metadata != null && IsCompletionCommittedStatus(metadata.Status))
+                if (metadata != null && QueueEventRecordFactory.IsCompletionCommittedStatus(metadata.Status))
                     return;
 
                 if (updated == null)
@@ -399,7 +402,7 @@ namespace Locus.Storage
 
                     var projected = BuildFailedMetadata(current, errorMessage);
                     await _queueEventJournal.AppendAsync(
-                        CreateProcessingFailedEvent(projected, errorMessage, lease.ProcessingStartTimeUtc),
+                        QueueEventRecordFactory.CreateProcessingFailed(projected, errorMessage, lease.ProcessingStartTimeUtc),
                         ct).ConfigureAwait(false);
                 }
                 catch
@@ -544,7 +547,8 @@ namespace Locus.Storage
 
         private SemaphoreSlim GetTransitionGuard(string fileKey)
         {
-            return _transitionGuards.GetOrAdd(fileKey, _ => new SemaphoreSlim(1, 1));
+            var hash = StringComparer.Ordinal.GetHashCode(fileKey) & int.MaxValue;
+            return _transitionGuardStripes[hash % _transitionGuardStripes.Length];
         }
 
         private async Task<FileMetadata?> LeaseNextPendingFileWithRecoveryAsync(string tenantId, CancellationToken ct)
@@ -720,106 +724,11 @@ namespace Locus.Storage
             return updated;
         }
 
-        private static QueueEventRecord CreateProcessingStartedEvent(FileMetadata metadata)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.ProcessingStarted,
-                OccurredAtUtc = metadata.ProcessingStartTime ?? DateTime.UtcNow,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Processing,
-                ProcessingStartTimeUtc = metadata.ProcessingStartTime,
-                RetryCount = metadata.RetryCount,
-                AvailableForProcessingAtUtc = null,
-                ErrorMessage = metadata.LastError,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension,
-            };
-        }
-
-        private static QueueEventRecord CreateProcessingCompletedEvent(
-            FileMetadata metadata,
-            DateTime processingStartTimeUtc,
-            DateTime completedAtUtc)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.ProcessingCompleted,
-                OccurredAtUtc = completedAtUtc,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Completed,
-                ProcessingStartTimeUtc = processingStartTimeUtc,
-                RetryCount = metadata.RetryCount,
-                AvailableForProcessingAtUtc = null,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension,
-            };
-        }
-
-        private static QueueEventRecord CreateDeleteRequestedEvent(FileMetadata metadata, DateTime occurredAtUtc)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.DeleteRequested,
-                OccurredAtUtc = occurredAtUtc,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.DeleteRequested,
-                RetryCount = metadata.RetryCount,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension,
-            };
-        }
-
-        private static bool IsCompletionCommittedStatus(FileProcessingStatus status)
-        {
-            return status == FileProcessingStatus.Completed
-                || status == FileProcessingStatus.DeleteRequested
-                || status == FileProcessingStatus.DeleteSucceeded;
-        }
-
-        private static QueueEventRecord CreateProcessingFailedEvent(
-            FileMetadata metadata,
-            string errorMessage,
-            DateTime expectedProcessingStartTimeUtc)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.ProcessingFailed,
-                OccurredAtUtc = metadata.LastFailedAt ?? DateTime.UtcNow,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = metadata.Status,
-                ProcessingStartTimeUtc = expectedProcessingStartTimeUtc,
-                RetryCount = metadata.RetryCount,
-                AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
-                ErrorMessage = errorMessage,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension,
-            };
-        }
 
         /// <inheritdoc/>
         public async Task<int> CleanupOrphanedMetadataAsync(CancellationToken ct = default)
         {
+            const int pageSize = 500;
             var removedCount = 0;
             var tenantIds = await _projectionStore.GetProjectedTenantIdsAsync(ct).ConfigureAwait(false);
 
@@ -831,80 +740,94 @@ namespace Locus.Storage
             {
                 ct.ThrowIfCancellationRequested();
 
-                var tenantMetadata = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
+                var skip = 0;
                 var physicalPathExistsCache = new Dictionary<string, bool>(PhysicalPathComparer);
 
-                foreach (var metadata in tenantMetadata)
+                while (true)
                 {
-                    if (string.IsNullOrWhiteSpace(metadata.PhysicalPath))
-                        continue;
+                    var page = await _projectionStore.GetProjectedFilesAsync(tenantId, skip, pageSize, ct).ConfigureAwait(false);
+                    if (page.Count == 0)
+                        break;
 
-                    var (shouldContinue, physicalFileMissing) = await TryConfirmPhysicalFileMissingAsync(
-                        metadata,
-                        physicalPathExistsCache,
-                        ct).ConfigureAwait(false);
-                    if (!shouldContinue)
-                        continue;
-
-                    if (physicalFileMissing)
+                    foreach (var metadata in page)
                     {
-                        _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
-                            metadata.FileKey, metadata.PhysicalPath);
-
-                        var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
-                        var quotaApplied = false;
-
-                        // Use default for the full cleanup sequence once a candidate orphan has
-                        // been selected; otherwise a mid-flight cancellation could leave cleanup
-                        // work half-applied.
-                        if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
-                        {
-                            await ApplyOrphanedMetadataDeleteQuotaAsync(
-                                metadata.TenantId,
-                                metadata.FileKey,
-                                normalizedDirectoryPath).ConfigureAwait(false);
-                            quotaApplied = true;
-                        }
-
-                        bool removed;
-                        try
-                        {
-                            removed = await _projectionStore.RemoveProjectedFileAsync(
-                                metadata.TenantId,
-                                metadata.FileKey,
-                                default).ConfigureAwait(false);
-                        }
-                        catch
-                        {
-                            if (quotaApplied)
-                            {
-                                await RollbackOrphanedMetadataDeleteQuotaAsync(
-                                    metadata.TenantId,
-                                    metadata.FileKey,
-                                    normalizedDirectoryPath).ConfigureAwait(false);
-                            }
-
-                            throw;
-                        }
-
-                        if (!removed)
-                        {
-                            if (quotaApplied)
-                            {
-                                await RollbackOrphanedMetadataDeleteQuotaAsync(
-                                    metadata.TenantId,
-                                    metadata.FileKey,
-                                    normalizedDirectoryPath).ConfigureAwait(false);
-                            }
-
-                            _logger.LogDebug(
-                                "Skipped orphaned metadata cleanup for {FileKey} because the metadata row changed concurrently",
-                                metadata.FileKey);
+                        if (string.IsNullOrWhiteSpace(metadata.PhysicalPath))
                             continue;
-                        }
 
-                        removedCount++;
+                        var (shouldContinue, physicalFileMissing) = await TryConfirmPhysicalFileMissingAsync(
+                            metadata,
+                            physicalPathExistsCache,
+                            ct).ConfigureAwait(false);
+                        if (!shouldContinue)
+                            continue;
+
+                        if (physicalFileMissing)
+                        {
+                            _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
+                                metadata.FileKey, metadata.PhysicalPath);
+
+                            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
+                            var quotaApplied = false;
+
+                            // Use default for the full cleanup sequence once a candidate orphan has
+                            // been selected; otherwise a mid-flight cancellation could leave cleanup
+                            // work half-applied.
+                            if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
+                            {
+                                await ApplyOrphanedMetadataDeleteQuotaAsync(
+                                    metadata.TenantId,
+                                    metadata.FileKey,
+                                    normalizedDirectoryPath).ConfigureAwait(false);
+                                quotaApplied = true;
+                            }
+
+                            bool removed;
+                            try
+                            {
+                                removed = await _projectionStore.RemoveProjectedFileAsync(
+                                    metadata.TenantId,
+                                    metadata.FileKey,
+                                    default).ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                if (quotaApplied)
+                                {
+                                    await RollbackOrphanedMetadataDeleteQuotaAsync(
+                                        metadata.TenantId,
+                                        metadata.FileKey,
+                                        normalizedDirectoryPath).ConfigureAwait(false);
+                                }
+
+                                throw;
+                            }
+
+                            if (!removed)
+                            {
+                                if (quotaApplied)
+                                {
+                                    await RollbackOrphanedMetadataDeleteQuotaAsync(
+                                        metadata.TenantId,
+                                        metadata.FileKey,
+                                        normalizedDirectoryPath).ConfigureAwait(false);
+                                }
+
+                                _logger.LogDebug(
+                                    "Skipped orphaned metadata cleanup for {FileKey} because the metadata row changed concurrently",
+                                    metadata.FileKey);
+                                continue;
+                            }
+
+                            removedCount++;
+                        }
                     }
+
+                    skip += pageSize;
+
+                    if (page.Count < pageSize)
+                        break;
+
+                    ct.ThrowIfCancellationRequested();
                 }
             }
 
@@ -1223,6 +1146,13 @@ namespace Locus.Storage
                 new ProcessingTimeoutRecoveryCoordinator(),
                 NullLogger<ProcessingTimeoutRecoveryService>.Instance,
                 queueEventJournal);
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            foreach (var stripe in _transitionGuardStripes)
+                stripe.Dispose();
         }
     }
 }

@@ -1550,7 +1550,7 @@ namespace Locus.Storage
             {
                 try
                 {
-                    tenantWriter.WorkerTask.GetAwaiter().GetResult();
+                    Task.Run(() => tenantWriter.WorkerTask).GetAwaiter().GetResult();
                 }
                 catch (Exception ex)
                 {

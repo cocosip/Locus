@@ -228,7 +228,7 @@ namespace Locus.Storage.Tests
                 .Setup(m => m.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new[] { "tenant-001" });
             projectionStore
-                .Setup(m => m.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Setup(m => m.GetProjectedFilesAsync("tenant-001", 0, 500, It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new[] { projected });
             projectionStore
                 .Setup(m => m.RemoveProjectedFileAsync("tenant-001", "projection-orphan", It.IsAny<CancellationToken>()))
@@ -247,7 +247,7 @@ namespace Locus.Storage.Tests
                 m => m.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()),
                 Times.Once);
             projectionStore.Verify(
-                m => m.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()),
+                m => m.GetProjectedFilesAsync("tenant-001", 0, 500, It.IsAny<CancellationToken>()),
                 Times.Once);
             projectionStore.Verify(
                 m => m.RemoveProjectedFileAsync("tenant-001", "projection-orphan", It.IsAny<CancellationToken>()),
@@ -669,7 +669,7 @@ namespace Locus.Storage.Tests
                 .Setup(m => m.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new[] { "tenant-001" });
             projectionStore
-                .Setup(m => m.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Setup(m => m.GetProjectedFilesAsync("tenant-001", 0, 500, It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new[] { projected });
             projectionStore
                 .Setup(m => m.RemoveProjectedFileAsync("tenant-001", "projection-remove-false", It.IsAny<CancellationToken>()))

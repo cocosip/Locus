@@ -108,6 +108,12 @@ namespace Locus.Storage
             return (await _repository.GetByTenantAsync(tenantId, ct).ConfigureAwait(false)).ToList();
         }
 
+        /// <inheritdoc/>
+        public Task<IReadOnlyList<FileMetadata>> GetProjectedFilesAsync(string tenantId, int skip, int take, CancellationToken ct = default)
+        {
+            return _repository.GetByTenantAsync(tenantId, skip, take, ct);
+        }
+
         IReadOnlyList<FileMetadata> IProjectionSnapshotSource.CaptureProjectedFilesSnapshot(string tenantId)
         {
             return _repository.SnapshotTenantMetadataRaw(tenantId);

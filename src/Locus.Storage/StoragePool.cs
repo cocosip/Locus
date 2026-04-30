@@ -20,7 +20,7 @@ namespace Locus.Storage
     /// Provides unified API for both basic storage operations and queue-based processing workflow.
     /// Volumes are configured at startup and managed internally.
     /// </summary>
-    public class StoragePool : IStoragePool
+    public class StoragePool : IStoragePool, IDisposable
     {
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
         private readonly IQueueProjectionStore _projectionStore;
@@ -729,7 +729,7 @@ namespace Locus.Storage
                 EnsureLease(location);
                 try
                 {
-                    await AppendQueueEventAsync(CreateProcessingStartedEvent(location), ct).ConfigureAwait(false);
+                    await AppendQueueEventAsync(QueueEventRecordFactory.CreateProcessingStarted(location), ct).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -766,7 +766,7 @@ namespace Locus.Storage
                 try
                 {
                     await AppendQueueEventsAsync(
-                        locations.Select(CreateProcessingStartedEvent).ToArray(),
+                        locations.Select(QueueEventRecordFactory.CreateProcessingStarted).ToArray(),
                         ct).ConfigureAwait(false);
                 }
                 catch
@@ -798,7 +798,7 @@ namespace Locus.Storage
                 if (metadata == null)
                     return;
 
-                if (IsCompletionCommittedStatus(metadata.Status))
+                if (QueueEventRecordFactory.IsCompletionCommittedStatus(metadata.Status))
                     return;
 
                 if (metadata.Status != FileProcessingStatus.Processing
@@ -825,8 +825,8 @@ namespace Locus.Storage
                     await AppendQueueEventsAsync(
                         new[]
                         {
-                            CreateProcessingCompletedEvent(completed, lease.ProcessingStartTimeUtc),
-                            CreateDeleteRequestedEvent(completed),
+                            QueueEventRecordFactory.CreateProcessingCompleted(completed, lease.ProcessingStartTimeUtc),
+                            QueueEventRecordFactory.CreateDeleteRequested(completed),
                         },
                         ct).ConfigureAwait(false);
                 }
@@ -862,7 +862,7 @@ namespace Locus.Storage
                     try
                     {
                         await AppendQueueEventAsync(
-                            CreateProcessingFailedEvent(updated, errorMessage, lease.ProcessingStartTimeUtc),
+                            QueueEventRecordFactory.CreateProcessingFailed(updated, errorMessage, lease.ProcessingStartTimeUtc),
                             ct).ConfigureAwait(false);
                     }
                     catch
@@ -1281,100 +1281,6 @@ namespace Locus.Storage
             }
         }
 
-        private static QueueEventRecord CreateProcessingStartedEvent(FileLocation location)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = location.TenantId,
-                FileKey = location.FileKey,
-                EventType = QueueEventType.ProcessingStarted,
-                OccurredAtUtc = location.ProcessingStartTime ?? DateTime.UtcNow,
-                VolumeId = location.VolumeId,
-                PhysicalPath = location.PhysicalPath,
-                DirectoryPath = location.DirectoryPath,
-                FileSize = location.FileSize,
-                Status = FileProcessingStatus.Processing,
-                ProcessingStartTimeUtc = location.ProcessingStartTime,
-                RetryCount = location.RetryCount,
-                AvailableForProcessingAtUtc = null,
-                ErrorMessage = location.LastError
-            };
-        }
-
-        private static QueueEventRecord CreateProcessingCompletedEvent(
-            FileMetadata metadata,
-            DateTime processingStartTimeUtc)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.ProcessingCompleted,
-                OccurredAtUtc = metadata.CompletedAt ?? DateTime.UtcNow,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.Completed,
-                ProcessingStartTimeUtc = processingStartTimeUtc,
-                RetryCount = metadata.RetryCount,
-                AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
-            };
-        }
-
-        private static QueueEventRecord CreateDeleteRequestedEvent(FileMetadata metadata)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.DeleteRequested,
-                OccurredAtUtc = DateTime.UtcNow,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = FileProcessingStatus.DeleteRequested,
-                RetryCount = metadata.RetryCount,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
-            };
-        }
-
-        private static bool IsCompletionCommittedStatus(FileProcessingStatus status)
-        {
-            return status == FileProcessingStatus.Completed
-                || status == FileProcessingStatus.DeleteRequested
-                || status == FileProcessingStatus.DeleteSucceeded;
-        }
-
-        private static QueueEventRecord CreateProcessingFailedEvent(
-            FileMetadata metadata,
-            string errorMessage,
-            DateTime expectedProcessingStartTimeUtc)
-        {
-            return new QueueEventRecord
-            {
-                TenantId = metadata.TenantId,
-                FileKey = metadata.FileKey,
-                EventType = QueueEventType.ProcessingFailed,
-                OccurredAtUtc = metadata.LastFailedAt ?? DateTime.UtcNow,
-                VolumeId = metadata.VolumeId,
-                PhysicalPath = metadata.PhysicalPath,
-                DirectoryPath = metadata.DirectoryPath,
-                FileSize = metadata.FileSize,
-                Status = metadata.Status,
-                ProcessingStartTimeUtc = expectedProcessingStartTimeUtc,
-                RetryCount = metadata.RetryCount,
-                AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
-                ErrorMessage = errorMessage,
-                OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
-            };
-        }
-
         private static Task DeleteWrittenFileAsync(IStorageVolume? volume, string physicalPath)
         {
             if (volume != null)
@@ -1495,6 +1401,13 @@ namespace Locus.Storage
                 // The caller owns the wrapped stream lifetime.
                 base.Dispose(disposing);
             }
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            foreach (var guard in _completionGuards)
+                guard.Dispose();
         }
     }
 }
