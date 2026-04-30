@@ -1504,11 +1504,27 @@ namespace Locus.Storage
 
         private sealed class JournalState
         {
-            public long BaseOffset { get; set; }
+            private long _baseOffset;
+            private long _tailOffset;
+            private long _lastSequenceNumber;
 
-            public long TailOffset { get; set; }
+            public long BaseOffset
+            {
+                get => Volatile.Read(ref _baseOffset);
+                set => Volatile.Write(ref _baseOffset, value);
+            }
 
-            public long LastSequenceNumber { get; set; }
+            public long TailOffset
+            {
+                get => Volatile.Read(ref _tailOffset);
+                set => Volatile.Write(ref _tailOffset, value);
+            }
+
+            public long LastSequenceNumber
+            {
+                get => Volatile.Read(ref _lastSequenceNumber);
+                set => Volatile.Write(ref _lastSequenceNumber, value);
+            }
 
             [JsonConverter(typeof(JsonStringEnumConverter))]
             public JournalFormat Format { get; set; } = JournalFormat.JsonLines;
@@ -1546,15 +1562,26 @@ namespace Locus.Storage
             foreach (var tenantWriter in _tenantWriters.Values)
                 tenantWriter.RequestShutdown();
 
+            const int drainTimeoutMs = 30_000;
+            var drainTasks = _tenantWriters.Values.Select(w => w.WorkerTask).ToArray();
+            if (!Task.WaitAll(drainTasks, drainTimeoutMs))
+            {
+                _logger.LogWarning(
+                    "Queue journal writers did not drain within {TimeoutMs}ms during disposal; {PendingCount} writer(s) still active",
+                    drainTimeoutMs,
+                    drainTasks.Count(t => !t.IsCompleted));
+            }
+
             foreach (var tenantWriter in _tenantWriters.Values)
             {
                 try
                 {
-                    Task.Run(() => tenantWriter.WorkerTask).GetAwaiter().GetResult();
+                    if (tenantWriter.WorkerTask.IsCompleted)
+                        tenantWriter.WorkerTask.GetAwaiter().GetResult();
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed while draining queue journal writer for tenant {TenantId}", tenantWriter.TenantId);
+                    _logger.LogWarning(ex, "Queue journal writer for tenant {TenantId} threw during drain", tenantWriter.TenantId);
                 }
             }
 

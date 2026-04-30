@@ -307,11 +307,16 @@ namespace Locus.Storage
 
         private static int GetErrorHash(IList<string> errors)
         {
-            var hash = 17;
+            // FNV-1a per string for platform-stable hashing, XOR for order independence.
+            // string.GetHashCode() is not used because it differs across .NET runtimes.
+            var hash = 0;
             foreach (var error in errors)
             {
-                // XOR is order-independent: (A, B) and (B, A) produce the same hash
-                hash ^= (error?.GetHashCode() ?? 0);
+                if (error == null) continue;
+                var errorHash = unchecked((int)0x811C9DC5);
+                foreach (char c in error)
+                    errorHash = unchecked((errorHash ^ c) * (int)0x01000193);
+                hash ^= errorHash;
             }
             // Mix in the count so different numbers of errors produce different hashes
             hash ^= errors.Count * 31;

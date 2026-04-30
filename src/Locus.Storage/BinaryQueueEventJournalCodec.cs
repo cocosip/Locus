@@ -65,6 +65,11 @@ namespace Locus.Storage
             if (stream == null)
                 throw new ArgumentNullException(nameof(stream));
 
+            return Task.Run(() => ReadBatchCore(stream, startOffset, maxRecords, ct), ct);
+        }
+
+        private QueueEventJournalCodecReadResult ReadBatchCore(Stream stream, long startOffset, int maxRecords, CancellationToken ct)
+        {
             stream.Seek(startOffset, SeekOrigin.Begin);
             var records = new List<QueueEventRecord>(maxRecords);
             var nextOffset = startOffset;
@@ -80,7 +85,7 @@ namespace Locus.Storage
                         break;
 
                     if ((stream.Length - stream.Position) < HeaderSize)
-                        return Task.FromResult(new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true));
+                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
 
                     int magic;
                     short version;
@@ -100,7 +105,7 @@ namespace Locus.Storage
                     }
                     catch (EndOfStreamException)
                     {
-                        return Task.FromResult(new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true));
+                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
                     }
 
                     if (magic != RecordMagic
@@ -109,16 +114,16 @@ namespace Locus.Storage
                         || payloadLength < 0
                         || (stream.Length - stream.Position) < payloadLength)
                     {
-                        return Task.FromResult(new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true));
+                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
                     }
 
                     var payload = reader.ReadBytes(payloadLength);
                     if (payload.Length != payloadLength)
-                        return Task.FromResult(new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true));
+                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
 
                     nextOffset = stream.Position;
                     if (QueueEventCrc32.Compute(payload, 0, payload.Length) != payloadChecksum)
-                        return Task.FromResult(new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true));
+                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
 
                     QueueEventRecord record;
                     try
@@ -127,14 +132,14 @@ namespace Locus.Storage
                     }
                     catch (Exception) when (IsPayloadReadFailure())
                     {
-                        return Task.FromResult(new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true));
+                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
                     }
 
                     records.Add(record);
                 }
             }
 
-            return Task.FromResult(new QueueEventJournalCodecReadResult(records, nextOffset, nextOffset >= stream.Length, false));
+            return new QueueEventJournalCodecReadResult(records, nextOffset, nextOffset >= stream.Length, false);
         }
 
         public QueueEventJournalCodecScanResult Scan(Stream stream)
