@@ -210,6 +210,85 @@ namespace Locus.Storage
             return new QueueEventJournalCodecScanResult(nextOffset, lastSequenceNumber, false);
         }
 
+        public long NormalizeReadOffset(Stream stream, long startOffset)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+
+            if (startOffset <= 0)
+                return 0;
+
+            if (startOffset >= stream.Length)
+                return stream.Length;
+
+            stream.Seek(0, SeekOrigin.Begin);
+            var nextOffset = 0L;
+
+            using (var reader = new BinaryReader(stream, Utf8NoBom, leaveOpen: true))
+            {
+                while (stream.Position < stream.Length && nextOffset < startOffset)
+                {
+                    var recordStartOffset = nextOffset;
+                    if ((stream.Length - stream.Position) < HeaderSize)
+                        return recordStartOffset;
+
+                    int magic;
+                    short version;
+                    short flags;
+                    int payloadLength;
+                    long sequenceNumber;
+                    uint payloadChecksum;
+
+                    try
+                    {
+                        magic = reader.ReadInt32();
+                        version = reader.ReadInt16();
+                        flags = reader.ReadInt16();
+                        payloadLength = reader.ReadInt32();
+                        sequenceNumber = reader.ReadInt64();
+                        payloadChecksum = reader.ReadUInt32();
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        return recordStartOffset;
+                    }
+
+                    if (magic != RecordMagic
+                        || version != RecordVersion
+                        || flags != RecordFlags
+                        || payloadLength < 0
+                        || (stream.Length - stream.Position) < payloadLength)
+                    {
+                        return recordStartOffset;
+                    }
+
+                    var payload = reader.ReadBytes(payloadLength);
+                    if (payload.Length != payloadLength)
+                        return recordStartOffset;
+
+                    var recordEndOffset = stream.Position;
+                    if (QueueEventCrc32.Compute(payload, 0, payload.Length) != payloadChecksum)
+                        return recordStartOffset;
+
+                    try
+                    {
+                        ReadPayload(payload, sequenceNumber, payloadChecksum);
+                    }
+                    catch (Exception) when (IsPayloadReadFailure())
+                    {
+                        return recordStartOffset;
+                    }
+
+                    if (recordEndOffset >= startOffset)
+                        return recordEndOffset == startOffset ? startOffset : recordStartOffset;
+
+                    nextOffset = recordEndOffset;
+                }
+            }
+
+            return nextOffset;
+        }
+
         public static bool MatchesMagic(byte[] prefix, int bytesRead)
         {
             if (prefix == null)

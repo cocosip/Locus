@@ -623,6 +623,227 @@ namespace Locus.Storage.Tests
             }
         }
 
+        [Fact]
+        public async Task ReadBatchAsync_BinaryJournalWithPersistedCorruptTail_TruncatesTailAndStopsRepeatedDetection()
+        {
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-persisted-corrupt-tail",
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-persisted-corrupt-tail",
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            _journal.Dispose();
+
+            var journalPath = Path.Combine(_queueDirectory, "tenant-persisted-corrupt-tail", "queue.log");
+            var statePath = Path.Combine(_queueDirectory, "tenant-persisted-corrupt-tail", "queue.state.json");
+            using (var stream = _fileSystem.File.Open(journalPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+            {
+                var corruptTail = new byte[] { 1, 2, 3, 4, 5, 6, 7 };
+                stream.Write(corruptTail, 0, corruptTail.Length);
+            }
+
+            var corruptedLength = _fileSystem.FileInfo.New(journalPath).Length;
+            _fileSystem.File.WriteAllText(
+                statePath,
+                "{\"baseOffset\":0,\"tailOffset\":" + corruptedLength + ",\"lastSequenceNumber\":2,\"format\":\"BinaryV1\"}");
+
+            var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                });
+
+            try
+            {
+                QueueEventReadBatch initialBatch;
+                using (var metrics = new QueueJournalMetricCapture())
+                {
+                    initialBatch = await restartedJournal.ReadBatchAsync(
+                        "tenant-persisted-corrupt-tail",
+                        0,
+                        10,
+                        CancellationToken.None);
+
+                    Assert.Equal(1, metrics.GetCount("locus.queue_journal.corrupt_tail.detected"));
+                    Assert.Equal(1, metrics.GetCount("locus.queue_journal.corrupt_tail.auto_repaired"));
+                }
+
+                var repairedLength = _fileSystem.FileInfo.New(journalPath).Length;
+                Assert.Equal(2, initialBatch.Records.Count);
+                Assert.True(repairedLength < corruptedLength);
+
+                using (var metrics = new QueueJournalMetricCapture())
+                {
+                    var secondBatch = await restartedJournal.ReadBatchAsync(
+                        "tenant-persisted-corrupt-tail",
+                        initialBatch.NextOffset,
+                        10,
+                        CancellationToken.None);
+
+                    Assert.Empty(secondBatch.Records);
+                    Assert.Equal(0, metrics.GetCount("locus.queue_journal.corrupt_tail.detected"));
+                    Assert.Equal(0, metrics.GetCount("locus.queue_journal.corrupt_tail.auto_repaired"));
+                }
+            }
+            finally
+            {
+                restartedJournal.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ReadBatchAsync_BinaryJournalFromMiddleOfRecord_RewindsToValidBoundary()
+        {
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-misaligned-cursor",
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = "tenant-misaligned-cursor",
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            var firstBatch = await _journal.ReadBatchAsync("tenant-misaligned-cursor", 0, 1, CancellationToken.None);
+            var misalignedOffset = firstBatch.NextOffset + 1;
+
+            QueueEventReadBatch recoveredBatch;
+            using (var metrics = new QueueJournalMetricCapture())
+            {
+                recoveredBatch = await _journal.ReadBatchAsync(
+                    "tenant-misaligned-cursor",
+                    misalignedOffset,
+                    10,
+                    CancellationToken.None);
+
+                Assert.Equal(1, metrics.GetCount("locus.queue_journal.corrupt_tail.detected"));
+                Assert.Equal(0, metrics.GetCount("locus.queue_journal.corrupt_tail.auto_repaired"));
+            }
+
+            Assert.Single(recoveredBatch.Records);
+            Assert.Equal("file-002", recoveredBatch.Records[0].FileKey);
+            Assert.True(recoveredBatch.ReachedEndOfFile);
+            Assert.True(recoveredBatch.NextOffset > misalignedOffset);
+        }
+
+        [Fact]
+        public async Task ReadBatchAsync_JsonJournalFromMiddleOfLine_RewindsToValidBoundary()
+        {
+            var jsonJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.JsonLines,
+                });
+
+            try
+            {
+                await jsonJournal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-json-misaligned-cursor",
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                await jsonJournal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-json-misaligned-cursor",
+                    FileKey = "file-002",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                var firstBatch = await jsonJournal.ReadBatchAsync("tenant-json-misaligned-cursor", 0, 1, CancellationToken.None);
+                var misalignedOffset = firstBatch.NextOffset + 1;
+
+                QueueEventReadBatch recoveredBatch;
+                using (var metrics = new QueueJournalMetricCapture())
+                {
+                    recoveredBatch = await jsonJournal.ReadBatchAsync(
+                        "tenant-json-misaligned-cursor",
+                        misalignedOffset,
+                        10,
+                        CancellationToken.None);
+
+                    Assert.Equal(1, metrics.GetCount("locus.queue_journal.corrupt_tail.detected"));
+                    Assert.Equal(0, metrics.GetCount("locus.queue_journal.corrupt_tail.auto_repaired"));
+                }
+
+                Assert.Single(recoveredBatch.Records);
+                Assert.Equal("file-002", recoveredBatch.Records[0].FileKey);
+                Assert.True(recoveredBatch.ReachedEndOfFile);
+                Assert.True(recoveredBatch.NextOffset > misalignedOffset);
+            }
+            finally
+            {
+                jsonJournal.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ReadBatchAsync_MisalignedReadOffsetThatCanBeRecovered_LogsDebugWithoutWarning()
+        {
+            var logger = new Mock<ILogger<FileQueueEventJournal>>();
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                logger.Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.JsonLines,
+                });
+
+            try
+            {
+                await journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-debug-misaligned-cursor",
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                await journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-debug-misaligned-cursor",
+                    FileKey = "file-002",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                var firstBatch = await journal.ReadBatchAsync("tenant-debug-misaligned-cursor", 0, 1, CancellationToken.None);
+                var misalignedOffset = firstBatch.NextOffset + 1;
+
+                var recoveredBatch = await journal.ReadBatchAsync(
+                    "tenant-debug-misaligned-cursor",
+                    misalignedOffset,
+                    10,
+                    CancellationToken.None);
+
+                Assert.Single(recoveredBatch.Records);
+                Assert.Equal(0, CountLogCalls(logger, LogLevel.Warning));
+                Assert.Equal(1, CountLogCalls(logger, LogLevel.Debug));
+            }
+            finally
+            {
+                journal.Dispose();
+            }
+        }
+
         public void Dispose()
         {
             try
@@ -641,6 +862,23 @@ namespace Locus.Storage.Tests
             catch
             {
             }
+        }
+
+        private static int CountLogCalls(Mock<ILogger<FileQueueEventJournal>> logger, LogLevel level)
+        {
+            var count = 0;
+            foreach (var invocation in logger.Invocations)
+            {
+                if (invocation.Method.Name == nameof(ILogger.Log)
+                    && invocation.Arguments.Count > 0
+                    && invocation.Arguments[0] is LogLevel logLevel
+                    && logLevel == level)
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
     }
 }

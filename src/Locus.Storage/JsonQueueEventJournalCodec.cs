@@ -143,6 +143,38 @@ namespace Locus.Storage
             return new QueueEventJournalCodecScanResult(nextOffset, lastSequenceNumber, false);
         }
 
+        public long NormalizeReadOffset(Stream stream, long startOffset)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+
+            if (startOffset <= 0)
+                return 0;
+
+            if (startOffset >= stream.Length)
+                return stream.Length;
+
+            stream.Seek(0, SeekOrigin.Begin);
+            var nextOffset = 0L;
+
+            using (var reader = new StreamReader(stream, Utf8NoBom, detectEncodingFromByteOrderMarks: true, bufferSize: 16 * 1024, leaveOpen: true))
+            {
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    var lineStartOffset = nextOffset;
+                    nextOffset += Utf8NoBom.GetByteCount(line) + 1;
+                    if (nextOffset > stream.Length)
+                        nextOffset = stream.Length;
+
+                    if (nextOffset >= startOffset)
+                        return nextOffset == startOffset ? startOffset : lineStartOffset;
+                }
+            }
+
+            return nextOffset;
+        }
+
         private static bool ValidatePayloadChecksum(QueueEventRecord record)
         {
             if (!record.PayloadCrc32.HasValue)

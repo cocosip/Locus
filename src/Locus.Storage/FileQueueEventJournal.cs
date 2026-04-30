@@ -24,6 +24,7 @@ namespace Locus.Storage
         private static readonly EventId CorruptTailReadEventId = new EventId(4101, nameof(CorruptTailReadEventId));
         private static readonly EventId CorruptTailTruncatedEventId = new EventId(4102, nameof(CorruptTailTruncatedEventId));
         private static readonly EventId CorruptTailStateScanEventId = new EventId(4103, nameof(CorruptTailStateScanEventId));
+        private static readonly EventId MisalignedReadOffsetRecoveredEventId = new EventId(4104, nameof(MisalignedReadOffsetRecoveredEventId));
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -240,6 +241,28 @@ namespace Locus.Storage
                 if (result.EncounteredCorruptTail)
                 {
                     QueueJournalMetrics.RecordCorruptTailDetected();
+
+                    var normalizedRelativeOffset = codec.NormalizeReadOffset(stream, nextRelativeOffset);
+                    if (normalizedRelativeOffset < nextRelativeOffset)
+                    {
+                        var recoveredResult = await codec.ReadBatchAsync(stream, normalizedRelativeOffset, maxRecords, ct).ConfigureAwait(false);
+                        if (!recoveredResult.EncounteredCorruptTail)
+                        {
+                            _logger.LogDebug(
+                                MisalignedReadOffsetRecoveredEventId,
+                                "Recovered queue journal read offset for tenant {TenantId} from {RequestedOffset} to {RecoveredOffset} while reading {Format}.",
+                                tenantId,
+                                state.BaseOffset + nextRelativeOffset,
+                                state.BaseOffset + normalizedRelativeOffset,
+                                codec.Format);
+
+                            return new QueueEventReadBatch(
+                                recoveredResult.Records,
+                                state.BaseOffset + recoveredResult.NextOffset,
+                                recoveredResult.ReachedEndOfFile);
+                        }
+                    }
+
                     _logger.LogWarning(
                         CorruptTailReadEventId,
                         "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",

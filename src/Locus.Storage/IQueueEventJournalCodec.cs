@@ -18,6 +18,8 @@ namespace Locus.Storage
 
         Task<QueueEventJournalCodecReadResult> ReadBatchAsync(Stream stream, long startOffset, int maxRecords, CancellationToken ct);
 
+        long NormalizeReadOffset(Stream stream, long startOffset);
+
         QueueEventJournalCodecScanResult Scan(Stream stream);
     }
 
