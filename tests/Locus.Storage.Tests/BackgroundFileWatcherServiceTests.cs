@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -319,6 +320,281 @@ namespace Locus.Storage.Tests
 
                 if (Interlocked.CompareExchange(ref target, candidate, current) == current)
                     return;
+            }
+        }
+
+        [Fact]
+        public async Task ScanWatcher_SameErrorsAcrossScans_DeduplicatesToDebugLevel()
+        {
+            var options = new FileWatcherOptions
+            {
+                Enabled = true,
+                DefaultPollingInterval = TimeSpan.FromMilliseconds(50),
+                MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
+                MaximumPollingInterval = TimeSpan.FromSeconds(5),
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 1
+            };
+
+            var watcher = new FileWatcherConfiguration
+            {
+                WatcherId = "error-watcher",
+                Enabled = true,
+                PollingInterval = TimeSpan.FromMilliseconds(30),
+                WatchPath = "/watch/errors"
+            };
+
+            var fileWatcher = new Mock<IFileWatcher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            var logger = new InMemoryLogger<BackgroundFileWatcherService>();
+
+            optionsManager
+                .Setup(m => m.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(options);
+            optionsManager
+                .Setup(m => m.IsServiceEnabledAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            fileWatcher
+                .Setup(m => m.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { watcher });
+
+            var scanCount = 0;
+            fileWatcher
+                .Setup(m => m.ScanNowAsync(It.IsAny<FileWatcherConfiguration>(), It.IsAny<CancellationToken>()))
+                .Returns<FileWatcherConfiguration, CancellationToken>((_, _) =>
+                {
+                    scanCount++;
+                    return Task.FromResult(new FileWatcherScanResult
+                    {
+                        FilesDiscovered = 1,
+                        FilesImported = 0,
+                        FilesFailed = 1,
+                        Errors = new List<string> { "disk full", "permission denied" }
+                    });
+                });
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                logger);
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(() => scanCount >= 2, TimeSpan.FromSeconds(2),
+                    "Timed out waiting for at least two scan cycles.");
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var warnings = logger.Entries
+                .Where(e => e.Level == LogLevel.Warning)
+                .ToList();
+            var debugs = logger.Entries
+                .Where(e => e.Level == LogLevel.Debug)
+                .ToList();
+
+            Assert.Equal(2, warnings.Count);
+            var errorDebugs = debugs
+                .Where(e => e.Message.Contains("error:"))
+                .ToList();
+            Assert.True(errorDebugs.Count >= 2,
+                $"Expected at least 2 debug-level error entries for repeat scan, got {errorDebugs.Count}.");
+            Assert.All(warnings, e => Assert.Contains("error:", e.Message));
+            Assert.All(warnings, e => Assert.Equal(watcher.WatcherId, e.Args?[0]));
+        }
+
+        [Fact]
+        public async Task ScanWatcher_DifferentErrorsAcrossScans_EmitsWarningAgain()
+        {
+            var options = new FileWatcherOptions
+            {
+                Enabled = true,
+                DefaultPollingInterval = TimeSpan.FromMilliseconds(50),
+                MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
+                MaximumPollingInterval = TimeSpan.FromSeconds(5),
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 1
+            };
+
+            var watcher = new FileWatcherConfiguration
+            {
+                WatcherId = "changing-errors",
+                Enabled = true,
+                PollingInterval = TimeSpan.FromMilliseconds(30),
+                WatchPath = "/watch/changing"
+            };
+
+            var fileWatcher = new Mock<IFileWatcher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            var logger = new InMemoryLogger<BackgroundFileWatcherService>();
+
+            optionsManager
+                .Setup(m => m.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(options);
+
+            fileWatcher
+                .Setup(m => m.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { watcher });
+
+            // Return different error sets on each scan
+            var scanCount = 0;
+            fileWatcher
+                .Setup(m => m.ScanNowAsync(It.IsAny<FileWatcherConfiguration>(), It.IsAny<CancellationToken>()))
+                .Returns<FileWatcherConfiguration, CancellationToken>((_, _) =>
+                {
+                    scanCount++;
+                    var errors = scanCount == 1
+                        ? new List<string> { "error A" }
+                        : new List<string> { "error B" };
+                    return Task.FromResult(new FileWatcherScanResult
+                    {
+                        FilesDiscovered = 1,
+                        FilesFailed = 1,
+                        Errors = errors
+                    });
+                });
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                logger);
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(() => scanCount >= 2, TimeSpan.FromSeconds(2),
+                    "Timed out waiting for at least two scan cycles.");
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var warnings = logger.Entries
+                .Where(e => e.Level == LogLevel.Warning)
+                .ToList();
+
+            Assert.True(warnings.Count >= 2,
+                $"Expected at least 2 warnings for different error sets, got {warnings.Count}.");
+        }
+
+        [Fact]
+        public async Task ScanWatcher_ErrorsInDifferentOrder_StillDeduplicates()
+        {
+            var options = new FileWatcherOptions
+            {
+                Enabled = true,
+                DefaultPollingInterval = TimeSpan.FromMilliseconds(50),
+                MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
+                MaximumPollingInterval = TimeSpan.FromSeconds(5),
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 1
+            };
+
+            var watcher = new FileWatcherConfiguration
+            {
+                WatcherId = "reorder-watcher",
+                Enabled = true,
+                PollingInterval = TimeSpan.FromMilliseconds(30),
+                WatchPath = "/watch/reorder"
+            };
+
+            var fileWatcher = new Mock<IFileWatcher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            var logger = new InMemoryLogger<BackgroundFileWatcherService>();
+
+            optionsManager
+                .Setup(m => m.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(options);
+
+            fileWatcher
+                .Setup(m => m.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { watcher });
+
+            var scanCount = 0;
+            fileWatcher
+                .Setup(m => m.ScanNowAsync(It.IsAny<FileWatcherConfiguration>(), It.IsAny<CancellationToken>()))
+                .Returns<FileWatcherConfiguration, CancellationToken>((_, _) =>
+                {
+                    scanCount++;
+                    // Same errors, different order on each scan
+                    var errors = scanCount % 2 == 1
+                        ? new List<string> { "err1", "err2", "err3" }
+                        : new List<string> { "err3", "err1", "err2" };
+                    return Task.FromResult(new FileWatcherScanResult
+                    {
+                        FilesDiscovered = 1,
+                        FilesFailed = 1,
+                        Errors = errors
+                    });
+                });
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                logger);
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(() => scanCount >= 2, TimeSpan.FromSeconds(2),
+                    "Timed out waiting for at least two scan cycles.");
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var warnings = logger.Entries
+                .Where(e => e.Level == LogLevel.Warning)
+                .ToList();
+
+            Assert.Equal(3, warnings.Count);
+            Assert.All(warnings, e => Assert.Contains("error:", e.Message));
+        }
+
+        private sealed class InMemoryLogger<T> : ILogger<T>
+        {
+            private readonly List<LogEntry> _entries = new List<LogEntry>();
+
+            public IReadOnlyList<LogEntry> Entries => _entries;
+
+            public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullDisposable.Instance;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                var message = formatter(state, exception);
+                var args = (state as IReadOnlyList<KeyValuePair<string, object>>)
+                    ?.Select(kv => kv.Value)
+                    .ToArray();
+                _entries.Add(new LogEntry(logLevel, message, args));
+            }
+
+            public sealed class LogEntry
+            {
+                public LogLevel Level { get; }
+                public string Message { get; }
+                public object?[]? Args { get; }
+
+                public LogEntry(LogLevel level, string message, object?[]? args)
+                {
+                    Level = level;
+                    Message = message;
+                    Args = args;
+                }
+            }
+
+            private sealed class NullDisposable : IDisposable
+            {
+                public static readonly NullDisposable Instance = new NullDisposable();
+                public void Dispose() { }
             }
         }
 

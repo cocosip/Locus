@@ -54,6 +54,9 @@ namespace Locus.Storage
                     {
                         _logger.LogDebug("File watcher service is globally disabled, checking again in {Interval}",
                             options.DisabledCheckInterval);
+                        // Clear schedule so we recalculate next-due times when re-enabled.
+                        // Dedup dictionaries are intentionally NOT cleared: we want to
+                        // avoid re-emitting warnings for already-seen conditions.
                         _nextScanDueByWatcherId.Clear();
                         await Task.Delay(options.DisabledCheckInterval, stoppingToken);
                         continue;
@@ -259,22 +262,30 @@ namespace Locus.Storage
 
                     if (result.Errors.Any())
                     {
-                        var errorHash = GetErrorHash(result.Errors);
-                        var previousHash = _recentWatcherErrorHashes.GetOrAdd(watcher.WatcherId, 0);
-                        var isRepeat = previousHash == errorHash;
-                        if (!isRepeat)
-                            _recentWatcherErrorHashes[watcher.WatcherId] = errorHash;
+                        var distinctErrors = result.Errors.Distinct().ToList();
+                        var errorHash = GetErrorHash(distinctErrors);
+
+                        var isRepeat = false;
+                        _recentWatcherErrorHashes.AddOrUpdate(
+                            watcher.WatcherId,
+                            _ => { isRepeat = false; return errorHash; },
+                            (_, previousHash) =>
+                            {
+                                isRepeat = previousHash == errorHash;
+                                return isRepeat ? previousHash : errorHash;
+                            });
 
                         var level = isRepeat ? LogLevel.Debug : LogLevel.Warning;
-                        var distinctErrors = result.Errors.Distinct().Take(5).ToList();
-                        foreach (var error in distinctErrors)
+                        var displayErrors = distinctErrors.Take(5).ToList();
+                        foreach (var error in displayErrors)
                         {
                             _logger.Log(level, "Watcher {WatcherId} error: {Error}", watcher.WatcherId, error);
                         }
 
-                        if (result.Errors.Count > 5)
+                        if (distinctErrors.Count > 5)
                         {
-                            _logger.Log(level, "Watcher {WatcherId} had {Count} more errors", watcher.WatcherId, result.Errors.Count - 5);
+                            _logger.Log(level, "Watcher {WatcherId} had {Count} more distinct errors",
+                                watcher.WatcherId, distinctErrors.Count - 5);
                         }
                     }
                 }
@@ -299,8 +310,11 @@ namespace Locus.Storage
             var hash = 17;
             foreach (var error in errors)
             {
-                hash = hash * 31 + (error?.GetHashCode() ?? 0);
+                // XOR is order-independent: (A, B) and (B, A) produce the same hash
+                hash ^= (error?.GetHashCode() ?? 0);
             }
+            // Mix in the count so different numbers of errors produce different hashes
+            hash ^= errors.Count * 31;
             return hash;
         }
     }
