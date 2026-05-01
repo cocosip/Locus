@@ -583,6 +583,8 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         /// </summary>
         private SqliteConnection GetDatabase(string tenantId)
         {
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+
             // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
             // This prevents multiple threads from simultaneously creating the connection instance.
             var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
@@ -590,7 +592,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 try
                 {
                     // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
-                    var tenantDir = _fileSystem.Path.Combine(_metadataDirectory, tid);
+                    var tenantDir = GetTenantDirectoryPath(tid);
                     if (!_fileSystem.Directory.Exists(tenantDir))
                         _fileSystem.Directory.CreateDirectory(tenantDir);
 
@@ -631,7 +633,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                         _logger.LogWarning("Metadata database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}", tid, backupPath ?? "N/A");
 
                         // Retry initialization
-                        var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tid, "metadata.db");
+                        var dbPath = GetDatabasePath(tid);
                         var conn = OpenAndInitializeConnection(dbPath);
 
                         _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
@@ -647,6 +649,17 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
             return lazyConn.Value;
+        }
+
+        private string GetTenantDirectoryPath(string tenantId)
+        {
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            return _fileSystem.Path.Combine(_metadataDirectory, tenantId);
+        }
+
+        private string GetDatabasePath(string tenantId)
+        {
+            return _fileSystem.Path.Combine(GetTenantDirectoryPath(tenantId), "metadata.db");
         }
 
         private object GetDatabaseLock(string tenantId)
@@ -896,8 +909,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (_disposed)
                 throw new ObjectDisposedException(nameof(MetadataRepository));
 
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
 
             return new DirectProjectionBatch(this, tenantId);
         }
@@ -933,6 +945,8 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
+
+            TenantIdPathValidator.Validate(metadata.TenantId, nameof(metadata));
         }
 
         /// <summary>
@@ -2948,7 +2962,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         public Task<(long SizeBefore, long SizeAfter)> OptimizeDatabaseAsync(string tenantId, CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
+            var dbPath = GetDatabasePath(tenantId);
 
             long sizeBefore = 0;
             long sizeAfter = 0;
@@ -3102,7 +3116,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         /// <returns>Backup file path, or null if no database file existed.</returns>
         private string? RebuildDatabaseFileNoLock(string tenantId)
         {
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
+            var dbPath = GetDatabasePath(tenantId);
 
             if (!_fileSystem.File.Exists(dbPath))
             {
@@ -3211,10 +3225,9 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         /// </returns>
         public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
 
-            var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
+            var dbPath = GetDatabasePath(tenantId);
 
             // Get or create tenant lock (same lock used for all operations)
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
@@ -3635,22 +3648,45 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     }
 
                     txn.Commit();
-
-                    if (_sqliteOptions.CheckpointAfterBatch)
-                    {
-                        using var cmd = conn.CreateCommand();
-                        cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
-                        cmd.ExecuteNonQuery();
-                    }
-
-                    _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
                 }
                 catch
                 {
                     txn.Rollback();
                     throw;
                 }
+
+                TryCheckpointAfterCommittedBatch(conn, tenantId);
+                _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
             }
+        }
+
+        private void TryCheckpointAfterCommittedBatch(SqliteConnection connection, string tenantId)
+        {
+            if (!_sqliteOptions.CheckpointAfterBatch)
+                return;
+
+            try
+            {
+                CheckpointAfterCommittedBatch(connection);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "SQLite checkpoint failed after committed metadata batch for tenant {TenantId}",
+                    tenantId);
+            }
+        }
+
+        /// <summary>
+        /// Runs the optional SQLite checkpoint after a metadata batch has been committed.
+        /// </summary>
+        /// <param name="connection">The tenant SQLite connection.</param>
+        protected virtual void CheckpointAfterCommittedBatch(SqliteConnection connection)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
+            cmd.ExecuteNonQuery();
         }
 
         // Writes a batch of operations for a single tenant inside one SQLite transaction.

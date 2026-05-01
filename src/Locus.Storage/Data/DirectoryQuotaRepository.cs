@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Dapper;
 using Locus.Core.Models;
+using Locus.Storage;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -136,13 +137,15 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// </summary>
         private SqliteConnection GetDatabase(string tenantId)
         {
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+
             // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
             var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
             {
                 try
                 {
                     // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
-                    var tenantDir = _fileSystem.Path.Combine(_quotaDirectory, tid);
+                    var tenantDir = GetTenantDirectoryPath(tid);
                     if (!_fileSystem.Directory.Exists(tenantDir))
                         _fileSystem.Directory.CreateDirectory(tenantDir);
 
@@ -232,7 +235,13 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
 
         private string GetDatabasePath(string tenantId)
         {
-            return _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
+            return _fileSystem.Path.Combine(GetTenantDirectoryPath(tenantId), "quotas.db");
+        }
+
+        private string GetTenantDirectoryPath(string tenantId)
+        {
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            return _fileSystem.Path.Combine(_quotaDirectory, tenantId);
         }
 
         private void EnsureWritableDatabaseArtifacts(string dbPath)
@@ -339,6 +348,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// </summary>
         private SemaphoreSlim GetTenantLock(string tenantId)
         {
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
             return _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
         }
 

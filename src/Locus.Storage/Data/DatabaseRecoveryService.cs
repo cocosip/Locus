@@ -154,6 +154,8 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+
             var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
             var result = new DatabaseRebuildResult
             {
@@ -295,6 +297,8 @@ namespace Locus.Storage.Data
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
 
             var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
             var result = new DatabaseRebuildResult

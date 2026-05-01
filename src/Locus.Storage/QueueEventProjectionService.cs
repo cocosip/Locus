@@ -1474,11 +1474,7 @@ namespace Locus.Storage
 
         private static void ValidateTenantId(string tenantId)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
-
-            if (tenantId.IndexOf('/') >= 0 || tenantId.IndexOf('\\') >= 0 || tenantId.Contains(".."))
-                throw new ArgumentException($"TenantId contains invalid path characters: '{tenantId}'", nameof(tenantId));
+            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
         }
 
         private async Task ResetQuotaProjectionAsync(string tenantId, CancellationToken ct)

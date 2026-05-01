@@ -77,6 +77,16 @@ namespace Locus.Storage.Tests
             Assert.True(canAdd);
         }
 
+        [Theory]
+        [InlineData("../tenant-escape")]
+        [InlineData("tenant/escape")]
+        [InlineData("tenant\\escape")]
+        public async Task GetOrCreateAsync_RejectsPathTraversalTenantIds(string tenantId)
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _repository.GetOrCreateAsync(tenantId, "/test/dir", CancellationToken.None));
+        }
+
         [Fact]
         public async Task CanAddFileAsync_ReturnsTrueWhenBelowLimit()
         {

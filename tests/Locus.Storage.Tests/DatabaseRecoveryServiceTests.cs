@@ -91,6 +91,32 @@ namespace Locus.Storage.Tests
             catch { }
         }
 
+        [Theory]
+        [InlineData("../tenant-escape")]
+        [InlineData("tenant/escape")]
+        [InlineData("tenant\\escape")]
+        public async Task RebuildMetadataDatabaseAsync_RejectsPathTraversalTenantIds(string tenantId)
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _recoveryService.RebuildMetadataDatabaseAsync(
+                    tenantId,
+                    new[] { _volumePath },
+                    CancellationToken.None));
+        }
+
+        [Theory]
+        [InlineData("../tenant-escape")]
+        [InlineData("tenant/escape")]
+        [InlineData("tenant\\escape")]
+        public async Task RebuildQuotaDatabaseAsync_RejectsPathTraversalTenantIds(string tenantId)
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _recoveryService.RebuildQuotaDatabaseAsync(
+                    tenantId,
+                    new[] { _volumePath },
+                    CancellationToken.None));
+        }
+
         [Fact]
         public void IsDatabaseCorrupted_ReturnsFalseForNonExistentDatabase()
         {

@@ -258,6 +258,57 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ProjectionBatch_CommittedDelete_DoesNotRollbackWhenCheckpointFails()
+        {
+            const string tenantId = "tenant-checkpoint";
+            const string fileKey = "batch-delete-checkpoint";
+            var metadataDir = Path.Combine(Path.GetTempPath(), $"locus-test-metadata-checkpoint-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(metadataDir);
+
+            using (var repository = new CheckpointFailingMetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                metadataDir))
+            {
+                var metadata = CreateMetadata(fileKey, FileProcessingStatus.Completed, tenantId);
+                metadata.CompletedAt = DateTime.UtcNow;
+                await InvokeAddOrUpdateDirectAsync(repository, metadata);
+
+                var batch = BeginProjectionBatch(repository, tenantId);
+                var removed = await InvokeBatchRemoveProjectedFileAsync(batch, fileKey);
+                Assert.True(removed);
+
+                repository.FailNextCheckpoint();
+                await InvokeBatchFlushAsync(batch);
+
+                Assert.Null(await repository.GetAsync(tenantId, fileKey, CancellationToken.None));
+                Assert.Null(ReadPersistedMetadata(metadataDir, tenantId, fileKey));
+            }
+
+            try
+            {
+                if (_fileSystem.Directory.Exists(metadataDir))
+                    _fileSystem.Directory.Delete(metadataDir, recursive: true);
+            }
+            catch
+            {
+                // Ignore cleanup failures in tests.
+            }
+        }
+
+        [Theory]
+        [InlineData("../tenant-escape")]
+        [InlineData("tenant/escape")]
+        [InlineData("tenant\\escape")]
+        public async Task AddOrUpdateAsync_RejectsPathTraversalTenantIds(string tenantId)
+        {
+            var metadata = CreateMetadata("tenant-path-validation", FileProcessingStatus.Pending, tenantId);
+
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                _repository.AddOrUpdateAsync(metadata, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task GetByFileKeyAsync_ReturnsMetadataAcrossTenants()
         {
             await _repository.AddOrUpdateAsync(CreateMetadata("file-tenant-1", FileProcessingStatus.Pending, "tenant-001"), CancellationToken.None);
@@ -1084,6 +1135,40 @@ WHERE file_key = $file_key;";
                 OriginalFileName = reader.IsDBNull(16) ? null : reader.GetString(16),
                 FileExtension = reader.IsDBNull(17) ? null : reader.GetString(17),
             };
+        }
+
+        private sealed class CheckpointFailingMetadataRepository : MetadataRepository
+        {
+            private bool _failNextCheckpoint;
+
+            public CheckpointFailingMetadataRepository(
+                IFileSystem fileSystem,
+                ILogger<MetadataRepository> logger,
+                string metadataDirectory)
+                : base(
+                    fileSystem,
+                    logger,
+                    metadataDirectory,
+                    new SqliteOptions { CheckpointAfterBatch = true },
+                    enableBackgroundPersistence: false)
+            {
+            }
+
+            public void FailNextCheckpoint()
+            {
+                _failNextCheckpoint = true;
+            }
+
+            protected override void CheckpointAfterCommittedBatch(SqliteConnection connection)
+            {
+                if (_failNextCheckpoint)
+                {
+                    _failNextCheckpoint = false;
+                    throw new InvalidOperationException("Injected checkpoint failure after commit.");
+                }
+
+                base.CheckpointAfterCommittedBatch(connection);
+            }
         }
     }
 }

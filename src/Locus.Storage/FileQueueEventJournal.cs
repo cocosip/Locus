@@ -922,12 +922,7 @@ namespace Locus.Storage
 
         private static void ValidateTenantIdForPath(string? tenantId, string paramName)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", paramName);
-
-            var validatedTenantId = tenantId!;
-            if (validatedTenantId.IndexOf('/') >= 0 || validatedTenantId.IndexOf('\\') >= 0 || validatedTenantId.Contains(".."))
-                throw new ArgumentException($"TenantId contains invalid path characters: '{validatedTenantId}'", paramName);
+            TenantIdPathValidator.Validate(tenantId, paramName);
         }
 
         private IReadOnlyList<QueueEventRecord> CloneRecords(IReadOnlyList<QueueEventRecord> records)
