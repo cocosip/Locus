@@ -56,6 +56,22 @@ namespace Locus.Storage.Tests
                 enableBackgroundFlush: false);
         }
 
+        [Theory]
+        [InlineData("../tenant-escape")]
+        [InlineData("tenant/escape")]
+        [InlineData("tenant\\escape")]
+        public async Task MaintenanceTenantOperations_RejectPathTraversalTenantIds(string tenantId)
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            await Assert.ThrowsAsync<ArgumentException>(() => service.ReplayTenantAsync(tenantId, CancellationToken.None));
+            await Assert.ThrowsAsync<ArgumentException>(() => service.RebuildTenantAsync(tenantId, CancellationToken.None));
+            await Assert.ThrowsAsync<ArgumentException>(() => service.SnapshotTenantAsync(tenantId, CancellationToken.None));
+        }
+
         [Fact]
         public async Task ExecuteAsync_RebuildsAcceptedEventIntoMetadataAndQuota()
         {

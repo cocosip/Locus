@@ -1131,6 +1131,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             private readonly MetadataRepository _repository;
             private readonly string _tenantId;
             private readonly List<PersistenceOperation> _operations;
+            private readonly Dictionary<string, FileMetadata?> _originalMetadataByFileKey;
             private bool _flushed;
 
             public DirectProjectionBatch(MetadataRepository repository, string tenantId)
@@ -1138,6 +1139,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 _repository = repository;
                 _tenantId = tenantId;
                 _operations = new List<PersistenceOperation>();
+                _originalMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
             }
 
             public string TenantId => _tenantId;
@@ -1157,6 +1159,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (!string.Equals(metadata.TenantId, _tenantId, StringComparison.Ordinal))
                     throw new ArgumentException("Metadata tenant does not match the active projection batch.", nameof(metadata));
 
+                CaptureOriginalMetadata(metadata.FileKey);
                 _repository.UpdateCacheAndIndices(metadata);
                 _operations.Add(_repository.CreatePersistenceUpsert(metadata));
                 return Task.CompletedTask;
@@ -1175,6 +1178,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (string.IsNullOrWhiteSpace(fileKey))
                     throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
+                CaptureOriginalMetadata(fileKey);
                 var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
                 if (removed)
                     _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
@@ -1190,8 +1194,44 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                     return Task.CompletedTask;
 
                 _flushed = true;
-                _repository.ExecuteDirectBatch(_tenantId, _operations);
+                try
+                {
+                    _repository.ExecuteDirectBatch(_tenantId, _operations);
+                    _originalMetadataByFileKey.Clear();
+                }
+                catch
+                {
+                    RollbackInMemoryProjection();
+                    throw;
+                }
+
                 return Task.CompletedTask;
+            }
+
+            private void CaptureOriginalMetadata(string fileKey)
+            {
+                if (_originalMetadataByFileKey.ContainsKey(fileKey))
+                    return;
+
+                var cache = _repository.GetCache(_tenantId);
+                _originalMetadataByFileKey[fileKey] = cache.TryGetValue(fileKey, out var current)
+                    ? current.Clone()
+                    : null;
+            }
+
+            private void RollbackInMemoryProjection()
+            {
+                foreach (var entry in _originalMetadataByFileKey)
+                {
+                    if (entry.Value == null)
+                    {
+                        _repository.TryRemoveFromCacheAndIndices(_tenantId, entry.Key, out _);
+                    }
+                    else
+                    {
+                        _repository.UpdateCacheAndIndices(entry.Value.Clone());
+                    }
+                }
             }
         }
 

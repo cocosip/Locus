@@ -215,6 +215,49 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ProjectionBatch_FailedDeleteFlush_RollsBackInMemoryProjection()
+        {
+            const string fileKey = "batch-delete-rollback";
+            var metadata = CreateMetadata(fileKey, FileProcessingStatus.Completed);
+            metadata.CompletedAt = DateTime.UtcNow;
+            await InvokeAddOrUpdateDirectAsync(_repository, metadata);
+
+            var batch = BeginProjectionBatch(_repository, _tenantId);
+            var removed = await InvokeBatchRemoveProjectedFileAsync(batch, fileKey);
+            Assert.True(removed);
+
+            DisposeTenantDatabaseConnection(_repository, _tenantId);
+
+            await Assert.ThrowsAnyAsync<Exception>(() => InvokeBatchFlushAsync(batch));
+
+            var current = await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None);
+            var persisted = ReadPersistedMetadata(_metadataDir, _tenantId, fileKey);
+
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Completed, current!.Status);
+            Assert.NotNull(persisted);
+            Assert.Equal(FileProcessingStatus.Completed, persisted!.Status);
+        }
+
+        [Fact]
+        public async Task ProjectionBatch_FailedUpsertFlush_RollsBackInMemoryProjection()
+        {
+            const string fileKey = "batch-upsert-rollback";
+            var metadata = CreateMetadata(fileKey, FileProcessingStatus.Pending);
+            Assert.Null(await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None));
+
+            var batch = BeginProjectionBatch(_repository, _tenantId);
+            await InvokeBatchUpsertProjectedFileAsync(batch, metadata);
+
+            DisposeTenantDatabaseConnection(_repository, _tenantId);
+
+            await Assert.ThrowsAnyAsync<Exception>(() => InvokeBatchFlushAsync(batch));
+
+            Assert.Null(await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None));
+            Assert.Null(ReadPersistedMetadata(_metadataDir, _tenantId, fileKey));
+        }
+
+        [Fact]
         public async Task GetByFileKeyAsync_ReturnsMetadataAcrossTenants()
         {
             await _repository.AddOrUpdateAsync(CreateMetadata("file-tenant-1", FileProcessingStatus.Pending, "tenant-001"), CancellationToken.None);
@@ -877,6 +920,69 @@ namespace Locus.Storage.Tests
             Assert.NotNull(field);
 
             return (ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>>)field!.GetValue(repository)!;
+        }
+
+        private static Task InvokeAddOrUpdateDirectAsync(MetadataRepository repository, FileMetadata metadata)
+        {
+            var method = typeof(MetadataRepository).GetMethod(
+                "AddOrUpdateDirectAsync",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            return (Task)method!.Invoke(repository, new object[] { metadata, CancellationToken.None })!;
+        }
+
+        private static object BeginProjectionBatch(MetadataRepository repository, string tenantId)
+        {
+            var method = typeof(MetadataRepository).GetMethod(
+                "BeginProjectionBatch",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            return method!.Invoke(repository, new object[] { tenantId })!;
+        }
+
+        private static Task InvokeBatchUpsertProjectedFileAsync(object batch, FileMetadata metadata)
+        {
+            var method = batch.GetType().GetMethod("UpsertProjectedFileAsync");
+            Assert.NotNull(method);
+
+            return (Task)method!.Invoke(batch, new object[] { metadata, CancellationToken.None })!;
+        }
+
+        private static Task<bool> InvokeBatchRemoveProjectedFileAsync(object batch, string fileKey)
+        {
+            var method = batch.GetType().GetMethod("RemoveProjectedFileAsync");
+            Assert.NotNull(method);
+
+            return (Task<bool>)method!.Invoke(batch, new object[] { fileKey, CancellationToken.None })!;
+        }
+
+        private static Task InvokeBatchFlushAsync(object batch)
+        {
+            var method = batch.GetType().GetMethod("FlushAsync");
+            Assert.NotNull(method);
+
+            try
+            {
+                return (Task)method!.Invoke(batch, new object[] { CancellationToken.None })!;
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException != null)
+            {
+                return Task.FromException(ex.InnerException);
+            }
+        }
+
+        private static void DisposeTenantDatabaseConnection(MetadataRepository repository, string tenantId)
+        {
+            var field = typeof(MetadataRepository).GetField("_databases", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+
+            var databases = (ConcurrentDictionary<string, Lazy<SqliteConnection>>)field!.GetValue(repository)!;
+            Assert.True(databases.TryGetValue(tenantId, out var lazyConnection));
+            Assert.True(lazyConnection!.IsValueCreated);
+
+            lazyConnection.Value.Dispose();
         }
 
         private static ConcurrentDictionary<string, SemaphoreSlim> GetTenantLocks(MetadataRepository repository)
