@@ -2154,6 +2154,206 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupCompletedFilesAsync_WithJournal_DoesNotCountWhenDeleteSucceededProjectionRejected()
+        {
+            var completedAt = DateTime.UtcNow.AddMinutes(-5);
+            var physicalPath = Path.Combine(_volumePath, "completed-rejected.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+
+            var metadata = new FileMetadata
+            {
+                FileKey = "completed-rejected",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = completedAt
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            queueEventJournal
+                .Setup(j => j.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.DeleteRequested
+                        && records[0].Status == FileProcessingStatus.DeleteRequested
+                        && records[1].EventType == QueueEventType.DeleteSucceeded
+                        && records[1].Status == FileProcessingStatus.DeleteSucceeded),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { "tenant-001" });
+            projectionStore
+                .Setup(store => store.GetProjectedFileAsync("tenant-001", "completed-rejected", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(metadata);
+
+            var projectionCleanupStore = new Mock<IQueueProjectionCleanupStore>(MockBehavior.Strict);
+            projectionCleanupStore
+                .Setup(store => store.GetDeleteRequestedFilesOlderThanAsync(
+                    "tenant-001",
+                    It.IsAny<DateTime>(),
+                    It.IsAny<int>(),
+                    It.IsAny<ISet<string>?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projectionCleanupStore
+                .SetupSequence(store => store.GetCompletedFilesOlderThanAsync(
+                    "tenant-001",
+                    It.IsAny<DateTime>(),
+                    It.IsAny<int>(),
+                    It.IsAny<ISet<string>?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { metadata })
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projectionCleanupStore
+                .Setup(store => store.TryMarkDeleteSucceededAsync(
+                    "tenant-001",
+                    "completed-rejected",
+                    completedAt,
+                    It.IsAny<DateTime>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(false);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object,
+                projectionStore: projectionStore.Object,
+                projectionCleanupStore: projectionCleanupStore.Object,
+                allowLegacyNonJournalMode: true);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await SeedProjectedCountsAsync("tenant-001", "/done");
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+
+            var reloaded = await _metadataRepository.GetAsync("tenant-001", "completed-rejected", CancellationToken.None);
+            Assert.NotNull(reloaded);
+            Assert.Equal(FileProcessingStatus.Completed, reloaded!.Status);
+            Assert.NotNull(reloaded.CompletedAt);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(0, stats.CompletedRecordsRemoved);
+
+            queueEventJournal.VerifyAll();
+            projectionStore.VerifyAll();
+            projectionCleanupStore.VerifyAll();
+        }
+
+        [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_WithJournal_DoesNotCountWhenDeleteSucceededProjectionRejected()
+        {
+            var failedAt = DateTime.UtcNow.AddDays(-8);
+            var physicalPath = Path.Combine(_volumePath, "failed-rejected.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "failed content");
+
+            var metadata = new FileMetadata
+            {
+                FileKey = "failed-rejected",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/failed",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddDays(-10),
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = failedAt
+            };
+
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            queueEventJournal
+                .Setup(j => j.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.DeleteRequested
+                        && records[0].Status == FileProcessingStatus.DeleteRequested
+                        && records[1].EventType == QueueEventType.DeleteSucceeded
+                        && records[1].Status == FileProcessingStatus.DeleteSucceeded),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(store => store.GetProjectedTenantIdsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { "tenant-001" });
+            projectionStore
+                .Setup(store => store.GetProjectedFileAsync("tenant-001", "failed-rejected", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(metadata);
+
+            var projectionCleanupStore = new Mock<IQueueProjectionCleanupStore>(MockBehavior.Strict);
+            projectionCleanupStore
+                .SetupSequence(store => store.GetPermanentlyFailedFilesOlderThanAsync(
+                    "tenant-001",
+                    It.IsAny<DateTime>(),
+                    It.IsAny<int>(),
+                    It.IsAny<ISet<string>?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { metadata })
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projectionCleanupStore
+                .Setup(store => store.TryMarkPermanentlyFailedDeleteSucceededAsync(
+                    "tenant-001",
+                    "failed-rejected",
+                    failedAt,
+                    It.IsAny<DateTime>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(false);
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new CleanupOptions
+                {
+                    PermanentlyFailedDisposition = PermanentlyFailedDisposition.Delete
+                },
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object,
+                projectionStore: projectionStore.Object,
+                projectionCleanupStore: projectionCleanupStore.Object,
+                allowLegacyNonJournalMode: true);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), CancellationToken.None);
+
+            Assert.False(_fileSystem.File.Exists(physicalPath));
+
+            var reloaded = await _metadataRepository.GetAsync("tenant-001", "failed-rejected", CancellationToken.None);
+            Assert.NotNull(reloaded);
+            Assert.Equal(FileProcessingStatus.PermanentlyFailed, reloaded!.Status);
+            Assert.NotNull(reloaded.LastFailedAt);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(0, stats.PermanentlyFailedFilesRemoved);
+
+            queueEventJournal.VerifyAll();
+            projectionStore.VerifyAll();
+            projectionCleanupStore.VerifyAll();
+        }
+
+        [Fact]
         public async Task CleanupCompletedFilesAsync_WithoutJournal_RemovesMetadataAndQuota()
         {
             var cleanupService = new StorageCleanupService(

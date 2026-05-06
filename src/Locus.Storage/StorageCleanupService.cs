@@ -1231,12 +1231,17 @@ namespace Locus.Storage
                                     default).ConfigureAwait(false);
                             }
 
-                            await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
+                            var metadataTransitionApplied = await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
                                 metadata.TenantId,
                                 metadata.FileKey,
                                 metadata.CompletedAt.Value,
                                 deleteSucceededAtUtc,
                                 ct).ConfigureAwait(false);
+                            if (!metadataTransitionApplied
+                                && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
+                            {
+                                throw new InvalidOperationException($"Failed to mark completed file {metadata.FileKey} as delete-succeeded after physical deletion.");
+                            }
                         }
                         else
                         {
@@ -1409,12 +1414,17 @@ namespace Locus.Storage
                                         },
                                         default).ConfigureAwait(false);
 
-                                    await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
+                                    metadataTransitionApplied = await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
                                         metadata.TenantId,
                                         metadata.FileKey,
                                         metadata.LastFailedAt.Value,
                                         deleteSucceededAtUtc,
                                         ct).ConfigureAwait(false);
+                                    if (!metadataTransitionApplied
+                                        && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
+                                    {
+                                        throw new InvalidOperationException($"Failed to mark permanently-failed file {metadata.FileKey} as delete-succeeded after physical deletion.");
+                                    }
                                 }
 
                                 else
@@ -1615,6 +1625,20 @@ namespace Locus.Storage
         {
             var current = await _projectionStore.GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct).ConfigureAwait(false);
             return current == null;
+        }
+
+        private async Task<bool> WasMetadataDeleteSucceededConcurrentlyAsync(
+            FileMetadata metadata,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct)
+        {
+            var current = await _projectionStore.GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct).ConfigureAwait(false);
+            if (current == null)
+                return false;
+
+            return current.Status == FileProcessingStatus.DeleteSucceeded
+                && current.DeleteSucceededAt.HasValue
+                && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc;
         }
 
         private static QueueEventRecord CreateDeleteSucceededEvent(FileMetadata metadata, DateTime deleteSucceededAtUtc)
