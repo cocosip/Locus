@@ -541,7 +541,9 @@
       // 数据库优化周期
       "DatabaseOptimizationInterval": "7.00:00:00",
 
-      // 单租户单轮清理批大小
+      // 单租户单轮清理批大小。
+      // Completed / DeleteRequested / PermanentlyFailed 等冷状态清理会按该大小从 SQLite 分页读取。
+      // 调大可以提高后台清理吞吐，但也会增加单轮 SQLite 工作量和短生命周期批次内存。
       "CleanupBatchSizePerTenant": 2000,
 
       // 单轮孤儿文件扫描上限

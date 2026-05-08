@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Dapper;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
@@ -910,6 +911,242 @@ namespace Locus.Storage.Tests
 
                 Assert.Equal(expected, allocated);
             }
+        }
+
+        [Fact]
+        public async Task StartupLoad_LoadsOnlyHotStatesIntoMemory()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var tenantId = "tenant-hot-startup";
+            var startupDir = Path.Combine(_metadataDir, $"hot-startup-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(startupDir);
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                startupDir,
+                enableBackgroundPersistence: false,
+                startupLoadBatchSize: 2))
+            {
+                foreach (FileProcessingStatus status in Enum.GetValues(typeof(FileProcessingStatus)))
+                {
+                    var metadata = CreateMetadata($"file-{status}", status, tenantId);
+                    metadata.CreatedAt = DateTime.UtcNow.AddMinutes(-10);
+                    metadata.ProcessingStartTime = status == FileProcessingStatus.Processing
+                        ? DateTime.UtcNow.AddMinutes(-5)
+                        : (DateTime?)null;
+                    metadata.CompletedAt = status == FileProcessingStatus.Completed
+                        || status == FileProcessingStatus.DeleteRequested
+                        || status == FileProcessingStatus.DeleteSucceeded
+                            ? DateTime.UtcNow.AddMinutes(-4)
+                            : (DateTime?)null;
+                    metadata.DeleteSucceededAt = status == FileProcessingStatus.DeleteSucceeded
+                        ? DateTime.UtcNow.AddMinutes(-3)
+                        : (DateTime?)null;
+                    metadata.LastFailedAt = status == FileProcessingStatus.Failed
+                        || status == FileProcessingStatus.PermanentlyFailed
+                            ? DateTime.UtcNow.AddMinutes(-2)
+                            : (DateTime?)null;
+                    metadata.DeadLetteredAt = status == FileProcessingStatus.DeadLettered
+                        ? DateTime.UtcNow.AddMinutes(-1)
+                        : (DateTime?)null;
+
+                    await writer.AddOrUpdateAsync(metadata, CancellationToken.None);
+                }
+            }
+
+            using (var reader = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                startupDir,
+                enableBackgroundPersistence: false,
+                startupLoadBatchSize: 2))
+            {
+                await reader.GetNextPendingFileAsync(tenantId, CancellationToken.None);
+
+                var activeFiles = GetActiveFiles(reader);
+                Assert.True(activeFiles.TryGetValue(tenantId, out var tenantCache));
+                Assert.Contains("file-Pending", tenantCache.Keys);
+                Assert.Contains("file-Processing", tenantCache.Keys);
+                Assert.Contains("file-Failed", tenantCache.Keys);
+                Assert.DoesNotContain("file-Completed", tenantCache.Keys);
+                Assert.DoesNotContain("file-DeleteRequested", tenantCache.Keys);
+                Assert.DoesNotContain("file-DeleteSucceeded", tenantCache.Keys);
+                Assert.DoesNotContain("file-PermanentlyFailed", tenantCache.Keys);
+                Assert.DoesNotContain("file-DeadLettered", tenantCache.Keys);
+            }
+        }
+
+        [Fact]
+        public async Task DatabaseInitialization_CreatesColdStateCompositeIndexes()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var tenantId = "tenant-indexes";
+            var indexDir = Path.Combine(_metadataDir, $"indexes-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(indexDir);
+
+            using (var repository = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                indexDir,
+                enableBackgroundPersistence: false))
+            {
+                await repository.AddOrUpdateAsync(
+                    CreateMetadata("index-file", FileProcessingStatus.Pending, tenantId),
+                    CancellationToken.None);
+            }
+
+            var dbPath = Path.Combine(indexDir, tenantId, "metadata.db");
+            using var conn = new SqliteConnection($"Data Source={dbPath}");
+            conn.Open();
+
+            var indexes = conn.Query<string>(
+                "SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name;")
+                .ToArray();
+
+            Assert.Contains("idx_files_tenant_status_completed_at", indexes);
+            Assert.Contains("idx_files_tenant_status_last_failed_at", indexes);
+            Assert.Contains("idx_files_tenant_physical_path", indexes);
+            Assert.Contains("idx_files_tenant_status_created_at", indexes);
+        }
+
+        [Fact]
+        public async Task ColdCleanupQueries_ReturnColdRowsThatAreNotInMemory()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var tenantId = "tenant-cold-query";
+            var coldDir = Path.Combine(_metadataDir, $"cold-query-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(coldDir);
+            var oldTime = DateTime.UtcNow.AddHours(-2);
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                coldDir,
+                enableBackgroundPersistence: false))
+            {
+                var completed = CreateMetadata("completed-cold", FileProcessingStatus.Completed, tenantId);
+                completed.CompletedAt = oldTime;
+                await writer.AddOrUpdateAsync(completed, CancellationToken.None);
+
+                var deleteRequested = CreateMetadata("delete-requested-cold", FileProcessingStatus.DeleteRequested, tenantId);
+                deleteRequested.CompletedAt = oldTime;
+                await writer.AddOrUpdateAsync(deleteRequested, CancellationToken.None);
+
+                var failed = CreateMetadata("permanent-cold", FileProcessingStatus.PermanentlyFailed, tenantId);
+                failed.LastFailedAt = oldTime;
+                await writer.AddOrUpdateAsync(failed, CancellationToken.None);
+            }
+
+            using (var reader = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                coldDir,
+                enableBackgroundPersistence: false))
+            {
+                await reader.GetNextPendingFileAsync(tenantId, CancellationToken.None);
+                var tenantCache = GetActiveFiles(reader).TryGetValue(tenantId, out var cache)
+                    ? cache
+                    : new ConcurrentDictionary<string, FileMetadata>();
+
+                Assert.DoesNotContain("completed-cold", tenantCache.Keys);
+                Assert.DoesNotContain("delete-requested-cold", tenantCache.Keys);
+                Assert.DoesNotContain("permanent-cold", tenantCache.Keys);
+
+                var cutoff = DateTime.UtcNow.AddMinutes(-30);
+                var completedRows = await reader.GetCompletedOlderThanAsync(tenantId, cutoff, 10, null, CancellationToken.None);
+                var deleteRequestedRows = await reader.GetDeleteRequestedOlderThanAsync(tenantId, cutoff, 10, null, CancellationToken.None);
+                var permanentlyFailedRows = await reader.GetPermanentlyFailedOlderThanAsync(tenantId, cutoff, 10, null, CancellationToken.None);
+
+                Assert.Contains(completedRows, m => m.FileKey == "completed-cold");
+                Assert.Contains(deleteRequestedRows, m => m.FileKey == "delete-requested-cold");
+                Assert.Contains(permanentlyFailedRows, m => m.FileKey == "permanent-cold");
+            }
+        }
+
+        [Fact]
+        public async Task AddOrUpdateAsync_TransitionToColdStatus_RemovesFromHotCache()
+        {
+            var tenantId = "tenant-cold-transition";
+            var metadata = CreateMetadata("transition-file", FileProcessingStatus.Pending, tenantId);
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var completed = metadata.Clone();
+            completed.Status = FileProcessingStatus.Completed;
+            completed.CompletedAt = DateTime.UtcNow;
+            await _repository.AddOrUpdateAsync(completed, CancellationToken.None);
+
+            var activeFiles = GetActiveFiles(_repository);
+            Assert.True(activeFiles.TryGetValue(tenantId, out var tenantCache));
+            Assert.DoesNotContain("transition-file", tenantCache.Keys);
+
+            var rows = await _repository.GetCompletedOlderThanAsync(
+                tenantId,
+                DateTime.UtcNow.AddSeconds(1),
+                10,
+                null,
+                CancellationToken.None);
+            Assert.Contains(rows, m => m.FileKey == "transition-file");
+        }
+
+        [Fact]
+        public async Task ExistsByPhysicalPathAsync_FindsColdMetadataFromDatabase()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var tenantId = "tenant-cold-path";
+            var pathDir = Path.Combine(_metadataDir, $"cold-path-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(pathDir);
+            var physicalPath = Path.Combine(pathDir, "completed.dat");
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                pathDir,
+                enableBackgroundPersistence: false))
+            {
+                var completed = CreateMetadata("completed-path", FileProcessingStatus.Completed, tenantId);
+                completed.PhysicalPath = physicalPath;
+                completed.CompletedAt = DateTime.UtcNow.AddMinutes(-10);
+                await writer.AddOrUpdateAsync(completed, CancellationToken.None);
+            }
+
+            using (var reader = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                pathDir,
+                enableBackgroundPersistence: false))
+            {
+                Assert.True(await reader.ExistsByPhysicalPathAsync(tenantId, physicalPath, CancellationToken.None));
+            }
+        }
+
+        [Fact]
+        public async Task GetByStatusAsync_ReturnsColdRowsFromDatabase()
+        {
+            var tenantId = "tenant-status-list";
+            var completed = CreateMetadata("completed-status-list", FileProcessingStatus.Completed, tenantId);
+            completed.CompletedAt = DateTime.UtcNow.AddMinutes(-10);
+            await _repository.AddOrUpdateAsync(completed, CancellationToken.None);
+
+            var rows = (await _repository.GetByStatusAsync(FileProcessingStatus.Completed, CancellationToken.None)).ToList();
+
+            Assert.Contains(rows, m => m.FileKey == "completed-status-list");
+        }
+
+        [Fact]
+        public async Task GetByTenantAsync_ReturnsHotAndColdRows()
+        {
+            var tenantId = "tenant-full-list";
+            await _repository.AddOrUpdateAsync(CreateMetadata("pending-list", FileProcessingStatus.Pending, tenantId), CancellationToken.None);
+
+            var completed = CreateMetadata("completed-list", FileProcessingStatus.Completed, tenantId);
+            completed.CompletedAt = DateTime.UtcNow.AddMinutes(-10);
+            await _repository.AddOrUpdateAsync(completed, CancellationToken.None);
+
+            var rows = (await _repository.GetByTenantAsync(tenantId, CancellationToken.None)).ToList();
+
+            Assert.Contains(rows, m => m.FileKey == "pending-list");
+            Assert.Contains(rows, m => m.FileKey == "completed-list");
         }
 
         [Fact]

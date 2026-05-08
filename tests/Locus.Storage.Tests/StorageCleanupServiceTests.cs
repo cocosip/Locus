@@ -2398,6 +2398,67 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupCompletedFilesAsync_WithoutJournal_CleansColdCompletedRowsAfterRestart()
+        {
+            var physicalPath = Path.Combine(_volumePath, "completed-cold-restart.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+
+            _metadataRepository.Dispose();
+
+            using (var seedRepository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await seedRepository.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = "completed-cold-restart",
+                    TenantId = "tenant-001",
+                    VolumeId = "vol-001",
+                    PhysicalPath = physicalPath,
+                    DirectoryPath = "/done",
+                    FileSize = 17,
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                    Status = FileProcessingStatus.Completed,
+                    CompletedAt = DateTime.UtcNow.AddMinutes(-5)
+                }, CancellationToken.None);
+            }
+
+            using (var reopenedRepository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await reopenedRepository.GetNextPendingFileAsync("tenant-001", CancellationToken.None);
+
+                var cleanupService = new StorageCleanupService(
+                    reopenedRepository,
+                    _quotaRepository,
+                    _tenantQuotaManager,
+                    _fileSystem,
+                    _logger.Object,
+                    _metadataDir,
+                    _quotaDir,
+                    tenantManager: _tenantManager.Object,
+                    allowLegacyNonJournalMode: true);
+                cleanupService.RegisterVolume(_volume.Object);
+
+                await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+                Assert.False(_fileSystem.File.Exists(physicalPath));
+                var remaining = await reopenedRepository.GetCompletedOlderThanAsync(
+                    "tenant-001",
+                    DateTime.UtcNow.AddSeconds(1),
+                    10,
+                    null,
+                    CancellationToken.None);
+                Assert.DoesNotContain(remaining, m => m.FileKey == "completed-cold-restart");
+            }
+        }
+
+        [Fact]
         public async Task CleanupCompletedFilesAsync_SkipsWhenVolumeIsUnavailableAndMissingCannotBeConfirmed()
         {
             var cleanupService = new StorageCleanupService(

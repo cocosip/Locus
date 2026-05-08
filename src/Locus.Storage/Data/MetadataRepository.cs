@@ -19,8 +19,8 @@ using Microsoft.Extensions.Logging;
 namespace Locus.Storage.Data
 {
     /// <summary>
-    /// Repository for file metadata storage using per-tenant SQLite with active-data in-memory caching.
-    /// Keeps all non-deleted file states in memory, including Completed files awaiting background reaping.
+    /// Repository for file metadata storage using per-tenant SQLite with hot-state in-memory caching.
+    /// Keeps scheduler-critical states in memory while cold cleanup/history states are paged from SQLite.
     ///
     /// Write-Behind Architecture:
     /// - AddOrUpdateAsync and RemoveAsync update in-memory cache first, then enqueue SQLite persistence asynchronously.
@@ -60,7 +60,7 @@ namespace Locus.Storage.Data
         private readonly string _metadataDirectory;
         private readonly SqliteOptions _sqliteOptions;
 
-        // Per-tenant in-memory cache for all non-deleted file states.
+        // Per-tenant in-memory cache for scheduler-critical hot states.
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
 
         // Global fileKey -> tenantId index for O(1) cross-tenant lookup by file key.
@@ -132,6 +132,7 @@ namespace Locus.Storage.Data
         private readonly ChannelReader<PersistenceOperation> _persistenceReader;
         private readonly Task _persistenceTask;
         private readonly CancellationTokenSource _persistenceCts;
+        private readonly object _persistenceDrainLock;
         private readonly bool _enableBackgroundPersistence;
         private readonly int _maxPersistenceQueueSize;
         private readonly int _maxDrainBatchSize;
@@ -495,6 +496,7 @@ namespace Locus.Storage.Data
             _pendingGenerations = new ConcurrentDictionary<string, ConcurrentDictionary<string, long>>();
             _prefetchedPendingByTenant = new ConcurrentDictionary<string, ConcurrentQueue<FileMetadata>>();
             _pendingFileCounts = new ConcurrentDictionary<string, int>();
+            _persistenceDrainLock = new object();
             _processingByStartTime = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _processingByStartTimeLocks = new ConcurrentDictionary<string, object>();
             _completedByCompletedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
@@ -575,7 +577,11 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);
 CREATE INDEX IF NOT EXISTS idx_files_available_at ON files(available_for_processing_at);
-CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
+CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);
+CREATE INDEX IF NOT EXISTS idx_files_tenant_status_completed_at ON files(tenant_id, status, completed_at, file_key);
+CREATE INDEX IF NOT EXISTS idx_files_tenant_status_last_failed_at ON files(tenant_id, status, last_failed_at, file_key);
+CREATE INDEX IF NOT EXISTS idx_files_tenant_status_created_at ON files(tenant_id, status, created_at, file_key);
+CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, physical_path);";
 
         /// <summary>
         /// Gets or creates a SQLite connection for a tenant.
@@ -707,36 +713,19 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             var totalLoaded = 0;
             var batchCount = 0;
 
-            // Process non-pending statuses first; pending files are loaded in CreatedAt order afterwards
-            // to rebuild FIFO scheduling without materializing all active records into one large list.
+            // Load hot scheduler states only. Cold cleanup/history states remain in SQLite
+            // and are read in bounded pages by maintenance paths.
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
                 FileProcessingStatus.Processing, orderByCreatedAt: false,
                 nowUtc, ref pendingCount, ref batchCount);
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
-                FileProcessingStatus.Completed, orderByCreatedAt: false,
-                nowUtc, ref pendingCount, ref batchCount);
-            totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId, conn, cache, pendingQueue,
-                FileProcessingStatus.DeleteRequested, orderByCreatedAt: false,
-                nowUtc, ref pendingCount, ref batchCount);
-            totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId, conn, cache, pendingQueue,
-                FileProcessingStatus.DeleteSucceeded, orderByCreatedAt: false,
-                nowUtc, ref pendingCount, ref batchCount);
-            totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId, conn, cache, pendingQueue,
                 FileProcessingStatus.Failed, orderByCreatedAt: false,
                 nowUtc, ref pendingCount, ref batchCount);
-            totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId, conn, cache, pendingQueue,
-                FileProcessingStatus.PermanentlyFailed, orderByCreatedAt: false,
-                nowUtc, ref pendingCount, ref batchCount);
-            totalLoaded += LoadActiveFilesByStatusInBatches(
-                tenantId, conn, cache, pendingQueue,
-                FileProcessingStatus.DeadLettered, orderByCreatedAt: false,
-                nowUtc, ref pendingCount, ref batchCount);
+
+            // Pending files are loaded in CreatedAt order to rebuild FIFO scheduling
+            // without materializing all active records into one large list.
             totalLoaded += LoadActiveFilesByStatusInBatches(
                 tenantId, conn, cache, pendingQueue,
                 FileProcessingStatus.Pending, orderByCreatedAt: true,
@@ -749,7 +738,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             _pendingFileCounts[tenantId] = pendingCount;
 
             _logger.LogInformation(
-                "Loaded {Count} active files for tenant {TenantId} into memory in {BatchCount} startup batch(es) (batchSize={BatchSize})",
+                "Loaded {Count} hot metadata files for tenant {TenantId} into memory in {BatchCount} startup batch(es) (batchSize={BatchSize})",
                 totalLoaded, tenantId, batchCount, _startupLoadBatchSize);
         }
 
@@ -849,6 +838,13 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             return batch.Count;
         }
 
+        private static bool IsHotCachedStatus(FileProcessingStatus status)
+        {
+            return status == FileProcessingStatus.Pending
+                || status == FileProcessingStatus.Processing
+                || status == FileProcessingStatus.Failed;
+        }
+
         /// <summary>
         /// Gets the in-memory cache for a tenant.
         /// </summary>
@@ -882,15 +878,20 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 ref _observedProjectionValidationTicks,
                 Stopwatch.GetTimestamp() - validationStarted);
 
-            // 1. Update in-memory cache FIRST -- always succeeds, immediately visible to readers.
+            // 1. Update hot in-memory state FIRST -- always succeeds, immediately visible to schedulers.
             UpdateCacheAndIndices(metadata, observeProjectionWritePath: true);
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
 
-            // 2. Queue SQLite persistence -- caller is not blocked; background loop drains the queue.
+            // 2. Persist hot states through write-behind. Cold states are no longer resident
+            // in memory, so enqueue them through the same ordered path and drain immediately
+            // so DB-backed cleanup and management queries can observe the latest state.
             var persistenceEnqueueStarted = Stopwatch.GetTimestamp();
-            EnqueuePersistence(CreatePersistenceUpsert(metadata));
+            var persistenceOperation = CreatePersistenceUpsert(metadata);
+            EnqueuePersistence(persistenceOperation);
+            if (!IsHotCachedStatus(metadata.Status) && _enableBackgroundPersistence)
+                DrainPersistenceQueue();
             RecordProjectionPhase(
                 ref _observedProjectionPersistenceEnqueueCount,
                 ref _observedProjectionPersistenceEnqueueTicks,
@@ -964,15 +965,35 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             var cacheAndIndexStarted = observeProjectionWritePath
                 ? Stopwatch.GetTimestamp()
                 : 0;
-            var cache = _activeFiles.GetOrAdd(metadata.TenantId,
-                _ => new ConcurrentDictionary<string, FileMetadata>());
+            var isHot = IsHotCachedStatus(metadata.Status);
+            ConcurrentDictionary<string, FileMetadata>? cache;
+            if (isHot)
+            {
+                cache = _activeFiles.GetOrAdd(metadata.TenantId,
+                    _ => new ConcurrentDictionary<string, FileMetadata>());
+            }
+            else
+            {
+                _activeFiles.TryGetValue(metadata.TenantId, out cache);
+            }
 
             var cacheMutationStarted = observeProjectionWritePath
                 ? Stopwatch.GetTimestamp()
                 : 0;
-            cache.TryGetValue(metadata.FileKey, out var previous);
-            cache[metadata.FileKey] = metadata;
-            _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
+            FileMetadata? previous = null;
+            cache?.TryGetValue(metadata.FileKey, out previous);
+            if (isHot)
+            {
+                cache![metadata.FileKey] = metadata;
+                _fileKeyTenantIndex[metadata.FileKey] = metadata.TenantId;
+            }
+            else
+            {
+                if (cache != null && cache.TryRemove(metadata.FileKey, out var removed))
+                    previous = removed;
+
+                _fileKeyTenantIndex.TryRemove(metadata.FileKey, out _);
+            }
             if (observeProjectionWritePath)
             {
                 RecordProjectionPhase(
@@ -984,7 +1005,10 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             var physicalPathIndexStarted = observeProjectionWritePath
                 ? Stopwatch.GetTimestamp()
                 : 0;
-            IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
+            if (isHot)
+                IndexPhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous, metadata);
+            else
+                RemovePhysicalPathCandidate(metadata.TenantId, metadata.FileKey, previous?.PhysicalPath);
             if (observeProjectionWritePath)
             {
                 RecordProjectionPhase(
@@ -1024,7 +1048,8 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             var statusIndexStarted = observeProjectionWritePath
                 ? Stopwatch.GetTimestamp()
                 : 0;
-            IndexStatusCandidate(previous, metadata);
+            if (isHot)
+                IndexStatusCandidate(previous, metadata);
             if (observeProjectionWritePath)
             {
                 RecordProjectionPhase(
@@ -1040,7 +1065,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
         /// <summary>
         /// Gets file metadata by file key.
-        /// All queries hit memory first (microseconds).
+        /// Hot states hit memory first; cold states fall back to SQLite.
         /// </summary>
         public Task<FileMetadata?> GetAsync(string tenantId, string fileKey, CancellationToken ct = default)
         {
@@ -1050,9 +1075,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
+            ct.ThrowIfCancellationRequested();
             var cache = GetCache(tenantId);
-            cache.TryGetValue(fileKey, out var metadata);
-            return Task.FromResult<FileMetadata?>(metadata?.Clone());
+            if (cache.TryGetValue(fileKey, out var metadata))
+                return Task.FromResult<FileMetadata?>(metadata.Clone());
+
+            return Task.FromResult(TryGetFromDatabase(tenantId, fileKey)?.Clone());
         }
 
         /// <summary>
@@ -1070,21 +1098,11 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            // Remove from memory cache
-            var cache = GetCache(tenantId);
-            var removed = cache.TryRemove(fileKey, out var removedMetadata);
+            ct.ThrowIfCancellationRequested();
+            var removed = TryRemoveFromCacheAndIndices(tenantId, fileKey, out var removedMetadata);
 
             if (removed)
             {
-                _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                RemovePhysicalPathCandidate(tenantId, fileKey, removedMetadata?.PhysicalPath);
-
-                // Maintain _pendingFileCounts: if the removed file was Pending, decrement.
-                if (removedMetadata?.Status == FileProcessingStatus.Pending)
-                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
-
-                InvalidatePendingGeneration(tenantId, fileKey);
-
                 // No explicit removal from _pendingKeys: ConcurrentQueue does not support
                 // O(1) keyed removal. The stale entry (if any) will be skipped by the
                 // dequeue-and-validate loop in GetNextPendingFileAsync.
@@ -1093,6 +1111,13 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
 
                 _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+            }
+            else if (TryDeleteFromDatabase(tenantId, fileKey))
+            {
+                removed = true;
+                _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                InvalidatePendingGeneration(tenantId, fileKey);
+                _logger.LogDebug("Removed cold metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
             }
 
             return Task.FromResult(removed);
@@ -1120,6 +1145,14 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 return Task.FromResult(true);
             }
 
+            if (TryGetFromDatabase(tenantId, fileKey) != null)
+            {
+                ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { CreatePersistenceDelete(tenantId, fileKey) });
+
+                _logger.LogDebug("Directly removed cold metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                return Task.FromResult(true);
+            }
+
             return Task.FromResult(false);
         }
 
@@ -1138,6 +1171,60 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             InvalidatePendingGeneration(tenantId, fileKey);
             return true;
+        }
+
+        private FileMetadata? TryGetFromDatabase(string tenantId, string fileKey)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                return TryGetColdRowFromDatabaseCore(tenantId, fileKey);
+            }
+        }
+
+        private FileMetadata? TryGetColdRowFromDatabaseCore(
+            string tenantId,
+            string fileKey,
+            FileProcessingStatus? expectedStatus = null)
+        {
+            var statusFilter = expectedStatus.HasValue
+                ? "AND status = @expectedStatus"
+                : "AND status IN (@completed, @deleteRequested, @deleteSucceeded, @permanentlyFailed, @deadLettered)";
+            var conn = GetDatabase(tenantId);
+            var row = conn.QuerySingleOrDefault<FileMetadataRow>(
+                $@"SELECT * FROM files
+                   WHERE tenant_id = @tenantId
+                     AND file_key = @fileKey
+                     {statusFilter}
+                   LIMIT 1;",
+                new
+                {
+                    tenantId,
+                    fileKey,
+                    expectedStatus = expectedStatus.HasValue ? (int)expectedStatus.Value : 0,
+                    completed = (int)FileProcessingStatus.Completed,
+                    deleteRequested = (int)FileProcessingStatus.DeleteRequested,
+                    deleteSucceeded = (int)FileProcessingStatus.DeleteSucceeded,
+                    permanentlyFailed = (int)FileProcessingStatus.PermanentlyFailed,
+                    deadLettered = (int)FileProcessingStatus.DeadLettered
+                });
+
+            return row?.ToFileMetadata();
+        }
+
+        private bool TryDeleteFromDatabase(string tenantId, string fileKey)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+DELETE FROM files
+WHERE tenant_id = @tenant_id
+  AND file_key = @file_key;";
+                cmd.Parameters.AddWithValue("@tenant_id", tenantId);
+                cmd.Parameters.AddWithValue("@file_key", fileKey);
+                return cmd.ExecuteNonQuery() > 0;
+            }
         }
 
         private sealed class DirectProjectionBatch : IQueueProjectionBatch
@@ -1192,12 +1279,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 if (string.IsNullOrWhiteSpace(fileKey))
                     throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-                CaptureOriginalMetadata(fileKey);
+                var original = CaptureOriginalMetadata(fileKey);
                 var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
-                if (removed)
+                if (removed || original != null)
                     _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
 
-                return Task.FromResult(removed);
+                return Task.FromResult(removed || original != null);
             }
 
             public Task FlushAsync(CancellationToken ct = default)
@@ -1222,15 +1309,17 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 return Task.CompletedTask;
             }
 
-            private void CaptureOriginalMetadata(string fileKey)
+            private FileMetadata? CaptureOriginalMetadata(string fileKey)
             {
                 if (_originalMetadataByFileKey.ContainsKey(fileKey))
-                    return;
+                    return _originalMetadataByFileKey[fileKey];
 
                 var cache = _repository.GetCache(_tenantId);
-                _originalMetadataByFileKey[fileKey] = cache.TryGetValue(fileKey, out var current)
+                var original = cache.TryGetValue(fileKey, out var current)
                     ? current.Clone()
-                    : null;
+                    : _repository.TryGetFromDatabase(_tenantId, fileKey)?.Clone();
+                _originalMetadataByFileKey[fileKey] = original;
+                return original;
             }
 
             private void RollbackInMemoryProjection()
@@ -1323,7 +1412,7 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var cache = GetCache(tenantId);
                 if (!cache.TryGetValue(fileKey, out var current))
-                    return false;
+                    return TryDeletePermanentlyFailedFromDatabase(tenantId, fileKey, expectedLastFailedAtUtc);
 
                 if (current.Status != FileProcessingStatus.PermanentlyFailed
                     || !current.LastFailedAt.HasValue
@@ -1377,7 +1466,11 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var cache = GetCache(tenantId);
                 if (!cache.TryGetValue(fileKey, out var current))
-                    return false;
+                    return TryMarkPermanentlyFailedDeleteSucceededInDatabase(
+                        tenantId,
+                        fileKey,
+                        expectedLastFailedAtUtc,
+                        deleteSucceededAtUtc);
 
                 if (current.Status != FileProcessingStatus.PermanentlyFailed
                     || !current.LastFailedAt.HasValue
@@ -1442,7 +1535,14 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var cache = GetCache(tenantId);
                 if (!cache.TryGetValue(fileKey, out var current))
-                    return false;
+                    return TryMarkPermanentlyFailedDeadLetteredInDatabase(
+                        tenantId,
+                        fileKey,
+                        expectedLastFailedAtUtc,
+                        deadLetteredAtUtc,
+                        deadLetterPhysicalPath,
+                        volumeId,
+                        projectionApplied);
 
                 if (current.Status != FileProcessingStatus.PermanentlyFailed
                     || !current.LastFailedAt.HasValue
@@ -1508,7 +1608,19 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var cache = GetCache(tenantId);
                 if (!cache.TryGetValue(fileKey, out var current))
-                    return false;
+                {
+                    var removedFromDatabase = TryDeleteCompletedFromDatabase(
+                        tenantId,
+                        fileKey,
+                        expectedCompletedAtUtc);
+                    if (removedFromDatabase)
+                    {
+                        _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                        InvalidatePendingGeneration(tenantId, fileKey);
+                    }
+
+                    return removedFromDatabase;
+                }
 
                 if ((current.Status != FileProcessingStatus.Completed
                     && current.Status != FileProcessingStatus.DeleteRequested)
@@ -1536,6 +1648,153 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             }
         }
 
+        private bool TryDeleteCompletedFromDatabase(
+            string tenantId,
+            string fileKey,
+            DateTime expectedCompletedAtUtc)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+DELETE FROM files
+WHERE tenant_id = @tenant_id
+  AND file_key = @file_key
+  AND status IN (@completed_status, @delete_requested_status)
+  AND completed_at = @completed_at;";
+                cmd.Parameters.AddWithValue("@tenant_id", tenantId);
+                cmd.Parameters.AddWithValue("@file_key", fileKey);
+                cmd.Parameters.AddWithValue("@completed_status", (int)FileProcessingStatus.Completed);
+                cmd.Parameters.AddWithValue("@delete_requested_status", (int)FileProcessingStatus.DeleteRequested);
+                cmd.Parameters.AddWithValue("@completed_at", expectedCompletedAtUtc.ToString("O"));
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        private bool TryMarkCompletedDeleteSucceededInDatabase(
+            string tenantId,
+            string fileKey,
+            DateTime expectedCompletedAtUtc,
+            DateTime deleteSucceededAtUtc)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var current = TryGetColdRowFromDatabaseCore(tenantId, fileKey);
+                if (current == null
+                    || (current.Status != FileProcessingStatus.Completed
+                        && current.Status != FileProcessingStatus.DeleteRequested)
+                    || !current.CompletedAt.HasValue
+                    || current.CompletedAt.Value != expectedCompletedAtUtc)
+                {
+                    return false;
+                }
+
+                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                    return true;
+
+                current.Status = FileProcessingStatus.DeleteSucceeded;
+                current.DeleteSucceededAt = deleteSucceededAtUtc;
+                UpsertFile(GetDatabase(tenantId), current);
+                return true;
+            }
+        }
+
+        private bool TryDeletePermanentlyFailedFromDatabase(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+DELETE FROM files
+WHERE tenant_id = @tenant_id
+  AND file_key = @file_key
+  AND status = @status
+  AND last_failed_at = @last_failed_at;";
+                cmd.Parameters.AddWithValue("@tenant_id", tenantId);
+                cmd.Parameters.AddWithValue("@file_key", fileKey);
+                cmd.Parameters.AddWithValue("@status", (int)FileProcessingStatus.PermanentlyFailed);
+                cmd.Parameters.AddWithValue("@last_failed_at", expectedLastFailedAtUtc.ToString("O"));
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        private bool TryMarkPermanentlyFailedDeleteSucceededInDatabase(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deleteSucceededAtUtc)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var current = TryGetColdRowFromDatabaseCore(
+                    tenantId,
+                    fileKey,
+                    FileProcessingStatus.PermanentlyFailed);
+                if (current == null
+                    || !current.LastFailedAt.HasValue
+                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                {
+                    return false;
+                }
+
+                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                    return true;
+
+                current.Status = FileProcessingStatus.DeleteSucceeded;
+                current.CompletedAt = current.CompletedAt ?? deleteSucceededAtUtc;
+                current.DeleteSucceededAt = deleteSucceededAtUtc;
+                UpsertFile(GetDatabase(tenantId), current);
+                return true;
+            }
+        }
+
+        private bool TryMarkPermanentlyFailedDeadLetteredInDatabase(
+            string tenantId,
+            string fileKey,
+            DateTime expectedLastFailedAtUtc,
+            DateTime deadLetteredAtUtc,
+            string deadLetterPhysicalPath,
+            string? volumeId,
+            bool projectionApplied)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var current = TryGetColdRowFromDatabaseCore(
+                    tenantId,
+                    fileKey,
+                    FileProcessingStatus.PermanentlyFailed);
+                if (current == null
+                    || !current.LastFailedAt.HasValue
+                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                {
+                    return false;
+                }
+
+                current.Status = FileProcessingStatus.DeadLettered;
+                current.ProcessingStartTime = null;
+                current.CompletedAt = null;
+                current.DeleteSucceededAt = null;
+                current.DeadLetteredAt = deadLetteredAtUtc;
+                current.AvailableForProcessingAt = null;
+                current.PhysicalPath = deadLetterPhysicalPath;
+                if (!string.IsNullOrWhiteSpace(volumeId))
+                    current.VolumeId = volumeId!;
+
+                if (projectionApplied)
+                    QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(current);
+                else
+                    QueueProjectionMetadataState.MarkDeadLetterProjectionPending(current);
+
+                UpsertFile(GetDatabase(tenantId), current);
+                return true;
+            }
+        }
+
         /// <summary>
         /// Marks a Completed file as physically deleted so background cleanup does not append
         /// duplicate DeleteSucceeded events while projection catch-up is pending.
@@ -1560,7 +1819,11 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             {
                 var cache = GetCache(tenantId);
                 if (!cache.TryGetValue(fileKey, out var current))
-                    return false;
+                    return TryMarkCompletedDeleteSucceededInDatabase(
+                        tenantId,
+                        fileKey,
+                        expectedCompletedAtUtc,
+                        deleteSucceededAtUtc);
 
                 if ((current.Status != FileProcessingStatus.Completed
                     && current.Status != FileProcessingStatus.DeleteRequested)
@@ -1787,8 +2050,13 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             try
             {
                 var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return null;
+                var currentFromCache = cache.TryGetValue(fileKey, out var current);
+                if (!currentFromCache)
+                {
+                    current = TryGetFromDatabase(tenantId, fileKey);
+                    if (current == null)
+                        return null;
+                }
 
                 if (current.Status == FileProcessingStatus.Processing)
                     return current.Clone();
@@ -1801,18 +2069,24 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 updated.LastError = null;
                 updated.LastFailedAt = null;
 
-                if (!cache.TryUpdate(fileKey, updated, current))
+                if (currentFromCache && !cache.TryUpdate(fileKey, updated, current))
                     return null;
 
-                _fileKeyTenantIndex[fileKey] = tenantId;
-                IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+                if (!currentFromCache)
+                    UpdateCacheAndIndices(updated);
+                else
+                {
+                    _fileKeyTenantIndex[fileKey] = tenantId;
+                    IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
 
-                if (current.Status != FileProcessingStatus.Pending)
-                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                    if (current.Status != FileProcessingStatus.Pending)
+                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
 
-                InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePendingCandidate(updated, refreshGeneration: false);
-                IndexStatusCandidate(current, updated);
+                    InvalidatePendingGeneration(tenantId, fileKey);
+                    EnqueuePendingCandidate(updated, refreshGeneration: false);
+                    IndexStatusCandidate(current, updated);
+                }
+
                 EnqueuePersistence(CreatePersistenceUpsert(updated));
                 _logger.LogDebug(
                     "Conditionally reset file metadata to pending for file: {FileKey}, Tenant: {TenantId}, PreviousStatus: {PreviousStatus}",
@@ -1840,9 +2114,32 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            var cache = GetCache(tenantId);
-            var results = cache.Values.Select(m => m.Clone()).ToList();
-            return Task.FromResult<IEnumerable<FileMetadata>>(results);
+            ct.ThrowIfCancellationRequested();
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                var rows = conn.Query<FileMetadataRow>(
+                    @"SELECT * FROM files
+                      WHERE tenant_id = @tenantId
+                      ORDER BY created_at ASC, file_key ASC;",
+                    new { tenantId },
+                    buffered: true);
+                var byFileKey = rows
+                    .Select(row => row.ToFileMetadata())
+                    .ToDictionary(metadata => metadata.FileKey, StringComparer.Ordinal);
+                if (_activeFiles.TryGetValue(tenantId, out var cache))
+                {
+                    foreach (var hotMetadata in cache.Values)
+                        byFileKey[hotMetadata.FileKey] = hotMetadata.Clone();
+                }
+
+                var results = byFileKey.Values
+                    .OrderBy(metadata => metadata.CreatedAt)
+                    .ThenBy(metadata => metadata.FileKey, StringComparer.Ordinal)
+                    .Select(metadata => metadata.Clone())
+                    .ToList();
+                return Task.FromResult<IEnumerable<FileMetadata>>(results);
+            }
         }
 
         /// <summary>
@@ -1857,9 +2154,34 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             if (take <= 0)
                 throw new ArgumentOutOfRangeException(nameof(take));
 
-            var cache = GetCache(tenantId);
-            var results = cache.Values.Skip(skip).Take(take).Select(m => m.Clone()).ToList();
-            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
+            ct.ThrowIfCancellationRequested();
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                var rows = conn.Query<FileMetadataRow>(
+                    @"SELECT * FROM files
+                      WHERE tenant_id = @tenantId
+                      ORDER BY created_at ASC, file_key ASC;",
+                    new { tenantId },
+                    buffered: true);
+                var byFileKey = rows
+                    .Select(row => row.ToFileMetadata())
+                    .ToDictionary(metadata => metadata.FileKey, StringComparer.Ordinal);
+                if (_activeFiles.TryGetValue(tenantId, out var cache))
+                {
+                    foreach (var hotMetadata in cache.Values)
+                        byFileKey[hotMetadata.FileKey] = hotMetadata.Clone();
+                }
+
+                var results = byFileKey.Values
+                    .OrderBy(metadata => metadata.CreatedAt)
+                    .ThenBy(metadata => metadata.FileKey, StringComparer.Ordinal)
+                    .Skip(skip)
+                    .Take(take)
+                    .Select(metadata => metadata.Clone())
+                    .ToList();
+                return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
+            }
         }
 
         /// <summary>
@@ -1913,10 +2235,10 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             var cache = GetCache(tenantId);
             if (!_physicalPathIndex.TryGetValue(tenantId, out var tenantPathIndex))
-                return Task.FromResult(false);
+                return Task.FromResult(ExistsByPhysicalPathInDatabase(tenantId, normalizedPhysicalPath));
 
             if (!tenantPathIndex.TryGetValue(normalizedPhysicalPath, out var fileKey))
-                return Task.FromResult(false);
+                return Task.FromResult(ExistsByPhysicalPathInDatabase(tenantId, normalizedPhysicalPath));
 
             if (cache.TryGetValue(fileKey, out var metadata))
             {
@@ -1930,7 +2252,35 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
 
             // Stale index entry (e.g., out-of-order concurrent update): self-heal on read.
             tenantPathIndex.TryRemove(normalizedPhysicalPath, out _);
-            return Task.FromResult(false);
+            return Task.FromResult(ExistsByPhysicalPathInDatabase(tenantId, normalizedPhysicalPath));
+        }
+
+        private bool ExistsByPhysicalPathInDatabase(string tenantId, string normalizedPhysicalPath)
+        {
+            long count;
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                count = conn.ExecuteScalar<long>(
+                    @"SELECT COUNT(1)
+                      FROM files
+                      WHERE tenant_id = @tenantId
+                        AND physical_path = @physicalPath
+                        AND status IN (@completed, @deleteRequested, @deleteSucceeded, @permanentlyFailed, @deadLettered)
+                      LIMIT 1;",
+                    new
+                    {
+                        tenantId,
+                        physicalPath = normalizedPhysicalPath,
+                        completed = (int)FileProcessingStatus.Completed,
+                        deleteRequested = (int)FileProcessingStatus.DeleteRequested,
+                        deleteSucceeded = (int)FileProcessingStatus.DeleteSucceeded,
+                        permanentlyFailed = (int)FileProcessingStatus.PermanentlyFailed,
+                        deadLettered = (int)FileProcessingStatus.DeadLettered
+                    });
+            }
+
+            return count > 0;
         }
 
         /// <summary>
@@ -1984,25 +2334,15 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             ISet<string>? excludedFileKeys = null,
             CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
-
-            if (limit <= 0)
-                return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
-
-            ct.ThrowIfCancellationRequested();
-            var results = GetStatusBatchFromIndex(
+            return QueryByStatusTimestampFromDatabaseAsync(
                 tenantId,
+                FileProcessingStatus.PermanentlyFailed,
+                "last_failed_at",
                 cutoffUtc,
                 limit,
-                FileProcessingStatus.PermanentlyFailed,
-                _permanentlyFailedByLastFailedAt,
-                _permanentlyFailedByLastFailedAtLocks,
-                metadata => metadata.LastFailedAt,
-                additionalPredicate: null,
-                excludedFileKeys);
-
-            return Task.FromResult(results);
+                requireDeleteSucceededAtNull: false,
+                excludedFileKeys,
+                ct);
         }
 
         /// <summary>
@@ -2016,25 +2356,15 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             ISet<string>? excludedFileKeys = null,
             CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
-
-            if (limit <= 0)
-                return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
-
-            ct.ThrowIfCancellationRequested();
-            var results = GetStatusBatchFromIndex(
+            return QueryByStatusTimestampFromDatabaseAsync(
                 tenantId,
+                FileProcessingStatus.Completed,
+                "completed_at",
                 cutoffUtc,
                 limit,
-                FileProcessingStatus.Completed,
-                _completedByCompletedAt,
-                _completedByCompletedAtLocks,
-                metadata => metadata.CompletedAt,
-                metadata => !metadata.DeleteSucceededAt.HasValue,
-                excludedFileKeys);
-
-            return Task.FromResult(results);
+                requireDeleteSucceededAtNull: true,
+                excludedFileKeys,
+                ct);
         }
 
         /// <summary>
@@ -2048,6 +2378,27 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
             ISet<string>? excludedFileKeys = null,
             CancellationToken ct = default)
         {
+            return QueryByStatusTimestampFromDatabaseAsync(
+                tenantId,
+                FileProcessingStatus.DeleteRequested,
+                "completed_at",
+                cutoffUtc,
+                limit,
+                requireDeleteSucceededAtNull: true,
+                excludedFileKeys,
+                ct);
+        }
+
+        private Task<IReadOnlyList<FileMetadata>> QueryByStatusTimestampFromDatabaseAsync(
+            string tenantId,
+            FileProcessingStatus status,
+            string timestampColumn,
+            DateTime cutoffUtc,
+            int limit,
+            bool requireDeleteSucceededAtNull,
+            ISet<string>? excludedFileKeys,
+            CancellationToken ct)
+        {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
@@ -2055,18 +2406,47 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
 
             ct.ThrowIfCancellationRequested();
-            var results = GetStatusBatchFromIndex(
-                tenantId,
-                cutoffUtc,
-                limit,
-                FileProcessingStatus.DeleteRequested,
-                _deleteRequestedByCompletedAt,
-                _deleteRequestedByCompletedAtLocks,
-                metadata => metadata.CompletedAt,
-                metadata => !metadata.DeleteSucceededAt.HasValue,
-                excludedFileKeys);
 
-            return Task.FromResult(results);
+            if (timestampColumn != "completed_at" && timestampColumn != "last_failed_at")
+                throw new ArgumentOutOfRangeException(nameof(timestampColumn));
+
+            var excluded = excludedFileKeys == null || excludedFileKeys.Count == 0
+                ? Array.Empty<string>()
+                : excludedFileKeys.ToArray();
+            var deleteSucceededFilter = requireDeleteSucceededAtNull
+                ? "  AND delete_succeeded_at IS NULL\r\n"
+                : string.Empty;
+            var excludedFilter = excluded.Length == 0
+                ? string.Empty
+                : "  AND file_key NOT IN @excluded\r\n";
+            var sql = $@"
+SELECT * FROM files
+WHERE tenant_id = @tenantId
+  AND status = @status
+  AND {timestampColumn} IS NOT NULL
+  AND {timestampColumn} < @cutoff
+{deleteSucceededFilter}{excludedFilter}ORDER BY {timestampColumn} ASC, file_key ASC
+LIMIT @limit;";
+
+            List<FileMetadata> results;
+            lock (GetDatabaseLock(tenantId))
+            {
+                var conn = GetDatabase(tenantId);
+                var rows = conn.Query<FileMetadataRow>(
+                    sql,
+                    new
+                    {
+                        tenantId,
+                        status = (int)status,
+                        cutoff = cutoffUtc.ToString("O"),
+                        limit,
+                        excluded
+                    },
+                    buffered: true);
+                results = rows.Select(row => row.ToFileMetadata()).ToList();
+            }
+
+            return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
         }
 
         /// <summary>
@@ -2076,10 +2456,20 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         {
             var results = new List<FileMetadata>();
 
-            foreach (var kvp in _activeFiles)
+            foreach (var tenantId in GetAllKnownTenantIds())
             {
-                var tenantFiles = kvp.Value.Values.Where(m => m.Status == status).Select(m => m.Clone());
-                results.AddRange(tenantFiles);
+                ct.ThrowIfCancellationRequested();
+                lock (GetDatabaseLock(tenantId))
+                {
+                    var conn = GetDatabase(tenantId);
+                    var rows = conn.Query<FileMetadataRow>(
+                        @"SELECT * FROM files
+                          WHERE status = @status
+                          ORDER BY created_at ASC, file_key ASC;",
+                        new { status = (int)status },
+                        buffered: true);
+                    results.AddRange(rows.Select(row => row.ToFileMetadata()));
+                }
             }
 
             return Task.FromResult<IEnumerable<FileMetadata>>(results);
@@ -2905,6 +3295,17 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
                 return Task.FromResult<FileMetadata?>(indexedMetadata.Clone());
             }
 
+            foreach (var knownTenantId in GetAllKnownTenantIds())
+            {
+                ct.ThrowIfCancellationRequested();
+                var metadata = TryGetFromDatabase(knownTenantId, fileKey);
+                if (metadata == null)
+                    continue;
+
+                _fileKeyTenantIndex[fileKey] = knownTenantId;
+                return Task.FromResult<FileMetadata?>(metadata.Clone());
+            }
+
             return Task.FromResult<FileMetadata?>(null);
         }
 
@@ -3025,8 +3426,14 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         {
             // Include in-memory tenants first so cleanup can process recent writes that have not
             // been flushed to disk yet by the write-behind persistence loop.
-            var tenantIds = new HashSet<string>(_activeFiles.Keys, StringComparer.Ordinal);
+            var tenantIds = GetAllKnownTenantIds();
 
+            return tenantIds;
+        }
+
+        private HashSet<string> GetAllKnownTenantIds()
+        {
+            var tenantIds = new HashSet<string>(_activeFiles.Keys, StringComparer.Ordinal);
             foreach (var tenantId in GetTenantDirectoryIdsSnapshot())
             {
                 if (!string.IsNullOrWhiteSpace(tenantId))
@@ -3541,9 +3948,12 @@ CREATE INDEX IF NOT EXISTS idx_files_completed_at ON files(completed_at);";
         // per tenant, minimising fsync overhead and memory spikes.
         private void DrainPersistenceQueue()
         {
-            while (DrainPersistenceBatch())
+            lock (_persistenceDrainLock)
             {
-                // Keep draining until both queues are empty.
+                while (DrainPersistenceBatch())
+                {
+                    // Keep draining until both queues are empty.
+                }
             }
         }
 

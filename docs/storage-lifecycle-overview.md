@@ -37,6 +37,26 @@
 
 ## 正式架构图
 
+## Metadata Residency Model
+
+Locus keeps only scheduler-critical metadata states resident in process memory:
+
+- `Pending`
+- `Processing`
+- retryable `Failed`
+
+Cold states remain in each tenant's SQLite `metadata.db` and are read in bounded pages by cleanup and management workflows:
+
+- `Completed`
+- `DeleteRequested`
+- `DeleteSucceeded`
+- `PermanentlyFailed`
+- `DeadLettered`
+
+This keeps memory proportional to the active processing working set instead of the full historical metadata table. Cleanup paths use SQLite indexes and batch sizes to trade a small amount of background database work for a bounded process memory footprint.
+
+`Pending` and `Processing` scheduling still uses in-memory queues and indexes. Completed-file cleanup, permanently-failed cleanup, physical-path existence checks for cold rows, and broad management listings use SQLite-backed queries.
+
 ```mermaid
 flowchart LR
     Client["调用方 / Worker"] --> Pool["StoragePool / IStoragePool"]
