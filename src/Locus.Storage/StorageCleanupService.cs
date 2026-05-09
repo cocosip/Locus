@@ -46,6 +46,7 @@ namespace Locus.Storage
         private readonly int _orphanRebuildLookupCacheSize;
         private readonly PermanentlyFailedDisposition _permanentlyFailedDisposition;
         private readonly DeadLetterOptions _deadLetterOptions;
+        private readonly IReadOnlyDictionary<string, RetiredVolumeDisposition> _retiredVolumeDispositions;
         private readonly StringComparer _pathComparer;
         private readonly StringComparison _pathComparison;
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
@@ -145,6 +146,7 @@ namespace Locus.Storage
                 : 0;
             _permanentlyFailedDisposition = options.PermanentlyFailedDisposition;
             _deadLetterOptions = options.DeadLetter ?? new DeadLetterOptions();
+            _retiredVolumeDispositions = BuildRetiredVolumeDispositionMap(options.RetiredVolumes);
             _pathComparer = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
@@ -1175,6 +1177,25 @@ namespace Locus.Storage
                     var physicalFilePresence = GetCachedPhysicalFilePresence(metadata, physicalPathExistsCache);
                     if (physicalFilePresence == PhysicalFilePresence.Unknown)
                     {
+                        if (IsPurgeMetadataOnlyRetiredVolume(metadata.VolumeId))
+                        {
+                            try
+                            {
+                                await PurgeCompletedMetadataOnlyForRetiredVolumeAsync(metadata, ct).ConfigureAwait(false);
+                                removedCount++;
+                                continue;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(
+                                    ex,
+                                    "Failed to purge metadata for completed file on retired volume. Tenant={TenantId}, Volume={VolumeId}, FileKey={FileKey}",
+                                    metadata.TenantId,
+                                    metadata.VolumeId,
+                                    metadata.FileKey);
+                            }
+                        }
+
                         blockedFileKeys.Add(metadata.FileKey);
                         continue;
                     }
@@ -1354,6 +1375,34 @@ namespace Locus.Storage
                     var physicalFilePresence = GetCachedPhysicalFilePresence(metadata, physicalPathExistsCache);
                     if (physicalFilePresence == PhysicalFilePresence.Unknown)
                     {
+                        if (IsPurgeMetadataOnlyRetiredVolume(metadata.VolumeId))
+                        {
+                            try
+                            {
+                                if (!await PurgePermanentlyFailedMetadataOnlyForRetiredVolumeAsync(
+                                    metadata,
+                                    normalizedDirectoryPath,
+                                    ct).ConfigureAwait(false))
+                                {
+                                    blockedFileKeys.Add(metadata.FileKey);
+                                    continue;
+                                }
+
+                                removedCount++;
+                                removedThisIteration++;
+                                continue;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(
+                                    ex,
+                                    "Failed to purge metadata for permanently-failed file on retired volume. Tenant={TenantId}, Volume={VolumeId}, FileKey={FileKey}",
+                                    metadata.TenantId,
+                                    metadata.VolumeId,
+                                    metadata.FileKey);
+                            }
+                        }
+
                         blockedFileKeys.Add(metadata.FileKey);
                         continue;
                     }
@@ -1627,6 +1676,107 @@ namespace Locus.Storage
             return current == null;
         }
 
+        private async Task PurgeCompletedMetadataOnlyForRetiredVolumeAsync(FileMetadata metadata, CancellationToken ct)
+        {
+            if (_queueEventJournal != null)
+            {
+                var deleteSucceededAtUtc = DateTime.UtcNow;
+                await _queueEventJournal.AppendBatchAsync(
+                    new[]
+                    {
+                        CreateDeleteRequestedEvent(metadata, deleteSucceededAtUtc.AddTicks(-1)),
+                        CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                    },
+                    default).ConfigureAwait(false);
+
+                var metadataTransitionApplied = await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
+                    metadata.TenantId,
+                    metadata.FileKey,
+                    metadata.CompletedAt!.Value,
+                    deleteSucceededAtUtc,
+                    ct).ConfigureAwait(false);
+                if (!metadataTransitionApplied
+                    && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
+                {
+                    throw new InvalidOperationException($"Failed to mark completed file {metadata.FileKey} as delete-succeeded for retired volume metadata purge.");
+                }
+
+                return;
+            }
+
+            await FinalizeCompletedWithoutJournalAsync(metadata, ct).ConfigureAwait(false);
+        }
+
+        private async Task<bool> PurgePermanentlyFailedMetadataOnlyForRetiredVolumeAsync(
+            FileMetadata metadata,
+            string normalizedDirectoryPath,
+            CancellationToken ct)
+        {
+            if (_queueEventJournal != null)
+            {
+                var deleteRequestedAtUtc = DateTime.UtcNow;
+                var deleteSucceededAtUtc = deleteRequestedAtUtc.AddTicks(1);
+                await _queueEventJournal.AppendBatchAsync(
+                    new[]
+                    {
+                        CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
+                        CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
+                    },
+                    default).ConfigureAwait(false);
+
+                var metadataTransitionApplied = await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
+                    metadata.TenantId,
+                    metadata.FileKey,
+                    metadata.LastFailedAt!.Value,
+                    deleteSucceededAtUtc,
+                    ct).ConfigureAwait(false);
+                if (!metadataTransitionApplied
+                    && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
+                {
+                    throw new InvalidOperationException($"Failed to mark permanently-failed file {metadata.FileKey} as delete-succeeded for retired volume metadata purge.");
+                }
+
+                return true;
+            }
+
+            var directoryQuotaDecremented = false;
+            var tenantQuotaDecremented = false;
+            try
+            {
+                await ApplyDeleteSucceededDirectoryProjectionAsync(metadata.TenantId, normalizedDirectoryPath, default);
+                directoryQuotaDecremented = true;
+
+                await ApplyDeleteSucceededTenantProjectionAsync(metadata.TenantId, default);
+                tenantQuotaDecremented = true;
+
+                var metadataRemoved = await _projectionCleanupStore.TryRemovePermanentlyFailedFileAsync(
+                    metadata.TenantId,
+                    metadata.FileKey,
+                    metadata.LastFailedAt!.Value,
+                    ct).ConfigureAwait(false);
+                if (metadataRemoved || await WasMetadataRemovedConcurrentlyAsync(metadata, ct).ConfigureAwait(false))
+                    return true;
+
+                await RollbackProjectionCleanupAsync(
+                    metadata,
+                    normalizedDirectoryPath,
+                    restoreMetadata: false,
+                    tenantQuotaDecremented,
+                    directoryQuotaDecremented).ConfigureAwait(false);
+                return false;
+            }
+            catch
+            {
+                await RollbackProjectionCleanupAsync(
+                    metadata,
+                    normalizedDirectoryPath,
+                    restoreMetadata: false,
+                    tenantQuotaDecremented,
+                    directoryQuotaDecremented).ConfigureAwait(false);
+                throw;
+            }
+        }
+
         private async Task<bool> WasMetadataDeleteSucceededConcurrentlyAsync(
             FileMetadata metadata,
             DateTime deleteSucceededAtUtc,
@@ -1756,6 +1906,31 @@ namespace Locus.Storage
 
             cache[physicalPath] = exists ? PhysicalFilePresence.Exists : PhysicalFilePresence.Missing;
             return exists;
+        }
+
+        private static IReadOnlyDictionary<string, RetiredVolumeDisposition> BuildRetiredVolumeDispositionMap(
+            IEnumerable<RetiredVolumeOptions> retiredVolumes)
+        {
+            var map = new Dictionary<string, RetiredVolumeDisposition>(StringComparer.Ordinal);
+            if (retiredVolumes == null)
+                return map;
+
+            foreach (var retiredVolume in retiredVolumes)
+            {
+                if (retiredVolume == null || string.IsNullOrWhiteSpace(retiredVolume.VolumeId))
+                    continue;
+
+                map[retiredVolume.VolumeId] = retiredVolume.Disposition;
+            }
+
+            return map;
+        }
+
+        private bool IsPurgeMetadataOnlyRetiredVolume(string volumeId)
+        {
+            return !string.IsNullOrWhiteSpace(volumeId)
+                && _retiredVolumeDispositions.TryGetValue(volumeId, out var disposition)
+                && disposition == RetiredVolumeDisposition.PurgeMetadataOnly;
         }
 
         private bool TryConfirmPhysicalFileExists(string physicalPath, out bool physicalFileExists)

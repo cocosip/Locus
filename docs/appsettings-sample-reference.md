@@ -529,6 +529,19 @@
         "ShardingDepth": 2
       },
 
+      "RetiredVolumes": [
+        {
+          // 明确退役的历史卷 ID。
+          // 只从 Volumes 移除卷不会自动清理历史元数据；未声明退役的未知卷仍会被保护性跳过。
+          "VolumeId": "vol-retired-example",
+
+          // 退役卷元数据处理方式：
+          // Keep：保留元数据并继续跳过清理。
+          // PurgeMetadataOnly：只清理 metadata/quota，不访问物理卷。
+          "Disposition": "Keep"
+        }
+      ],
+
       // 是否清理已完成文件
       "CleanupCompletedFiles": true,
 

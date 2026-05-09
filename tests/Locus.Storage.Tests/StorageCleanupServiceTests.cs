@@ -1936,6 +1936,108 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupCompletedFilesAsync_PurgesMetadataOnlyForConfiguredRetiredVolume()
+        {
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new CleanupOptions
+                {
+                    RetiredVolumes =
+                    {
+                        new RetiredVolumeOptions
+                        {
+                            VolumeId = "vol-retired",
+                            Disposition = RetiredVolumeDisposition.PurgeMetadataOnly
+                        }
+                    }
+                },
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager,
+                allowLegacyNonJournalMode: true);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "completed-retired-volume",
+                TenantId = "tenant-001",
+                VolumeId = "vol-retired",
+                PhysicalPath = Path.Combine(_volumePath, "retired", "completed.dat"),
+                DirectoryPath = "/retired",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddDays(-2),
+                Status = FileProcessingStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddDays(-1)
+            }, CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/retired");
+
+            await cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "completed-retired-volume", CancellationToken.None));
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/retired", CancellationToken.None)).CurrentCount);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.CompletedRecordsRemoved);
+        }
+
+        [Fact]
+        public async Task CleanupPermanentlyFailedFilesAsync_PurgesMetadataOnlyForConfiguredRetiredVolume()
+        {
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                new CleanupOptions
+                {
+                    RetiredVolumes =
+                    {
+                        new RetiredVolumeOptions
+                        {
+                            VolumeId = "vol-retired",
+                            Disposition = RetiredVolumeDisposition.PurgeMetadataOnly
+                        }
+                    }
+                },
+                tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager,
+                allowLegacyNonJournalMode: true);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "failed-retired-volume",
+                TenantId = "tenant-001",
+                VolumeId = "vol-retired",
+                PhysicalPath = Path.Combine(_volumePath, "retired", "failed.dat"),
+                DirectoryPath = "/retired",
+                FileSize = 12,
+                CreatedAt = DateTime.UtcNow.AddDays(-4),
+                Status = FileProcessingStatus.PermanentlyFailed,
+                LastFailedAt = DateTime.UtcNow.AddDays(-3)
+            }, CancellationToken.None);
+            await SeedProjectedCountsAsync("tenant-001", "/retired");
+
+            await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "failed-retired-volume", CancellationToken.None));
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/retired", CancellationToken.None)).CurrentCount);
+
+            var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
+        }
+
+        [Fact]
         public async Task CleanupPermanentlyFailedFilesAsync_ContinuesPastMoreThanDeferredSkipLimit()
         {
             var cleanupService = new StorageCleanupService(

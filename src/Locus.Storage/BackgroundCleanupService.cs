@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -260,6 +261,12 @@ namespace Locus.Storage
         public DeadLetterOptions DeadLetter { get; set; } = new DeadLetterOptions();
 
         /// <summary>
+        /// Gets the storage volumes that were explicitly retired by configuration.
+        /// Unknown volumes are protected by default unless they are listed here.
+        /// </summary>
+        public List<RetiredVolumeOptions> RetiredVolumes { get; } = new List<RetiredVolumeOptions>();
+
+        /// <summary>
         /// Gets or sets whether to optimize (shrink) SQLite databases periodically.
         /// Database optimization reclaims space from deleted records by running VACUUM on the database files.
         /// This is a heavy operation and should be run during low-activity periods.
@@ -328,6 +335,39 @@ namespace Locus.Storage
         /// Delete permanently failed files physically and remove their metadata.
         /// </summary>
         Delete = 2,
+    }
+
+    /// <summary>
+    /// Defines how metadata on an explicitly retired volume is handled.
+    /// </summary>
+    public enum RetiredVolumeDisposition
+    {
+        /// <summary>
+        /// Keep metadata and continue logging unknown-volume cleanup skips.
+        /// </summary>
+        Keep = 0,
+
+        /// <summary>
+        /// Remove metadata and quota projection rows without touching physical storage.
+        /// </summary>
+        PurgeMetadataOnly = 1,
+    }
+
+    /// <summary>
+    /// Configures cleanup behavior for a storage volume that has been intentionally retired.
+    /// </summary>
+    public sealed class RetiredVolumeOptions
+    {
+        /// <summary>
+        /// Gets or sets the retired volume identifier.
+        /// </summary>
+        public string VolumeId { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets how metadata that still points to this retired volume should be handled.
+        /// Default: Keep.
+        /// </summary>
+        public RetiredVolumeDisposition Disposition { get; set; } = RetiredVolumeDisposition.Keep;
     }
 
     /// <summary>
