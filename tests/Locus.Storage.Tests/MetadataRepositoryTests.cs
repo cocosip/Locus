@@ -238,6 +238,40 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetAsync_DoesNotPublishSecondLazyDuringInitializationRecovery()
+        {
+            var tenantId = $"tenant-recovery-race-{Guid.NewGuid():N}";
+            var tenantDir = Path.Combine(_metadataDir, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantDir);
+            _fileSystem.File.WriteAllText(Path.Combine(tenantDir, "metadata.db"), "corrupted");
+
+            using var repository = new BlockingRecoveryMetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir);
+
+            var first = Task.Run(() => repository.GetAsync(tenantId, "file-001", CancellationToken.None));
+            Assert.True(
+                repository.WaitForRecoveryOpenStarted(TimeSpan.FromSeconds(5)),
+                "The first initialization attempt did not enter recovery.");
+
+            var second = Task.Run(() => repository.GetAsync(tenantId, "file-001", CancellationToken.None));
+
+            try
+            {
+                for (var i = 0; i < 20 && repository.OpenCallCount <= 2; i++)
+                    await Task.Delay(50);
+
+                Assert.Equal(2, repository.OpenCallCount);
+            }
+            finally
+            {
+                repository.AllowRecoveryOpen();
+                await Task.WhenAll(first, second);
+            }
+        }
+
+        [Fact]
         public async Task ProjectionBatch_FailedDeleteFlush_RollsBackInMemoryProjection()
         {
             const string fileKey = "batch-delete-rollback";
@@ -1506,6 +1540,54 @@ WHERE file_key = $file_key;";
             {
                 if (Interlocked.Decrement(ref _failuresRemaining) >= 0)
                     throw new IOException("Injected initialization failure.");
+
+                return base.OpenAndInitializeConnection(dbPath);
+            }
+        }
+
+        private sealed class BlockingRecoveryMetadataRepository : MetadataRepository
+        {
+            private readonly ManualResetEventSlim _recoveryOpenStarted = new ManualResetEventSlim(false);
+            private readonly ManualResetEventSlim _allowRecoveryOpen = new ManualResetEventSlim(false);
+            private int _openCallCount;
+
+            public BlockingRecoveryMetadataRepository(
+                IFileSystem fileSystem,
+                ILogger<MetadataRepository> logger,
+                string metadataDirectory)
+                : base(
+                    fileSystem,
+                    logger,
+                    metadataDirectory,
+                    enableBackgroundPersistence: false)
+            {
+            }
+
+            public int OpenCallCount => Volatile.Read(ref _openCallCount);
+
+            public bool WaitForRecoveryOpenStarted(TimeSpan timeout)
+            {
+                return _recoveryOpenStarted.Wait(timeout);
+            }
+
+            public void AllowRecoveryOpen()
+            {
+                _allowRecoveryOpen.Set();
+            }
+
+            protected override SqliteConnection OpenAndInitializeConnection(string dbPath)
+            {
+                var call = Interlocked.Increment(ref _openCallCount);
+                if (call == 1)
+                    throw new IOException("Injected initialization failure.");
+
+                if (call == 2)
+                {
+                    _recoveryOpenStarted.Set();
+                    Assert.True(
+                        _allowRecoveryOpen.Wait(TimeSpan.FromSeconds(5)),
+                        "Timed out waiting to continue recovery initialization.");
+                }
 
                 return base.OpenAndInitializeConnection(dbPath);
             }

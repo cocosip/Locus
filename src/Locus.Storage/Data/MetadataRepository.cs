@@ -1037,7 +1037,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             // Maintain _pendingFileCounts: +1 when transitioning INTO Pending, -1 when leaving.
             // Keeps CompactPendingQueues O(1) instead of O(N).
             bool wasP = previous?.Status == FileProcessingStatus.Pending;
-            bool isP  = metadata.Status  == FileProcessingStatus.Pending;
+            bool isP = metadata.Status == FileProcessingStatus.Pending;
             var pendingQueueStarted = observeProjectionWritePath
                 ? Stopwatch.GetTimestamp()
                 : 0;
@@ -3576,19 +3576,6 @@ LIMIT @limit;";
             // The Lazy lock already serializes all concurrent callers for this tenantId, so all
             // ConcurrentDictionary updates and file operations below are safe without an extra lock.
             {
-                // Remove from cache FIRST so no concurrent thread can acquire the disposed instance.
-                _databases.TryRemove(tenantId, out var existingLazy);
-
-                // Dispose the removed connection (safe: it's no longer reachable via cache).
-                if (existingLazy != null && existingLazy.IsValueCreated)
-                {
-                    try { existingLazy.Value?.Dispose(); }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Error disposing SQLite connection during lock-free rebuild for tenant {TenantId}", tenantId);
-                    }
-                }
-
                 if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                     RemoveTenantFromGlobalIndex(staleTenantCache);
                 _physicalPathIndex.TryRemove(tenantId, out _);
@@ -3600,12 +3587,12 @@ LIMIT @limit;";
                 _delayedQueueLocks.TryRemove(tenantId, out _);
                 _processingByStartTime.TryRemove(tenantId, out _);
                 _processingByStartTimeLocks.TryRemove(tenantId, out _);
-            _completedByCompletedAt.TryRemove(tenantId, out _);
-            _completedByCompletedAtLocks.TryRemove(tenantId, out _);
-            _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
-            _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
-            _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-            _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+                _completedByCompletedAt.TryRemove(tenantId, out _);
+                _completedByCompletedAtLocks.TryRemove(tenantId, out _);
+                _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
+                _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
+                _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+                _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                 _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -3723,12 +3710,12 @@ LIMIT @limit;";
                     _delayedQueueLocks.TryRemove(tenantId, out _);
                     _processingByStartTime.TryRemove(tenantId, out _);
                     _processingByStartTimeLocks.TryRemove(tenantId, out _);
-            _completedByCompletedAt.TryRemove(tenantId, out _);
-            _completedByCompletedAtLocks.TryRemove(tenantId, out _);
-            _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
-            _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
-            _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-            _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+                    _completedByCompletedAt.TryRemove(tenantId, out _);
+                    _completedByCompletedAtLocks.TryRemove(tenantId, out _);
+                    _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
+                    _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
+                    _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
+                    _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                     // Step 4: Backup corrupted database
                     backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
@@ -4270,25 +4257,25 @@ ON CONFLICT(file_key) DO UPDATE SET
     file_extension             = excluded.file_extension,
     metadata_json              = excluded.metadata_json;";
 
-            cmd.Parameters.AddWithValue("@file_key",                   m.FileKey);
-            cmd.Parameters.AddWithValue("@tenant_id",                  m.TenantId);
-            cmd.Parameters.AddWithValue("@volume_id",                  m.VolumeId);
-            cmd.Parameters.AddWithValue("@physical_path",              m.PhysicalPath);
-            cmd.Parameters.AddWithValue("@directory_path",             m.DirectoryPath);
-            cmd.Parameters.AddWithValue("@file_size",                  m.FileSize);
-            cmd.Parameters.AddWithValue("@created_at",                 m.CreatedAt.ToString("O"));
-            cmd.Parameters.AddWithValue("@status",                     (int)m.Status);
-            cmd.Parameters.AddWithValue("@retry_count",                m.RetryCount);
-            cmd.Parameters.AddWithValue("@last_failed_at",             m.LastFailedAt.HasValue ? (object)m.LastFailedAt.Value.ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("@last_error",                 (object?)m.LastError ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@processing_start_time",      m.ProcessingStartTime.HasValue ? (object)m.ProcessingStartTime.Value.ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("@completed_at",               m.CompletedAt.HasValue ? (object)m.CompletedAt.Value.ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("@delete_succeeded_at",        m.DeleteSucceededAt.HasValue ? (object)m.DeleteSucceededAt.Value.ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("@dead_lettered_at",           m.DeadLetteredAt.HasValue ? (object)m.DeadLetteredAt.Value.ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("@available_for_processing_at",m.AvailableForProcessingAt.HasValue ? (object)m.AvailableForProcessingAt.Value.ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("@original_file_name",         (object?)m.OriginalFileName ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@file_extension",             (object?)m.FileExtension ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@metadata_json",              m.Metadata != null ? (object)System.Text.Json.JsonSerializer.Serialize(m.Metadata) : DBNull.Value);
+            cmd.Parameters.AddWithValue("@file_key", m.FileKey);
+            cmd.Parameters.AddWithValue("@tenant_id", m.TenantId);
+            cmd.Parameters.AddWithValue("@volume_id", m.VolumeId);
+            cmd.Parameters.AddWithValue("@physical_path", m.PhysicalPath);
+            cmd.Parameters.AddWithValue("@directory_path", m.DirectoryPath);
+            cmd.Parameters.AddWithValue("@file_size", m.FileSize);
+            cmd.Parameters.AddWithValue("@created_at", m.CreatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("@status", (int)m.Status);
+            cmd.Parameters.AddWithValue("@retry_count", m.RetryCount);
+            cmd.Parameters.AddWithValue("@last_failed_at", m.LastFailedAt.HasValue ? (object)m.LastFailedAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@last_error", (object?)m.LastError ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@processing_start_time", m.ProcessingStartTime.HasValue ? (object)m.ProcessingStartTime.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@completed_at", m.CompletedAt.HasValue ? (object)m.CompletedAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@delete_succeeded_at", m.DeleteSucceededAt.HasValue ? (object)m.DeleteSucceededAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@dead_lettered_at", m.DeadLetteredAt.HasValue ? (object)m.DeadLetteredAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@available_for_processing_at", m.AvailableForProcessingAt.HasValue ? (object)m.AvailableForProcessingAt.Value.ToString("O") : DBNull.Value);
+            cmd.Parameters.AddWithValue("@original_file_name", (object?)m.OriginalFileName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@file_extension", (object?)m.FileExtension ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@metadata_json", m.Metadata != null ? (object)System.Text.Json.JsonSerializer.Serialize(m.Metadata) : DBNull.Value);
             cmd.ExecuteNonQuery();
         }
 
