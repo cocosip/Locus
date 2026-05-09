@@ -682,6 +682,42 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             return _fileSystem.Path.Combine(GetTenantDirectoryPath(tenantId), "metadata.db");
         }
 
+        private void EnsureWritableDatabaseArtifacts(string dbPath)
+        {
+            ClearReadOnlyAttributeIfNeeded(dbPath);
+            ClearReadOnlyAttributeIfNeeded(dbPath + "-wal");
+            ClearReadOnlyAttributeIfNeeded(dbPath + "-shm");
+        }
+
+        private void ClearReadOnlyAttributeIfNeeded(string path)
+        {
+            if (!_fileSystem.File.Exists(path))
+                return;
+
+            try
+            {
+                var fileInfo = _fileSystem.FileInfo.New(path);
+                if (!fileInfo.IsReadOnly)
+                    return;
+
+                fileInfo.IsReadOnly = false;
+                _logger.LogWarning("Cleared read-only attribute from SQLite file: {Path}", path);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is NotSupportedException)
+            {
+                _logger.LogWarning(ex, "Failed to clear read-only attribute from SQLite file: {Path}", path);
+            }
+        }
+
+        private InvalidOperationException CreateReadonlyDatabaseException(string dbPath, SqliteException ex)
+        {
+            var directory = _fileSystem.Path.GetDirectoryName(dbPath) ?? _metadataDirectory;
+            return new InvalidOperationException(
+                $"SQLite database '{dbPath}' is read-only or its parent directory '{directory}' is not writable. " +
+                "Ensure the current process has write permission to the database file and directory.",
+                ex);
+        }
+
         private object GetDatabaseLock(string tenantId)
         {
             return _databaseLocks.GetOrAdd(tenantId, _ => new object());
@@ -692,29 +728,46 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
         /// </summary>
         protected virtual SqliteConnection OpenAndInitializeConnection(string dbPath)
         {
-            var connStr = _sqliteOptions.BuildConnectionString(dbPath);
-            var conn = new SqliteConnection(connStr);
-            conn.Open();
+            SqliteConnection? conn = null;
 
-            // Apply PRAGMAs
-            using (var cmd = conn.CreateCommand())
+            EnsureWritableDatabaseArtifacts(dbPath);
+
+            try
             {
-                cmd.CommandText = _sqliteOptions.BuildPragmaSql();
-                cmd.ExecuteNonQuery();
-            }
+                var connStr = _sqliteOptions.BuildConnectionString(dbPath);
+                conn = new SqliteConnection(connStr);
+                conn.Open();
 
-            // Create schema (idempotent)
-            using (var cmd = conn.CreateCommand())
+                // Apply PRAGMAs
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = _sqliteOptions.BuildPragmaSql();
+                    cmd.ExecuteNonQuery();
+                }
+
+                // Create schema (idempotent)
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = FilesDdl;
+                    cmd.ExecuteNonQuery();
+                }
+
+                EnsureColumnExists(conn, "files", "completed_at", "TEXT");
+                EnsureColumnExists(conn, "files", "delete_succeeded_at", "TEXT");
+                EnsureColumnExists(conn, "files", "dead_lettered_at", "TEXT");
+
+                return conn;
+            }
+            catch (SqliteException ex) when (IsReadonlyDatabaseException(ex))
             {
-                cmd.CommandText = FilesDdl;
-                cmd.ExecuteNonQuery();
+                conn?.Dispose();
+                throw CreateReadonlyDatabaseException(dbPath, ex);
             }
-
-            EnsureColumnExists(conn, "files", "completed_at", "TEXT");
-            EnsureColumnExists(conn, "files", "delete_succeeded_at", "TEXT");
-            EnsureColumnExists(conn, "files", "dead_lettered_at", "TEXT");
-
-            return conn;
+            catch
+            {
+                conn?.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
@@ -3408,6 +3461,8 @@ LIMIT @limit;";
                     }
 
                     // Step 2: run VACUUM on a fresh dedicated connection.
+                    EnsureWritableDatabaseArtifacts(dbPath);
+
                     var vacuumConnStr = _sqliteOptions.BuildConnectionString(dbPath);
                     using (var vacuumConn = new SqliteConnection(vacuumConnStr))
                     {
@@ -3550,6 +3605,11 @@ LIMIT @limit;";
             return false;
         }
 
+        private static bool IsReadonlyDatabaseException(SqliteException ex)
+        {
+            return ex.SqliteErrorCode == 8;
+        }
+
         /// <summary>
         /// Backs up and deletes the corrupted database file WITHOUT acquiring the tenant lock.
         /// Must only be called from within the Lazy factory (GetDatabase) where acquiring the
@@ -3593,6 +3653,8 @@ LIMIT @limit;";
                 _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
                 _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
                 _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+
+                EnsureWritableDatabaseArtifacts(dbPath);
 
                 var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
                 _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
@@ -3716,6 +3778,8 @@ LIMIT @limit;";
                     _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
                     _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
                     _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
+
+                    EnsureWritableDatabaseArtifacts(dbPath);
 
                     // Step 4: Backup corrupted database
                     backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";

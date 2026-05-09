@@ -299,12 +299,14 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// </summary>
         protected virtual SqliteConnection OpenAndInitializeConnection(string dbPath)
         {
+            SqliteConnection? conn = null;
+
             EnsureWritableDatabaseArtifacts(dbPath);
 
             try
             {
                 var connStr = _sqliteOptions.BuildConnectionString(dbPath);
-                var conn = new SqliteConnection(connStr);
+                conn = new SqliteConnection(connStr);
                 conn.Open();
 
                 using (var cmd = conn.CreateCommand())
@@ -323,7 +325,13 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
             }
             catch (SqliteException ex) when (IsReadonlyDatabaseException(ex))
             {
+                conn?.Dispose();
                 throw CreateReadonlyDatabaseException(dbPath, ex);
+            }
+            catch
+            {
+                conn?.Dispose();
+                throw;
             }
         }
 

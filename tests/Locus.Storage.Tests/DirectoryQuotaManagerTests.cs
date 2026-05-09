@@ -246,6 +246,29 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetOrCreateAsync_RebuildsReadonlyCorruptedDatabaseDuringInitializationRecovery()
+        {
+            var tenantId = $"tenant-quota-readonly-{Guid.NewGuid():N}";
+            var tenantDir = Path.Combine(_quotaDir, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantDir);
+            var dbPath = Path.Combine(tenantDir, "quotas.db");
+            _fileSystem.File.WriteAllText(dbPath, "corrupted");
+            File.SetAttributes(dbPath, File.GetAttributes(dbPath) | FileAttributes.ReadOnly);
+
+            using var repository = new DirectoryQuotaRepository(
+                _fileSystem,
+                new Mock<ILogger<DirectoryQuotaRepository>>().Object,
+                _quotaDir,
+                enableBackgroundFlush: false);
+
+            var quota = await repository.GetOrCreateAsync(tenantId, "/test/dir", CancellationToken.None);
+
+            Assert.NotNull(quota);
+            Assert.Equal("/test/dir", quota.DirectoryPath);
+            Assert.False(new System.IO.FileInfo(dbPath).IsReadOnly);
+        }
+
+        [Fact]
         public async Task GetFileCountAsync_ReturnsZeroForNewDirectory()
         {
             // Arrange

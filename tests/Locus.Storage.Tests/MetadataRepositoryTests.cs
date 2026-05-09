@@ -272,6 +272,136 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetAsync_RebuildsReadonlyCorruptedDatabaseDuringInitializationRecovery()
+        {
+            var tenantId = $"tenant-recovery-readonly-{Guid.NewGuid():N}";
+            var tenantDir = Path.Combine(_metadataDir, tenantId);
+            _fileSystem.Directory.CreateDirectory(tenantDir);
+            var dbPath = Path.Combine(tenantDir, "metadata.db");
+            _fileSystem.File.WriteAllText(dbPath, "corrupted");
+            File.SetAttributes(dbPath, File.GetAttributes(dbPath) | FileAttributes.ReadOnly);
+
+            using var repository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false);
+
+            var file = await repository.GetAsync(tenantId, "file-001", CancellationToken.None);
+
+            Assert.Null(file);
+            Assert.False(new System.IO.FileInfo(dbPath).IsReadOnly);
+        }
+
+        [Fact]
+        public async Task AddOrUpdateAsync_ClearsReadOnlyDatabaseAttributeAndPersistsUpdate()
+        {
+            var tenantId = $"tenant-readonly-{Guid.NewGuid():N}";
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await writer.AddOrUpdateAsync(CreateMetadata("file-001", FileProcessingStatus.Pending, tenantId), CancellationToken.None);
+            }
+
+            SqliteConnection.ClearAllPools();
+
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
+            File.SetAttributes(dbPath, File.GetAttributes(dbPath) | FileAttributes.ReadOnly);
+
+            using (var repository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await repository.AddOrUpdateAsync(CreateMetadata("file-002", FileProcessingStatus.Pending, tenantId), CancellationToken.None);
+            }
+
+            Assert.False(new System.IO.FileInfo(dbPath).IsReadOnly);
+
+            using (var reader = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                var files = (await reader.GetByTenantAsync(tenantId, CancellationToken.None)).ToList();
+                Assert.Contains(files, file => file.FileKey == "file-001");
+                Assert.Contains(files, file => file.FileKey == "file-002");
+            }
+        }
+
+        [Fact]
+        public async Task OptimizeDatabaseAsync_ClearsReadOnlyDatabaseAttributeBeforeVacuum()
+        {
+            var tenantId = $"tenant-vacuum-readonly-{Guid.NewGuid():N}";
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await writer.AddOrUpdateAsync(CreateMetadata("file-001", FileProcessingStatus.Pending, tenantId), CancellationToken.None);
+            }
+
+            SqliteConnection.ClearAllPools();
+
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
+            File.SetAttributes(dbPath, File.GetAttributes(dbPath) | FileAttributes.ReadOnly);
+
+            using var repository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false);
+
+            var (before, after) = await repository.OptimizeDatabaseAsync(tenantId, CancellationToken.None);
+
+            Assert.True(before > 0);
+            Assert.False(new System.IO.FileInfo(dbPath).IsReadOnly);
+            Assert.True(after >= 0);
+        }
+
+        [Fact]
+        public async Task BeginDatabaseRebuildAsync_ClearsReadOnlyDatabaseAttributeBeforeBackupAndDelete()
+        {
+            var tenantId = $"tenant-rebuild-readonly-{Guid.NewGuid():N}";
+
+            using (var writer = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false))
+            {
+                await writer.AddOrUpdateAsync(CreateMetadata("file-001", FileProcessingStatus.Pending, tenantId), CancellationToken.None);
+            }
+
+            SqliteConnection.ClearAllPools();
+
+            var dbPath = Path.Combine(_metadataDir, tenantId, "metadata.db");
+            File.SetAttributes(dbPath, File.GetAttributes(dbPath) | FileAttributes.ReadOnly);
+
+            using var repository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir,
+                enableBackgroundPersistence: false);
+
+            using var handle = await repository.BeginDatabaseRebuildAsync(tenantId, CancellationToken.None);
+
+            Assert.NotNull(handle.BackupPath);
+            Assert.True(_fileSystem.File.Exists(handle.BackupPath!));
+            Assert.False(_fileSystem.File.Exists(dbPath));
+            Assert.False(_fileSystem.FileInfo.New(dbPath).Exists);
+            Assert.False(_fileSystem.FileInfo.New(handle.BackupPath!).IsReadOnly);
+        }
+
+        [Fact]
         public async Task ProjectionBatch_FailedDeleteFlush_RollsBackInMemoryProjection()
         {
             const string fileKey = "batch-delete-rollback";
