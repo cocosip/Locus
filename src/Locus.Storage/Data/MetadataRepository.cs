@@ -595,6 +595,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             // This prevents multiple threads from simultaneously creating the connection instance.
             var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
             {
+                SqliteConnection? conn = null;
                 try
                 {
                     // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
@@ -603,7 +604,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                         _fileSystem.Directory.CreateDirectory(tenantDir);
 
                     var dbPath = _fileSystem.Path.Combine(tenantDir, "metadata.db");
-                    var conn = OpenAndInitializeConnection(dbPath);
+                    conn = OpenAndInitializeConnection(dbPath);
 
                     _logger.LogDebug("Created/opened SQLite database for tenant {TenantId} at {Path}", tid, dbPath);
 
@@ -614,6 +615,8 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                 }
                 catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
+                    DisposeOpenConnection(conn, tid, "initialization");
+
                     // Database is corrupted during initialization - attempt automatic recovery.
                     // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here - it acquires _tenantLocks[tid],
                     // which another thread may already hold while waiting for this Lazy to complete,
@@ -640,14 +643,25 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
 
                         // Retry initialization
                         var dbPath = GetDatabasePath(tid);
-                        var conn = OpenAndInitializeConnection(dbPath);
+                        SqliteConnection? recoveredConn = null;
+                        try
+                        {
+                            recoveredConn = OpenAndInitializeConnection(dbPath);
 
-                        _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
+                            _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
 
-                        return conn;
+                            return recoveredConn;
+                        }
+                        catch
+                        {
+                            DisposeOpenConnection(recoveredConn, tid, "recovery");
+                            _databases.TryRemove(tid, out _);
+                            throw;
+                        }
                     }
                     catch (Exception recoveryEx)
                     {
+                        _databases.TryRemove(tid, out _);
                         _logger.LogError(recoveryEx, "Failed to recover corrupted metadata database for tenant {TenantId} during initialization", tid);
                         throw;
                     }
@@ -673,7 +687,10 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             return _databaseLocks.GetOrAdd(tenantId, _ => new object());
         }
 
-        private SqliteConnection OpenAndInitializeConnection(string dbPath)
+        /// <summary>
+        /// Opens a SQLite connection and applies schema / pragmas for a tenant database.
+        /// </summary>
+        protected virtual SqliteConnection OpenAndInitializeConnection(string dbPath)
         {
             var connStr = _sqliteOptions.BuildConnectionString(dbPath);
             var conn = new SqliteConnection(connStr);
@@ -3491,6 +3508,25 @@ LIMIT @limit;";
                         _logger.LogWarning(ex, "Failed to delete SQLite sidecar file: {Path}", sidecarPath);
                     }
                 }
+            }
+        }
+
+        private void DisposeOpenConnection(SqliteConnection? conn, string tenantId, string phase)
+        {
+            if (conn == null)
+                return;
+
+            try
+            {
+                conn.Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                _logger.LogWarning(
+                    disposeEx,
+                    "Error disposing SQLite connection during {Phase} recovery for tenant {TenantId}",
+                    phase,
+                    tenantId);
             }
         }
 

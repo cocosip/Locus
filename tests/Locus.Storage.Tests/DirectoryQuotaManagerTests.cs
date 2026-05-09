@@ -226,6 +226,26 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetOrCreateAsync_RetriesInitializationAfterTransientRecoveryFailure()
+        {
+            var tenantId = $"tenant-quota-retry-{Guid.NewGuid():N}";
+            using var repository = new TestableRecoveryDirectoryQuotaRepository(
+                _fileSystem,
+                new Mock<ILogger<DirectoryQuotaRepository>>().Object,
+                _quotaDir);
+
+            repository.FailInitializationTwice();
+
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                repository.GetOrCreateAsync(tenantId, "/test/dir", CancellationToken.None));
+
+            var quota = await repository.GetOrCreateAsync(tenantId, "/test/dir", CancellationToken.None);
+
+            Assert.NotNull(quota);
+            Assert.Equal("/test/dir", quota.DirectoryPath);
+        }
+
+        [Fact]
         public async Task GetFileCountAsync_ReturnsZeroForNewDirectory()
         {
             // Arrange
@@ -510,6 +530,36 @@ namespace Locus.Storage.Tests
             var field = target.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
             Assert.NotNull(field);
             return (T)field!.GetValue(target)!;
+        }
+
+        private sealed class TestableRecoveryDirectoryQuotaRepository : DirectoryQuotaRepository
+        {
+            private int _failuresRemaining;
+
+            public TestableRecoveryDirectoryQuotaRepository(
+                IFileSystem fileSystem,
+                ILogger<DirectoryQuotaRepository> logger,
+                string quotaDirectory)
+                : base(
+                    fileSystem,
+                    logger,
+                    quotaDirectory,
+                    enableBackgroundFlush: false)
+            {
+            }
+
+            public void FailInitializationTwice()
+            {
+                _failuresRemaining = 2;
+            }
+
+            protected override SqliteConnection OpenAndInitializeConnection(string dbPath)
+            {
+                if (Interlocked.Decrement(ref _failuresRemaining) >= 0)
+                    throw new IOException("Injected initialization failure.");
+
+                return base.OpenAndInitializeConnection(dbPath);
+            }
         }
     }
 }

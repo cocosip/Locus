@@ -142,6 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
             // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
             var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
             {
+                SqliteConnection? conn = null;
                 try
                 {
                     // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
@@ -150,7 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         _fileSystem.Directory.CreateDirectory(tenantDir);
 
                     var dbPath = _fileSystem.Path.Combine(tenantDir, "quotas.db");
-                    var conn = OpenAndInitializeConnection(dbPath);
+                    conn = OpenAndInitializeConnection(dbPath);
 
                     _logger.LogDebug("Created/opened SQLite quota database for tenant {TenantId} at {Path}", tid, dbPath);
 
@@ -161,6 +162,8 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 }
                 catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
+                    DisposeOpenConnection(conn, tid, "initialization");
+
                     _logger.LogError(ex,
                         "CORRUPTED QUOTA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...",
                         tid);
@@ -203,20 +206,31 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         }
 
                         // Open fresh connection and reload quotas into the in-memory cache.
-                        var recoveredConn = OpenAndInitializeConnection(dbPath);
-                        LoadQuotasForTenant(tid, recoveredConn);
+                        SqliteConnection? recoveredConn = null;
+                        try
+                        {
+                            recoveredConn = OpenAndInitializeConnection(dbPath);
+                            LoadQuotasForTenant(tid, recoveredConn);
 
-                        _logger.LogWarning(
-                            "Quota database rebuilt for tenant {TenantId} during initialization.",
-                            tid);
-                        _logger.LogInformation(
-                            "Successfully recovered and initialized quota database for tenant {TenantId}",
-                            tid);
+                            _logger.LogWarning(
+                                "Quota database rebuilt for tenant {TenantId} during initialization.",
+                                tid);
+                            _logger.LogInformation(
+                                "Successfully recovered and initialized quota database for tenant {TenantId}",
+                                tid);
 
-                        return recoveredConn;
+                            return recoveredConn;
+                        }
+                        catch
+                        {
+                            DisposeOpenConnection(recoveredConn, tid, "recovery");
+                            _databases.TryRemove(tid, out _);
+                            throw;
+                        }
                     }
                     catch (Exception recoveryEx)
                     {
+                        _databases.TryRemove(tid, out _);
                         _logger.LogError(recoveryEx,
                             "Failed to recover corrupted quota database for tenant {TenantId} during initialization",
                             tid);
@@ -280,7 +294,10 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 ex);
         }
 
-        private SqliteConnection OpenAndInitializeConnection(string dbPath)
+        /// <summary>
+        /// Opens a SQLite connection and applies schema / pragmas for a tenant quota database.
+        /// </summary>
+        protected virtual SqliteConnection OpenAndInitializeConnection(string dbPath)
         {
             EnsureWritableDatabaseArtifacts(dbPath);
 
@@ -410,6 +427,25 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         _logger.LogWarning(ex, "Failed to delete SQLite sidecar file: {Path}", sidecarPath);
                     }
                 }
+            }
+        }
+
+        private void DisposeOpenConnection(SqliteConnection? conn, string tenantId, string phase)
+        {
+            if (conn == null)
+                return;
+
+            try
+            {
+                conn.Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                _logger.LogWarning(
+                    disposeEx,
+                    "Error disposing SQLite quota connection during {Phase} recovery for tenant {TenantId}",
+                    phase,
+                    tenantId);
             }
         }
 
