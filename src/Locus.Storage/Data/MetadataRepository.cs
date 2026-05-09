@@ -4080,9 +4080,33 @@ LIMIT @limit;";
         {
             lock (GetDatabaseLock(tenantId))
             {
-                var conn = GetDatabase(tenantId);
+                try
+                {
+                    ExecuteBatchCoreNoLock(tenantId, ops);
+                }
+                catch (InvalidOperationException ex) when (IsNestedTransactionException(ex))
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Detected a stale SQLite transaction on the cached metadata connection for tenant {TenantId}. Reopening the connection and retrying the batch once.",
+                        tenantId);
 
-                using var txn = conn.BeginTransaction();
+                    ReopenDatabaseConnectionNoLock(tenantId);
+                    ExecuteBatchCoreNoLock(tenantId, ops);
+                }
+
+                var conn = GetDatabase(tenantId);
+                TryCheckpointAfterCommittedBatch(conn, tenantId);
+                _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
+            }
+        }
+
+        private void ExecuteBatchCoreNoLock(string tenantId, IReadOnlyList<PersistenceOperation> ops)
+        {
+            var conn = GetDatabase(tenantId);
+
+            using (var txn = conn.BeginTransaction())
+            {
                 try
                 {
                     foreach (var op in ops)
@@ -4100,10 +4124,18 @@ LIMIT @limit;";
                     txn.Rollback();
                     throw;
                 }
-
-                TryCheckpointAfterCommittedBatch(conn, tenantId);
-                _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
             }
+        }
+
+        private bool IsNestedTransactionException(InvalidOperationException ex)
+        {
+            return ex.Message.IndexOf("nested transactions", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private void ReopenDatabaseConnectionNoLock(string tenantId)
+        {
+            if (_databases.TryRemove(tenantId, out var lazyConn) && lazyConn.IsValueCreated)
+                DisposeOpenConnection(lazyConn.Value, tenantId, "nested transaction recovery");
         }
 
         private void TryCheckpointAfterCommittedBatch(SqliteConnection connection, string tenantId)

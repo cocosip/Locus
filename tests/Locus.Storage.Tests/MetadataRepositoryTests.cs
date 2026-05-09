@@ -883,6 +883,46 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public void DrainPersistenceBatch_WithLargeQueuedBatch_PersistsAllOperationsInSingleTransaction()
+        {
+            var logger = new Mock<ILogger<MetadataRepository>>();
+            var batchDir = Path.Combine(_metadataDir, $"large-batch-{Guid.NewGuid():N}");
+            _fileSystem.Directory.CreateDirectory(batchDir);
+            var tenantId = "tenant-large-batch";
+            const int operationCount = 8000;
+
+            var repository = new MetadataRepository(
+                _fileSystem,
+                logger.Object,
+                batchDir,
+                enableBackgroundPersistence: false,
+                maxDrainBatchSize: operationCount,
+                maxPersistenceQueueSize: operationCount);
+
+            try
+            {
+                for (var i = 0; i < operationCount; i++)
+                {
+                    var metadata = CreateMetadata($"large-batch-{i:D4}", FileProcessingStatus.Pending, tenantId);
+                    Assert.True(InvokeTryWritePersistenceOperation(repository, metadata));
+                }
+
+                Assert.True(InvokeDrainPersistenceBatch(repository));
+
+                Assert.Equal(operationCount, CountPersistedMetadataRows(batchDir, tenantId));
+                Assert.NotNull(ReadPersistedMetadata(batchDir, tenantId, "large-batch-0000"));
+                Assert.NotNull(ReadPersistedMetadata(batchDir, tenantId, "large-batch-7999"));
+            }
+            finally
+            {
+                repository.Dispose();
+                SqliteConnection.ClearAllPools();
+                if (_fileSystem.Directory.Exists(batchDir))
+                    _fileSystem.Directory.Delete(batchDir, recursive: true);
+            }
+        }
+
+        [Fact]
         public async Task StartupLoad_BatchedPendingLoad_PreservesCreatedAtOrder()
         {
             var logger = new Mock<ILogger<MetadataRepository>>();
@@ -1394,6 +1434,17 @@ WHERE file_key = $file_key;";
                 OriginalFileName = reader.IsDBNull(16) ? null : reader.GetString(16),
                 FileExtension = reader.IsDBNull(17) ? null : reader.GetString(17),
             };
+        }
+
+        private static long CountPersistedMetadataRows(string metadataDirectory, string tenantId)
+        {
+            var dbPath = Path.Combine(metadataDirectory, tenantId, "metadata.db");
+            using var connection = new SqliteConnection($"Data Source={dbPath}");
+            connection.Open();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(1) FROM files;";
+            return (long)command.ExecuteScalar()!;
         }
 
         private sealed class CheckpointFailingMetadataRepository : MetadataRepository
