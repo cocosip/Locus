@@ -47,6 +47,21 @@ namespace Locus.Storage.Tests
             Assert.Contains("EnableProjection", ex.Message);
         }
 
+        [Theory]
+        [InlineData(QueueEventJournalAckMode.Balanced)]
+        [InlineData(QueueEventJournalAckMode.Async)]
+        public void Validate_ProjectionEnabledWithNonDurableAckMode_Throws(QueueEventJournalAckMode ackMode)
+        {
+            var options = new QueueEventJournalOptions
+            {
+                EnableProjection = true,
+                AckMode = ackMode
+            };
+
+            var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
+            Assert.Contains("must be Durable", ex.Message);
+        }
+
         [Fact]
         public void Validate_NegativeStateFlushDebounce_Throws()
         {

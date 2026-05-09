@@ -255,6 +255,7 @@ namespace Locus.Storage.Tests
                     QueueDirectory = queueDirectory,
                     JournalFormat = JournalFormat.BinaryV1,
                     AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = false,
                     StateFlushDebounce = TimeSpan.Zero,
                 });
 
@@ -298,6 +299,7 @@ namespace Locus.Storage.Tests
                     QueueDirectory = queueDirectory,
                     JournalFormat = JournalFormat.BinaryV1,
                     AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = false,
                 });
 
             var batch = await restartedJournal.ReadBatchAsync("tenant-async", 0, 10, CancellationToken.None);
