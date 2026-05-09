@@ -9,6 +9,9 @@ namespace Locus.Benchmarks
             if (OrphanRebuildPeakMemoryCommand.ShouldRun(args))
                 return OrphanRebuildPeakMemoryCommand.RunAsync(args).GetAwaiter().GetResult();
 
+            if (MetadataColdStartMemoryCommand.ShouldRun(args))
+                return MetadataColdStartMemoryCommand.RunAsync(args).GetAwaiter().GetResult();
+
             if (AcceptedWriteOverlapCommand.ShouldRun(args))
                 return AcceptedWriteOverlapCommand.RunAsync(args).GetAwaiter().GetResult();
 

@@ -48,6 +48,9 @@ dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherConfigurationDispatc
 dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherMultiTenantStatusBenchmarks*"
 dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherPrunePressureBenchmarks*"
 
+# Metadata 冷启动内存验证（SQLite 冷状态不进内存）
+dotnet run -c Release -- metadata-cold-start-memory --cold 900000 --hot 100 --cold-query-limit 100
+
 # 生成第5/6点参数矩阵对比面板（会自动跑基准并输出 Markdown）
 pwsh ./tests/Locus.Benchmarks/build-phase56-matrix-panel.ps1
 
