@@ -1099,6 +1099,17 @@ namespace Locus.Storage
 
             try
             {
+                var currentState = LoadJournalState(tenantId);
+                if (!ReferenceEquals(currentState, state))
+                {
+                    var currentExpectedLength = Math.Max(0, currentState.TailOffset - currentState.BaseOffset);
+                    if (currentExpectedLength >= expectedLength)
+                    {
+                        state = currentState;
+                        expectedLength = currentExpectedLength;
+                    }
+                }
+
                 fileLength = _fileSystem.FileInfo.New(path).Length;
                 if (fileLength <= expectedLength)
                     return;

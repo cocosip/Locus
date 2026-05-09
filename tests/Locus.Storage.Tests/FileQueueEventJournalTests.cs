@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.IO.Abstractions;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -884,6 +885,55 @@ namespace Locus.Storage.Tests
             }
         }
 
+        [Fact]
+        public async Task RepairCorruptTailAsync_WithStaleState_DoesNotTruncateValidRecords()
+        {
+            var tenantId = "tenant-stale-state";
+            var queueDirectory = Path.Combine(_queueDirectory, "stale-state");
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            try
+            {
+                await journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                var firstTailOffset = await journal.GetTailOffsetAsync(tenantId, CancellationToken.None);
+                var staleState = CreateJournalStateForTest(firstTailOffset, lastSequenceNumber: 1);
+
+                await journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-002",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                await InvokeRepairCorruptTailAsync(journal, tenantId, staleState);
+
+                var batch = await journal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+                Assert.Equal(2, batch.Records.Count);
+                Assert.Equal("file-001", batch.Records[0].FileKey);
+                Assert.Equal("file-002", batch.Records[1].FileKey);
+            }
+            finally
+            {
+                journal.Dispose();
+            }
+        }
+
         public void Dispose()
         {
             try
@@ -919,6 +969,35 @@ namespace Locus.Storage.Tests
             }
 
             return count;
+        }
+
+        private static object CreateJournalStateForTest(long tailOffset, long lastSequenceNumber)
+        {
+            var stateType = typeof(FileQueueEventJournal).GetNestedType("JournalState", BindingFlags.NonPublic)!;
+            var state = Activator.CreateInstance(stateType)!;
+            stateType.GetProperty("BaseOffset")!.SetValue(state, 0L);
+            stateType.GetProperty("TailOffset")!.SetValue(state, tailOffset);
+            stateType.GetProperty("LastSequenceNumber")!.SetValue(state, lastSequenceNumber);
+            stateType.GetProperty("Format")!.SetValue(state, JournalFormat.BinaryV1);
+            return state;
+        }
+
+        private static Task InvokeRepairCorruptTailAsync(
+            FileQueueEventJournal journal,
+            string tenantId,
+            object staleState)
+        {
+            var lockField = typeof(FileQueueEventJournal).GetField("_appendLocks", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var appendLocks = (System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim>)lockField.GetValue(journal)!;
+            var appendLock = appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+
+            var method = typeof(FileQueueEventJournal).GetMethod(
+                "RepairCorruptTailCoreAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+            return (Task)method.Invoke(
+                journal,
+                new[] { tenantId, staleState, appendLock, CancellationToken.None, false })!;
         }
     }
 }

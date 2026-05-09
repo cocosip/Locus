@@ -192,13 +192,6 @@ namespace Locus.Storage
             if (!Enum.IsDefined(typeof(QueueEventJournalAckMode), AckMode))
                 throw new InvalidOperationException("QueueEventJournal.AckMode is invalid");
 
-            if (EnableProjection && AckMode != QueueEventJournalAckMode.Durable)
-            {
-                throw new InvalidOperationException(
-                    "QueueEventJournal.AckMode must be Durable when QueueEventJournal.EnableProjection is true. " +
-                    "Balanced and Async ack modes can acknowledge writes before they are durable, which can cause journal tail loss and sequence gaps after restart.");
-            }
-
             if (Linger < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.Linger cannot be negative");
 

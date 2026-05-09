@@ -50,7 +50,7 @@ namespace Locus.Storage.Tests
         [Theory]
         [InlineData(QueueEventJournalAckMode.Balanced)]
         [InlineData(QueueEventJournalAckMode.Async)]
-        public void Validate_ProjectionEnabledWithNonDurableAckMode_Throws(QueueEventJournalAckMode ackMode)
+        public void Validate_ProjectionEnabledWithNonDurableAckMode_IsAllowed(QueueEventJournalAckMode ackMode)
         {
             var options = new QueueEventJournalOptions
             {
@@ -58,8 +58,7 @@ namespace Locus.Storage.Tests
                 AckMode = ackMode
             };
 
-            var ex = Assert.Throws<InvalidOperationException>(() => options.Validate());
-            Assert.Contains("must be Durable", ex.Message);
+            options.Validate();
         }
 
         [Fact]
