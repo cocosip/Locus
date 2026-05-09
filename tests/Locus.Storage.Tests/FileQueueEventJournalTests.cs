@@ -363,6 +363,44 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetTailOffsetAsync_RepairsEmptyJournalStateFile()
+        {
+            var tenantId = "tenant-empty-state";
+            var statePath = Path.Combine(_queueDirectory, tenantId, "queue.state.json");
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+            _fileSystem.File.WriteAllText(statePath, string.Empty);
+
+            var tailOffset = await _journal.GetTailOffsetAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(0, tailOffset);
+
+            var repairedState = _fileSystem.File.ReadAllText(statePath);
+            Assert.NotEmpty(repairedState);
+            Assert.Contains("\"baseOffset\":0", repairedState);
+        }
+
+        [Fact]
+        public async Task AppendAsync_AfterEmptyJournalStateFileCanStillWriteRecords()
+        {
+            var tenantId = "tenant-empty-state-write";
+            var statePath = Path.Combine(_queueDirectory, tenantId, "queue.state.json");
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+            _fileSystem.File.WriteAllText(statePath, string.Empty);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            var batch = await _journal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+            Assert.Single(batch.Records);
+            Assert.Equal("file-001", batch.Records[0].FileKey);
+        }
+
+        [Fact]
         public async Task CompactAsync_PreservesLogicalOffsetsAcrossCompaction()
         {
             await _journal.AppendAsync(new QueueEventRecord

@@ -1150,6 +1150,7 @@ namespace Locus.Storage
         private JournalState LoadJournalStateFromDisk(string tenantId)
         {
             var path = GetJournalStatePath(tenantId);
+            var needsRepair = false;
             if (_fileSystem.File.Exists(path))
             {
                 try
@@ -1168,15 +1169,31 @@ namespace Locus.Storage
                             return state;
                         }
                     }
+
+                    needsRepair = true;
                 }
                 catch (Exception ex) when (ex is IOException || ex is JsonException || ex is UnauthorizedAccessException)
                 {
                     _logger.LogWarning(ex, "Failed to load journal state for tenant {TenantId}", tenantId);
+                    needsRepair = true;
                 }
             }
 
             var fallback = new JournalState();
             NormalizeJournalState(tenantId, fallback);
+
+            if (needsRepair)
+            {
+                try
+                {
+                    SaveJournalState(tenantId, fallback);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Failed to repair journal state for tenant {TenantId}", tenantId);
+                }
+            }
+
             return fallback;
         }
 
