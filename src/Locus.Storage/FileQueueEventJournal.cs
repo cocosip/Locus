@@ -222,63 +222,70 @@ namespace Locus.Storage
             if (maxRecords <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxRecords), "MaxRecords must be greater than zero.");
 
-            var state = LoadJournalState(tenantId);
             var path = GetJournalPath(tenantId);
             if (!_fileSystem.File.Exists(path))
-                return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), state.BaseOffset, true);
+                return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), 0, true);
 
             var appendLock = _appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             await appendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var effectiveOffset = offset < state.BaseOffset ? state.BaseOffset : offset;
-                var nextRelativeOffset = effectiveOffset - state.BaseOffset;
-                await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
-
-                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
                 {
-                    if (nextRelativeOffset > stream.Length)
-                        nextRelativeOffset = stream.Length;
+                    var state = LoadJournalState(tenantId);
+                    path = GetJournalPath(tenantId);
+                    if (!_fileSystem.File.Exists(path))
+                        return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), state.BaseOffset, true);
 
-                    var codec = GetCodec(tenantId);
-                    var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
-                    if (result.EncounteredCorruptTail)
+                    var effectiveOffset = offset < state.BaseOffset ? state.BaseOffset : offset;
+                    var nextRelativeOffset = effectiveOffset - state.BaseOffset;
+                    await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
+
+                    using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                     {
-                        QueueJournalMetrics.RecordCorruptTailDetected();
+                        if (nextRelativeOffset > stream.Length)
+                            nextRelativeOffset = stream.Length;
 
-                        var normalizedRelativeOffset = codec.NormalizeReadOffset(stream, nextRelativeOffset);
-                        if (normalizedRelativeOffset < nextRelativeOffset)
+                        var codec = GetCodec(tenantId);
+                        var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
+                        if (result.EncounteredCorruptTail)
                         {
-                            var recoveredResult = await codec.ReadBatchAsync(stream, normalizedRelativeOffset, maxRecords, ct).ConfigureAwait(false);
-                            if (!recoveredResult.EncounteredCorruptTail)
-                            {
-                                _logger.LogDebug(
-                                    MisalignedReadOffsetRecoveredEventId,
-                                    "Recovered queue journal read offset for tenant {TenantId} from {RequestedOffset} to {RecoveredOffset} while reading {Format}.",
-                                    tenantId,
-                                    state.BaseOffset + nextRelativeOffset,
-                                    state.BaseOffset + normalizedRelativeOffset,
-                                    codec.Format);
+                            QueueJournalMetrics.RecordCorruptTailDetected();
 
-                                return new QueueEventReadBatch(
-                                    recoveredResult.Records,
-                                    state.BaseOffset + recoveredResult.NextOffset,
-                                    recoveredResult.ReachedEndOfFile);
+                            var normalizedRelativeOffset = codec.NormalizeReadOffset(stream, nextRelativeOffset);
+                            if (normalizedRelativeOffset < nextRelativeOffset)
+                            {
+                                var recoveredResult = await codec.ReadBatchAsync(stream, normalizedRelativeOffset, maxRecords, ct).ConfigureAwait(false);
+                                if (!recoveredResult.EncounteredCorruptTail)
+                                {
+                                    _logger.LogDebug(
+                                        MisalignedReadOffsetRecoveredEventId,
+                                        "Recovered queue journal read offset for tenant {TenantId} from {RequestedOffset} to {RecoveredOffset} while reading {Format}.",
+                                        tenantId,
+                                        state.BaseOffset + nextRelativeOffset,
+                                        state.BaseOffset + normalizedRelativeOffset,
+                                        codec.Format);
+
+                                    return new QueueEventReadBatch(
+                                        recoveredResult.Records,
+                                        state.BaseOffset + recoveredResult.NextOffset,
+                                        recoveredResult.ReachedEndOfFile);
+                                }
                             }
+
+                            _logger.LogWarning(
+                                CorruptTailReadEventId,
+                                "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
+                                tenantId,
+                                state.BaseOffset + result.NextOffset,
+                                codec.Format);
                         }
 
-                        _logger.LogWarning(
-                            CorruptTailReadEventId,
-                            "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
-                            tenantId,
+                        return new QueueEventReadBatch(
+                            result.Records,
                             state.BaseOffset + result.NextOffset,
-                            codec.Format);
+                            result.ReachedEndOfFile);
                     }
-
-                    return new QueueEventReadBatch(
-                        result.Records,
-                        state.BaseOffset + result.NextOffset,
-                        result.ReachedEndOfFile);
                 }
             }
             finally
@@ -302,47 +309,50 @@ namespace Locus.Storage
             await appendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                CloseTenantAppendStream(tenantId);
-
-                var state = LoadJournalState(tenantId);
-                await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
-                var path = GetJournalPath(tenantId);
-                if (!_fileSystem.File.Exists(path))
-                    return state.BaseOffset;
-
-                var fileInfo = _fileSystem.FileInfo.New(path);
-                var length = fileInfo.Length;
-                var relativeProcessedOffset = processedOffset - state.BaseOffset;
-                if (relativeProcessedOffset <= 0 || relativeProcessedOffset > length)
-                    return relativeProcessedOffset > length ? state.BaseOffset + length : state.BaseOffset;
-
-                if (relativeProcessedOffset == length)
+                using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
                 {
-                    using (var truncateStream = _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+                    CloseTenantAppendStream(tenantId);
+
+                    var state = LoadJournalState(tenantId);
+                    await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
+                    var path = GetJournalPath(tenantId);
+                    if (!_fileSystem.File.Exists(path))
+                        return state.BaseOffset;
+
+                    var fileInfo = _fileSystem.FileInfo.New(path);
+                    var length = fileInfo.Length;
+                    var relativeProcessedOffset = processedOffset - state.BaseOffset;
+                    if (relativeProcessedOffset <= 0 || relativeProcessedOffset > length)
+                        return relativeProcessedOffset > length ? state.BaseOffset + length : state.BaseOffset;
+
+                    if (relativeProcessedOffset == length)
                     {
-                        await truncateStream.FlushAsync(ct).ConfigureAwait(false);
+                        using (var truncateStream = _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+                        {
+                            await truncateStream.FlushAsync(ct).ConfigureAwait(false);
+                        }
+
+                        state.BaseOffset = processedOffset;
+                        state.TailOffset = processedOffset;
+                        SaveJournalState(tenantId, state);
+                        return processedOffset;
                     }
 
+                    var tempPath = path + ".compact";
+                    using (var source = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    using (var destination = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        source.Seek(relativeProcessedOffset, SeekOrigin.Begin);
+                        await source.CopyToAsync(destination, 16 * 1024, ct).ConfigureAwait(false);
+                        await destination.FlushAsync(ct).ConfigureAwait(false);
+                    }
+
+                    ReplaceFileAtomically(tempPath, path);
                     state.BaseOffset = processedOffset;
-                    state.TailOffset = processedOffset;
+                    state.TailOffset = processedOffset + (length - relativeProcessedOffset);
                     SaveJournalState(tenantId, state);
                     return processedOffset;
                 }
-
-                var tempPath = path + ".compact";
-                using (var source = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
-                using (var destination = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    source.Seek(relativeProcessedOffset, SeekOrigin.Begin);
-                    await source.CopyToAsync(destination, 16 * 1024, ct).ConfigureAwait(false);
-                    await destination.FlushAsync(ct).ConfigureAwait(false);
-                }
-
-                ReplaceFileAtomically(tempPath, path);
-                state.BaseOffset = processedOffset;
-                state.TailOffset = processedOffset + (length - relativeProcessedOffset);
-                SaveJournalState(tenantId, state);
-                return processedOffset;
             }
             finally
             {
@@ -351,7 +361,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public Task<long> GetTailOffsetAsync(string tenantId, CancellationToken ct = default)
+        public async Task<long> GetTailOffsetAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -359,12 +369,15 @@ namespace Locus.Storage
             ValidateTenantIdForPath(tenantId, nameof(tenantId));
 
             ct.ThrowIfCancellationRequested();
-            var state = LoadJournalState(tenantId);
-            return Task.FromResult(state.TailOffset);
+            using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
+            {
+                var state = LoadJournalState(tenantId);
+                return state.TailOffset;
+            }
         }
 
         /// <inheritdoc/>
-        public Task<long> GetBaseOffsetAsync(string tenantId, CancellationToken ct = default)
+        public async Task<long> GetBaseOffsetAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
@@ -372,8 +385,11 @@ namespace Locus.Storage
             ValidateTenantIdForPath(tenantId, nameof(tenantId));
 
             ct.ThrowIfCancellationRequested();
-            var state = LoadJournalState(tenantId);
-            return Task.FromResult(state.BaseOffset);
+            using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
+            {
+                var state = LoadJournalState(tenantId);
+                return state.BaseOffset;
+            }
         }
 
         /// <inheritdoc/>
@@ -591,60 +607,58 @@ namespace Locus.Storage
             await appendLock.WaitAsync(writer.Cancellation.Token).ConfigureAwait(false);
             try
             {
-                var state = LoadJournalState(writer.TenantId);
-                await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
-                var stream = EnsureAppendStream(writer);
-                var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
-                if (batch.Count == 1 && batch[0].TryGetSingleRecord(out var singleAppendRecord))
+                using (await AcquireTenantJournalLockAsync(writer.TenantId, writer.Cancellation.Token).ConfigureAwait(false))
                 {
-                    var singleRecord = SerializeSingleRecord(state, singleAppendRecord);
-                    await stream.WriteAsync(singleRecord, 0, singleRecord.Length, writer.Cancellation.Token).ConfigureAwait(false);
+                    CloseTenantAppendStream(writer);
+                    var state = LoadJournalState(writer.TenantId);
+                    await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
+                    var stream = EnsureAppendStream(writer);
+                    var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
+                    if (batch.Count == 1 && batch[0].TryGetSingleRecord(out var singleAppendRecord))
+                    {
+                        var singleRecord = SerializeSingleRecord(state, singleAppendRecord);
+                        await stream.WriteAsync(singleRecord, 0, singleRecord.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
-                    state.TailOffset += singleRecord.Length;
-                    var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
+                        state.TailOffset += singleRecord.Length;
+                        var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                    if (shouldFlushBeforeAck || _ackMode == QueueEventJournalAckMode.Async)
                         await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
-                    else
-                        writer.HasUnflushedData = true;
 
-                    MarkJournalStateDirty(writer.TenantId);
+                        MarkJournalStateDirty(writer.TenantId);
 
-                    var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
-                    QueueJournalOperationMetrics.RecordAppendBatch(
-                        singleRecord.Length,
-                        durationTicks);
-                    RecordObservedAppendBatch(recordCount: 1, totalBytes: singleRecord.Length, durationTicks: appendDurationTicks);
-                    CompleteRequests(batch);
-                    return;
-                }
-
-                using (var serializedBatch = SerializeBatch(state, batch, out var batchRecords))
-                {
-                    if (serializedBatch.Length == 0)
+                        var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
+                        QueueJournalOperationMetrics.RecordAppendBatch(
+                            singleRecord.Length,
+                            durationTicks);
+                        RecordObservedAppendBatch(recordCount: 1, totalBytes: singleRecord.Length, durationTicks: appendDurationTicks);
+                        CompleteRequests(batch);
                         return;
+                    }
 
-                    await stream.WriteAsync(serializedBatch.Buffer, 0, serializedBatch.Length, writer.Cancellation.Token).ConfigureAwait(false);
+                    using (var serializedBatch = SerializeBatch(state, batch, out var batchRecords))
+                    {
+                        if (serializedBatch.Length == 0)
+                            return;
 
-                    state.TailOffset += serializedBatch.Length;
-                    var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
+                        await stream.WriteAsync(serializedBatch.Buffer, 0, serializedBatch.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
-                    if (shouldFlushBeforeAck || _ackMode == QueueEventJournalAckMode.Async)
+                        state.TailOffset += serializedBatch.Length;
+                        var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
+
                         await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
-                    else
-                        writer.HasUnflushedData = true;
 
-                    MarkJournalStateDirty(writer.TenantId);
+                        MarkJournalStateDirty(writer.TenantId);
 
-                    var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
-                    QueueJournalOperationMetrics.RecordAppendBatch(
-                        serializedBatch.Length,
-                        durationTicks);
-                    RecordObservedAppendBatch(
-                        recordCount: batchRecords.Length,
-                        totalBytes: serializedBatch.Length,
-                        durationTicks: appendDurationTicks);
-                    CompleteRequests(batch);
+                        var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
+                        QueueJournalOperationMetrics.RecordAppendBatch(
+                            serializedBatch.Length,
+                            durationTicks);
+                        RecordObservedAppendBatch(
+                            recordCount: batchRecords.Length,
+                            totalBytes: serializedBatch.Length,
+                            durationTicks: appendDurationTicks);
+                        CompleteRequests(batch);
+                    }
                 }
             }
             finally
@@ -660,21 +674,25 @@ namespace Locus.Storage
             await appendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var state = LoadJournalState(writer.TenantId);
-                await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
-                var stream = EnsureAppendStream(writer);
-                var serializedRecord = SerializeSingleRecord(state, record);
-                ct.ThrowIfCancellationRequested();
-                stream.Write(serializedRecord, 0, serializedRecord.Length);
+                using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
+                {
+                    CloseTenantAppendStream(writer);
+                    var state = LoadJournalState(writer.TenantId);
+                    await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
+                    var stream = EnsureAppendStream(writer);
+                    var serializedRecord = SerializeSingleRecord(state, record);
+                    ct.ThrowIfCancellationRequested();
+                    stream.Write(serializedRecord, 0, serializedRecord.Length);
 
-                state.TailOffset += serializedRecord.Length;
-                var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                FlushAppendStreamCore(writer);
-                MarkJournalStateDirty(writer.TenantId);
+                    state.TailOffset += serializedRecord.Length;
+                    var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                    FlushAppendStreamCore(writer);
+                    MarkJournalStateDirty(writer.TenantId);
 
-                var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
-                RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
+                    var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                    QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
+                    RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
+                }
             }
             finally
             {
@@ -689,42 +707,46 @@ namespace Locus.Storage
             await appendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var state = LoadJournalState(writer.TenantId);
-                await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
-                var stream = EnsureAppendStream(writer);
-                if (records.Count == 1)
+                using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
                 {
-                    var serializedRecord = SerializeSingleRecord(state, records[0]);
-                    ct.ThrowIfCancellationRequested();
-                    stream.Write(serializedRecord, 0, serializedRecord.Length);
+                    CloseTenantAppendStream(writer);
+                    var state = LoadJournalState(writer.TenantId);
+                    await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
+                    var stream = EnsureAppendStream(writer);
+                    if (records.Count == 1)
+                    {
+                        var serializedRecord = SerializeSingleRecord(state, records[0]);
+                        ct.ThrowIfCancellationRequested();
+                        stream.Write(serializedRecord, 0, serializedRecord.Length);
 
-                    state.TailOffset += serializedRecord.Length;
-                    var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                    FlushAppendStreamCore(writer);
-                    MarkJournalStateDirty(writer.TenantId);
+                        state.TailOffset += serializedRecord.Length;
+                        var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                        FlushAppendStreamCore(writer);
+                        MarkJournalStateDirty(writer.TenantId);
 
-                    var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                    QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
-                    RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
-                    return;
-                }
-
-                using (var serializedBatch = SerializeBatch(state, records))
-                {
-                    if (serializedBatch.Length == 0)
+                        var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                        QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
+                        RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
                         return;
+                    }
 
-                    ct.ThrowIfCancellationRequested();
-                    stream.Write(serializedBatch.Buffer, 0, serializedBatch.Length);
+                    using (var serializedBatch = SerializeBatch(state, records))
+                    {
+                        if (serializedBatch.Length == 0)
+                            return;
 
-                    state.TailOffset += serializedBatch.Length;
-                    var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                    FlushAppendStreamCore(writer);
-                    MarkJournalStateDirty(writer.TenantId);
+                        ct.ThrowIfCancellationRequested();
+                        stream.Write(serializedBatch.Buffer, 0, serializedBatch.Length);
 
-                    var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                    QueueJournalOperationMetrics.RecordAppendBatch(serializedBatch.Length, durationTicks);
-                    RecordObservedAppendBatch(recordCount: records.Count, totalBytes: serializedBatch.Length, durationTicks: appendDurationTicks);
+                        state.TailOffset += serializedBatch.Length;
+                        var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                        FlushAppendStreamCore(writer);
+                        MarkJournalStateDirty(writer.TenantId);
+
+                        var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
+                        QueueJournalOperationMetrics.RecordAppendBatch(serializedBatch.Length, durationTicks);
+                        RecordObservedAppendBatch(recordCount: records.Count, totalBytes: serializedBatch.Length, durationTicks: appendDurationTicks);
+                    }
                 }
             }
             finally
@@ -785,7 +807,7 @@ namespace Locus.Storage
                 GetJournalPath(writer.TenantId),
                 FileMode.Append,
                 FileAccess.Write,
-                FileShare.Read | FileShare.Delete);
+                FileShare.ReadWrite | FileShare.Delete);
             writer.LastFlushUtc = DateTime.UtcNow;
             return writer.AppendStream;
         }
@@ -1058,6 +1080,38 @@ namespace Locus.Storage
             return _fileSystem.Path.Combine(GetTenantDirectory(tenantId), "queue.state.json");
         }
 
+        private string GetJournalLockPath(string tenantId)
+        {
+            return _fileSystem.Path.Combine(GetTenantDirectory(tenantId), "queue.lock");
+        }
+
+        private async Task<IDisposable> AcquireTenantJournalLockAsync(string tenantId, CancellationToken ct)
+        {
+            var tenantDirectory = GetTenantDirectory(tenantId);
+            if (!_fileSystem.Directory.Exists(tenantDirectory))
+                _fileSystem.Directory.CreateDirectory(tenantDirectory);
+
+            var lockPath = GetJournalLockPath(tenantId);
+            const int retryDelayMs = 10;
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    var stream = _fileSystem.File.Open(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                    return new TenantJournalFileLock(stream);
+                }
+                catch (IOException)
+                {
+                    await Task.Delay(retryDelayMs, ct).ConfigureAwait(false);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    await Task.Delay(retryDelayMs, ct).ConfigureAwait(false);
+                }
+            }
+        }
+
         private IQueueEventJournalCodec GetCodec(string tenantId)
         {
             return GetCodec(ResolveJournalFormat(tenantId));
@@ -1140,6 +1194,20 @@ namespace Locus.Storage
                 fileLength = _fileSystem.FileInfo.New(path).Length;
                 if (fileLength <= expectedLength)
                     return;
+
+                var scan = ScanJournal(tenantId, state.Format);
+                if (scan.LastValidOffset > expectedLength)
+                {
+                    expectedLength = scan.LastValidOffset;
+                    state.TailOffset = state.BaseOffset + scan.LastValidOffset;
+                    state.LastSequenceNumber = Math.Max(state.LastSequenceNumber, scan.LastSequenceNumber);
+
+                    if (!scan.EncounteredCorruptTail || fileLength <= expectedLength)
+                    {
+                        SaveJournalState(tenantId, state);
+                        return;
+                    }
+                }
 
                 CloseTenantAppendStream(tenantId);
                 using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Write, FileShare.Read))
@@ -1323,10 +1391,13 @@ namespace Locus.Storage
                     await appendLock.WaitAsync().ConfigureAwait(false);
                     try
                     {
-                        await FlushAppendStreamWithoutTakingLockAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+                        using (await AcquireTenantJournalLockAsync(tenantId, CancellationToken.None).ConfigureAwait(false))
+                        {
+                            await FlushAppendStreamWithoutTakingLockAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
 
-                        if (_dirtyStateTenants.ContainsKey(tenantId))
-                            SaveJournalState(tenantId, LoadJournalState(tenantId));
+                            if (_dirtyStateTenants.ContainsKey(tenantId))
+                                SaveJournalState(tenantId, LoadJournalState(tenantId));
+                        }
                     }
                     finally
                     {
@@ -1554,6 +1625,21 @@ namespace Locus.Storage
             }
         }
 
+        private sealed class TenantJournalFileLock : IDisposable
+        {
+            private readonly Stream _stream;
+
+            public TenantJournalFileLock(Stream stream)
+            {
+                _stream = stream ?? throw new ArgumentNullException(nameof(stream));
+            }
+
+            public void Dispose()
+            {
+                _stream.Dispose();
+            }
+        }
+
         private sealed class JournalState
         {
             private long _baseOffset;
@@ -1645,7 +1731,21 @@ namespace Locus.Storage
                 try
                 {
                     foreach (var tenantId in _dirtyStateTenants.Keys.ToArray())
-                        SaveJournalState(tenantId, LoadJournalState(tenantId));
+                    {
+                        var appendLock = _appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+                        appendLock.Wait();
+                        try
+                        {
+                            using (AcquireTenantJournalLockAsync(tenantId, CancellationToken.None).GetAwaiter().GetResult())
+                            {
+                                SaveJournalState(tenantId, LoadJournalState(tenantId));
+                            }
+                        }
+                        finally
+                        {
+                            appendLock.Release();
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {

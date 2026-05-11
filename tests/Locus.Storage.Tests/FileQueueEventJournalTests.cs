@@ -935,6 +935,118 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReadBatchAsync_WithStaleStateFromAnotherJournalInstance_DoesNotTruncateValidRecords()
+        {
+            var tenantId = "tenant-cross-instance-stale-state";
+            var queueDirectory = Path.Combine(_queueDirectory, "cross-instance-stale-state");
+            var writer = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            var readerLogger = new Mock<ILogger<FileQueueEventJournal>>();
+            var reader = new FileQueueEventJournal(
+                _fileSystem,
+                readerLogger.Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            try
+            {
+                await writer.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                var staleTailOffset = await reader.GetTailOffsetAsync(tenantId, CancellationToken.None);
+                Assert.True(staleTailOffset > 0);
+
+                await writer.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-002",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                writer.Dispose();
+
+                var batch = await reader.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+                Assert.Equal(2, batch.Records.Count);
+                Assert.Equal("file-001", batch.Records[0].FileKey);
+                Assert.Equal("file-002", batch.Records[1].FileKey);
+                Assert.Equal(0, CountLogCalls(readerLogger, LogLevel.Warning));
+            }
+            finally
+            {
+                writer.Dispose();
+                reader.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task AppendAsync_FromConcurrentJournalInstances_AssignsUniqueMonotonicSequenceNumbers()
+        {
+            var tenantId = "tenant-cross-instance-concurrent";
+            var queueDirectory = Path.Combine(_queueDirectory, "cross-instance-concurrent");
+            using var journalA = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            using var journalB = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            var appendTasks = new Task[40];
+            for (var i = 0; i < appendTasks.Length; i++)
+            {
+                var index = i;
+                var journal = index % 2 == 0 ? journalA : journalB;
+                appendTasks[i] = journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-" + index.ToString("D2"),
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+            }
+
+            await Task.WhenAll(appendTasks);
+
+            var batch = await journalA.ReadBatchAsync(tenantId, 0, 100, CancellationToken.None);
+
+            Assert.Equal(appendTasks.Length, batch.Records.Count);
+            for (var i = 0; i < batch.Records.Count; i++)
+                Assert.Equal(i + 1, batch.Records[i].SequenceNumber);
+        }
+
+        [Fact]
         public async Task FlushDirtyJournalStatesAsync_WithAsyncAckMode_FlushesAppendStreamBeforeScanningState()
         {
             var tenantId = "tenant-async-state-flush";
