@@ -786,11 +786,11 @@ namespace Locus.Storage
         {
             ValidateLease(lease);
 
-            // Concurrent duplicate completion calls for the same key must be idempotent.
-            // Without this guard, two callers can both read metadata before scheduler update
-            // and both try to move the same file into Completed.
-            var completionGuard = GetCompletionGuard(lease.FileKey);
-            await completionGuard.WaitAsync(ct);
+            // All release paths for the same key must be serialized. Otherwise a failed
+            // release can return the file to Pending while a concurrent completed release
+            // still validates against the old Processing snapshot.
+            var releaseGuard = GetCompletionGuard(lease.FileKey);
+            await releaseGuard.WaitAsync(ct);
             try
             {
                 // Read current metadata before delegating so we can validate the active lease once.
@@ -799,6 +799,9 @@ namespace Locus.Storage
                     return;
 
                 if (QueueEventRecordFactory.IsCompletionCommittedStatus(metadata.Status))
+                    return;
+
+                if (IsSameLeaseAlreadyReleased(metadata))
                     return;
 
                 if (metadata.Status != FileProcessingStatus.Processing
@@ -838,7 +841,7 @@ namespace Locus.Storage
             }
             finally
             {
-                completionGuard.Release();
+                releaseGuard.Release();
             }
         }
 
@@ -847,32 +850,41 @@ namespace Locus.Storage
         {
             ValidateLease(lease);
 
-            var previousMetadata = ShouldAppendQueueEventsInStoragePool()
-                ? await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false)
-                : null;
-
-            // Delegate to file scheduler
-            await _fileScheduler.MarkAsFailedAsync(lease, errorMessage, ct);
-
-            if (ShouldAppendQueueEventsInStoragePool())
+            var releaseGuard = GetCompletionGuard(lease.FileKey);
+            await releaseGuard.WaitAsync(ct);
+            try
             {
-                var updated = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
-                if (updated != null)
-                {
-                    try
-                    {
-                        await AppendQueueEventAsync(
-                            QueueEventRecordFactory.CreateProcessingFailed(updated, errorMessage, lease.ProcessingStartTimeUtc),
-                            ct).ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        if (previousMetadata != null)
-                            await RestoreProjectedMetadataAsync(previousMetadata).ConfigureAwait(false);
+                var previousMetadata = ShouldAppendQueueEventsInStoragePool()
+                    ? await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false)
+                    : null;
 
-                        throw;
+                // Delegate to file scheduler
+                await _fileScheduler.MarkAsFailedAsync(lease, errorMessage, ct);
+
+                if (ShouldAppendQueueEventsInStoragePool())
+                {
+                    var updated = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
+                    if (updated != null)
+                    {
+                        try
+                        {
+                            await AppendQueueEventAsync(
+                                QueueEventRecordFactory.CreateProcessingFailed(updated, errorMessage, lease.ProcessingStartTimeUtc),
+                                ct).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            if (previousMetadata != null)
+                                await RestoreProjectedMetadataAsync(previousMetadata).ConfigureAwait(false);
+
+                            throw;
+                        }
                     }
                 }
+            }
+            finally
+            {
+                releaseGuard.Release();
             }
         }
 
@@ -1102,6 +1114,22 @@ namespace Locus.Storage
 
             if (string.IsNullOrWhiteSpace(lease.FileKey))
                 throw new ArgumentException("File key cannot be empty", nameof(lease));
+        }
+
+        private static bool IsSameLeaseAlreadyReleased(FileMetadata metadata)
+        {
+            if (metadata.ProcessingStartTime.HasValue)
+                return false;
+
+            if (metadata.Status == FileProcessingStatus.Pending)
+            {
+                return metadata.LastFailedAt.HasValue
+                    || metadata.AvailableForProcessingAt.HasValue
+                    || !string.IsNullOrEmpty(metadata.LastError);
+            }
+
+            return metadata.Status == FileProcessingStatus.PermanentlyFailed
+                || metadata.Status == FileProcessingStatus.DeadLettered;
         }
 
         private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId, CancellationToken ct)

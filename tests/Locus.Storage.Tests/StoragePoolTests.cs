@@ -1274,6 +1274,77 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenSameLeaseWasAlreadyFailed_IsIdempotent()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("complete after fail"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var processingStart = DateTime.UtcNow;
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("completion should not run after failed release"));
+
+            _fileScheduler
+                .Setup(s => s.MarkAsFailedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    "decode failed",
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetAsync("tenant-001", fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Pending;
+                    current.ProcessingStartTime = null;
+                    current.LastError = "decode failed";
+                    current.LastFailedAt = DateTime.UtcNow;
+                    current.AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(1);
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                });
+
+            var lease = CreateLease("tenant-001", fileKey, processingStart);
+
+            await _storagePool.MarkAsFailedAsync(lease, "decode failed", CancellationToken.None);
+            await _storagePool.MarkAsCompletedAsync(lease, CancellationToken.None);
+
+            _fileScheduler.Verify(
+                s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+
+            var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadataAfterRelease);
+            Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
+            Assert.Null(metadataAfterRelease.ProcessingStartTime);
+            Assert.Equal("decode failed", metadataAfterRelease.LastError);
+        }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_WhenFileIsPlainPending_ThrowsLeaseMismatch()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("plain pending"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var processingStart = DateTime.UtcNow;
+
+            var exception = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                _storagePool.MarkAsCompletedAsync(CreateLease("tenant-001", fileKey, processingStart), CancellationToken.None));
+
+            Assert.Equal(fileKey, exception.FileKey);
+            Assert.Equal(processingStart, exception.ExpectedProcessingStartTimeUtc);
+            Assert.Null(exception.ActualProcessingStartTimeUtc);
+            _fileScheduler.Verify(
+                s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_WhenCompletionFails_KeepsQuotaAndMetadata()
         {
             var tenantQuotaManager = new TenantQuotaManager(
