@@ -1327,6 +1327,71 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenSameLeaseIsFailingConcurrently_WaitsAndReturnsIdempotently()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("concurrent complete after fail"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var processingStart = DateTime.UtcNow;
+            var failedReleaseUpdated = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var allowFailedReleaseToReturn = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("completion should not run after failed release"));
+
+            _fileScheduler
+                .Setup(s => s.MarkAsFailedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    "decode failed",
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetAsync("tenant-001", fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Pending;
+                    current.ProcessingStartTime = null;
+                    current.LastError = "decode failed";
+                    current.LastFailedAt = DateTime.UtcNow;
+                    current.AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(1);
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                    failedReleaseUpdated.SetResult(true);
+                    await allowFailedReleaseToReturn.Task;
+                });
+
+            var lease = CreateLease("tenant-001", fileKey, processingStart);
+            var failedReleaseTask = _storagePool.MarkAsFailedAsync(lease, "decode failed", CancellationToken.None);
+
+            await failedReleaseUpdated.Task;
+            var completedReleaseTask = _storagePool.MarkAsCompletedAsync(lease, CancellationToken.None);
+
+            var firstFinished = await Task.WhenAny(completedReleaseTask, Task.Delay(TimeSpan.FromMilliseconds(100)));
+            Assert.NotSame(completedReleaseTask, firstFinished);
+
+            allowFailedReleaseToReturn.SetResult(true);
+            await failedReleaseTask;
+            await completedReleaseTask;
+
+            _fileScheduler.Verify(
+                s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+
+            var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadataAfterRelease);
+            Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
+            Assert.Null(metadataAfterRelease.ProcessingStartTime);
+            Assert.Equal("decode failed", metadataAfterRelease.LastError);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_WhenFileIsPlainPending_ThrowsLeaseMismatch()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("plain pending"));
