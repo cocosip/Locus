@@ -1920,5 +1920,50 @@ namespace Locus.Storage.Tests
                 m => m.DecrementFileCountAsync("tenant-001", "/deadletter", It.IsAny<CancellationToken>()),
                 Times.Once);
         }
+
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_AppliesDeleteSucceededProjectionBeforeRemovingMissingRows()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>(MockBehavior.Strict);
+
+            await _repository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "delete-succeeded-orphan",
+                TenantId = "tenant-001",
+                PhysicalPath = Path.Combine(_metadataDir, "missing-delete-succeeded-file.dat"),
+                DirectoryPath = "/done",
+                Status = FileProcessingStatus.DeleteSucceeded,
+                CompletedAt = DateTime.UtcNow.AddMinutes(-5),
+                DeleteSucceededAt = DateTime.UtcNow.AddMinutes(-4),
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10)
+            }, CancellationToken.None);
+
+            tenantQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryQuotaManager
+                .Setup(m => m.DecrementFileCountAsync("tenant-001", "/done", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var removedCount = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(1, removedCount);
+            Assert.Null(await _repository.GetAsync("tenant-001", "delete-succeeded-orphan", CancellationToken.None));
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync("tenant-001", "/done", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
     }
 }

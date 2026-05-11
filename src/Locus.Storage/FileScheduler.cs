@@ -759,8 +759,18 @@ namespace Locus.Storage
 
                         if (physicalFileMissing)
                         {
-                            _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
-                                metadata.FileKey, metadata.PhysicalPath);
+                            if (metadata.Status == FileProcessingStatus.DeleteSucceeded)
+                            {
+                                _logger.LogDebug(
+                                    "Finalizing delete-succeeded metadata for missing file: {FileKey}, Path: {PhysicalPath}",
+                                    metadata.FileKey,
+                                    metadata.PhysicalPath);
+                            }
+                            else
+                            {
+                                _logger.LogInformation("Removing orphaned metadata for missing file: {FileKey}, Path: {PhysicalPath}",
+                                    metadata.FileKey, metadata.PhysicalPath);
+                            }
 
                             var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
                             var quotaApplied = false;
@@ -768,7 +778,7 @@ namespace Locus.Storage
                             // Use default for the full cleanup sequence once a candidate orphan has
                             // been selected; otherwise a mid-flight cancellation could leave cleanup
                             // work half-applied.
-                            if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
+                            if (ShouldApplyOrphanedMetadataDeleteProjection(metadata))
                             {
                                 await ApplyOrphanedMetadataDeleteQuotaAsync(
                                     metadata.TenantId,
@@ -833,6 +843,14 @@ namespace Locus.Storage
             }
 
             return removedCount;
+        }
+
+        private static bool ShouldApplyOrphanedMetadataDeleteProjection(FileMetadata metadata)
+        {
+            if (ActiveQuotaMetadata.CountsTowardActiveQuota(metadata))
+                return true;
+
+            return metadata.Status == FileProcessingStatus.DeleteSucceeded;
         }
 
         private async Task ApplyOrphanedMetadataDeleteQuotaAsync(
