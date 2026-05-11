@@ -592,13 +592,14 @@ namespace Locus.Storage
                     await stream.WriteAsync(singleRecord, 0, singleRecord.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
                     state.TailOffset += singleRecord.Length;
-                    MarkJournalStateDirty(writer.TenantId);
                     var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                    if (shouldFlushBeforeAck)
+                    if (shouldFlushBeforeAck || _ackMode == QueueEventJournalAckMode.Async)
                         await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
                     else
                         writer.HasUnflushedData = true;
+
+                    MarkJournalStateDirty(writer.TenantId);
 
                     var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(
@@ -617,13 +618,14 @@ namespace Locus.Storage
                     await stream.WriteAsync(serializedBatch.Buffer, 0, serializedBatch.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
                     state.TailOffset += serializedBatch.Length;
-                    MarkJournalStateDirty(writer.TenantId);
                     var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                    if (shouldFlushBeforeAck)
+                    if (shouldFlushBeforeAck || _ackMode == QueueEventJournalAckMode.Async)
                         await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
                     else
                         writer.HasUnflushedData = true;
+
+                    MarkJournalStateDirty(writer.TenantId);
 
                     var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(
@@ -657,9 +659,9 @@ namespace Locus.Storage
                 stream.Write(serializedRecord, 0, serializedRecord.Length);
 
                 state.TailOffset += serializedRecord.Length;
-                MarkJournalStateDirty(writer.TenantId);
                 var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
                 FlushAppendStreamCore(writer);
+                MarkJournalStateDirty(writer.TenantId);
 
                 var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
                 QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
@@ -688,9 +690,9 @@ namespace Locus.Storage
                     stream.Write(serializedRecord, 0, serializedRecord.Length);
 
                     state.TailOffset += serializedRecord.Length;
-                    MarkJournalStateDirty(writer.TenantId);
                     var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
                     FlushAppendStreamCore(writer);
+                    MarkJournalStateDirty(writer.TenantId);
 
                     var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
@@ -707,9 +709,9 @@ namespace Locus.Storage
                     stream.Write(serializedBatch.Buffer, 0, serializedBatch.Length);
 
                     state.TailOffset += serializedBatch.Length;
-                    MarkJournalStateDirty(writer.TenantId);
                     var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
                     FlushAppendStreamCore(writer);
+                    MarkJournalStateDirty(writer.TenantId);
 
                     var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
                     QueueJournalOperationMetrics.RecordAppendBatch(serializedBatch.Length, durationTicks);
@@ -829,11 +831,27 @@ namespace Locus.Storage
             }
         }
 
+        private async Task FlushAppendStreamWithoutTakingLockAsync(string tenantId, CancellationToken ct)
+        {
+            if (!_tenantWriters.TryGetValue(tenantId, out var writer))
+                return;
+
+            if (!writer.HasUnflushedData)
+                return;
+
+            await FlushAppendStreamCoreAsync(writer, ct).ConfigureAwait(false);
+        }
+
         private async Task FlushAppendStreamCoreAsync(TenantWriterState writer)
+        {
+            await FlushAppendStreamCoreAsync(writer, writer.Cancellation.Token).ConfigureAwait(false);
+        }
+
+        private async Task FlushAppendStreamCoreAsync(TenantWriterState writer, CancellationToken ct)
         {
             var flushStartedAt = Stopwatch.GetTimestamp();
             if (writer.AppendStream != null)
-                await DurableFileWrite.FlushToDiskAsync(writer.AppendStream, writer.Cancellation.Token).ConfigureAwait(false);
+                await DurableFileWrite.FlushToDiskAsync(writer.AppendStream, ct).ConfigureAwait(false);
 
             CompleteAppendFlush(writer, flushStartedAt);
         }
@@ -1296,6 +1314,8 @@ namespace Locus.Storage
                     await appendLock.WaitAsync().ConfigureAwait(false);
                     try
                     {
+                        await FlushAppendStreamWithoutTakingLockAsync(tenantId, CancellationToken.None).ConfigureAwait(false);
+
                         if (_dirtyStateTenants.ContainsKey(tenantId))
                             SaveJournalState(tenantId, LoadJournalState(tenantId));
                     }

@@ -934,6 +934,79 @@ namespace Locus.Storage.Tests
             }
         }
 
+        [Fact]
+        public async Task FlushDirtyJournalStatesAsync_WithAsyncAckMode_FlushesAppendStreamBeforeScanningState()
+        {
+            var tenantId = "tenant-async-state-flush";
+            var queueDirectory = Path.Combine(_queueDirectory, "async-state-flush");
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = false,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            try
+            {
+                await journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-001",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None);
+
+                await WaitForJournalFileAsync(queueDirectory, tenantId, CancellationToken.None);
+                await InvokeFlushDirtyJournalStatesAsync(journal);
+
+                var batch = await journal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+                Assert.Single(batch.Records);
+                Assert.Equal("file-001", batch.Records[0].FileKey);
+                Assert.Equal(await journal.GetTailOffsetAsync(tenantId, CancellationToken.None), batch.NextOffset);
+            }
+            finally
+            {
+                journal.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task AppendAsync_WithAsyncAckModeAndImmediateStateFlush_DoesNotLoseWrittenRecord()
+        {
+            var tenantId = "tenant-async-immediate-state";
+            var queueDirectory = Path.Combine(_queueDirectory, "async-immediate-state");
+            using var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = true,
+                    StateFlushDebounce = TimeSpan.Zero,
+                });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await WaitForJournalRecordAsync(journal, tenantId, expectedCount: 1, CancellationToken.None);
+
+            var batch = await journal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+            Assert.Single(batch.Records);
+            Assert.Equal("file-001", batch.Records[0].FileKey);
+        }
+
         public void Dispose()
         {
             try
@@ -998,6 +1071,53 @@ namespace Locus.Storage.Tests
             return (Task)method.Invoke(
                 journal,
                 new[] { tenantId, staleState, appendLock, CancellationToken.None, false })!;
+        }
+
+        private static Task InvokeFlushDirtyJournalStatesAsync(FileQueueEventJournal journal)
+        {
+            var method = typeof(FileQueueEventJournal).GetMethod(
+                "FlushDirtyJournalStatesAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+            return (Task)method.Invoke(journal, Array.Empty<object>())!;
+        }
+
+        private static async Task WaitForJournalFileAsync(
+            string queueDirectory,
+            string tenantId,
+            CancellationToken ct)
+        {
+            var journalPath = Path.Combine(queueDirectory, tenantId, "queue.log");
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (!File.Exists(journalPath))
+            {
+                ct.ThrowIfCancellationRequested();
+                if (DateTime.UtcNow >= deadline)
+                    throw new TimeoutException($"Journal file was not created: {journalPath}");
+
+                await Task.Delay(10, ct);
+            }
+        }
+
+        private static async Task WaitForJournalRecordAsync(
+            FileQueueEventJournal journal,
+            string tenantId,
+            int expectedCount,
+            CancellationToken ct)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                var batch = await journal.ReadBatchAsync(tenantId, 0, expectedCount, ct);
+                if (batch.Records.Count >= expectedCount)
+                    return;
+
+                if (DateTime.UtcNow >= deadline)
+                    throw new TimeoutException($"Expected {expectedCount} journal record(s) for tenant {tenantId}.");
+
+                await Task.Delay(10, ct);
+            }
         }
     }
 }

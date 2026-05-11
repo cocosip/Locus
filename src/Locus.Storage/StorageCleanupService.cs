@@ -1259,7 +1259,8 @@ namespace Locus.Storage
                                 deleteSucceededAtUtc,
                                 ct).ConfigureAwait(false);
                             if (!metadataTransitionApplied
-                                && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
+                                && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false)
+                                && !await TryConvergeMissingFileToDeleteSucceededAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
                             {
                                 throw new InvalidOperationException($"Failed to mark completed file {metadata.FileKey} as delete-succeeded after physical deletion.");
                             }
@@ -1470,7 +1471,8 @@ namespace Locus.Storage
                                         deleteSucceededAtUtc,
                                         ct).ConfigureAwait(false);
                                     if (!metadataTransitionApplied
-                                        && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
+                                        && !await WasMetadataDeleteSucceededConcurrentlyAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false)
+                                        && !await TryConvergeMissingFileToDeleteSucceededAsync(metadata, deleteSucceededAtUtc, ct).ConfigureAwait(false))
                                     {
                                         throw new InvalidOperationException($"Failed to mark permanently-failed file {metadata.FileKey} as delete-succeeded after physical deletion.");
                                     }
@@ -1789,6 +1791,38 @@ namespace Locus.Storage
             return current.Status == FileProcessingStatus.DeleteSucceeded
                 && current.DeleteSucceededAt.HasValue
                 && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc;
+        }
+
+        private async Task<bool> TryConvergeMissingFileToDeleteSucceededAsync(
+            FileMetadata metadata,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct)
+        {
+            var current = await _projectionStore.GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct).ConfigureAwait(false);
+            if (current == null)
+                return false;
+
+            if (!PathsEqual(current.PhysicalPath, metadata.PhysicalPath))
+                return false;
+
+            if (TryConfirmPhysicalFileExists(current.PhysicalPath, out var physicalFileExists) && physicalFileExists)
+                return false;
+
+            var converged = current.Clone();
+            converged.Status = FileProcessingStatus.DeleteSucceeded;
+            converged.DeleteSucceededAt = deleteSucceededAtUtc;
+            converged.ProcessingStartTime = null;
+            converged.AvailableForProcessingAt = null;
+
+            await _projectionStore.UpsertProjectedFileAsync(converged, ct).ConfigureAwait(false);
+
+            _logger.LogWarning(
+                "Converged metadata to DeleteSucceeded after physical deletion was confirmed but conditional cleanup projection was rejected. Tenant={TenantId}, FileKey={FileKey}, Path={PhysicalPath}",
+                metadata.TenantId,
+                metadata.FileKey,
+                metadata.PhysicalPath);
+
+            return true;
         }
 
         private static QueueEventRecord CreateDeleteSucceededEvent(FileMetadata metadata, DateTime deleteSucceededAtUtc)

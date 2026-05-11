@@ -2296,6 +2296,20 @@ namespace Locus.Storage.Tests
             projectionStore
                 .Setup(store => store.GetProjectedFileAsync("tenant-001", "completed-rejected", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(metadata);
+            projectionStore
+                .Setup(store => store.UpsertProjectedFileAsync(
+                    It.Is<FileMetadata>(m =>
+                        m.TenantId == "tenant-001"
+                        && m.FileKey == "completed-rejected"
+                        && m.Status == FileProcessingStatus.DeleteSucceeded
+                        && m.DeleteSucceededAt.HasValue),
+                    It.IsAny<CancellationToken>()))
+                .Returns<FileMetadata, CancellationToken>((m, _) =>
+                {
+                    metadata.Status = m.Status;
+                    metadata.DeleteSucceededAt = m.DeleteSucceededAt;
+                    return _metadataRepository.AddOrUpdateAsync(m, CancellationToken.None);
+                });
 
             var projectionCleanupStore = new Mock<IQueueProjectionCleanupStore>(MockBehavior.Strict);
             projectionCleanupStore
@@ -2347,11 +2361,11 @@ namespace Locus.Storage.Tests
 
             var reloaded = await _metadataRepository.GetAsync("tenant-001", "completed-rejected", CancellationToken.None);
             Assert.NotNull(reloaded);
-            Assert.Equal(FileProcessingStatus.Completed, reloaded!.Status);
-            Assert.NotNull(reloaded.CompletedAt);
+            Assert.Equal(FileProcessingStatus.DeleteSucceeded, reloaded!.Status);
+            Assert.NotNull(reloaded.DeleteSucceededAt);
 
             var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
-            Assert.Equal(0, stats.CompletedRecordsRemoved);
+            Assert.Equal(1, stats.CompletedRecordsRemoved);
 
             queueEventJournal.VerifyAll();
             projectionStore.VerifyAll();
@@ -2399,6 +2413,20 @@ namespace Locus.Storage.Tests
             projectionStore
                 .Setup(store => store.GetProjectedFileAsync("tenant-001", "failed-rejected", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(metadata);
+            projectionStore
+                .Setup(store => store.UpsertProjectedFileAsync(
+                    It.Is<FileMetadata>(m =>
+                        m.TenantId == "tenant-001"
+                        && m.FileKey == "failed-rejected"
+                        && m.Status == FileProcessingStatus.DeleteSucceeded
+                        && m.DeleteSucceededAt.HasValue),
+                    It.IsAny<CancellationToken>()))
+                .Returns<FileMetadata, CancellationToken>((m, _) =>
+                {
+                    metadata.Status = m.Status;
+                    metadata.DeleteSucceededAt = m.DeleteSucceededAt;
+                    return _metadataRepository.AddOrUpdateAsync(m, CancellationToken.None);
+                });
 
             var projectionCleanupStore = new Mock<IQueueProjectionCleanupStore>(MockBehavior.Strict);
             projectionCleanupStore
@@ -2444,11 +2472,11 @@ namespace Locus.Storage.Tests
 
             var reloaded = await _metadataRepository.GetAsync("tenant-001", "failed-rejected", CancellationToken.None);
             Assert.NotNull(reloaded);
-            Assert.Equal(FileProcessingStatus.PermanentlyFailed, reloaded!.Status);
-            Assert.NotNull(reloaded.LastFailedAt);
+            Assert.Equal(FileProcessingStatus.DeleteSucceeded, reloaded!.Status);
+            Assert.NotNull(reloaded.DeleteSucceededAt);
 
             var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
-            Assert.Equal(0, stats.PermanentlyFailedFilesRemoved);
+            Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);
 
             queueEventJournal.VerifyAll();
             projectionStore.VerifyAll();
