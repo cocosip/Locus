@@ -1210,7 +1210,7 @@ namespace Locus.Storage
                 {
                     expectedLength = scan.LastValidOffset;
                     state.TailOffset = state.BaseOffset + scan.LastValidOffset;
-                    state.LastSequenceNumber = Math.Max(state.LastSequenceNumber, scan.LastSequenceNumber);
+                    state.LastSequenceNumber = scan.LastSequenceNumber;
 
                     if (!scan.EncounteredCorruptTail || fileLength <= expectedLength)
                     {
@@ -1563,7 +1563,7 @@ namespace Locus.Storage
                 {
                     var scan = ScanJournal(tenantId, state.Format);
                     state.TailOffset = state.BaseOffset + scan.LastValidOffset;
-                    state.LastSequenceNumber = Math.Max(state.LastSequenceNumber, scan.LastSequenceNumber);
+                    state.LastSequenceNumber = scan.LastSequenceNumber;
 
                     if (scan.EncounteredCorruptTail)
                     {

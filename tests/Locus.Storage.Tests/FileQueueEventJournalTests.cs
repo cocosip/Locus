@@ -725,6 +725,79 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReadBatchAsync_BinaryJournalWithTruncatedRecord_RewindsLastSequenceBeforeFurtherAppends()
+        {
+            var tenantId = "tenant-corrupt-tail-sequence-rewind";
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-003",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            _journal.Dispose();
+
+            var journalPath = Path.Combine(_queueDirectory, tenantId, "queue.log");
+            var fullLength = _fileSystem.FileInfo.New(journalPath).Length;
+            QueueEventReadBatch firstTwoRecords;
+            using (var scanner = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                }))
+            {
+                firstTwoRecords = await scanner.ReadBatchAsync(tenantId, 0, 2, CancellationToken.None);
+            }
+
+            using (var stream = _fileSystem.File.Open(journalPath, FileMode.Open, FileAccess.Write, FileShare.Read))
+                stream.SetLength(firstTwoRecords.NextOffset + 1);
+
+            var corruptedLength = _fileSystem.FileInfo.New(journalPath).Length;
+            Assert.True(corruptedLength < fullLength);
+
+            using var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                });
+
+            var repairedBatch = await restartedJournal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+            await restartedJournal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-004",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            var finalBatch = await restartedJournal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+
+            Assert.Equal(new[] { "file-001", "file-002" }, repairedBatch.Records.Select(record => record.FileKey));
+            Assert.Equal(new[] { 1L, 2L }, repairedBatch.Records.Select(record => record.SequenceNumber!.Value));
+            Assert.Equal(new[] { "file-001", "file-002", "file-004" }, finalBatch.Records.Select(record => record.FileKey));
+            Assert.Equal(new[] { 1L, 2L, 3L }, finalBatch.Records.Select(record => record.SequenceNumber!.Value));
+        }
+
+        [Fact]
         public async Task ReadBatchAsync_BinaryJournalWithPersistedCorruptTail_TruncatesTailAndStopsRepeatedDetection()
         {
             await _journal.AppendAsync(new QueueEventRecord
