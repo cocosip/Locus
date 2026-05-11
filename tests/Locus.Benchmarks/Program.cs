@@ -15,6 +15,9 @@ namespace Locus.Benchmarks
             if (AcceptedWriteOverlapCommand.ShouldRun(args))
                 return AcceptedWriteOverlapCommand.RunAsync(args).GetAwaiter().GetResult();
 
+            if (AsyncJournalDrainCommand.ShouldRun(args))
+                return AsyncJournalDrainCommand.RunAsync(args).GetAwaiter().GetResult();
+
             if (VolumeWritePhaseBreakdownCommand.ShouldRun(args))
                 return VolumeWritePhaseBreakdownCommand.RunAsync(args).GetAwaiter().GetResult();
 
