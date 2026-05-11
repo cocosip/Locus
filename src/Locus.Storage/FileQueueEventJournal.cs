@@ -232,7 +232,9 @@ namespace Locus.Storage
             {
                 using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
                 {
-                    var state = LoadJournalState(tenantId);
+                    await FlushAppendStreamWithoutTakingLockAsync(tenantId, ct).ConfigureAwait(false);
+
+                    var state = ReloadJournalStateFromDisk(tenantId);
                     path = GetJournalPath(tenantId);
                     if (!_fileSystem.File.Exists(path))
                         return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), state.BaseOffset, true);
@@ -313,7 +315,7 @@ namespace Locus.Storage
                 {
                     CloseTenantAppendStream(tenantId);
 
-                    var state = LoadJournalState(tenantId);
+                    var state = ReloadJournalStateFromDisk(tenantId);
                     await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                     var path = GetJournalPath(tenantId);
                     if (!_fileSystem.File.Exists(path))
@@ -327,7 +329,7 @@ namespace Locus.Storage
 
                     if (relativeProcessedOffset == length)
                     {
-                        using (var truncateStream = _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+                        using (var truncateStream = _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
                         {
                             await truncateStream.FlushAsync(ct).ConfigureAwait(false);
                         }
@@ -339,7 +341,7 @@ namespace Locus.Storage
                     }
 
                     var tempPath = path + ".compact";
-                    using (var source = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    using (var source = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                     using (var destination = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                     {
                         source.Seek(relativeProcessedOffset, SeekOrigin.Begin);
@@ -371,7 +373,7 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
             using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
             {
-                var state = LoadJournalState(tenantId);
+                var state = ReloadJournalStateFromDisk(tenantId);
                 return state.TailOffset;
             }
         }
@@ -387,7 +389,7 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
             using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
             {
-                var state = LoadJournalState(tenantId);
+                var state = ReloadJournalStateFromDisk(tenantId);
                 return state.BaseOffset;
             }
         }
@@ -609,8 +611,10 @@ namespace Locus.Storage
             {
                 using (await AcquireTenantJournalLockAsync(writer.TenantId, writer.Cancellation.Token).ConfigureAwait(false))
                 {
-                    CloseTenantAppendStream(writer);
-                    var state = LoadJournalState(writer.TenantId);
+                    if (_ackMode == QueueEventJournalAckMode.Durable)
+                        CloseTenantAppendStream(writer);
+
+                    var state = ReloadJournalStateFromDisk(writer.TenantId);
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
@@ -622,9 +626,11 @@ namespace Locus.Storage
                         state.TailOffset += singleRecord.Length;
                         var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
-
                         MarkJournalStateDirty(writer.TenantId);
+                        if (shouldFlushBeforeAck)
+                            await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                        else
+                            writer.HasUnflushedData = true;
 
                         var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                         QueueJournalOperationMetrics.RecordAppendBatch(
@@ -645,9 +651,11 @@ namespace Locus.Storage
                         state.TailOffset += serializedBatch.Length;
                         var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                        await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
-
                         MarkJournalStateDirty(writer.TenantId);
+                        if (shouldFlushBeforeAck)
+                            await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
+                        else
+                            writer.HasUnflushedData = true;
 
                         var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                         QueueJournalOperationMetrics.RecordAppendBatch(
@@ -677,7 +685,7 @@ namespace Locus.Storage
                 using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
                 {
                     CloseTenantAppendStream(writer);
-                    var state = LoadJournalState(writer.TenantId);
+                    var state = ReloadJournalStateFromDisk(writer.TenantId);
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     var serializedRecord = SerializeSingleRecord(state, record);
@@ -710,7 +718,7 @@ namespace Locus.Storage
                 using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
                 {
                     CloseTenantAppendStream(writer);
-                    var state = LoadJournalState(writer.TenantId);
+                    var state = ReloadJournalStateFromDisk(writer.TenantId);
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     if (records.Count == 1)
@@ -1251,6 +1259,13 @@ namespace Locus.Storage
         private JournalState LoadJournalState(string tenantId)
         {
             return _stateCache.GetOrAdd(tenantId, LoadJournalStateFromDisk);
+        }
+
+        private JournalState ReloadJournalStateFromDisk(string tenantId)
+        {
+            var state = LoadJournalStateFromDisk(tenantId);
+            _stateCache[tenantId] = state;
+            return state;
         }
 
         private JournalState LoadJournalStateFromDisk(string tenantId)

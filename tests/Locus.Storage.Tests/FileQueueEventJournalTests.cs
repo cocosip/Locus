@@ -528,6 +528,66 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AppendAsync_AfterCompactionByAnotherInstance_PreservesCompactedBaseOffset()
+        {
+            var tenantId = "tenant-cross-instance-compact";
+            var queueDirectory = Path.Combine(_queueDirectory, "cross-instance-compact");
+            using var journalA = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            using var journalB = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            await journalA.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            await journalA.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            Assert.True(await journalA.GetTailOffsetAsync(tenantId, CancellationToken.None) > 0);
+
+            var firstBatch = await journalB.ReadBatchAsync(tenantId, 0, 1, CancellationToken.None);
+            var compactedOffset = await journalB.CompactAsync(tenantId, firstBatch.NextOffset, CancellationToken.None);
+
+            await journalA.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-003",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            var baseOffset = await journalA.GetBaseOffsetAsync(tenantId, CancellationToken.None);
+            var remainingBatch = await journalA.ReadBatchAsync(tenantId, compactedOffset, 10, CancellationToken.None);
+
+            Assert.Equal(compactedOffset, baseOffset);
+            Assert.Equal(new[] { "file-002", "file-003" }, remainingBatch.Records.Select(record => record.FileKey));
+        }
+
+        [Fact]
         public async Task AppendAsync_WithBinaryDefault_ReusesExistingJsonJournalWithoutMixingFormats()
         {
             var jsonJournal = new FileQueueEventJournal(
@@ -1160,6 +1220,33 @@ namespace Locus.Storage.Tests
             Assert.Equal("file-001", batch.Records[0].FileKey);
         }
 
+        [Fact]
+        public async Task AppendAsync_WithAsyncAckMode_DefersAppendStreamFlushAfterBackgroundWrite()
+        {
+            var tenantId = "tenant-async-deferred-flush";
+            var queueDirectory = Path.Combine(_queueDirectory, "async-deferred-flush");
+            using var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = false,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await WaitForTenantWriterHasUnflushedDataAsync(journal, tenantId, CancellationToken.None);
+        }
+
         public void Dispose()
         {
             try
@@ -1229,6 +1316,36 @@ namespace Locus.Storage.Tests
             var lockField = typeof(FileQueueEventJournal).GetField("_appendLocks", BindingFlags.Instance | BindingFlags.NonPublic)!;
             var appendLocks = (System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim>)lockField.GetValue(journal)!;
             return appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+        }
+
+        private static bool GetTenantWriterHasUnflushedData(FileQueueEventJournal journal, string tenantId)
+        {
+            var writersField = typeof(FileQueueEventJournal).GetField("_tenantWriters", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var writers = (System.Collections.IDictionary)writersField.GetValue(journal)!;
+            if (!writers.Contains(tenantId))
+                return false;
+
+            var writer = writers[tenantId]!;
+            return (bool)writer.GetType().GetProperty("HasUnflushedData")!.GetValue(writer)!;
+        }
+
+        private static async Task WaitForTenantWriterHasUnflushedDataAsync(
+            FileQueueEventJournal journal,
+            string tenantId,
+            CancellationToken ct)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (GetTenantWriterHasUnflushedData(journal, tenantId))
+                    return;
+
+                if (DateTime.UtcNow >= deadline)
+                    throw new TimeoutException($"Expected unflushed journal data for tenant {tenantId}.");
+
+                await Task.Delay(10, ct);
+            }
         }
 
         private static Task InvokeFlushDirtyJournalStatesAsync(FileQueueEventJournal journal)
