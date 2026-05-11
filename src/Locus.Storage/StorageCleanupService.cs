@@ -1786,7 +1786,7 @@ namespace Locus.Storage
         {
             var current = await _projectionStore.GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct).ConfigureAwait(false);
             if (current == null)
-                return false;
+                return true;
 
             return current.Status == FileProcessingStatus.DeleteSucceeded
                 && current.DeleteSucceededAt.HasValue
@@ -1808,38 +1808,14 @@ namespace Locus.Storage
             if (TryConfirmPhysicalFileExists(current.PhysicalPath, out var physicalFileExists) && physicalFileExists)
                 return false;
 
-            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(current.DirectoryPath);
-            var tenantQuotaDecremented = false;
-            var directoryQuotaDecremented = false;
-
-            var converged = current.Clone();
-            converged.Status = FileProcessingStatus.DeleteSucceeded;
-            converged.DeleteSucceededAt = deleteSucceededAtUtc;
-            converged.ProcessingStartTime = null;
-            converged.AvailableForProcessingAt = null;
-
-            try
+            if (!await _projectionCleanupStore.TryConvergeMissingFileToDeleteSucceededAsync(
+                    metadata.TenantId,
+                    metadata.FileKey,
+                    metadata.PhysicalPath,
+                    deleteSucceededAtUtc,
+                    ct).ConfigureAwait(false))
             {
-                if (ActiveQuotaMetadata.CountsTowardActiveQuota(current))
-                {
-                    await ApplyDeleteSucceededDirectoryProjectionAsync(current.TenantId, normalizedDirectoryPath, ct).ConfigureAwait(false);
-                    directoryQuotaDecremented = true;
-
-                    await ApplyDeleteSucceededTenantProjectionAsync(current.TenantId, ct).ConfigureAwait(false);
-                    tenantQuotaDecremented = true;
-                }
-
-                await _projectionStore.UpsertProjectedFileAsync(converged, ct).ConfigureAwait(false);
-            }
-            catch
-            {
-                await RollbackProjectionCleanupAsync(
-                    current,
-                    normalizedDirectoryPath,
-                    restoreMetadata: false,
-                    tenantQuotaDecremented,
-                    directoryQuotaDecremented).ConfigureAwait(false);
-                throw;
+                return false;
             }
 
             _logger.LogWarning(

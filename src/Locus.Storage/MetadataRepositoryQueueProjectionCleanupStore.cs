@@ -123,6 +123,22 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
+        public Task<bool> TryConvergeMissingFileToDeleteSucceededAsync(
+            string tenantId,
+            string fileKey,
+            string expectedPhysicalPath,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct = default)
+        {
+            return _repository.TryConvergeMissingFileToDeleteSucceededAsync(
+                tenantId,
+                fileKey,
+                expectedPhysicalPath,
+                deleteSucceededAtUtc,
+                ct);
+        }
+
+        /// <inheritdoc/>
         public Task<bool> TryMarkPermanentlyFailedDeadLetteredAsync(
             string tenantId,
             string fileKey,

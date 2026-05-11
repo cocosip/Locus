@@ -1577,6 +1577,68 @@ WHERE tenant_id = @tenant_id
         }
 
         /// <summary>
+        /// Converges a projected row to DeleteSucceeded after physical deletion was confirmed.
+        /// Returns false when the row was removed or changed concurrently.
+        /// </summary>
+        internal async Task<bool> TryConvergeMissingFileToDeleteSucceededAsync(
+            string tenantId,
+            string fileKey,
+            string expectedPhysicalPath,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
+
+            if (string.IsNullOrWhiteSpace(fileKey))
+                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+            if (string.IsNullOrWhiteSpace(expectedPhysicalPath))
+                throw new ArgumentException("Physical path cannot be empty", nameof(expectedPhysicalPath));
+
+            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var cache = GetCache(tenantId);
+                if (!cache.TryGetValue(fileKey, out var current))
+                    return TryConvergeMissingFileToDeleteSucceededInDatabase(
+                        tenantId,
+                        fileKey,
+                        expectedPhysicalPath,
+                        deleteSucceededAtUtc);
+
+                if (!CanConvergeMissingFileToDeleteSucceeded(current, expectedPhysicalPath))
+                    return false;
+
+                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                    return true;
+
+                var updated = current.Clone();
+                updated.Status = FileProcessingStatus.DeleteSucceeded;
+                updated.DeleteSucceededAt = deleteSucceededAtUtc;
+                updated.ProcessingStartTime = null;
+                updated.AvailableForProcessingAt = null;
+
+                if (!cache.TryUpdate(fileKey, updated, current))
+                    return false;
+
+                IndexStatusCandidate(current, updated);
+
+                lock (GetDatabaseLock(tenantId))
+                {
+                    UpsertFile(GetDatabase(tenantId), updated);
+                }
+
+                return true;
+            }
+            finally
+            {
+                tenantLock.Release();
+            }
+        }
+
+        /// <summary>
         /// Marks a PermanentlyFailed file as DeadLettered if it still matches the expected failure timestamp.
         /// Returns false when the record was removed or changed concurrently.
         /// </summary>
@@ -1821,6 +1883,46 @@ WHERE tenant_id = @tenant_id
                 UpsertFile(GetDatabase(tenantId), current);
                 return true;
             }
+        }
+
+        private bool TryConvergeMissingFileToDeleteSucceededInDatabase(
+            string tenantId,
+            string fileKey,
+            string expectedPhysicalPath,
+            DateTime deleteSucceededAtUtc)
+        {
+            lock (GetDatabaseLock(tenantId))
+            {
+                var current = TryGetColdRowFromDatabaseCore(tenantId, fileKey);
+                if (!CanConvergeMissingFileToDeleteSucceeded(current, expectedPhysicalPath))
+                    return false;
+
+                if (current!.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                    return true;
+
+                current.Status = FileProcessingStatus.DeleteSucceeded;
+                current.DeleteSucceededAt = deleteSucceededAtUtc;
+                current.ProcessingStartTime = null;
+                current.AvailableForProcessingAt = null;
+                UpsertFile(GetDatabase(tenantId), current);
+                return true;
+            }
+        }
+
+        private static bool CanConvergeMissingFileToDeleteSucceeded(
+            FileMetadata? current,
+            string expectedPhysicalPath)
+        {
+            if (current == null)
+                return false;
+
+            if (!string.Equals(current.PhysicalPath, expectedPhysicalPath, StringComparison.Ordinal))
+                return false;
+
+            return current.Status == FileProcessingStatus.Completed
+                || current.Status == FileProcessingStatus.DeleteRequested
+                || current.Status == FileProcessingStatus.PermanentlyFailed
+                || current.Status == FileProcessingStatus.DeleteSucceeded;
         }
 
         private bool TryMarkPermanentlyFailedDeadLetteredInDatabase(

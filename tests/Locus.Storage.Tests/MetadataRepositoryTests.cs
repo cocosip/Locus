@@ -1291,6 +1291,75 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task TryConvergeMissingFileToDeleteSucceededAsync_UpdatesMatchingProjectedRow()
+        {
+            var physicalPath = Path.Combine(_metadataDir, "missing-converge.dat");
+            var metadata = CreateMetadata("missing-converge", FileProcessingStatus.Completed);
+            metadata.PhysicalPath = physicalPath;
+            metadata.CompletedAt = DateTime.UtcNow.AddMinutes(-5);
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var deleteSucceededAt = DateTime.UtcNow;
+
+            var converged = await InvokeTryConvergeMissingFileToDeleteSucceededAsync(
+                _repository,
+                _tenantId,
+                "missing-converge",
+                physicalPath,
+                deleteSucceededAt);
+
+            var reloaded = await _repository.GetAsync(_tenantId, "missing-converge", CancellationToken.None);
+            Assert.True(converged);
+            Assert.NotNull(reloaded);
+            Assert.Equal(FileProcessingStatus.DeleteSucceeded, reloaded!.Status);
+            Assert.Equal(deleteSucceededAt, reloaded.DeleteSucceededAt);
+        }
+
+        [Fact]
+        public async Task TryConvergeMissingFileToDeleteSucceededAsync_ReturnsFalseWhenPhysicalPathChanged()
+        {
+            var originalPath = Path.Combine(_metadataDir, "missing-original.dat");
+            var metadata = CreateMetadata("missing-path-changed", FileProcessingStatus.Completed);
+            metadata.PhysicalPath = Path.Combine(_metadataDir, "missing-new.dat");
+            metadata.CompletedAt = DateTime.UtcNow.AddMinutes(-5);
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var converged = await InvokeTryConvergeMissingFileToDeleteSucceededAsync(
+                _repository,
+                _tenantId,
+                "missing-path-changed",
+                originalPath,
+                DateTime.UtcNow);
+
+            var reloaded = await _repository.GetAsync(_tenantId, "missing-path-changed", CancellationToken.None);
+            Assert.False(converged);
+            Assert.NotNull(reloaded);
+            Assert.Equal(FileProcessingStatus.Completed, reloaded!.Status);
+        }
+
+        [Fact]
+        public async Task TryConvergeMissingFileToDeleteSucceededAsync_ReturnsFalseWhenRowWasRemoved()
+        {
+            var physicalPath = Path.Combine(_metadataDir, "missing-removed.dat");
+            var metadata = CreateMetadata("missing-removed", FileProcessingStatus.Completed);
+            metadata.PhysicalPath = physicalPath;
+            metadata.CompletedAt = DateTime.UtcNow.AddMinutes(-5);
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            await new MetadataRepositoryQueueProjectionStore(_repository)
+                .RemoveProjectedFileAsync(_tenantId, "missing-removed", CancellationToken.None);
+
+            var converged = await InvokeTryConvergeMissingFileToDeleteSucceededAsync(
+                _repository,
+                _tenantId,
+                "missing-removed",
+                physicalPath,
+                DateTime.UtcNow);
+
+            Assert.False(converged);
+            Assert.Null(await _repository.GetAsync(_tenantId, "missing-removed", CancellationToken.None));
+        }
+
+        [Fact]
         public async Task AddOrUpdateAsync_TransitionToColdStatus_RemovesFromHotCache()
         {
             var tenantId = "tenant-cold-transition";
@@ -1444,6 +1513,23 @@ namespace Locus.Storage.Tests
             Assert.NotNull(method);
 
             return (Task)method!.Invoke(repository, new object[] { metadata, CancellationToken.None })!;
+        }
+
+        private static Task<bool> InvokeTryConvergeMissingFileToDeleteSucceededAsync(
+            MetadataRepository repository,
+            string tenantId,
+            string fileKey,
+            string expectedPhysicalPath,
+            DateTime deleteSucceededAtUtc)
+        {
+            var method = typeof(MetadataRepository).GetMethod(
+                "TryConvergeMissingFileToDeleteSucceededAsync",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            return (Task<bool>)method!.Invoke(
+                repository,
+                new object[] { tenantId, fileKey, expectedPhysicalPath, deleteSucceededAtUtc, CancellationToken.None })!;
         }
 
         private static object BeginProjectionBatch(MetadataRepository repository, string tenantId)

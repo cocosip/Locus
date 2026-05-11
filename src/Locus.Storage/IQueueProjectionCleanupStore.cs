@@ -92,6 +92,17 @@ namespace Locus.Storage
             CancellationToken ct = default);
 
         /// <summary>
+        /// Marks a projected missing file as DeleteSucceeded if the row still exists and still
+        /// references the expected physical path. Returns false when the row changed concurrently.
+        /// </summary>
+        Task<bool> TryConvergeMissingFileToDeleteSucceededAsync(
+            string tenantId,
+            string fileKey,
+            string expectedPhysicalPath,
+            DateTime deleteSucceededAtUtc,
+            CancellationToken ct = default);
+
+        /// <summary>
         /// Marks a projected permanently-failed file as DeadLettered if it still matches the expected failure timestamp.
         /// </summary>
         Task<bool> TryMarkPermanentlyFailedDeadLetteredAsync(
