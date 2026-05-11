@@ -1247,6 +1247,104 @@ namespace Locus.Storage.Tests
             await WaitForTenantWriterHasUnflushedDataAsync(journal, tenantId, CancellationToken.None);
         }
 
+        [Fact]
+        public async Task LoadJournalStateForLockedOperation_WhenStateFileChangedWithoutScan_PreservesPersistedTailOffset()
+        {
+            var tenantId = "tenant-reload-state-no-scan";
+            var queueDirectory = Path.Combine(_queueDirectory, "reload-state-no-scan");
+            using var writer = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.Zero,
+                });
+
+            using var reader = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    StateFlushDebounce = TimeSpan.Zero,
+                });
+
+            await writer.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            var initialState = InvokeLoadJournalStateForLockedOperation(
+                reader,
+                tenantId,
+                allowJournalScanCatchUp: false);
+            Assert.True(GetJournalStateTailOffset(initialState) > 0);
+
+            await writer.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            var reloadedState = InvokeLoadJournalStateForLockedOperation(
+                reader,
+                tenantId,
+                allowJournalScanCatchUp: false);
+
+            Assert.True(GetJournalStateTailOffset(reloadedState) > GetJournalStateTailOffset(initialState));
+            Assert.Equal(2L, GetJournalStateLastSequenceNumber(reloadedState));
+        }
+
+        [Fact]
+        public async Task AppendAsync_WithAsyncAckMode_AdvancesCachedTailAcrossBackgroundBatches()
+        {
+            var tenantId = "tenant-async-cached-tail";
+            var queueDirectory = Path.Combine(_queueDirectory, "async-cached-tail");
+            using var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = false,
+                    StateFlushDebounce = TimeSpan.FromMinutes(5),
+                    Linger = TimeSpan.Zero,
+                    MaxBatchRecords = 1,
+                });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await WaitForJournalRecordAsync(journal, tenantId, expectedCount: 1, CancellationToken.None);
+            var firstTailOffset = await journal.GetTailOffsetAsync(tenantId, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+
+            await WaitForJournalRecordAsync(journal, tenantId, expectedCount: 2, CancellationToken.None);
+            var secondTailOffset = await journal.GetTailOffsetAsync(tenantId, CancellationToken.None);
+
+            Assert.True(secondTailOffset > firstTailOffset);
+        }
+
         public void Dispose()
         {
             try
@@ -1355,6 +1453,28 @@ namespace Locus.Storage.Tests
                 BindingFlags.Instance | BindingFlags.NonPublic)!;
 
             return (Task)method.Invoke(journal, Array.Empty<object>())!;
+        }
+
+        private static object InvokeLoadJournalStateForLockedOperation(
+            FileQueueEventJournal journal,
+            string tenantId,
+            bool allowJournalScanCatchUp)
+        {
+            var method = typeof(FileQueueEventJournal).GetMethod(
+                "LoadJournalStateForLockedOperation",
+                BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+            return method.Invoke(journal, new object[] { tenantId, allowJournalScanCatchUp })!;
+        }
+
+        private static long GetJournalStateTailOffset(object state)
+        {
+            return (long)state.GetType().GetProperty("TailOffset")!.GetValue(state)!;
+        }
+
+        private static long GetJournalStateLastSequenceNumber(object state)
+        {
+            return (long)state.GetType().GetProperty("LastSequenceNumber")!.GetValue(state)!;
         }
 
         private static async Task WaitForJournalFileAsync(

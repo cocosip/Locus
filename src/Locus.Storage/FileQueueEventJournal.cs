@@ -36,6 +36,7 @@ namespace Locus.Storage
         private readonly string _queueDirectory;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _appendLocks;
         private readonly ConcurrentDictionary<string, JournalState> _stateCache;
+        private readonly ConcurrentDictionary<string, JournalStateFileStamp> _stateFileStamps;
         private readonly ConcurrentDictionary<string, byte> _dirtyStateTenants;
         private readonly ConcurrentDictionary<string, TenantWriterState> _tenantWriters;
         private readonly Timer? _stateFlushTimer;
@@ -97,6 +98,7 @@ namespace Locus.Storage
             _queueDirectory = options.QueueDirectory;
             _appendLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
             _stateCache = new ConcurrentDictionary<string, JournalState>(StringComparer.Ordinal);
+            _stateFileStamps = new ConcurrentDictionary<string, JournalStateFileStamp>(StringComparer.Ordinal);
             _dirtyStateTenants = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             _tenantWriters = new ConcurrentDictionary<string, TenantWriterState>(StringComparer.Ordinal);
             _stateFlushDebounce = options.StateFlushDebounce;
@@ -234,7 +236,7 @@ namespace Locus.Storage
                 {
                     await FlushAppendStreamWithoutTakingLockAsync(tenantId, ct).ConfigureAwait(false);
 
-                    var state = ReloadJournalStateFromDisk(tenantId);
+                    var state = LoadJournalStateForLockedOperation(tenantId, allowJournalScanCatchUp: false);
                     path = GetJournalPath(tenantId);
                     if (!_fileSystem.File.Exists(path))
                         return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), state.BaseOffset, true);
@@ -315,7 +317,7 @@ namespace Locus.Storage
                 {
                     CloseTenantAppendStream(tenantId);
 
-                    var state = ReloadJournalStateFromDisk(tenantId);
+                    var state = LoadJournalStateForLockedOperation(tenantId, allowJournalScanCatchUp: false);
                     await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                     var path = GetJournalPath(tenantId);
                     if (!_fileSystem.File.Exists(path))
@@ -373,7 +375,7 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
             using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
             {
-                var state = ReloadJournalStateFromDisk(tenantId);
+                var state = LoadJournalStateForLockedOperation(tenantId, allowJournalScanCatchUp: false);
                 return state.TailOffset;
             }
         }
@@ -389,7 +391,7 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
             using (await AcquireTenantJournalLockAsync(tenantId, ct).ConfigureAwait(false))
             {
-                var state = ReloadJournalStateFromDisk(tenantId);
+                var state = LoadJournalStateForLockedOperation(tenantId, allowJournalScanCatchUp: false);
                 return state.BaseOffset;
             }
         }
@@ -614,7 +616,7 @@ namespace Locus.Storage
                     if (_ackMode == QueueEventJournalAckMode.Durable)
                         CloseTenantAppendStream(writer);
 
-                    var state = ReloadJournalStateFromDisk(writer.TenantId);
+                    var state = LoadJournalStateForLockedOperation(writer.TenantId, allowJournalScanCatchUp: true);
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
@@ -685,7 +687,7 @@ namespace Locus.Storage
                 using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
                 {
                     CloseTenantAppendStream(writer);
-                    var state = ReloadJournalStateFromDisk(writer.TenantId);
+                    var state = LoadJournalStateForLockedOperation(writer.TenantId, allowJournalScanCatchUp: true);
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     var serializedRecord = SerializeSingleRecord(state, record);
@@ -718,7 +720,7 @@ namespace Locus.Storage
                 using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
                 {
                     CloseTenantAppendStream(writer);
-                    var state = ReloadJournalStateFromDisk(writer.TenantId);
+                    var state = LoadJournalStateForLockedOperation(writer.TenantId, allowJournalScanCatchUp: true);
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     if (records.Count == 1)
@@ -1261,14 +1263,42 @@ namespace Locus.Storage
             return _stateCache.GetOrAdd(tenantId, LoadJournalStateFromDisk);
         }
 
-        private JournalState ReloadJournalStateFromDisk(string tenantId)
+        private JournalState LoadJournalStateForLockedOperation(string tenantId, bool allowJournalScanCatchUp)
         {
-            var state = LoadJournalStateFromDisk(tenantId);
+            var state = LoadJournalState(tenantId);
+            if (!HasJournalStateFileChangedSinceCached(tenantId))
+            {
+                if (allowJournalScanCatchUp)
+                {
+                    var path = GetJournalPath(tenantId);
+                    if (_fileSystem.File.Exists(path))
+                    {
+                        var expectedLength = Math.Max(0, state.TailOffset - state.BaseOffset);
+                        var fileLength = _fileSystem.FileInfo.New(path).Length;
+                        if (fileLength > expectedLength)
+                            return ReloadJournalStateFromDisk(tenantId, scanJournal: true);
+                    }
+                }
+
+                return state;
+            }
+
+            return ReloadJournalStateFromDisk(tenantId, scanJournal: false);
+        }
+
+        private JournalState ReloadJournalStateFromDisk(string tenantId, bool scanJournal)
+        {
+            var state = LoadJournalStateFromDisk(tenantId, scanJournal);
             _stateCache[tenantId] = state;
             return state;
         }
 
         private JournalState LoadJournalStateFromDisk(string tenantId)
+        {
+            return LoadJournalStateFromDisk(tenantId, scanJournal: true);
+        }
+
+        private JournalState LoadJournalStateFromDisk(string tenantId, bool scanJournal)
         {
             var path = GetJournalStatePath(tenantId);
             var needsRepair = false;
@@ -1286,7 +1316,8 @@ namespace Locus.Storage
                         var state = JsonSerializer.Deserialize<JournalState>(stream, JsonOptions);
                         if (state != null)
                         {
-                            NormalizeJournalState(tenantId, state);
+                            NormalizeJournalState(tenantId, state, scanJournal);
+                            CacheJournalStateFileStamp(tenantId);
                             return state;
                         }
                     }
@@ -1301,7 +1332,8 @@ namespace Locus.Storage
             }
 
             var fallback = new JournalState();
-            NormalizeJournalState(tenantId, fallback);
+            NormalizeJournalState(tenantId, fallback, scanJournal);
+            CacheJournalStateFileStamp(tenantId);
 
             if (needsRepair)
             {
@@ -1337,6 +1369,7 @@ namespace Locus.Storage
 
                 ReplaceFileAtomically(tempPath, path);
                 _stateCache[tenantId] = state;
+                CacheJournalStateFileStamp(tenantId);
                 _dirtyStateTenants.TryRemove(tenantId, out _);
             }
             finally
@@ -1478,7 +1511,36 @@ namespace Locus.Storage
             return exception is IOException || exception is UnauthorizedAccessException;
         }
 
+        private bool HasJournalStateFileChangedSinceCached(string tenantId)
+        {
+            var currentStamp = GetJournalStateFileStamp(tenantId);
+            if (!_stateFileStamps.TryGetValue(tenantId, out var cachedStamp))
+                return currentStamp.Exists;
+
+            return !cachedStamp.Equals(currentStamp);
+        }
+
+        private void CacheJournalStateFileStamp(string tenantId)
+        {
+            _stateFileStamps[tenantId] = GetJournalStateFileStamp(tenantId);
+        }
+
+        private JournalStateFileStamp GetJournalStateFileStamp(string tenantId)
+        {
+            var path = GetJournalStatePath(tenantId);
+            if (!_fileSystem.File.Exists(path))
+                return JournalStateFileStamp.Missing;
+
+            var info = _fileSystem.FileInfo.New(path);
+            return new JournalStateFileStamp(exists: true, info.Length, info.LastWriteTimeUtc);
+        }
+
         private void NormalizeJournalState(string tenantId, JournalState state)
+        {
+            NormalizeJournalState(tenantId, state, scanJournal: true);
+        }
+
+        private void NormalizeJournalState(string tenantId, JournalState state, bool scanJournal)
         {
             if (state.BaseOffset < 0)
                 state.BaseOffset = 0;
@@ -1495,7 +1557,7 @@ namespace Locus.Storage
             if (state.TailOffset < state.BaseOffset)
                 state.TailOffset = state.BaseOffset;
 
-            if (fileLength > 0)
+            if (scanJournal && fileLength > 0)
             {
                 try
                 {
@@ -1522,10 +1584,6 @@ namespace Locus.Storage
                     _logger.LogWarning(ex, "Failed to scan queue journal state for tenant {TenantId}", tenantId);
                     state.TailOffset = Math.Max(state.TailOffset, state.BaseOffset + fileLength);
                 }
-            }
-            else
-            {
-                state.TailOffset = state.BaseOffset;
             }
         }
 
@@ -1652,6 +1710,48 @@ namespace Locus.Storage
             public void Dispose()
             {
                 _stream.Dispose();
+            }
+        }
+
+        private sealed class JournalStateFileStamp : IEquatable<JournalStateFileStamp>
+        {
+            public static readonly JournalStateFileStamp Missing = new JournalStateFileStamp(exists: false, 0, DateTime.MinValue);
+
+            public JournalStateFileStamp(bool exists, long length, DateTime lastWriteTimeUtc)
+            {
+                Exists = exists;
+                Length = length;
+                LastWriteTimeUtc = lastWriteTimeUtc;
+            }
+
+            public bool Exists { get; }
+
+            public long Length { get; }
+
+            public DateTime LastWriteTimeUtc { get; }
+
+            public bool Equals(JournalStateFileStamp? other)
+            {
+                return other != null
+                    && Exists == other.Exists
+                    && Length == other.Length
+                    && LastWriteTimeUtc == other.LastWriteTimeUtc;
+            }
+
+            public override bool Equals(object? obj)
+            {
+                return Equals(obj as JournalStateFileStamp);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    var hash = Exists ? 17 : 23;
+                    hash = (hash * 31) + Length.GetHashCode();
+                    hash = (hash * 31) + LastWriteTimeUtc.GetHashCode();
+                    return hash;
+                }
             }
         }
 
