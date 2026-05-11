@@ -227,54 +227,63 @@ namespace Locus.Storage
             if (!_fileSystem.File.Exists(path))
                 return new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), state.BaseOffset, true);
 
-            var effectiveOffset = offset < state.BaseOffset ? state.BaseOffset : offset;
-            var nextRelativeOffset = effectiveOffset - state.BaseOffset;
-            await RepairCorruptTailIfNeededAsync(tenantId, state, ct).ConfigureAwait(false);
-
-            using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            var appendLock = _appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            await appendLock.WaitAsync(ct).ConfigureAwait(false);
+            try
             {
-                if (nextRelativeOffset > stream.Length)
-                    nextRelativeOffset = stream.Length;
+                var effectiveOffset = offset < state.BaseOffset ? state.BaseOffset : offset;
+                var nextRelativeOffset = effectiveOffset - state.BaseOffset;
+                await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
 
-                var codec = GetCodec(tenantId);
-                var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
-                if (result.EncounteredCorruptTail)
+                using (var stream = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
-                    QueueJournalMetrics.RecordCorruptTailDetected();
+                    if (nextRelativeOffset > stream.Length)
+                        nextRelativeOffset = stream.Length;
 
-                    var normalizedRelativeOffset = codec.NormalizeReadOffset(stream, nextRelativeOffset);
-                    if (normalizedRelativeOffset < nextRelativeOffset)
+                    var codec = GetCodec(tenantId);
+                    var result = await codec.ReadBatchAsync(stream, nextRelativeOffset, maxRecords, ct).ConfigureAwait(false);
+                    if (result.EncounteredCorruptTail)
                     {
-                        var recoveredResult = await codec.ReadBatchAsync(stream, normalizedRelativeOffset, maxRecords, ct).ConfigureAwait(false);
-                        if (!recoveredResult.EncounteredCorruptTail)
-                        {
-                            _logger.LogDebug(
-                                MisalignedReadOffsetRecoveredEventId,
-                                "Recovered queue journal read offset for tenant {TenantId} from {RequestedOffset} to {RecoveredOffset} while reading {Format}.",
-                                tenantId,
-                                state.BaseOffset + nextRelativeOffset,
-                                state.BaseOffset + normalizedRelativeOffset,
-                                codec.Format);
+                        QueueJournalMetrics.RecordCorruptTailDetected();
 
-                            return new QueueEventReadBatch(
-                                recoveredResult.Records,
-                                state.BaseOffset + recoveredResult.NextOffset,
-                                recoveredResult.ReachedEndOfFile);
+                        var normalizedRelativeOffset = codec.NormalizeReadOffset(stream, nextRelativeOffset);
+                        if (normalizedRelativeOffset < nextRelativeOffset)
+                        {
+                            var recoveredResult = await codec.ReadBatchAsync(stream, normalizedRelativeOffset, maxRecords, ct).ConfigureAwait(false);
+                            if (!recoveredResult.EncounteredCorruptTail)
+                            {
+                                _logger.LogDebug(
+                                    MisalignedReadOffsetRecoveredEventId,
+                                    "Recovered queue journal read offset for tenant {TenantId} from {RequestedOffset} to {RecoveredOffset} while reading {Format}.",
+                                    tenantId,
+                                    state.BaseOffset + nextRelativeOffset,
+                                    state.BaseOffset + normalizedRelativeOffset,
+                                    codec.Format);
+
+                                return new QueueEventReadBatch(
+                                    recoveredResult.Records,
+                                    state.BaseOffset + recoveredResult.NextOffset,
+                                    recoveredResult.ReachedEndOfFile);
+                            }
                         }
+
+                        _logger.LogWarning(
+                            CorruptTailReadEventId,
+                            "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
+                            tenantId,
+                            state.BaseOffset + result.NextOffset,
+                            codec.Format);
                     }
 
-                    _logger.LogWarning(
-                        CorruptTailReadEventId,
-                        "Queue journal corrupt tail detected for tenant {TenantId} at offset {Offset} while reading {Format}.",
-                        tenantId,
+                    return new QueueEventReadBatch(
+                        result.Records,
                         state.BaseOffset + result.NextOffset,
-                        codec.Format);
+                        result.ReachedEndOfFile);
                 }
-
-                return new QueueEventReadBatch(
-                    result.Records,
-                    state.BaseOffset + result.NextOffset,
-                    result.ReachedEndOfFile);
+            }
+            finally
+            {
+                appendLock.Release();
             }
         }
 

@@ -976,6 +976,47 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReadBatchAsync_WaitsForTenantAppendLockBeforeReadingJournal()
+        {
+            var tenantId = "tenant-read-waits-for-append";
+            var queueDirectory = Path.Combine(_queueDirectory, "read-waits-for-append");
+            using var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Async,
+                    EnableProjection = true,
+                    StateFlushDebounce = TimeSpan.Zero,
+                });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted,
+            }, CancellationToken.None);
+            await WaitForJournalRecordAsync(journal, tenantId, expectedCount: 1, CancellationToken.None);
+
+            var appendLock = GetAppendLock(journal, tenantId);
+            await appendLock.WaitAsync();
+
+            var readTask = journal.ReadBatchAsync(tenantId, 0, 10, CancellationToken.None);
+            var delayTask = Task.Delay(100);
+            var completed = await Task.WhenAny(readTask, delayTask);
+
+            Assert.Same(delayTask, completed);
+
+            appendLock.Release();
+            var batch = await readTask;
+
+            Assert.Single(batch.Records);
+            Assert.Equal("file-001", batch.Records[0].FileKey);
+        }
+
+        [Fact]
         public async Task AppendAsync_WithAsyncAckModeAndImmediateStateFlush_DoesNotLoseWrittenRecord()
         {
             var tenantId = "tenant-async-immediate-state";
@@ -1060,9 +1101,7 @@ namespace Locus.Storage.Tests
             string tenantId,
             object staleState)
         {
-            var lockField = typeof(FileQueueEventJournal).GetField("_appendLocks", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            var appendLocks = (System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim>)lockField.GetValue(journal)!;
-            var appendLock = appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+            var appendLock = GetAppendLock(journal, tenantId);
 
             var method = typeof(FileQueueEventJournal).GetMethod(
                 "RepairCorruptTailCoreAsync",
@@ -1071,6 +1110,13 @@ namespace Locus.Storage.Tests
             return (Task)method.Invoke(
                 journal,
                 new[] { tenantId, staleState, appendLock, CancellationToken.None, false })!;
+        }
+
+        private static SemaphoreSlim GetAppendLock(FileQueueEventJournal journal, string tenantId)
+        {
+            var lockField = typeof(FileQueueEventJournal).GetField("_appendLocks", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var appendLocks = (System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim>)lockField.GetValue(journal)!;
+            return appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
         }
 
         private static Task InvokeFlushDirtyJournalStatesAsync(FileQueueEventJournal journal)

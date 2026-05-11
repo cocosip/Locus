@@ -2363,6 +2363,8 @@ namespace Locus.Storage.Tests
             Assert.NotNull(reloaded);
             Assert.Equal(FileProcessingStatus.DeleteSucceeded, reloaded!.Status);
             Assert.NotNull(reloaded.DeleteSucceededAt);
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/done", CancellationToken.None)).CurrentCount);
 
             var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
             Assert.Equal(1, stats.CompletedRecordsRemoved);
@@ -2466,6 +2468,8 @@ namespace Locus.Storage.Tests
                 allowLegacyNonJournalMode: true);
             cleanupService.RegisterVolume(_volume.Object);
 
+            await SeedProjectedCountsAsync("tenant-001", "/failed");
+
             await cleanupService.CleanupPermanentlyFailedFilesAsync(TimeSpan.FromDays(7), CancellationToken.None);
 
             Assert.False(_fileSystem.File.Exists(physicalPath));
@@ -2474,6 +2478,8 @@ namespace Locus.Storage.Tests
             Assert.NotNull(reloaded);
             Assert.Equal(FileProcessingStatus.DeleteSucceeded, reloaded!.Status);
             Assert.NotNull(reloaded.DeleteSucceededAt);
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001", CancellationToken.None));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/failed", CancellationToken.None)).CurrentCount);
 
             var stats = await cleanupService.GetCleanupStatisticsAsync(CancellationToken.None);
             Assert.Equal(1, stats.PermanentlyFailedFilesRemoved);

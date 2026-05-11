@@ -1808,13 +1808,39 @@ namespace Locus.Storage
             if (TryConfirmPhysicalFileExists(current.PhysicalPath, out var physicalFileExists) && physicalFileExists)
                 return false;
 
+            var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(current.DirectoryPath);
+            var tenantQuotaDecremented = false;
+            var directoryQuotaDecremented = false;
+
             var converged = current.Clone();
             converged.Status = FileProcessingStatus.DeleteSucceeded;
             converged.DeleteSucceededAt = deleteSucceededAtUtc;
             converged.ProcessingStartTime = null;
             converged.AvailableForProcessingAt = null;
 
-            await _projectionStore.UpsertProjectedFileAsync(converged, ct).ConfigureAwait(false);
+            try
+            {
+                if (ActiveQuotaMetadata.CountsTowardActiveQuota(current))
+                {
+                    await ApplyDeleteSucceededDirectoryProjectionAsync(current.TenantId, normalizedDirectoryPath, ct).ConfigureAwait(false);
+                    directoryQuotaDecremented = true;
+
+                    await ApplyDeleteSucceededTenantProjectionAsync(current.TenantId, ct).ConfigureAwait(false);
+                    tenantQuotaDecremented = true;
+                }
+
+                await _projectionStore.UpsertProjectedFileAsync(converged, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                await RollbackProjectionCleanupAsync(
+                    current,
+                    normalizedDirectoryPath,
+                    restoreMetadata: false,
+                    tenantQuotaDecremented,
+                    directoryQuotaDecremented).ConfigureAwait(false);
+                throw;
+            }
 
             _logger.LogWarning(
                 "Converged metadata to DeleteSucceeded after physical deletion was confirmed but conditional cleanup projection was rejected. Tenant={TenantId}, FileKey={FileKey}, Path={PhysicalPath}",
