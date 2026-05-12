@@ -69,6 +69,8 @@ namespace Locus.Storage
                 var recoveredCount = 0;
                 foreach (var metadata in batch)
                 {
+                    ct.ThrowIfCancellationRequested();
+
                     if (!metadata.ProcessingStartTime.HasValue)
                         continue;
 
@@ -78,7 +80,7 @@ namespace Locus.Storage
                         {
                             await _queueEventJournal.AppendAsync(
                                 CreateProcessingTimedOutEvent(metadata, nowUtc),
-                                default).ConfigureAwait(false);
+                                ct).ConfigureAwait(false);
                         }
 
                         var reset = await _projectionCleanupStore.TryResetTimedOutFileAsync(
@@ -96,6 +98,10 @@ namespace Locus.Storage
                         }
 
                         recoveredCount++;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception ex)
                     {
