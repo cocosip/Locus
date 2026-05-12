@@ -430,6 +430,9 @@ namespace Locus.Storage.Tests
             Assert.NotNull(rebuilt);
             Assert.Equal(FileProcessingStatus.Completed, rebuilt!.Status);
             Assert.NotNull(rebuilt.CompletedAt);
+            Assert.NotNull(rebuilt.Metadata);
+            Assert.True(rebuilt.Metadata!.TryGetValue("queue.released_lease_start_utc", out var releasedLeaseStart));
+            Assert.Equal(processingStartTime, DateTime.Parse(releasedLeaseStart!, null, System.Globalization.DateTimeStyles.RoundtripKind));
             Assert.Equal(1, tenantCount);
             Assert.Equal(1, directoryCount);
         }

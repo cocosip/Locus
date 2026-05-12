@@ -351,6 +351,7 @@ namespace Locus.Storage
                         current.AvailableForProcessingAt = null;
                         current.LastError = null;
                         QueueProjectionMetadataState.ClearDeadLetterProjection(current);
+                        QueueProjectionMetadataState.MarkReleasedLease(current, lease.ProcessingStartTimeUtc);
                         return current;
                     },
                     ct).ConfigureAwait(false);

@@ -859,6 +859,19 @@ namespace Locus.Storage
                     ? await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false)
                     : null;
 
+                if (previousMetadata != null
+                    && QueueEventRecordFactory.IsCompletionCommittedStatus(previousMetadata.Status))
+                {
+                    if (IsSameLeaseAlreadyCompleted(previousMetadata, lease.ProcessingStartTimeUtc))
+                        return;
+
+                    throw new FileProcessingLeaseMismatchException(
+                        lease.FileKey,
+                        lease.ProcessingStartTimeUtc,
+                        null,
+                        previousMetadata.Status);
+                }
+
                 // Delegate to file scheduler
                 await _fileScheduler.MarkAsFailedAsync(lease, errorMessage, ct);
 
@@ -1145,6 +1158,19 @@ namespace Locus.Storage
             }
 
             return false;
+        }
+
+        private static bool IsSameLeaseAlreadyCompleted(FileMetadata metadata, DateTime processingStartTimeUtc)
+        {
+            if (metadata.ProcessingStartTime.HasValue)
+                return false;
+
+            if (!QueueEventRecordFactory.IsCompletionCommittedStatus(metadata.Status))
+                return false;
+
+            var releasedLeaseStart = QueueProjectionMetadataState.GetReleasedLeaseStartUtc(metadata);
+            return releasedLeaseStart.HasValue
+                && releasedLeaseStart.Value == processingStartTimeUtc;
         }
 
         private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId, CancellationToken ct)

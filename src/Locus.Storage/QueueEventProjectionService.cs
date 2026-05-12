@@ -656,7 +656,10 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = null;
             updated.LastError = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
-            QueueProjectionMetadataState.ClearReleasedLease(updated);
+            if (record.ProcessingStartTimeUtc.HasValue)
+                QueueProjectionMetadataState.MarkReleasedLease(updated, record.ProcessingStartTimeUtc.Value);
+            else
+                QueueProjectionMetadataState.ClearReleasedLease(updated);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }

@@ -863,6 +863,9 @@ namespace Locus.Storage.Tests
             Assert.Equal(FileProcessingStatus.Completed, metadata!.Status);
             Assert.Null(metadata.ProcessingStartTime);
             Assert.NotNull(metadata.CompletedAt);
+            Assert.NotNull(metadata.Metadata);
+            Assert.True(metadata.Metadata!.TryGetValue("queue.released_lease_start_utc", out var releasedLeaseStart));
+            Assert.Equal(processingStart, DateTime.Parse(releasedLeaseStart!, null, System.Globalization.DateTimeStyles.RoundtripKind));
         }
 
         [Fact]

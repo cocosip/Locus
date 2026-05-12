@@ -1456,6 +1456,96 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsFailedAsync_WhenSameLeaseWasAlreadyCompleted_ReturnsIdempotently()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("return after complete"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var processingStart = DateTime.UtcNow;
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == processingStart),
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetAsync("tenant-001", fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Completed;
+                    current.ProcessingStartTime = null;
+                    current.CompletedAt = DateTime.UtcNow;
+                    current.Metadata = new Dictionary<string, string>
+                    {
+                        ["queue.released_lease_start_utc"] = processingStart.ToString("O")
+                    };
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                });
+
+            _fileScheduler
+                .Setup(s => s.MarkAsFailedAsync(
+                    It.IsAny<FileProcessingLease>(),
+                    It.IsAny<string>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("failure should not run after completed release"));
+
+            var lease = CreateLease("tenant-001", fileKey, processingStart);
+
+            await _storagePool.MarkAsCompletedAsync(lease, CancellationToken.None);
+            await _storagePool.MarkAsFailedAsync(lease, "return to queue", CancellationToken.None);
+
+            _fileScheduler.Verify(
+                s => s.MarkAsFailedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+
+            var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadataAfterRelease);
+            Assert.Equal(FileProcessingStatus.Completed, metadataAfterRelease!.Status);
+            Assert.Null(metadataAfterRelease.ProcessingStartTime);
+            Assert.NotNull(metadataAfterRelease.CompletedAt);
+        }
+
+        [Fact]
+        public async Task MarkAsFailedAsync_WhenDifferentLeaseWasAlreadyCompleted_ThrowsLeaseMismatch()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("stale return after complete"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var completedProcessingStart = DateTime.UtcNow.AddMinutes(-1);
+            var staleProcessingStart = DateTime.UtcNow.AddMinutes(-2);
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Completed;
+            metadata.ProcessingStartTime = null;
+            metadata.CompletedAt = DateTime.UtcNow;
+            metadata.Metadata = new Dictionary<string, string>
+            {
+                ["queue.released_lease_start_utc"] = completedProcessingStart.ToString("O")
+            };
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var exception = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                _storagePool.MarkAsFailedAsync(
+                    CreateLease("tenant-001", fileKey, staleProcessingStart),
+                    "return to queue",
+                    CancellationToken.None));
+
+            Assert.Equal(fileKey, exception.FileKey);
+            Assert.Equal(staleProcessingStart, exception.ExpectedProcessingStartTimeUtc);
+            Assert.Equal(FileProcessingStatus.Completed, exception.ActualStatus);
+            _fileScheduler.Verify(
+                s => s.MarkAsFailedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_WhenFileIsPlainPending_ThrowsLeaseMismatch()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("plain pending"));
