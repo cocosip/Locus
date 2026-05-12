@@ -11,6 +11,7 @@ namespace Locus.Storage
     {
         private const string AcceptedProjectionAppliedKey = "queue.accepted_projection_applied";
         private const string DeadLetterProjectionAppliedKey = "queue.dead_letter_projection_applied";
+        private const string ReleasedLeaseStartUtcKey = "queue.released_lease_start_utc";
 
         public static bool IsAcceptedProjectionApplied(FileMetadata metadata)
         {
@@ -78,6 +79,50 @@ namespace Locus.Storage
 
             metadata.Metadata = new Dictionary<string, string>(metadata.Metadata, StringComparer.Ordinal);
             metadata.Metadata.Remove(DeadLetterProjectionAppliedKey);
+        }
+
+        public static void MarkReleasedLease(FileMetadata metadata, DateTime processingStartTimeUtc)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            GetWritableMetadata(metadata)[ReleasedLeaseStartUtcKey] = processingStartTimeUtc.ToString("O");
+        }
+
+        public static DateTime? GetReleasedLeaseStartUtc(FileMetadata metadata)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (metadata.Metadata == null
+                || !metadata.Metadata.TryGetValue(ReleasedLeaseStartUtcKey, out var value)
+                || string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            if (DateTime.TryParse(
+                value,
+                null,
+                System.Globalization.DateTimeStyles.RoundtripKind,
+                out var parsed))
+            {
+                return parsed;
+            }
+
+            return null;
+        }
+
+        public static void ClearReleasedLease(FileMetadata metadata)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (metadata.Metadata == null)
+                return;
+
+            metadata.Metadata = new Dictionary<string, string>(metadata.Metadata, StringComparer.Ordinal);
+            metadata.Metadata.Remove(ReleasedLeaseStartUtcKey);
         }
 
         private static IDictionary<string, string> GetWritableMetadata(FileMetadata metadata)

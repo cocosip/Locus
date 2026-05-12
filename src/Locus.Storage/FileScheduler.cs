@@ -396,7 +396,7 @@ namespace Locus.Storage
                         throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, current);
                     }
 
-                    var projected = BuildFailedMetadata(current, errorMessage);
+                    var projected = BuildFailedMetadata(current, errorMessage, lease.ProcessingStartTimeUtc);
                     await _queueEventJournal.AppendAsync(
                         QueueEventRecordFactory.CreateProcessingFailed(projected, errorMessage, lease.ProcessingStartTimeUtc),
                         ct).ConfigureAwait(false);
@@ -423,6 +423,7 @@ namespace Locus.Storage
                         current.DeleteSucceededAt = null;
                         current.DeadLetteredAt = null;
                         QueueProjectionMetadataState.ClearDeadLetterProjection(current);
+                        QueueProjectionMetadataState.MarkReleasedLease(current, lease.ProcessingStartTimeUtc);
 
                         if (current.RetryCount >= _retryPolicy.MaxRetryCount)
                         {
@@ -695,7 +696,10 @@ namespace Locus.Storage
             }
         }
 
-        private FileMetadata BuildFailedMetadata(FileMetadata current, string errorMessage)
+        private FileMetadata BuildFailedMetadata(
+            FileMetadata current,
+            string errorMessage,
+            DateTime processingStartTimeUtc)
         {
             var updated = current.Clone();
             updated.RetryCount++;
@@ -705,6 +709,7 @@ namespace Locus.Storage
             updated.DeleteSucceededAt = null;
             updated.DeadLetteredAt = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
+            QueueProjectionMetadataState.MarkReleasedLease(updated, processingStartTimeUtc);
 
             if (updated.RetryCount >= _retryPolicy.MaxRetryCount)
             {

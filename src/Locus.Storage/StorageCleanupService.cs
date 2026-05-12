@@ -1185,6 +1185,10 @@ namespace Locus.Storage
                                 removedCount++;
                                 continue;
                             }
+                            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                            {
+                                throw;
+                            }
                             catch (Exception ex)
                             {
                                 _logger.LogWarning(
@@ -1238,7 +1242,7 @@ namespace Locus.Storage
                             {
                                 await _queueEventJournal.AppendAsync(
                                     CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
-                                    default).ConfigureAwait(false);
+                                    ct).ConfigureAwait(false);
                             }
                             else
                             {
@@ -1249,7 +1253,7 @@ namespace Locus.Storage
                                         CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
                                         CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
                                     },
-                                    default).ConfigureAwait(false);
+                                    ct).ConfigureAwait(false);
                             }
 
                             var metadataTransitionApplied = await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
@@ -1269,6 +1273,10 @@ namespace Locus.Storage
                         {
                             await FinalizeCompletedWithoutJournalAsync(metadata, ct).ConfigureAwait(false);
                         }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception ex)
                     {
@@ -1393,6 +1401,10 @@ namespace Locus.Storage
                                 removedThisIteration++;
                                 continue;
                             }
+                            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                            {
+                                throw;
+                            }
                             catch (Exception ex)
                             {
                                 _logger.LogWarning(
@@ -1462,7 +1474,7 @@ namespace Locus.Storage
                                             CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
                                             CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
                                         },
-                                        default).ConfigureAwait(false);
+                                        ct).ConfigureAwait(false);
 
                                     metadataTransitionApplied = await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
                                         metadata.TenantId,
@@ -1563,7 +1575,7 @@ namespace Locus.Storage
 
                                     await _queueEventJournal.AppendAsync(
                                         CreateDeadLetteredEvent(metadata, deadLetterPhysicalPath, deadLetteredAtUtc),
-                                        default).ConfigureAwait(false);
+                                        ct).ConfigureAwait(false);
                                 }
                                 else
                                 {
@@ -1601,6 +1613,10 @@ namespace Locus.Storage
                             default:
                                 throw new InvalidOperationException($"Unsupported permanently failed disposition: {_permanentlyFailedDisposition}");
                         }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception ex)
                     {
@@ -1689,7 +1705,7 @@ namespace Locus.Storage
                         CreateDeleteRequestedEvent(metadata, deleteSucceededAtUtc.AddTicks(-1)),
                         CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
                     },
-                    default).ConfigureAwait(false);
+                    ct).ConfigureAwait(false);
 
                 var metadataTransitionApplied = await _projectionCleanupStore.TryMarkDeleteSucceededAsync(
                     metadata.TenantId,
@@ -1724,7 +1740,7 @@ namespace Locus.Storage
                         CreateDeleteRequestedEvent(metadata, deleteRequestedAtUtc),
                         CreateDeleteSucceededEvent(metadata, deleteSucceededAtUtc),
                     },
-                    default).ConfigureAwait(false);
+                    ct).ConfigureAwait(false);
 
                 var metadataTransitionApplied = await _projectionCleanupStore.TryMarkPermanentlyFailedDeleteSucceededAsync(
                     metadata.TenantId,

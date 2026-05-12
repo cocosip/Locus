@@ -569,6 +569,7 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = null;
             updated.LastError = record.ErrorMessage ?? updated.LastError;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
+            QueueProjectionMetadataState.ClearReleasedLease(updated);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -600,6 +601,8 @@ namespace Locus.Storage
                 ? record.AvailableForProcessingAtUtc
                 : null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
+            if (record.ProcessingStartTimeUtc.HasValue)
+                QueueProjectionMetadataState.MarkReleasedLease(updated, record.ProcessingStartTimeUtc.Value);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -625,6 +628,8 @@ namespace Locus.Storage
             updated.DeadLetteredAt = null;
             updated.AvailableForProcessingAt = record.AvailableForProcessingAtUtc ?? record.OccurredAtUtc;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
+            if (record.ProcessingStartTimeUtc.HasValue)
+                QueueProjectionMetadataState.MarkReleasedLease(updated, record.ProcessingStartTimeUtc.Value);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -651,6 +656,7 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = null;
             updated.LastError = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
+            QueueProjectionMetadataState.ClearReleasedLease(updated);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -682,6 +688,7 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = null;
             updated.LastError = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
+            QueueProjectionMetadataState.ClearReleasedLease(updated);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }

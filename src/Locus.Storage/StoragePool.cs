@@ -801,7 +801,7 @@ namespace Locus.Storage
                 if (QueueEventRecordFactory.IsCompletionCommittedStatus(metadata.Status))
                     return;
 
-                if (IsSameLeaseAlreadyReleased(metadata))
+                if (IsSameLeaseAlreadyReleased(metadata, lease.ProcessingStartTimeUtc))
                     return;
 
                 if (metadata.Status != FileProcessingStatus.Processing
@@ -1117,20 +1117,34 @@ namespace Locus.Storage
                 throw new ArgumentException("File key cannot be empty", nameof(lease));
         }
 
-        private static bool IsSameLeaseAlreadyReleased(FileMetadata metadata)
+        private static bool IsSameLeaseAlreadyReleased(FileMetadata metadata, DateTime processingStartTimeUtc)
         {
             if (metadata.ProcessingStartTime.HasValue)
                 return false;
 
             if (metadata.Status == FileProcessingStatus.Pending)
             {
-                return metadata.LastFailedAt.HasValue
+                if (!(metadata.LastFailedAt.HasValue
                     || metadata.AvailableForProcessingAt.HasValue
-                    || !string.IsNullOrEmpty(metadata.LastError);
+                    || !string.IsNullOrEmpty(metadata.LastError)))
+                {
+                    return false;
+                }
+
+                var releasedLeaseStart = QueueProjectionMetadataState.GetReleasedLeaseStartUtc(metadata);
+                return releasedLeaseStart.HasValue
+                    && releasedLeaseStart.Value == processingStartTimeUtc;
             }
 
-            return metadata.Status == FileProcessingStatus.PermanentlyFailed
-                || metadata.Status == FileProcessingStatus.DeadLettered;
+            if (metadata.Status == FileProcessingStatus.PermanentlyFailed
+                || metadata.Status == FileProcessingStatus.DeadLettered)
+            {
+                var releasedLeaseStart = QueueProjectionMetadataState.GetReleasedLeaseStartUtc(metadata);
+                return releasedLeaseStart.HasValue
+                    && releasedLeaseStart.Value == processingStartTimeUtc;
+            }
+
+            return false;
         }
 
         private async Task<bool> ApplyAcceptedTenantProjectionAsync(string tenantId, CancellationToken ct)

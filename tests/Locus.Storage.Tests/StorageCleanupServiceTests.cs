@@ -2194,6 +2194,59 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupCompletedFilesAsync_WhenJournalAppendObservesCancellation_ThrowsAndDoesNotMarkDeleteSucceeded()
+        {
+            var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            using var cts = new CancellationTokenSource();
+            queueEventJournal
+                .Setup(j => j.AppendAsync(
+                    It.Is<QueueEventRecord>(record =>
+                        record.EventType == QueueEventType.DeleteSucceeded
+                        && record.FileKey == "completed-cancel"),
+                    cts.Token))
+                .Callback(() => cts.Cancel())
+                .ThrowsAsync(new OperationCanceledException(cts.Token));
+
+            var cleanupService = new StorageCleanupService(
+                _metadataRepository,
+                _quotaRepository,
+                _tenantQuotaManager,
+                _fileSystem,
+                _logger.Object,
+                _metadataDir,
+                _quotaDir,
+                tenantManager: _tenantManager.Object,
+                queueEventJournal: queueEventJournal.Object);
+            cleanupService.RegisterVolume(_volume.Object);
+
+            var physicalPath = Path.Combine(_volumePath, "completed-cancel.dat");
+            _fileSystem.File.WriteAllText(physicalPath, "completed content");
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = "completed-cancel",
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/done",
+                FileSize = 17,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Status = FileProcessingStatus.DeleteRequested,
+                CompletedAt = DateTime.UtcNow.AddMinutes(-5)
+            }, CancellationToken.None);
+
+            await Assert.ThrowsAsync<OperationCanceledException>(() =>
+                cleanupService.CleanupCompletedFilesAsync(TimeSpan.Zero, cts.Token));
+
+            var metadata = await _metadataRepository.GetAsync("tenant-001", "completed-cancel", CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.Equal(FileProcessingStatus.DeleteRequested, metadata!.Status);
+            Assert.Null(metadata.DeleteSucceededAt);
+            queueEventJournal.Verify(
+                j => j.AppendAsync(It.IsAny<QueueEventRecord>(), cts.Token),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task CleanupCompletedFilesAsync_WithJournal_AppendsMissingDeleteRequestedBeforeDeleteSucceeded()
         {
             var queueEventJournal = new Mock<IQueueEventJournal>(MockBehavior.Strict);

@@ -1307,6 +1307,10 @@ namespace Locus.Storage.Tests
                     current.LastError = "decode failed";
                     current.LastFailedAt = DateTime.UtcNow;
                     current.AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(1);
+                    current.Metadata = new Dictionary<string, string>
+                    {
+                        ["queue.released_lease_start_utc"] = processingStart.ToString("O")
+                    };
                     await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
                 });
 
@@ -1324,6 +1328,62 @@ namespace Locus.Storage.Tests
             Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
             Assert.Null(metadataAfterRelease.ProcessingStartTime);
             Assert.Equal("decode failed", metadataAfterRelease.LastError);
+        }
+
+        [Fact]
+        public async Task MarkAsCompletedAsync_WhenDifferentLeaseWasAlreadyFailed_ThrowsLeaseMismatch()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("stale complete after different fail"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var staleProcessingStart = DateTime.UtcNow.AddMinutes(-2);
+            var failedProcessingStart = DateTime.UtcNow.AddMinutes(-1);
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = failedProcessingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("stale completion should not run"));
+
+            _fileScheduler
+                .Setup(s => s.MarkAsFailedAsync(
+                    It.Is<FileProcessingLease>(lease =>
+                        lease.TenantId == "tenant-001"
+                        && lease.FileKey == fileKey
+                        && lease.ProcessingStartTimeUtc == failedProcessingStart),
+                    "retry failed",
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    var current = await _metadataRepository.GetAsync("tenant-001", fileKey, CancellationToken.None);
+                    Assert.NotNull(current);
+                    current!.Status = FileProcessingStatus.Pending;
+                    current.ProcessingStartTime = null;
+                    current.LastError = "retry failed";
+                    current.LastFailedAt = DateTime.UtcNow;
+                    current.AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(1);
+                    await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
+                });
+
+            await _storagePool.MarkAsFailedAsync(
+                CreateLease("tenant-001", fileKey, failedProcessingStart),
+                "retry failed",
+                CancellationToken.None);
+
+            var exception = await Assert.ThrowsAsync<FileProcessingLeaseMismatchException>(() =>
+                _storagePool.MarkAsCompletedAsync(
+                    CreateLease("tenant-001", fileKey, staleProcessingStart),
+                    CancellationToken.None));
+
+            Assert.Equal(fileKey, exception.FileKey);
+            Assert.Equal(staleProcessingStart, exception.ExpectedProcessingStartTimeUtc);
+            Assert.Null(exception.ActualProcessingStartTimeUtc);
+            _fileScheduler.Verify(
+                s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
+                Times.Never);
         }
 
         [Fact]
@@ -1362,6 +1422,10 @@ namespace Locus.Storage.Tests
                     current.LastError = "decode failed";
                     current.LastFailedAt = DateTime.UtcNow;
                     current.AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(1);
+                    current.Metadata = new Dictionary<string, string>
+                    {
+                        ["queue.released_lease_start_utc"] = processingStart.ToString("O")
+                    };
                     await _metadataRepository.AddOrUpdateAsync(current, CancellationToken.None);
                     failedReleaseUpdated.SetResult(true);
                     await allowFailedReleaseToReturn.Task;
