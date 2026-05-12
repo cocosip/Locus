@@ -1613,6 +1613,61 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ExecuteAsync_IgnoresStaleProcessingTimedOutWhenFileIsAlreadyPlainPending()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-timeout-stale";
+            const string fileKey = "timeout-file-stale";
+            const string directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "timeout-file-stale.dcm");
+            var processingStartTime = DateTime.UtcNow.AddMinutes(-10);
+            var resetAt = DateTime.UtcNow.AddMinutes(-1);
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3 });
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow.AddMinutes(-15),
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending
+            }, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.ProcessingTimedOut,
+                OccurredAtUtc = resetAt,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending,
+                ProcessingStartTimeUtc = processingStartTime,
+                AvailableForProcessingAtUtc = resetAt
+            }, CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            var rebuilt = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(rebuilt);
+            Assert.Equal(FileProcessingStatus.Pending, rebuilt!.Status);
+            Assert.Null(rebuilt.ProcessingStartTime);
+            Assert.Null(rebuilt.AvailableForProcessingAt);
+        }
+
+        [Fact]
         public async Task ReplayTenantAsync_WhenSequenceGapDetected_TriggersRecoveryAndReportsGapState()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();

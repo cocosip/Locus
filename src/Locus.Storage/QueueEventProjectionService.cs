@@ -1062,6 +1062,17 @@ namespace Locus.Storage
         private bool ShouldSkipTimedOutProjection(FileMetadata existing, QueueEventRecord record)
         {
             var eventProcessingStart = record.ProcessingStartTimeUtc ?? record.OccurredAtUtc;
+            if (existing.Status != FileProcessingStatus.Processing
+                || !existing.ProcessingStartTime.HasValue)
+            {
+                _logger.LogDebug(
+                    "Skipping stale ProcessingTimedOut projection for file {FileKey}: existing status {Status} has no active lease for event lease {EventLease}",
+                    existing.FileKey,
+                    existing.Status,
+                    eventProcessingStart);
+                return true;
+            }
+
             if (existing.ProcessingStartTime.HasValue && existing.ProcessingStartTime.Value > eventProcessingStart)
             {
                 _logger.LogDebug(

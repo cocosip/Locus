@@ -811,7 +811,8 @@ namespace Locus.Storage
                     throw new FileProcessingLeaseMismatchException(
                         lease.FileKey,
                         lease.ProcessingStartTimeUtc,
-                        metadata.Status == FileProcessingStatus.Processing ? metadata.ProcessingStartTime : null);
+                        metadata.Status == FileProcessingStatus.Processing ? metadata.ProcessingStartTime : null,
+                        metadata.Status);
                 }
 
                 await _fileScheduler.MarkAsCompletedAsync(lease, ct);

@@ -1144,7 +1144,8 @@ namespace Locus.Storage
                 expectedProcessingStartTimeUtc,
                 currentMetadata?.Status == FileProcessingStatus.Processing
                     ? currentMetadata.ProcessingStartTime
-                    : null);
+                    : null,
+                currentMetadata?.Status);
         }
 
         private static IProcessingTimeoutRecoveryService? CreateDefaultProcessingTimeoutRecoveryService(
