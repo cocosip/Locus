@@ -751,6 +751,8 @@ namespace Locus.Storage
                     if (page.Count == 0)
                         break;
 
+                    var removedFromPage = 0;
+
                     foreach (var metadata in page)
                     {
                         if (string.IsNullOrWhiteSpace(metadata.PhysicalPath))
@@ -831,10 +833,12 @@ namespace Locus.Storage
                             }
 
                             removedCount++;
+                            removedFromPage++;
                         }
                     }
 
-                    skip += pageSize;
+                    if (removedFromPage == 0)
+                        skip += page.Count;
 
                     if (page.Count < pageSize)
                         break;

@@ -61,7 +61,15 @@ namespace Locus.Storage
                     // Note: This no longer deletes empty directories, only the junk files within them.
                     await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
 
-                    // 2. Remove stale metadata whose physical files are already missing.
+                    // 2. Low-rate cleanup for completed files that are ready for physical deletion.
+                    if (_options.CleanupCompletedFiles && _options.CompletedFileRetentionPeriod.HasValue)
+                    {
+                        await _cleanupService.CleanupCompletedFilesAsync(
+                            _options.CompletedFileRetentionPeriod.Value,
+                            stoppingToken);
+                    }
+
+                    // 3. Remove stale metadata whose physical files are already missing.
                     // This closes the persistence-loss gap where SQLite still references files that
                     // no longer exist on disk after an incomplete shutdown or failed delete flush.
                     var orphanedMetadataRemoved = await _fileScheduler.CleanupOrphanedMetadataAsync(stoppingToken);
@@ -72,15 +80,7 @@ namespace Locus.Storage
                             orphanedMetadataRemoved);
                     }
 
-                    // 3. Orphan recovery is now handled by OrphanFileRecoveryService (independent BackgroundService).
-
-                    // 4. Low-rate cleanup for completed files that are ready for physical deletion.
-                    if (_options.CleanupCompletedFiles && _options.CompletedFileRetentionPeriod.HasValue)
-                    {
-                        await _cleanupService.CleanupCompletedFilesAsync(
-                            _options.CompletedFileRetentionPeriod.Value,
-                            stoppingToken);
-                    }
+                    // 4. Orphan recovery is now handled by OrphanFileRecoveryService (independent BackgroundService).
 
                     // 5-6. Combined single-pass cleanup: timed-out and permanently-failed files.
                     // Uses a single GetAllAsync call instead of one per status category.

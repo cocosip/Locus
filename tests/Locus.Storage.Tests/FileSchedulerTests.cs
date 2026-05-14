@@ -1652,6 +1652,31 @@ namespace Locus.Storage.Tests
             Assert.Null(await _repository.GetAsync("tenant-001", "file-003", CancellationToken.None));
         }
 
+        [Fact]
+        public async Task CleanupOrphanedMetadataAsync_RemovesAllMissingRowsAcrossPagesInSingleRun()
+        {
+            const int fileCount = 501;
+            var createdAt = DateTime.UtcNow.AddMinutes(-10);
+
+            for (var i = 0; i < fileCount; i++)
+            {
+                await _repository.AddOrUpdateAsync(new FileMetadata
+                {
+                    FileKey = $"missing-{i:D4}",
+                    TenantId = "tenant-001",
+                    PhysicalPath = Path.Combine(_metadataDir, $"missing-{i:D4}.dat"),
+                    CreatedAt = createdAt.AddTicks(i),
+                    Status = FileProcessingStatus.Completed,
+                    CompletedAt = createdAt.AddMinutes(1)
+                }, CancellationToken.None);
+            }
+
+            var removedCount = await _scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(fileCount, removedCount);
+            Assert.Empty(await _repository.GetByTenantAsync("tenant-001", CancellationToken.None));
+        }
+
         private sealed class CountingRecoveryService : IProcessingTimeoutRecoveryService
         {
             private int _callCount;
