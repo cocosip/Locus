@@ -4235,22 +4235,39 @@ LIMIT @limit;";
             {
                 try
                 {
-                    ExecuteBatchCoreNoLock(tenantId, ops);
+                    ExecuteBatchCoreWithConnectionRecoveryNoLock(tenantId, ops);
                 }
-                catch (InvalidOperationException ex) when (IsNestedTransactionException(ex))
+                catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
-                    _logger.LogWarning(
+                    _logger.LogError(
                         ex,
-                        "Detected a stale SQLite transaction on the cached metadata connection for tenant {TenantId}. Reopening the connection and retrying the batch once.",
+                        "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during batch persistence. Attempting automatic runtime recovery...",
                         tenantId);
 
-                    ReopenDatabaseConnectionNoLock(tenantId);
-                    ExecuteBatchCoreNoLock(tenantId, ops);
+                    RecoverCorruptedDatabaseAndReplayBatchNoLock(tenantId, ops);
                 }
 
                 var conn = GetDatabase(tenantId);
                 TryCheckpointAfterCommittedBatch(conn, tenantId);
                 _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
+            }
+        }
+
+        private void ExecuteBatchCoreWithConnectionRecoveryNoLock(string tenantId, IReadOnlyList<PersistenceOperation> ops)
+        {
+            try
+            {
+                ExecuteBatchCoreNoLock(tenantId, ops);
+            }
+            catch (InvalidOperationException ex) when (IsNestedTransactionException(ex))
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Detected a stale SQLite transaction on the cached metadata connection for tenant {TenantId}. Reopening the connection and retrying the batch once.",
+                    tenantId);
+
+                ReopenDatabaseConnectionNoLock(tenantId);
+                ExecuteBatchCoreNoLock(tenantId, ops);
             }
         }
 
@@ -4289,6 +4306,80 @@ LIMIT @limit;";
         {
             if (_databases.TryRemove(tenantId, out var lazyConn) && lazyConn.IsValueCreated)
                 DisposeOpenConnection(lazyConn.Value, tenantId, "nested transaction recovery");
+        }
+
+        private void RecoverCorruptedDatabaseAndReplayBatchNoLock(string tenantId, IReadOnlyList<PersistenceOperation> ops)
+        {
+            var hotSnapshot = CaptureHotTenantSnapshotNoLock(tenantId);
+            var backupPath = RebuildDatabaseFileForRuntimeRecoveryNoLock(tenantId);
+
+            RestoreHotTenantSnapshotNoLock(tenantId, hotSnapshot);
+            ExecuteBatchCoreWithConnectionRecoveryNoLock(tenantId, ops);
+
+            _logger.LogWarning(
+                "Metadata database rebuilt for tenant {TenantId} during runtime write recovery. Restored {HotCount} hot cached record(s), replayed {OperationCount} operation(s), backup: {BackupPath}. Cold history rows may require later rebuild from physical files or queue projection.",
+                tenantId,
+                hotSnapshot.Count,
+                ops.Count,
+                backupPath ?? "N/A");
+        }
+
+        private List<FileMetadata> CaptureHotTenantSnapshotNoLock(string tenantId)
+        {
+            if (!_activeFiles.TryGetValue(tenantId, out var cache) || cache.Count == 0)
+                return new List<FileMetadata>();
+
+            return cache.Values
+                .Where(metadata => IsHotCachedStatus(metadata.Status))
+                .Select(metadata => metadata.Clone())
+                .ToList();
+        }
+
+        private void RestoreHotTenantSnapshotNoLock(string tenantId, IReadOnlyList<FileMetadata> hotSnapshot)
+        {
+            if (hotSnapshot.Count == 0)
+                return;
+
+            var conn = GetDatabase(tenantId);
+            using var txn = conn.BeginTransaction();
+            try
+            {
+                foreach (var metadata in hotSnapshot)
+                    UpsertFile(conn, txn, metadata);
+
+                txn.Commit();
+            }
+            catch
+            {
+                txn.Rollback();
+                throw;
+            }
+        }
+
+        private string? RebuildDatabaseFileForRuntimeRecoveryNoLock(string tenantId)
+        {
+            var dbPath = GetDatabasePath(tenantId);
+
+            if (_databases.TryRemove(tenantId, out var lazyConn) && lazyConn.IsValueCreated)
+                DisposeOpenConnection(lazyConn.Value, tenantId, "runtime corruption recovery");
+
+            if (!_fileSystem.File.Exists(dbPath))
+            {
+                DeleteSidecarFiles(dbPath);
+                return null;
+            }
+
+            EnsureWritableDatabaseArtifacts(dbPath);
+
+            var backupPath = $"{dbPath}.corrupted.{DateTime.UtcNow:yyyyMMddHHmmss}";
+            _fileSystem.File.Copy(dbPath, backupPath, overwrite: true);
+            _logger.LogInformation("Backed up corrupted database during runtime recovery: {BackupPath}", backupPath);
+
+            _fileSystem.File.Delete(dbPath);
+            _logger.LogInformation("Deleted corrupted database during runtime recovery: {DatabasePath}", dbPath);
+
+            DeleteSidecarFiles(dbPath);
+            return backupPath;
         }
 
         private void TryCheckpointAfterCommittedBatch(SqliteConnection connection, string tenantId)

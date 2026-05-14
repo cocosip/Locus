@@ -402,6 +402,33 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task AddOrUpdateDirectAsync_WhenDatabaseCorruptsAfterInitialization_RebuildsAndPersistsLatestHotState()
+        {
+            var tenantId = $"tenant-runtime-corrupt-{Guid.NewGuid():N}";
+
+            using var repository = new RuntimeCorruptionMetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                _metadataDir);
+
+            var first = CreateMetadata("file-001", FileProcessingStatus.Pending, tenantId);
+            await InvokeAddOrUpdateDirectAsync(repository, first);
+
+            repository.CorruptPublishedConnectionSchema(tenantId);
+
+            var second = CreateMetadata("file-002", FileProcessingStatus.Pending, tenantId);
+            await InvokeAddOrUpdateDirectAsync(repository, second);
+
+            var persistedFirst = ReadPersistedMetadata(_metadataDir, tenantId, "file-001");
+            var persistedSecond = ReadPersistedMetadata(_metadataDir, tenantId, "file-002");
+
+            Assert.NotNull(persistedFirst);
+            Assert.NotNull(persistedSecond);
+            Assert.Equal(FileProcessingStatus.Pending, persistedFirst!.Status);
+            Assert.Equal(FileProcessingStatus.Pending, persistedSecond!.Status);
+        }
+
+        [Fact]
         public async Task ProjectionBatch_FailedDeleteFlush_RollsBackInMemoryProjection()
         {
             const string fileKey = "batch-delete-rollback";
@@ -1806,6 +1833,41 @@ WHERE file_key = $file_key;";
                 }
 
                 return base.OpenAndInitializeConnection(dbPath);
+            }
+        }
+
+        private sealed class RuntimeCorruptionMetadataRepository : MetadataRepository
+        {
+            public RuntimeCorruptionMetadataRepository(
+                IFileSystem fileSystem,
+                ILogger<MetadataRepository> logger,
+                string metadataDirectory)
+                : base(
+                    fileSystem,
+                    logger,
+                    metadataDirectory,
+                    enableBackgroundPersistence: false)
+            {
+            }
+
+            public void CorruptPublishedConnectionSchema(string tenantId)
+            {
+                var databasesField = typeof(MetadataRepository).GetField("_databases", BindingFlags.NonPublic | BindingFlags.Instance);
+                Assert.NotNull(databasesField);
+
+                var databases = (ConcurrentDictionary<string, Lazy<SqliteConnection>>)databasesField!.GetValue(this)!;
+                Assert.True(databases.TryGetValue(tenantId, out var lazyConn));
+                Assert.True(lazyConn!.IsValueCreated);
+
+                using var command = lazyConn.Value.CreateCommand();
+                command.CommandText = @"
+PRAGMA writable_schema=ON;
+UPDATE sqlite_master
+SET sql = 'CREATE TABLE files_broken('
+WHERE type = 'table' AND name = 'files';
+PRAGMA schema_version = 123456;
+PRAGMA writable_schema=OFF;";
+                command.ExecuteNonQuery();
             }
         }
     }
