@@ -2,149 +2,98 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Language Requirements
+## Build & Test Commands
 
-**IMPORTANT**: When working with this codebase:
-- All responses, explanations, and discussions should be in **Chinese (中文)**
-- All code comments, XML documentation, and code-related text should be in **English**
-- Code identifiers (class names, method names, variables) must follow English naming conventions
+```bash
+# Build
+dotnet build
 
-## Project Overview
+# Run all tests
+dotnet test
 
-Locus is a file storage pool system targeting .NET netstandard2.0 that provides:
-- Multi-tenant storage isolation (租户隔离存储)
-- Dynamic storage volume mounting (动态挂载存储空间/硬盘)
-- Concurrent read/write operations (并发读写)
-- Unlimited storage expansion (无限空间扩展)
-- Directory-level file count limits (目录级文件数量上限控制)
+# Run a single test project
+dotnet test tests/Locus.Storage.Tests
 
-## Architecture Goals
+# Run with specific filter
+dotnet test --filter "FullyQualifiedName~ClassName"
 
-### Multi-Tenant Storage
-- Each tenant should have isolated storage space
-- Tenant identification mechanism for routing file operations
-- Tenant lifecycle management: enable/disable tenants (启用/禁用租户)
-- Disabled tenants should reject all read/write operations
-- Quota management per tenant (optional future feature)
+# Run benchmarks
+cd tests/Locus.Benchmarks && dotnet run -c Release
+dotnet run -c Release --filter "Locus.Benchmarks.MetadataRepositoryBenchmarks*"
+```
 
-### Storage Pool Management
-- Abstract storage backend interface to support multiple storage providers
-- Dynamic mounting/unmounting of storage volumes
-- Load balancing across available storage volumes
-- Health monitoring for storage volumes
+## Architecture
 
-### Concurrency
-- Thread-safe file operations
-- Support for multiple concurrent readers and writers
-- Proper locking mechanisms to prevent data corruption
-- Consider async/await patterns for I/O operations
-- File allocation mechanism: ensure different threads read different files
-- Return file location/path rather than directly reading file content
-- Track file processing status to prevent duplicate reads
+The solution targets **netstandard2.0** for maximum compatibility, with central package versioning (`Directory.Packages.props`). All projects share `common.props` for metadata/versioning and use `Nullable=enable`, `LangVersion=latest`.
 
-### Unlimited Storage Expansion
-- Automatic volume expansion when storage capacity is low
-- Intelligent file distribution across multiple volumes
-- Support for adding new storage volumes at runtime
-- No single volume size limitation - aggregate capacity from all volumes
+### Project Layers (dependency direction: top → down)
 
-### Directory-Level File Count Limits
-- Configurable maximum file count per directory
-- Pre-write validation to enforce limits
-- Atomic counter management for concurrent writes
-- Clear error handling when limits are reached
+```
+Locus (meta-package, aggregates all)
+├── Locus.Storage ──────────────┐
+│   (StoragePool, FileScheduler,│
+│    MetadataRepository,        │
+│    QueueEventProjection,      │
+│    Cleanup/Recovery services) │
+├── Locus.MultiTenant ──────────┤
+│   (TenantManager, JSON-based  │
+│    tenant metadata)           │
+├── Locus.FileSystem ───────────┤
+│   (LocalFileSystemVolume,     │
+│    path sanitization)         │
+└── Locus.Core
+    (All interfaces, models, exceptions — no implementation)
+```
 
-### Failure Retry Mechanism
-- Automatic retry for failed file processing
-- Configurable retry policy (max retries, delay, exponential backoff)
-- Failed files automatically return to pool for retry
-- Permanent failure status after exceeding max retries
-- Track retry count and last error for diagnostics
+- **`Locus.Core`**: Zero dependencies. Defines `IStoragePool`, `IFileScheduler`, `ITenantManager`, `IStorageVolume`, `IDirectoryQuotaManager`, `IStorageCleanupService`, `IQueueEventJournal`, projection interfaces, plus all models and exception types.
+- **`Locus.FileSystem`**: Depends only on Core. Implements `IStorageVolume` for local disk storage with path sharding.
+- **`Locus.Storage`**: The heavy layer. Contains `StoragePool`, `FileScheduler`, `MetadataRepository` (SQLite via Dapper), `DirectoryQuotaRepository`, `FileQueueEventJournal`, `QueueEventProjectionService`, timeout recovery, cleanup, orphan recovery, FileWatcher. Depends on Core + FileSystem.
+- **`Locus.MultiTenant`**: Depends only on Core. JSON-file tenant metadata with 5-minute in-memory cache.
+- **`Locus`**: Meta-package. Contains `LocusBuilder` (fluent config), `ServiceCollectionExtensions` (DI wiring), and `LocusOptions`. Embeds all sub-project DLLs into the published NuGet package.
 
-### Automatic Cleanup
-- Automatic cleanup of empty directories (空目录自动清理)
-- Cleanup of orphaned files (physical file exists but no metadata)
-- Cleanup of timed-out processing files (reset to pending status)
-- Cleanup of permanently failed files
-- Scheduled background cleanup tasks
-- Database optimization (LiteDB shrinking to reclaim space from deleted records)
+### DI Wiring
 
-## Key Design Considerations
+`ServiceCollectionExtensions.AddLocus(LocusOptions)` in `src/Locus/ServiceCollectionExtensions.cs` registers everything. Most services are singletons. Async startup work (`StorageVolumeInitializationService`, `QueueEventProjectionService`, `BackgroundCleanupService`, etc.) uses `IHostedService` / `BackgroundService`.
 
-### .NET Standard 2.0 Compatibility
-- Must target netstandard2.0 for broad compatibility
-- Use System.IO.Abstractions for testable file operations
-- Avoid features only available in newer .NET versions
+Configuration can come from code (`LocusBuilder` fluent API), `LocusOptions` directly, or `IConfiguration` binding from the `"Locus"` section.
 
-### Storage Volume Abstraction
-- Define IStorageVolume interface for pluggable storage backends
-- Support local file system, network drives, and extensible to cloud storage
-- Volume metadata (capacity, available space, mount path)
+### Queue Journal & Projection Model
 
-### Tenant Context
-- Thread-safe tenant context management
-- Tenant identifier propagation through operation pipeline
-- Separate storage paths or databases per tenant
-- Tenant status management (Enabled/Disabled/Suspended)
-- Pre-operation validation to check tenant status
-- Tenant metadata storage (status, creation date, storage path, etc.)
-- Consider caching tenant status for performance
+This is the most important architectural pattern to understand:
 
-### File Operations API
-- Stream-based operations for memory efficiency
-- Metadata management (file size, created date, modified date)
-- **File extension preservation**: Original file names can be provided to preserve extensions in physical storage
-- Support for chunked uploads/downloads for large files
-- File scheduler/allocator for concurrent read scenarios
-- Return file metadata and location instead of direct content
-- Status tracking: Pending → Processing → Completed/Failed
+1. **Physical files** live on `IStorageVolume` implementations (mounted file system paths)
+2. **`queue.log`** (per-tenant, binary or JSON) is the durable source of truth for all queue state transitions (`Accepted`, `ProcessingStarted`, `ProcessingCompleted`, `ProcessingFailed`, etc.)
+3. **SQLite databases** (`metadata.db`, `quotas.db` per tenant) store **projections** — queryable current state rebuilt from the journal. They are rebuildable, not the primary durability layer.
+4. **In-memory caches** (`ConcurrentDictionary`-based) hold active-file metadata for hot-path reads. On first tenant access or restart, the cache warms from SQLite projections.
 
-### Quota Management
-- Directory-level file count tracking using atomic counters
-- Configuration system for setting directory limits
-- Pre-write validation to check against limits before accepting files
-- Consider using separate metadata store (e.g., SQLite, LiteDB) for fast counter access
-- Hierarchical quota inheritance (optional)
+Key classes:
+- `FileQueueEventJournal` — append-only binary journal (`IQueueEventJournal`)
+- `QueueEventProjectionService` — reads journal entries, updates SQLite projections + in-memory caches (implements `IHostedService`)
+- `MetadataRepository` — SQLite access via Dapper, write-behind persistence with configurable batch draining
+- `MetadataRepositoryQueueProjectionStore` / `MetadataRepositoryQueueProjectionWriteStore` / `MetadataRepositoryQueueProjectionCleanupStore` — facade adapters so the rest of the system doesn't depend on MetadataRepository internals
+- `FileScheduler` — thread-safe queue allocation, lease-based completion/failure, retry with exponential backoff
 
-### Unlimited Storage Strategy
-- Volume selection algorithm: prioritize volumes with most available space
-- Automatic volume addition when aggregate free space falls below threshold
-- File placement strategy: round-robin, least-used, or capacity-based
-- Metadata tracking for file-to-volume mapping
-- Handle volume failures gracefully with redundancy options (optional)
+### Lease Model
 
-### Failure Retry Strategy
-- When `MarkAsFailedAsync` is called, increment retry count
-- If retry count < max retries: set status back to Pending with delay
-- If retry count >= max retries: set status to PermanentlyFailed
-- Use delay before retry to avoid immediate re-failure
-- Exponential backoff formula: `InitialDelay * 2^(retryCount-1)`
-- Store failure information for debugging and monitoring
+`GetNextFileForProcessingAsync` returns a `FileProcessingLease` containing the file key and `ProcessingStartTime`. `MarkAsCompletedAsync` / `MarkAsFailedAsync` require the lease — this acts as an optimistic concurrency check. If the `ProcessingStartTime` doesn't match, the operation is rejected (another worker claimed it, or it timed out and was reset).
 
-### Automatic Cleanup Strategy
-- Background service running on schedule (e.g., every hour, daily)
-- Empty directory cleanup (空目录自动清理):
-  - Recursively check directories for files
-  - Remove directories with zero files
-  - Respect whitelist of protected directories
-  - Triggered after file deletion (immediate queue) or periodically (scheduled)
-- Timeout detection:
-  - Files in "Processing" status for longer than timeout threshold
-  - Automatically reset to "Pending" status for retry
-- Orphaned file cleanup:
-  - Compare physical files against metadata store
-  - Option to either delete or import orphaned files
-- Permanently failed files:
-  - Delete files that have exceeded max retry count
-  - Configurable retention period before deletion
-- Database optimization (LiteDB space reclamation):
-  - LiteDB databases grow continuously and don't shrink automatically when records are deleted
-  - Deleted records leave "dead space" that's marked as reusable but doesn't reduce file size
-  - Use LiteDB's Rebuild() method to compact databases and reclaim space
-  - Run periodically (e.g., weekly) during low-activity periods
-  - Independent optimization interval from regular cleanup tasks
-  - Track space reclaimed and optimization statistics
-- Use configurable retention policies for each cleanup type
+### Cleanup & Recovery
 
-### 配置调整
-- 如果 LocusOptions 或者他引用的任何子 Options 发生变更后，项目中的配置  *.appsettings.json 都要跟着调整，同时需要更新 appsettings-sample-reference.md 配置说明文档
+- `StorageCleanupService` — main cleanup orchestrator (completed file deletion, permanently failed handling, orphan detection, timeout reset)
+- `BackgroundCleanupService` — `IHostedService` wrapper that periodically invokes `StorageCleanupService`
+- `OrphanFileRecoveryService` — scans volumes for physical files with no matching metadata
+- `ProcessingTimeoutRecoveryService` — resets files stuck in `Processing` beyond the configured timeout
+- `DatabaseRecoveryService` — integrity check + automatic rebuild of corrupted SQLite databases on startup
+- `DatabaseHealthCheckService` — `IHostedService` that runs recovery at startup (opt-in)
+
+### Directory & Tenant Quotas
+
+Lock-free CAS (compare-and-swap) atomic counters track file counts per directory, backed by `DirectoryQuotaRepository` with write-behind SQLite persistence. `DirectoryQuotaManager` handles directory-level limits; `TenantQuotaManager` handles tenant-level file counts. Both use the projection model — quota state is maintained in memory and persisted asynchronously.
+
+### Key Conventions
+
+- Exceptions defined in `Locus.Core.Exceptions` namespace are the public API error surface
+- `IFileSystem` from `System.IO.Abstractions` is used everywhere (never `File`/`Directory` statics directly)
+- All async methods accept `CancellationToken`
+- Central package versioning with `CentralPackageTransitivePinningEnabled=true`
+- Test projects use xUnit + Moq; `Directory.Build.props` in tests disables MSCoverage reference path maps
