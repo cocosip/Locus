@@ -1523,7 +1523,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task ExecuteAsync_ProjectsProcessingTimedOutBackToPendingWithoutFailureSemantics()
+        public async Task ReplayTenantAsync_ProjectsProcessingTimedOutBackToPendingWithoutFailureSemantics()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
             var directoryQuotaManager = CreateDirectoryQuotaManager();
@@ -1588,21 +1588,7 @@ namespace Locus.Storage.Tests
             }, CancellationToken.None);
 
             var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
-            await service.StartAsync(CancellationToken.None);
-            try
-            {
-                await WaitUntilAsync(async () =>
-                {
-                    var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
-                    return metadata != null
-                        && metadata.Status == FileProcessingStatus.Pending
-                        && !metadata.ProcessingStartTime.HasValue;
-                }, TimeSpan.FromSeconds(2));
-            }
-            finally
-            {
-                await service.StopAsync(CancellationToken.None);
-            }
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
 
             var rebuilt = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.NotNull(rebuilt);
