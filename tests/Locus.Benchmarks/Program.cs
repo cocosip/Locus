@@ -18,6 +18,9 @@ namespace Locus.Benchmarks
             if (AsyncJournalDrainCommand.ShouldRun(args))
                 return AsyncJournalDrainCommand.RunAsync(args).GetAwaiter().GetResult();
 
+            if (BackgroundCpuDiagnosticCommand.ShouldRun(args))
+                return BackgroundCpuDiagnosticCommand.RunAsync(args).GetAwaiter().GetResult();
+
             if (VolumeWritePhaseBreakdownCommand.ShouldRun(args))
                 return VolumeWritePhaseBreakdownCommand.RunAsync(args).GetAwaiter().GetResult();
 
