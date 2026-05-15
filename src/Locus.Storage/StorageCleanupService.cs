@@ -53,6 +53,7 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _orphanScanLocks;
         private readonly ConcurrentDictionary<string, OrphanDirectoryScanState> _orphanDirectoryScanStates;
         private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
+        private readonly SemaphoreSlim _volumeScanGate;
         private long _statusCleanupIterationCount;
         private long _statusCleanupIterationStopwatchTicks;
         private int _emptyDirectoriesRemoved;
@@ -119,6 +120,7 @@ namespace Locus.Storage
             _orphanScanLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _orphanDirectoryScanStates = new ConcurrentDictionary<string, OrphanDirectoryScanState>();
             _orphanScanLastRunUtc = new ConcurrentDictionary<string, DateTime>();
+            _volumeScanGate = new SemaphoreSlim(1, 1);
 
             if (string.IsNullOrWhiteSpace(metadataDirectory))
                 throw new ArgumentException("Metadata directory cannot be empty", nameof(metadataDirectory));
@@ -210,19 +212,29 @@ namespace Locus.Storage
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
 
+            if (!await TryEnterVolumeScanAsync("junk-file sweep", tenantId, ct).ConfigureAwait(false))
+                return;
+
             _logger.LogInformation("Starting junk-file sweep for tenant: {TenantId}", tenantId);
 
             var removedCount = 0;
 
-            foreach (var volume in _volumes.Values)
+            try
             {
-                var tenantPath = _fileSystem.Path.Combine(volume.MountPath, tenantId);
-                if (_fileSystem.Directory.Exists(tenantPath))
+                foreach (var volume in _volumes.Values)
                 {
-                    // isProtectedRoot=true: never delete the tenant root directory itself.
-                    // Pass shardingDepth so shard directories are also protected.
-                    removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct, isProtectedRoot: true, shardingDepth: volume.ShardingDepth);
+                    var tenantPath = _fileSystem.Path.Combine(volume.MountPath, tenantId);
+                    if (_fileSystem.Directory.Exists(tenantPath))
+                    {
+                        // isProtectedRoot=true: never delete the tenant root directory itself.
+                        // Pass shardingDepth so shard directories are also protected.
+                        removedCount += await CleanupJunkFilesRecursiveAsync(tenantPath, ct, isProtectedRoot: true, shardingDepth: volume.ShardingDepth);
+                    }
                 }
+            }
+            finally
+            {
+                _volumeScanGate.Release();
             }
 
             Interlocked.Add(ref _emptyDirectoriesRemoved, removedCount);
@@ -235,21 +247,31 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task CleanupAllEmptyDirectoriesAsync(CancellationToken ct = default)
         {
+            if (!await TryEnterVolumeScanAsync("junk-file sweep", tenantId: null, ct).ConfigureAwait(false))
+                return;
+
             _logger.LogInformation("Starting junk-file sweep for all tenants");
 
             var removedCount = 0;
 
-            foreach (var volume in _volumes.Values)
+            try
             {
-                if (_fileSystem.Directory.Exists(volume.MountPath))
+                foreach (var volume in _volumes.Values)
                 {
-                    foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(volume.MountPath))
+                    if (_fileSystem.Directory.Exists(volume.MountPath))
                     {
-                        // Each subdirectory is a tenant root -- protect it from deletion.
-                        // Pass shardingDepth so shard directories are also protected.
-                        removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true, shardingDepth: volume.ShardingDepth);
+                        foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(volume.MountPath))
+                        {
+                            // Each subdirectory is a tenant root -- protect it from deletion.
+                            // Pass shardingDepth so shard directories are also protected.
+                            removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: true, shardingDepth: volume.ShardingDepth);
+                        }
                     }
                 }
+            }
+            finally
+            {
+                _volumeScanGate.Release();
             }
 
             Interlocked.Add(ref _emptyDirectoriesRemoved, removedCount);
@@ -318,91 +340,221 @@ namespace Locus.Storage
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
 
+            if (!await TryEnterVolumeScanAsync("orphaned file recovery", tenant.TenantId, ct).ConfigureAwait(false))
+                return;
+
+            try
+            {
+                await RecoverOrphanedFilesCoreAsync(tenant, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _volumeScanGate.Release();
+            }
+        }
+
+        private async Task RecoverOrphanedFilesCoreAsync(ITenantContext tenant, CancellationToken ct)
+        {
             _logger.LogInformation("Starting orphaned file metadata rebuild for tenant: {TenantId}", tenant.TenantId);
 
             var rebuiltCount = 0;
             HashSet<string>? knownPhysicalPaths = null;
             Dictionary<string, bool>? existenceCache = null;
 
-            foreach (var volume in _volumes.Values)
-            {
-                var tenantPath = _fileSystem.Path.Combine(volume.MountPath, tenant.TenantId);
-                if (!_fileSystem.Directory.Exists(tenantPath))
-                    continue;
-
-                var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
-                var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
-                if (knownPhysicalPaths == null)
-                    knownPhysicalPaths = await BuildKnownPhysicalPathSetAsync(tenant.TenantId, ct).ConfigureAwait(false);
-
-                if (existenceCache == null && _orphanRebuildLookupCacheSize > 0)
-                    existenceCache = new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer);
-
-                await scanLock.WaitAsync(ct);
-                try
+                foreach (var volume in _volumes.Values)
                 {
-                    var scanQueue = GetOrphanScanQueue(scanKey, tenantPath);
-                    var scannedThisRun = 0;
-                    var budgetReached = false;
+                    var tenantPath = _fileSystem.Path.Combine(volume.MountPath, tenant.TenantId);
+                    if (!_fileSystem.Directory.Exists(tenantPath))
+                        continue;
 
-                    while (scannedThisRun < _maxOrphanFilesPerRun && scanQueue.TryDequeue(out var directory))
+                    var scanKey = GetOrphanScanKey(tenant.TenantId, volume.VolumeId);
+                    var scanLock = _orphanScanLocks.GetOrAdd(scanKey, _ => new SemaphoreSlim(1, 1));
+                    if (knownPhysicalPaths == null)
+                        knownPhysicalPaths = await BuildKnownPhysicalPathSetAsync(tenant.TenantId, ct).ConfigureAwait(false);
+
+                    if (existenceCache == null && _orphanRebuildLookupCacheSize > 0)
+                        existenceCache = new Dictionary<string, bool>(_orphanRebuildLookupCacheSize, _pathComparer);
+
+                    await scanLock.WaitAsync(ct);
+                    try
                     {
-                        ct.ThrowIfCancellationRequested();
+                        var scanQueue = GetOrphanScanQueue(scanKey, tenantPath);
+                        var scannedThisRun = 0;
+                        var budgetReached = false;
 
-                        if (!_fileSystem.Directory.Exists(directory))
+                        while (scannedThisRun < _maxOrphanFilesPerRun && scanQueue.TryDequeue(out var directory))
                         {
-                            ClearOrphanDirectoryScanState(scanKey, directory);
-                            continue;
-                        }
+                            ct.ThrowIfCancellationRequested();
 
-                        try
-                        {
-                            var directoryScanState = GetOrphanDirectoryScanState(scanKey, directory);
-                            var remainingBudget = _maxOrphanFilesPerRun - scannedThisRun;
-                            if (remainingBudget <= 0)
+                            if (!_fileSystem.Directory.Exists(directory))
                             {
-                                scanQueue.Enqueue(directory);
-                                budgetReached = true;
-                                break;
+                                ClearOrphanDirectoryScanState(scanKey, directory);
+                                continue;
                             }
 
-                            var fileBatch = EnumerateOrphanScanBatch(
-                                directory,
-                                directoryScanState.ResumeAfterPath,
-                                remainingBudget);
-                            var directoryFullyScanned = !fileBatch.HasMore;
-
-                            foreach (var fileEntry in fileBatch.Entries)
+                            try
                             {
-                                ct.ThrowIfCancellationRequested();
-                                scannedThisRun++;
-
-                                directoryScanState.ResumeAfterPath = fileEntry.NormalizedPath;
-
-                                var physicalPath = fileEntry.PhysicalPath;
-                                var normalizedPhysical = fileEntry.NormalizedPath;
-                                var metadataExists = false;
-                                if (normalizedPhysical != null)
+                                var directoryScanState = GetOrphanDirectoryScanState(scanKey, directory);
+                                var remainingBudget = _maxOrphanFilesPerRun - scannedThisRun;
+                                if (remainingBudget <= 0)
                                 {
-                                    if (existenceCache != null
-                                        && existenceCache.TryGetValue(normalizedPhysical, out var cachedExists))
-                                    {
-                                        metadataExists = cachedExists;
-                                    }
-                                    else
-                                    {
-                                        metadataExists = knownPhysicalPaths.Contains(normalizedPhysical);
-
-                                        if (existenceCache != null
-                                            && existenceCache.Count < _orphanRebuildLookupCacheSize)
-                                        {
-                                            existenceCache[normalizedPhysical] = metadataExists;
-                                        }
-                                    }
+                                    scanQueue.Enqueue(directory);
+                                    budgetReached = true;
+                                    break;
                                 }
 
-                                if (metadataExists)
+                                var fileBatch = EnumerateOrphanScanBatch(
+                                    directory,
+                                    directoryScanState.ResumeAfterPath,
+                                    remainingBudget);
+                                var directoryFullyScanned = !fileBatch.HasMore;
+
+                                foreach (var fileEntry in fileBatch.Entries)
                                 {
+                                    ct.ThrowIfCancellationRequested();
+                                    scannedThisRun++;
+
+                                    directoryScanState.ResumeAfterPath = fileEntry.NormalizedPath;
+
+                                    var physicalPath = fileEntry.PhysicalPath;
+                                    var normalizedPhysical = fileEntry.NormalizedPath;
+                                    var metadataExists = false;
+                                    if (normalizedPhysical != null)
+                                    {
+                                        if (existenceCache != null
+                                            && existenceCache.TryGetValue(normalizedPhysical, out var cachedExists))
+                                        {
+                                            metadataExists = cachedExists;
+                                        }
+                                        else
+                                        {
+                                            metadataExists = knownPhysicalPaths.Contains(normalizedPhysical);
+
+                                            if (existenceCache != null
+                                                && existenceCache.Count < _orphanRebuildLookupCacheSize)
+                                            {
+                                                existenceCache[normalizedPhysical] = metadataExists;
+                                            }
+                                        }
+                                    }
+
+                                    if (metadataExists)
+                                    {
+                                        if (scannedThisRun >= _maxOrphanFilesPerRun)
+                                        {
+                                            directoryFullyScanned = false;
+                                            scanQueue.Enqueue(directory);
+                                            budgetReached = true;
+                                            break;
+                                        }
+
+                                        continue;
+                                    }
+
+                                    // Orphaned physical file -- reconstruct metadata and re-queue for processing.
+                                    // DO NOT delete the file: it contains real data that was uploaded but whose
+                                    // metadata record was lost (e.g. process crash during write-behind flush, or
+                                    // persistence queue overflow).  Rebuilding brings it back into the Pending
+                                    // queue so that normal consumers can process it on the next scheduling cycle.
+                                    try
+                                    {
+                                        var metadata = RebuildMetadataFromPath(physicalPath, volume, tenant.TenantId);
+
+                                        if (metadata == null)
+                                        {
+                                            _logger.LogWarning(
+                                                "Skipping orphaned file whose path does not match the expected storage layout: {PhysicalPath}",
+                                                physicalPath);
+                                            continue;
+                                        }
+
+                                        var existingMetadata = await _projectionStore
+                                            .GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct)
+                                            .ConfigureAwait(false);
+                                        if (existingMetadata != null
+                                            && !PathsEqual(existingMetadata.PhysicalPath, metadata.PhysicalPath))
+                                        {
+                                            if (ShouldRepairExistingMetadataPath(existingMetadata.PhysicalPath, metadata.PhysicalPath))
+                                            {
+                                                var correctedMetadata = CreatePathCorrectedMetadata(existingMetadata, metadata);
+                                                await _projectionStore.UpsertProjectedFileAsync(correctedMetadata, ct).ConfigureAwait(false);
+
+                                                if (normalizedPhysical != null && existenceCache != null)
+                                                {
+                                                    if (existenceCache.Count < _orphanRebuildLookupCacheSize
+                                                        || existenceCache.ContainsKey(normalizedPhysical))
+                                                    {
+                                                        existenceCache[normalizedPhysical] = true;
+                                                    }
+                                                }
+
+                                                if (normalizedPhysical != null)
+                                                    knownPhysicalPaths.Add(normalizedPhysical);
+
+                                                _logger.LogInformation(
+                                                    "Corrected metadata path casing for file key {FileKey} in tenant {TenantId}: {ExistingPath} -> {CorrectedPath}",
+                                                    correctedMetadata.FileKey,
+                                                    correctedMetadata.TenantId,
+                                                    existingMetadata.PhysicalPath,
+                                                    correctedMetadata.PhysicalPath);
+                                                continue;
+                                            }
+
+                                            _logger.LogWarning(
+                                                "Skipping orphaned file rebuild because file key {FileKey} for tenant {TenantId} already points to {ExistingPath}; orphan path was {OrphanPath}",
+                                                metadata.FileKey,
+                                                metadata.TenantId,
+                                                existingMetadata.PhysicalPath,
+                                                metadata.PhysicalPath);
+                                            continue;
+                                        }
+
+                                        var tenantReservationConsumed = false;
+                                        var directoryReservationConsumed = false;
+                                        try
+                                        {
+                                            tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, default);
+                                            directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(
+                                                metadata.TenantId,
+                                                metadata.DirectoryPath,
+                                                default);
+                                            QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
+
+                                            // Persist rebuilt metadata only after quota compensation succeeds so we never
+                                            // re-queue a file whose quota counters still under-report real usage.
+                                            await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
+                                        }
+                                        catch
+                                        {
+                                            await RollbackRebuiltFileQuotaCompensationAsync(
+                                                metadata,
+                                                tenantReservationConsumed,
+                                                directoryReservationConsumed);
+                                            throw;
+                                        }
+
+                                        if (normalizedPhysical != null && existenceCache != null)
+                                        {
+                                            if (existenceCache.Count < _orphanRebuildLookupCacheSize
+                                                || existenceCache.ContainsKey(normalizedPhysical))
+                                            {
+                                                existenceCache[normalizedPhysical] = true;
+                                            }
+                                        }
+
+                                        if (normalizedPhysical != null)
+                                            knownPhysicalPaths.Add(normalizedPhysical);
+
+                                        rebuiltCount++;
+                                        _logger.LogInformation(
+                                            "Rebuilt metadata and compensated quota for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
+                                            metadata.FileKey, metadata.TenantId, physicalPath);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        _logger.LogWarning(ex, "Failed to rebuild metadata for orphaned file {PhysicalPath}", physicalPath);
+                                    }
+
                                     if (scannedThisRun >= _maxOrphanFilesPerRun)
                                     {
                                         directoryFullyScanned = false;
@@ -410,167 +562,51 @@ namespace Locus.Storage
                                         budgetReached = true;
                                         break;
                                     }
-
-                                    continue;
                                 }
 
-                                // Orphaned physical file -- reconstruct metadata and re-queue for processing.
-                                // DO NOT delete the file: it contains real data that was uploaded but whose
-                                // metadata record was lost (e.g. process crash during write-behind flush, or
-                                // persistence queue overflow).  Rebuilding brings it back into the Pending
-                                // queue so that normal consumers can process it on the next scheduling cycle.
-                                try
-                                {
-                                    var metadata = RebuildMetadataFromPath(physicalPath, volume, tenant.TenantId);
-
-                                    if (metadata == null)
-                                    {
-                                        _logger.LogWarning(
-                                            "Skipping orphaned file whose path does not match the expected storage layout: {PhysicalPath}",
-                                            physicalPath);
-                                        continue;
-                                    }
-
-                                    var existingMetadata = await _projectionStore
-                                        .GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct)
-                                        .ConfigureAwait(false);
-                                    if (existingMetadata != null
-                                        && !PathsEqual(existingMetadata.PhysicalPath, metadata.PhysicalPath))
-                                    {
-                                        if (ShouldRepairExistingMetadataPath(existingMetadata.PhysicalPath, metadata.PhysicalPath))
-                                        {
-                                            var correctedMetadata = CreatePathCorrectedMetadata(existingMetadata, metadata);
-                                            await _projectionStore.UpsertProjectedFileAsync(correctedMetadata, ct).ConfigureAwait(false);
-
-                                            if (normalizedPhysical != null && existenceCache != null)
-                                            {
-                                                if (existenceCache.Count < _orphanRebuildLookupCacheSize
-                                                    || existenceCache.ContainsKey(normalizedPhysical))
-                                                {
-                                                    existenceCache[normalizedPhysical] = true;
-                                                }
-                                            }
-
-                                            if (normalizedPhysical != null)
-                                                knownPhysicalPaths.Add(normalizedPhysical);
-
-                                            _logger.LogInformation(
-                                                "Corrected metadata path casing for file key {FileKey} in tenant {TenantId}: {ExistingPath} -> {CorrectedPath}",
-                                                correctedMetadata.FileKey,
-                                                correctedMetadata.TenantId,
-                                                existingMetadata.PhysicalPath,
-                                                correctedMetadata.PhysicalPath);
-                                            continue;
-                                        }
-
-                                        _logger.LogWarning(
-                                            "Skipping orphaned file rebuild because file key {FileKey} for tenant {TenantId} already points to {ExistingPath}; orphan path was {OrphanPath}",
-                                            metadata.FileKey,
-                                            metadata.TenantId,
-                                            existingMetadata.PhysicalPath,
-                                            metadata.PhysicalPath);
-                                        continue;
-                                    }
-
-                                    var tenantReservationConsumed = false;
-                                    var directoryReservationConsumed = false;
-                                    try
-                                    {
-                                        tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, default);
-                                        directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(
-                                            metadata.TenantId,
-                                            metadata.DirectoryPath,
-                                            default);
-                                        QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
-
-                                        // Persist rebuilt metadata only after quota compensation succeeds so we never
-                                        // re-queue a file whose quota counters still under-report real usage.
-                                        await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
-                                    }
-                                    catch
-                                    {
-                                        await RollbackRebuiltFileQuotaCompensationAsync(
-                                            metadata,
-                                            tenantReservationConsumed,
-                                            directoryReservationConsumed);
-                                        throw;
-                                    }
-
-                                    if (normalizedPhysical != null && existenceCache != null)
-                                    {
-                                        if (existenceCache.Count < _orphanRebuildLookupCacheSize
-                                            || existenceCache.ContainsKey(normalizedPhysical))
-                                        {
-                                            existenceCache[normalizedPhysical] = true;
-                                        }
-                                    }
-
-                                    if (normalizedPhysical != null)
-                                        knownPhysicalPaths.Add(normalizedPhysical);
-
-                                    rebuiltCount++;
-                                    _logger.LogInformation(
-                                        "Rebuilt metadata and compensated quota for orphaned file: fileKey={FileKey}, tenant={TenantId}, path={PhysicalPath}",
-                                        metadata.FileKey, metadata.TenantId, physicalPath);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex, "Failed to rebuild metadata for orphaned file {PhysicalPath}", physicalPath);
-                                }
-
-                                if (scannedThisRun >= _maxOrphanFilesPerRun)
+                                if (!budgetReached && fileBatch.HasMore)
                                 {
                                     directoryFullyScanned = false;
                                     scanQueue.Enqueue(directory);
-                                    budgetReached = true;
-                                    break;
                                 }
-                            }
 
-                            if (!budgetReached && fileBatch.HasMore)
+                                if (directoryFullyScanned)
+                                    ClearOrphanDirectoryScanState(scanKey, directory);
+                            }
+                            catch (Exception ex)
                             {
-                                directoryFullyScanned = false;
-                                scanQueue.Enqueue(directory);
+                                ClearOrphanDirectoryScanState(scanKey, directory);
+                                _logger.LogWarning(ex, "Failed to enumerate files in directory {DirectoryPath}", directory);
                             }
 
-                            if (directoryFullyScanned)
-                                ClearOrphanDirectoryScanState(scanKey, directory);
-                        }
-                        catch (Exception ex)
-                        {
-                            ClearOrphanDirectoryScanState(scanKey, directory);
-                            _logger.LogWarning(ex, "Failed to enumerate files in directory {DirectoryPath}", directory);
+                            if (budgetReached)
+                                break;
+
+                            try
+                            {
+                                foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(directory))
+                                    scanQueue.Enqueue(subdirectory);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to enumerate subdirectories in directory {DirectoryPath}", directory);
+                            }
                         }
 
                         if (budgetReached)
-                            break;
-
-                        try
                         {
-                            foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(directory))
-                                scanQueue.Enqueue(subdirectory);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to enumerate subdirectories in directory {DirectoryPath}", directory);
+                            _logger.LogInformation(
+                                "Orphaned file scan budget reached for tenant {TenantId} on volume {VolumeId}; remaining directories will be scanned next run",
+                                tenant.TenantId, volume.VolumeId);
                         }
                     }
-
-                    if (budgetReached)
+                    finally
                     {
-                        _logger.LogInformation(
-                            "Orphaned file scan budget reached for tenant {TenantId} on volume {VolumeId}; remaining directories will be scanned next run",
-                            tenant.TenantId, volume.VolumeId);
+                        scanLock.Release();
                     }
-                }
-                finally
-                {
-                    scanLock.Release();
-                }
 
-                _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
-            }
-
+                    _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
+                }
             Interlocked.Add(ref _orphanedFilesRecovered, rebuiltCount);
 
             if (rebuiltCount > 0)
@@ -589,43 +625,73 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task RecoverAllOrphanedFilesAsync(CancellationToken ct = default)
         {
-            _logger.LogInformation("Starting orphaned file metadata rebuild across all registered volumes");
+            if (!await TryEnterVolumeScanAsync("orphaned file recovery", tenantId: null, ct).ConfigureAwait(false))
+                return;
 
-            var tenantIds = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var volume in _volumes.Values)
+            try
             {
-                ct.ThrowIfCancellationRequested();
+                _logger.LogInformation("Starting orphaned file metadata rebuild across all registered volumes");
 
-                if (!_fileSystem.Directory.Exists(volume.MountPath))
-                    continue;
-
-                try
+                var tenantIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var volume in _volumes.Values)
                 {
-                    foreach (var tenantDirectory in _fileSystem.Directory.EnumerateDirectories(volume.MountPath))
-                    {
-                        ct.ThrowIfCancellationRequested();
+                    ct.ThrowIfCancellationRequested();
 
-                        var tenantId = _fileSystem.Path.GetFileName(tenantDirectory);
-                        if (!string.IsNullOrWhiteSpace(tenantId))
-                            tenantIds.Add(tenantId);
+                    if (!_fileSystem.Directory.Exists(volume.MountPath))
+                        continue;
+
+                    try
+                    {
+                        foreach (var tenantDirectory in _fileSystem.Directory.EnumerateDirectories(volume.MountPath))
+                        {
+                            ct.ThrowIfCancellationRequested();
+
+                            var tenantId = _fileSystem.Path.GetFileName(tenantDirectory);
+                            if (!string.IsNullOrWhiteSpace(tenantId))
+                                tenantIds.Add(tenantId);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to enumerate tenant directories under volume {VolumeId}", volume.VolumeId);
+                        continue;
                     }
                 }
-                catch (Exception ex)
+
+                foreach (var tenantId in tenantIds)
                 {
-                    _logger.LogWarning(ex, "Failed to enumerate tenant directories under volume {VolumeId}", volume.VolumeId);
-                    continue;
+                    ct.ThrowIfCancellationRequested();
+                    var tenant = await ResolveCleanupTenantAsync(tenantId, ct);
+                    if (tenant == null)
+                        continue;
+
+                    await RecoverOrphanedFilesCoreAsync(tenant, ct).ConfigureAwait(false);
                 }
             }
-
-            foreach (var tenantId in tenantIds)
+            finally
             {
-                ct.ThrowIfCancellationRequested();
-                var tenant = await ResolveCleanupTenantAsync(tenantId, ct);
-                if (tenant == null)
-                    continue;
-
-                await RecoverOrphanedFilesAsync(tenant, ct);
+                _volumeScanGate.Release();
             }
+        }
+
+        private async Task<bool> TryEnterVolumeScanAsync(string operation, string? tenantId, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (_volumeScanGate.Wait(0))
+                return true;
+
+            await Task.Yield();
+            ct.ThrowIfCancellationRequested();
+
+            if (_volumeScanGate.Wait(0))
+                return true;
+
+            _logger.LogInformation(
+                "Skipping {Operation}{TenantSuffix} because another volume scan is already running",
+                operation,
+                string.IsNullOrWhiteSpace(tenantId) ? string.Empty : $" for tenant {tenantId}");
+            return false;
         }
 
         private async Task<ITenantContext?> ResolveCleanupTenantAsync(string tenantId, CancellationToken ct = default)

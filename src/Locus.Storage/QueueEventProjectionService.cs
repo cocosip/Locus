@@ -45,6 +45,7 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantProjectionLocks;
         private readonly ConcurrentDictionary<string, CachedProjectionCursor> _cursorCache;
         private readonly AsyncLocal<IQueueProjectionBatch?> _currentProjectionBatch;
+        private string? _nextTenantProjectionCursor;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="QueueEventProjectionService"/> class.
@@ -95,8 +96,10 @@ namespace Locus.Storage
 
                 try
                 {
-                    var tenantIds = await _journal.GetTenantIdsAsync(stoppingToken).ConfigureAwait(false);
+                    var tenantIds = RotateTenantIds(
+                        await _journal.GetTenantIdsAsync(stoppingToken).ConfigureAwait(false));
                     var tenantsProcessed = 0;
+                    string? lastTenantProcessed = null;
                     foreach (var tenantId in tenantIds)
                     {
                         stoppingToken.ThrowIfCancellationRequested();
@@ -110,7 +113,11 @@ namespace Locus.Storage
                         var processedForTenant = await ProjectTenantAsync(tenantId, stoppingToken).ConfigureAwait(false);
                         processedAny |= processedForTenant;
                         tenantsProcessed++;
+                        lastTenantProcessed = tenantId;
                     }
+
+                    if (lastTenantProcessed != null)
+                        _nextTenantProjectionCursor = GetNextTenantProjectionCursor(tenantIds, lastTenantProcessed);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -127,6 +134,47 @@ namespace Locus.Storage
             }
 
             _logger.LogInformation("QueueEventProjectionService stopped");
+        }
+
+        private IReadOnlyList<string> RotateTenantIds(IReadOnlyList<string> tenantIds)
+        {
+            var cursor = _nextTenantProjectionCursor;
+            if (tenantIds.Count <= 1 || cursor == null || cursor.Length == 0)
+                return tenantIds;
+
+            var startIndex = IndexOfTenantAtOrAfter(tenantIds, cursor);
+            if (startIndex <= 0)
+                return tenantIds;
+
+            var rotated = new string[tenantIds.Count];
+            for (var i = 0; i < tenantIds.Count; i++)
+                rotated[i] = tenantIds[(startIndex + i) % tenantIds.Count];
+
+            return rotated;
+        }
+
+        private static int IndexOfTenantAtOrAfter(IReadOnlyList<string> tenantIds, string tenantId)
+        {
+            for (var i = 0; i < tenantIds.Count; i++)
+            {
+                if (string.CompareOrdinal(tenantIds[i], tenantId) >= 0)
+                    return i;
+            }
+
+            return 0;
+        }
+
+        private static string? GetNextTenantProjectionCursor(IReadOnlyList<string> tenantIds, string lastTenantProcessed)
+        {
+            for (var i = 0; i < tenantIds.Count; i++)
+            {
+                if (!string.Equals(tenantIds[i], lastTenantProcessed, StringComparison.Ordinal))
+                    continue;
+
+                return tenantIds[(i + 1) % tenantIds.Count];
+            }
+
+            return null;
         }
 
         /// <inheritdoc/>

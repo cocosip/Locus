@@ -123,6 +123,60 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ExecuteAsync_SkipsJunkCleanupUntilJunkIntervalElapses()
+        {
+            var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
+            var fileScheduler = new Mock<IFileScheduler>(MockBehavior.Strict);
+            var logger = new Mock<ILogger<BackgroundCleanupService>>();
+            using var cts = new CancellationTokenSource();
+            var statsCalls = 0;
+
+            cleanupService
+                .Setup(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            fileScheduler
+                .Setup(s => s.CleanupOrphanedMetadataAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(0);
+            cleanupService
+                .Setup(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            cleanupService
+                .Setup(s => s.GetCleanupStatisticsAsync(It.IsAny<CancellationToken>()))
+                .Returns<CancellationToken>(_ =>
+                {
+                    statsCalls++;
+                    if (statsCalls >= 2)
+                        cts.Cancel();
+
+                    return Task.FromResult(new CleanupStatistics());
+                });
+
+            var service = new TestBackgroundCleanupService(
+                cleanupService.Object,
+                fileScheduler.Object,
+                new CleanupOptions
+                {
+                    InitialDelay = TimeSpan.Zero,
+                    CleanupInterval = TimeSpan.FromMilliseconds(1),
+                    CleanupJunkFiles = true,
+                    JunkFileCleanupInterval = TimeSpan.FromHours(1),
+                    OptimizeDatabases = false,
+                    CleanupTimedOutFiles = false,
+                    CleanupCompletedFiles = false,
+                    PermanentlyFailedDisposition = PermanentlyFailedDisposition.Keep,
+                    CleanupInvalidDatabaseBackups = false
+                },
+                logger.Object);
+
+            await service.RunAsync(cts.Token);
+
+            cleanupService.Verify(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()), Times.Once);
+            fileScheduler.Verify(s => s.CleanupOrphanedMetadataAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
+            cleanupService.Verify(s => s.CleanupFilesByStatusAsync(null, null, It.IsAny<CancellationToken>()), Times.Exactly(2));
+            cleanupService.Verify(s => s.GetCleanupStatisticsAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
         public async Task ExecuteAsync_SkipsCleanupTasks_WhenDisabled()
         {
             var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);

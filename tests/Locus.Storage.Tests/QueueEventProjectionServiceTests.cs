@@ -152,6 +152,51 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ExecuteAsync_RotatesTenantsAcrossCycles_WhenTenantBatchLimitIsLowerThanTenantCount()
+        {
+            var journal = new TrackingQueueEventJournal(
+                new[] { "tenant-001", "tenant-002", "tenant-003", "tenant-004", "tenant-005" });
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal,
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 2,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(1),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(1),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object));
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(
+                    () => Task.FromResult(journal.ReadTenantIds.Contains("tenant-005")),
+                    TimeSpan.FromSeconds(2));
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            Assert.Contains("tenant-001", journal.ReadTenantIds);
+            Assert.Contains("tenant-002", journal.ReadTenantIds);
+            Assert.Contains("tenant-003", journal.ReadTenantIds);
+            Assert.Contains("tenant-004", journal.ReadTenantIds);
+            Assert.Contains("tenant-005", journal.ReadTenantIds);
+        }
+
+        [Fact]
         public async Task ReplayTenantAsync_AcceptedEventOnExistingPendingProjection_SettlesQuotaAndMarksMetadata()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
@@ -1903,6 +1948,59 @@ namespace Locus.Storage.Tests
         {
             _trackedDisposables.Add(disposable);
             return disposable;
+        }
+
+        private sealed class TrackingQueueEventJournal : IQueueEventJournal
+        {
+            private readonly IReadOnlyList<string> _tenantIds;
+
+            public TrackingQueueEventJournal(IReadOnlyList<string> tenantIds)
+            {
+                _tenantIds = tenantIds;
+                ReadTenantIds = new HashSet<string>(StringComparer.Ordinal);
+            }
+
+            public HashSet<string> ReadTenantIds { get; }
+
+            public Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
+            {
+                throw new NotSupportedException();
+            }
+
+            public Task AppendBatchAsync(IReadOnlyList<QueueEventRecord> records, CancellationToken ct = default)
+            {
+                throw new NotSupportedException();
+            }
+
+            public Task<QueueEventReadBatch> ReadBatchAsync(
+                string tenantId,
+                long offset,
+                int maxRecords,
+                CancellationToken ct = default)
+            {
+                ReadTenantIds.Add(tenantId);
+                return Task.FromResult(new QueueEventReadBatch(Array.Empty<QueueEventRecord>(), offset, reachedEndOfFile: true));
+            }
+
+            public Task<long> CompactAsync(string tenantId, long processedOffset, CancellationToken ct = default)
+            {
+                throw new NotSupportedException();
+            }
+
+            public Task<long> GetTailOffsetAsync(string tenantId, CancellationToken ct = default)
+            {
+                return Task.FromResult(0L);
+            }
+
+            public Task<long> GetBaseOffsetAsync(string tenantId, CancellationToken ct = default)
+            {
+                return Task.FromResult(0L);
+            }
+
+            public Task<IReadOnlyList<string>> GetTenantIdsAsync(CancellationToken ct = default)
+            {
+                return Task.FromResult(_tenantIds);
+            }
         }
     }
 }

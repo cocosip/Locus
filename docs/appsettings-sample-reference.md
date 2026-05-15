@@ -232,10 +232,10 @@
       "MaxTenantsPerCycle": 32,
 
       // 上一轮仍有工作时，下一轮等待多久
-      "BusyCycleDelay": "00:00:00.050",
+      "BusyCycleDelay": "00:00:00.100",
 
       // 当前没有工作时，多久再检查一次
-      "IdleCycleDelay": "00:00:01",
+      "IdleCycleDelay": "00:00:03",
 
       // 单轮投影允许持续工作的最长时间
       "MaxProjectionTimePerCycle": "00:00:05",
@@ -410,7 +410,7 @@
         "PostImportAction": "Delete",
 
         // 轮询周期
-        "PollingInterval": "00:00:10",
+        "PollingInterval": "00:00:20",
 
         // 最大允许导入文件大小
         "MaxFileSizeBytes": 536870912,
@@ -461,7 +461,7 @@
           "*.bmp"
         ],
         "PostImportAction": "Delete",
-        "PollingInterval": "00:00:15",
+        "PollingInterval": "00:00:30",
 
         "MaxFileSizeBytes": 536870912,
 
@@ -484,10 +484,10 @@
       "RunOnStartup": true,
 
       // 周期性恢复间隔
-      "RecoveryInterval": "01:00:00",
+      "RecoveryInterval": "00:15:00",
 
       // 启动后多久再执行第一轮恢复
-      "InitialDelay": "00:01:00"
+      "InitialDelay": "00:03:00"
     },
 
     "CleanupOptions": {
@@ -495,13 +495,19 @@
       "Enabled": true,
 
       // 后台清理轮询间隔
-      "CleanupInterval": "00:01:00",
+      "CleanupInterval": "00:10:00",
 
       // 启动后首次清理前延迟
-      "InitialDelay": "00:01:00",
+      "InitialDelay": "00:03:00",
 
       // 是否清理处理超时文件
       "CleanupTimedOutFiles": true,
+
+      // 是否递归清理 Thumbs.db / .DS_Store / desktop.ini 等垃圾文件
+      "CleanupJunkFiles": true,
+
+      // 垃圾文件递归扫描最小间隔
+      "JunkFileCleanupInterval": "00:20:00",
 
       // 处理超时阈值
       "ProcessingTimeout": "00:20:00",

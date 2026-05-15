@@ -17,6 +17,7 @@ namespace Locus.Storage
         private readonly IFileScheduler _fileScheduler;
         private readonly ILogger<BackgroundCleanupService> _logger;
         private readonly CleanupOptions _options;
+        private DateTime _lastJunkFileCleanup;
         // Initialized to UtcNow so the first optimization is deferred by a full
         // DatabaseOptimizationInterval rather than running immediately on startup.
         private DateTime _lastDatabaseOptimization;
@@ -34,6 +35,7 @@ namespace Locus.Storage
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _lastJunkFileCleanup = DateTime.MinValue;
             _lastDatabaseOptimization = DateTime.UtcNow;
         }
 
@@ -57,9 +59,14 @@ namespace Locus.Storage
                 {
                     _logger.LogInformation("Starting scheduled cleanup tasks");
 
-                    // 1. Cleanup junk files (Thumbs.db, .DS_Store, etc.)
-                    // Note: This no longer deletes empty directories, only the junk files within them.
-                    await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
+                    // 1. Cleanup junk files (Thumbs.db, .DS_Store, etc.) on its own cadence.
+                    // This is a recursive volume scan, so keep it independent from the lighter
+                    // status cleanup cadence.
+                    if (_options.CleanupJunkFiles && ShouldCleanupJunkFiles())
+                    {
+                        await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
+                        _lastJunkFileCleanup = DateTime.UtcNow;
+                    }
 
                     // 2. Low-rate cleanup for completed files that are ready for physical deletion.
                     if (_options.CleanupCompletedFiles && _options.CompletedFileRetentionPeriod.HasValue)
@@ -186,6 +193,18 @@ namespace Locus.Storage
             var timeSinceLastOptimization = DateTime.UtcNow - _lastDatabaseOptimization;
             return timeSinceLastOptimization >= _options.DatabaseOptimizationInterval.Value;
         }
+
+        private bool ShouldCleanupJunkFiles()
+        {
+            if (!_options.JunkFileCleanupInterval.HasValue)
+                return true;
+
+            var interval = _options.JunkFileCleanupInterval.Value;
+            if (interval <= TimeSpan.Zero)
+                return true;
+
+            return DateTime.UtcNow - _lastJunkFileCleanup >= interval;
+        }
     }
 
     /// <summary>
@@ -222,6 +241,20 @@ namespace Locus.Storage
         /// Default: true.
         /// </summary>
         public bool CleanupCompletedFiles { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether background cleanup should recursively remove junk files
+        /// such as Thumbs.db, .DS_Store and desktop.ini.
+        /// Default: true.
+        /// </summary>
+        public bool CleanupJunkFiles { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the minimum interval between recursive junk-file sweeps.
+        /// Set to null or zero to run on every cleanup cycle.
+        /// Default: 20 minutes.
+        /// </summary>
+        public TimeSpan? JunkFileCleanupInterval { get; set; } = TimeSpan.FromMinutes(20);
 
         /// <summary>
         /// Gets or sets the processing timeout threshold.

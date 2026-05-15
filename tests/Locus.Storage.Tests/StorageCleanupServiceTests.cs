@@ -289,6 +289,34 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RecoverAllOrphanedFilesAsync_SkipsWhenVolumeScanAlreadyRunning()
+        {
+            // Arrange
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            _fileSystem.Directory.CreateDirectory(tenantPath);
+            var gateField = typeof(StorageCleanupService).GetField(
+                "_volumeScanGate",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var gate = Assert.IsType<SemaphoreSlim>(gateField?.GetValue(_cleanupService));
+            await gate.WaitAsync();
+
+            try
+            {
+                // Act
+                await _cleanupService.RecoverAllOrphanedFilesAsync(CancellationToken.None);
+            }
+            finally
+            {
+                gate.Release();
+            }
+
+            // Assert
+            _tenantManager.Verify(
+                m => m.TryGetTenantAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
         public async Task CleanupTimedOutProcessingFilesAsync_ResetsTimedOutFiles()
         {
             // Arrange
