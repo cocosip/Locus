@@ -64,15 +64,19 @@ var location = await storagePool.GetFileLocationAsync(tenant, fileKey, ct);
 ```mermaid
 flowchart LR
     Client["Client / Worker"] --> Pool["StoragePool / IStoragePool"]
+    Watcher["FileWatcher auto-import"] --> Pool
     Pool --> Tenant["Tenant validation"]
     Pool --> Projection["Projection lookup"]
     Projection --> Cache["In-memory active-data cache"]
     Cache -. "warm on first access or restart" .-> Sqlite["Per-tenant SQLite projections<br/>metadata.db / quotas.db"]
     Pool --> Volume["Storage volumes<br/>physical file bytes"]
-    Pool --> Journal["Per-tenant queue.log"]
+    Pool --> Journal["Per-tenant journal files<br/>queue.log / state / cursor / snapshot"]
     Journal --> Projector["QueueEventProjectionService"]
     Projector --> Sqlite
     Projector --> Cache
+    Cleanup["Cleanup / recovery services"] --> Projection
+    Cleanup --> Volume
+    Cleanup --> Journal
 ```
 
 ### Read Path
@@ -109,7 +113,7 @@ sequenceDiagram
 - **Unified API**: IStoragePool combines file storage and queue processing in one interface
 - **Per-Tenant SQLite**: Each tenant has an isolated subdirectory with `metadata.db` and `quotas.db`
 - **Active-Data Caching**: Only cache files in Pending/Processing/Failed states
-- **Completed Files**: Automatically removed from cache and database after processing
+- **Completed Files**: Move through `Completed` / `DeleteRequested` and are reaped by background cleanup
 - **Atomic Quota Operations**: Lock-free CAS counters + Write-Behind timer ensure concurrency safety
 - **Startup Volume Configuration**: Storage volumes are configured at startup and managed internally
 
@@ -120,7 +124,7 @@ Locus separates file content, queue-state durability, and queryable projections 
 - **Physical files on storage volumes** hold the actual bytes
 - **Per-tenant `queue.log`** stores durable queue-state transitions such as `Accepted`,
   `ProcessingStarted`, `ProcessingFailed`, `ProcessingTimedOut`, `ProcessingCompleted`,
-  `DeleteRequested`, and `DeleteSucceeded`
+  `DeleteRequested`, `DeleteSucceeded`, and `DeadLettered`
 - **Per-tenant SQLite projections** (`metadata.db` and `quotas.db`) provide the current queryable state
 - **In-memory caches** keep hot-path reads, leasing, and quota checks fast
 
@@ -158,10 +162,39 @@ Default behavior:
 
 - `EnableCompaction = true`
 - `EnableAutomaticSnapshots = true`
-- `MinBytesBeforeCompaction = 4 MB`
+- `MinBytesBeforeCompaction = 32 MB` in the current sample configuration
+- `MinBytesBeforeAutomaticSnapshot = 8 MB`
 
 When compaction runs, the already-projected prefix of `queue.log` is trimmed away. If the entire file has
 already been projected, the tenant journal is truncated to an empty file and its base/tail offsets advance.
+
+The sample appsettings file currently favors high-throughput image ingestion: `AckMode = Async`,
+`JournalFormat = BinaryV1`, larger projection batches, and `ForceFlushAfterWrite = false` on the first
+sample volume. Deployments that need stronger "success returned means flushed" semantics should evaluate
+`AckMode = Durable` or `Balanced`, and set critical volumes to `ForceFlushAfterWrite = true`.
+
+## Configuration Reference
+
+Runtime options are bound from the `Locus` section. Keep these files aligned when option shapes change:
+
+- [`src/Locus/appsettings.sample.json`](src/Locus/appsettings.sample.json) - package-level sample
+- [`samples/Locus.Sample.Console/appsettings.json`](samples/Locus.Sample.Console/appsettings.json) - runnable sample
+- [`docs/appsettings-sample-reference.md`](docs/appsettings-sample-reference.md) - field-by-field reference
+
+The current sample includes the major runtime surfaces:
+
+- `MetadataRepository`, `StoragePool`, and `QueueEventJournal` tune write-behind persistence, timeout
+  reclaim, journal ACK behavior, snapshots, projection, and compaction.
+- `Sqlite` controls WAL mode, synchronous behavior, cache size, busy timeout, and checkpoint policy.
+- `RetryPolicy`, `Volumes`, `Tenants`, and `FileWatchers` define retry cadence, physical storage,
+  tenant bootstrap, and directory import behavior.
+- `OrphanRecoveryOptions` and `CleanupOptions` cover startup/periodic recovery, timeout reset,
+  completed-file reaping, dead-letter handling, retired-volume metadata handling, invalid database
+  backup cleanup, database optimization, and junk-file cleanup.
+
+`CleanupOptions.CleanupJunkFiles` enables a background recursive sweep for common system files such as
+`Thumbs.db`, `.DS_Store`, and `desktop.ini`. `JunkFileCleanupInterval` controls the minimum time between
+those heavier volume scans, independent from the normal status cleanup cadence.
 
 ## Core APIs
 
@@ -505,72 +538,43 @@ Locus/
     └── Locus.Sample.Console/
 ```
 
-## Test Coverage
+## Verification
 
-**All tests passing: 252/252 ✅**
+The solution is covered by focused xUnit projects and BenchmarkDotNet harnesses:
 
-- ✅ FileSystem.Tests: 51 tests
-- ✅ Storage.Tests: 179 tests
-- ✅ MultiTenant.Tests: 12 tests
-- ✅ IntegrationTests: 10 tests
+- `tests/Locus.FileSystem.Tests`
+- `tests/Locus.Storage.Tests`
+- `tests/Locus.MultiTenant.Tests`
+- `tests/Locus.IntegrationTests`
+- `tests/Locus.Benchmarks`
+
+Use `dotnet test Locus.sln --no-build` after a successful build, or run a focused project such as
+`dotnet test tests/Locus.Storage.Tests/Locus.Storage.Tests.csproj --no-restore` while working on storage
+regressions.
 
 ## Implementation Status
 
-### ✅ Completed (Phases 1-6)
+Locus is implemented as a single public package surface over the core modules, with the console sample and
+configuration reference kept in the repository:
 
-**Core Infrastructure:**
-- ✅ Solution and project structure
-- ✅ All core interfaces (IStoragePool, IFileScheduler, ITenantManager, etc.)
-- ✅ All models and exceptions
-- ✅ Central package management (Directory.Packages.props)
-- ✅ Zero build warnings or errors
+**Runtime Core:**
+- Solution and project structure with central package management
+- `IStoragePool`, `IFileScheduler`, `ITenantManager`, FileWatcher, cleanup, and quota abstractions
+- `LocalFileSystemVolume`, path sanitization, volume health checks, and cross-platform path handling
+- Per-tenant metadata and quota persistence using SQLite with WAL-oriented defaults
 
-**Multi-Tenant Management (Phase 2):**
-- ✅ TenantManager with JSON-based metadata
-- ✅ Per-tenant isolation with auto-creation support
-- ✅ 5-minute cache with status checking
-- ✅ Enable/Disable/Suspend tenant controls
+**Queue and Recovery:**
+- Durable per-tenant `queue.log` with binary journal format support
+- Background projection to metadata/quota state, automatic snapshots, and compaction
+- Startup database health checks and corrupted database recovery
+- Processing timeout recovery, orphan recovery, retired-volume metadata handling, and dead-letter lifecycle
 
-**Storage Volumes (Phase 3):**
-- ✅ LocalFileSystemVolume implementation
-- ✅ Path sanitizer for security
-- ✅ Health checks and capacity monitoring
-- ✅ Cross-platform path handling
-
-**Directory Quota Management (Phase 4):**
-- ✅ DirectoryQuotaRepository with SQLite
-- ✅ Lock-free CAS atomic increment/decrement with Write-Behind persistence
-- ✅ Per-directory file count limits
-- ✅ Concurrent-safe operations
-
-**File Scheduler (Phase 5):**
-- ✅ FileScheduler with queue-based processing
-- ✅ Concurrent file allocation (no duplicates)
-- ✅ Retry mechanism with exponential backoff
-- ✅ Status tracking (Pending → Processing → Completed/Failed/PermanentlyFailed)
-
-**Storage Pool (Phase 6):**
-- ✅ StoragePool with volume management
-- ✅ MetadataRepository with per-tenant SQLite (WAL mode, per-tenant subdirectory)
-- ✅ Active-data caching strategy
-- ✅ Automatic volume selection
-- ✅ TenantQuotaManager integration
-
-**Testing:**
-- ✅ 252 unit/integration tests (100% passing)
-- ✅ Performance benchmarks
-
-### 🚧 In Progress (Phases 7-8)
-
-- ⏳ StorageCleanupService (background cleanup)
-- ⏳ BackgroundCleanupService (scheduled tasks)
-- ⏳ Configuration and DI setup (LocusBuilder)
-
-### 📋 Planned (Phases 9-10)
-
-- Sample applications
-- ~~NuGet packaging~~ ✅ Completed - Single consolidated package
-- Documentation and guides
+**Operations and Configuration:**
+- `LocusBuilder` and appsettings binding through the `Locus` section
+- Background cleanup for completed files, timed-out processing rows, permanently failed rows,
+  invalid database backups, and junk files
+- FileWatcher auto-import with single-tenant and multi-tenant modes
+- Sample console application with current appsettings defaults
 
 ## Build Commands
 
@@ -592,10 +596,12 @@ dotnet pack src/Locus/Locus.csproj -c Release
 
 ### Core Documentation
 - **[CLAUDE.md](CLAUDE.md)** - Complete implementation guidelines, architecture decisions, API references, and FileWatcher usage guide
+- **[docs/appsettings-sample-reference.md](docs/appsettings-sample-reference.md)** - Current appsettings field reference with JSONC-style comments
+- **[docs/storage-lifecycle-overview.md](docs/storage-lifecycle-overview.md)** - End-to-end lifecycle, projection, recovery, and cleanup flow
+- **[docs/queue-journal-observability.md](docs/queue-journal-observability.md)** - Queue journal metrics, state files, and recovery signals
 
 ### Sample Projects
 - **[Locus.Sample.Console](samples/Locus.Sample.Console/)** - Complete working example with appsettings.json configuration
-- **[Locus.Sample.StressTest](samples/Locus.Sample.StressTest/)** - Multi-threaded stress test with FileWatcher integration
 
 ### Key Features
 
@@ -608,7 +614,8 @@ dotnet pack src/Locus/Locus.csproj -c Release
 🔄 **File Queue Processing**
 - System-generated file keys
 - Automatic retry on failure with exponential backoff
-- Processing status tracking (Pending → Processing → Completed/Failed)
+- Processing status tracking (`Pending` -> `Processing` -> `Completed`/`Failed`/`PermanentlyFailed`/`DeadLettered`)
+- Durable queue journal, projection snapshots, and compaction
 
 📁 **FileWatcher Auto-Import**
 - Multi-tenant mode with automatic directory creation
@@ -616,10 +623,11 @@ dotnet pack src/Locus/Locus.csproj -c Release
 - Post-import actions (Delete/Move/Keep)
 
 🧹 **Automatic Cleanup**
-- Empty directory cleanup
+- Completed-file reaping and empty directory cleanup
+- Junk-file cleanup for `Thumbs.db`, `.DS_Store`, and `desktop.ini`
 - Timeout detection and reset
-- Orphaned file cleanup
-- Failed file retention policies
+- Orphan recovery and orphaned metadata cleanup
+- Failed file retention, dead-letter handling, and retired-volume metadata policies
 
 🔧 **Storage Management**
 - Dynamic volume mounting/unmounting
