@@ -1180,6 +1180,145 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsFailedAsync_WhenJournalProjectionAlreadyReleasedSameLease_IsIdempotent()
+        {
+            var processingStart = DateTime.UtcNow;
+            var processing = new FileMetadata
+            {
+                FileKey = "file-journal-failed-projected",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart,
+                RetryCount = 0,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-2),
+                PhysicalPath = Path.Combine(_metadataDir, "file-journal-failed-projected.dcm"),
+                DirectoryPath = "/incoming",
+                VolumeId = "vol-001",
+            };
+            var projectedFailure = processing.Clone();
+            projectedFailure.Status = FileProcessingStatus.Pending;
+            projectedFailure.ProcessingStartTime = null;
+            projectedFailure.RetryCount = 1;
+            projectedFailure.LastError = "decode failed";
+            projectedFailure.LastFailedAt = DateTime.UtcNow;
+            projectedFailure.AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(5);
+            projectedFailure.Metadata = new Dictionary<string, string>
+            {
+                ["queue.released_lease_start_utc"] = processingStart.ToString("O")
+            };
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .SetupSequence(m => m.GetProjectedFileAsync("tenant-001", "file-journal-failed-projected", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(processing)
+                .ReturnsAsync(projectedFailure);
+            projectionStore
+                .Setup(m => m.TryUpdateProjectedProcessingFileAsync(
+                    "tenant-001",
+                    "file-journal-failed-projected",
+                    processingStart,
+                    It.IsAny<Func<FileMetadata, FileMetadata>>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync((FileMetadata?)null);
+
+            var journal = new Mock<IQueueEventJournal>();
+            journal
+                .Setup(m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record => record.EventType == QueueEventType.ProcessingFailed),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                projectionStore.Object,
+                _fileSystem,
+                _logger.Object,
+                queueEventJournal: journal.Object);
+
+            await scheduler.MarkAsFailedAsync(
+                CreateLease("tenant-001", "file-journal-failed-projected", processingStart),
+                "decode failed",
+                CancellationToken.None);
+
+            journal.Verify(
+                m => m.AppendAsync(
+                    It.Is<QueueEventRecord>(record => record.EventType == QueueEventType.ProcessingFailed),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+            projectionStore.Verify(
+                m => m.TryUpdateProjectedProcessingFileAsync(
+                    "tenant-001",
+                    "file-journal-failed-projected",
+                    processingStart,
+                    It.IsAny<Func<FileMetadata, FileMetadata>>(),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task MarkAsFailedAsync_WhenJournalProjectionWasAlreadyReleasedSameLease_DoesNotAppendAgain()
+        {
+            var processingStart = DateTime.UtcNow;
+            var projectedFailure = new FileMetadata
+            {
+                FileKey = "file-journal-failed-already-projected",
+                TenantId = "tenant-001",
+                Status = FileProcessingStatus.Pending,
+                ProcessingStartTime = null,
+                RetryCount = 1,
+                LastError = "decode failed",
+                LastFailedAt = DateTime.UtcNow,
+                AvailableForProcessingAt = DateTime.UtcNow.AddSeconds(5),
+                CreatedAt = DateTime.UtcNow.AddMinutes(-2),
+                PhysicalPath = Path.Combine(_metadataDir, "file-journal-failed-already-projected.dcm"),
+                DirectoryPath = "/incoming",
+                VolumeId = "vol-001",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["queue.released_lease_start_utc"] = processingStart.ToString("O")
+                }
+            };
+
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projectionStore
+                .Setup(m => m.GetProjectedFileAsync("tenant-001", "file-journal-failed-already-projected", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(projectedFailure);
+
+            var journal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            var scheduler = new FileScheduler(
+                projectionStore.Object,
+                _fileSystem,
+                _logger.Object,
+                queueEventJournal: journal.Object);
+
+            await scheduler.MarkAsFailedAsync(
+                CreateLease("tenant-001", "file-journal-failed-already-projected", processingStart),
+                "decode failed",
+                CancellationToken.None);
+            await scheduler.MarkAsFailedAsync(
+                CreateLease("tenant-001", "file-journal-failed-already-projected", processingStart),
+                "decode failed",
+                CancellationToken.None);
+
+            journal.Verify(
+                m => m.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            projectionStore.Verify(
+                m => m.GetProjectedFileAsync(
+                    "tenant-001",
+                    "file-journal-failed-already-projected",
+                    It.IsAny<CancellationToken>()),
+                Times.Exactly(2));
+            projectionStore.Verify(
+                m => m.TryUpdateProjectedProcessingFileAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<DateTime>(),
+                    It.IsAny<Func<FileMetadata, FileMetadata>>(),
+                    It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
         public async Task MarkAsFailedAsync_UsesExponentialBackoff()
         {
             // Arrange

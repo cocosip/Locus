@@ -5,7 +5,6 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Collections.Generic;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
@@ -558,6 +557,96 @@ namespace Locus.Storage.Tests
             Assert.Null(rebuilt.ProcessingStartTime);
             Assert.NotNull(rebuilt.CompletedAt);
             Assert.True(rebuilt.CompletedAt.Value >= processingStartTime);
+        }
+
+        [Fact]
+        public async Task ReplayTenantAsync_DeleteRequestedAfterCompletedPreservesReleasedLeaseMarker()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-delete-preserve-lease";
+            const string fileKey = "file-delete-preserve-lease";
+            const string directoryPath = "/done";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "done", "file-delete-preserve-lease.dcm");
+            var acceptedAt = DateTime.UtcNow.AddSeconds(-30);
+            var processingStartTime = DateTime.UtcNow.AddSeconds(-20);
+            var completedAt = DateTime.UtcNow.AddSeconds(-10);
+            var deleteRequestedAt = DateTime.UtcNow.AddSeconds(-5);
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3, 4, 5 });
+
+            await journal.AppendBatchAsync(
+                new[]
+                {
+                    new QueueEventRecord
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        EventType = QueueEventType.Accepted,
+                        OccurredAtUtc = acceptedAt,
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalPath,
+                        DirectoryPath = directoryPath,
+                        FileSize = 5,
+                        Status = FileProcessingStatus.Pending
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        EventType = QueueEventType.ProcessingStarted,
+                        OccurredAtUtc = processingStartTime,
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalPath,
+                        DirectoryPath = directoryPath,
+                        FileSize = 5,
+                        Status = FileProcessingStatus.Processing,
+                        ProcessingStartTimeUtc = processingStartTime
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        EventType = QueueEventType.ProcessingCompleted,
+                        OccurredAtUtc = completedAt,
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalPath,
+                        DirectoryPath = directoryPath,
+                        FileSize = 5,
+                        Status = FileProcessingStatus.Completed,
+                        ProcessingStartTimeUtc = processingStartTime
+                    },
+                    new QueueEventRecord
+                    {
+                        TenantId = tenantId,
+                        FileKey = fileKey,
+                        EventType = QueueEventType.DeleteRequested,
+                        OccurredAtUtc = deleteRequestedAt,
+                        VolumeId = "vol-001",
+                        PhysicalPath = physicalPath,
+                        DirectoryPath = directoryPath,
+                        FileSize = 5,
+                        Status = FileProcessingStatus.DeleteRequested
+                    }
+                },
+                CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            var rebuilt = await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None);
+
+            Assert.NotNull(rebuilt);
+            Assert.Equal(FileProcessingStatus.DeleteRequested, rebuilt!.Status);
+            Assert.NotNull(rebuilt.Metadata);
+            Assert.True(rebuilt.Metadata!.TryGetValue("queue.released_lease_start_utc", out var releasedLeaseStart));
+            Assert.Equal(
+                processingStartTime,
+                DateTime.Parse(releasedLeaseStart!, null, System.Globalization.DateTimeStyles.RoundtripKind));
         }
 
         [Fact]

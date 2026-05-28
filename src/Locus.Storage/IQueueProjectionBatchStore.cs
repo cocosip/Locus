@@ -37,6 +37,11 @@ namespace Locus.Storage
         Task<bool> RemoveProjectedFileAsync(string fileKey, CancellationToken ct = default);
 
         /// <summary>
+        /// Gets the current staged projection for a file within the in-flight batch.
+        /// </summary>
+        Task<FileMetadata?> TryGetProjectedFileAsync(string fileKey, CancellationToken ct = default);
+
+        /// <summary>
         /// Flushes the staged mutations durably.
         /// </summary>
         Task FlushAsync(CancellationToken ct = default);

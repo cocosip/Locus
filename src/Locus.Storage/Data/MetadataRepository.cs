@@ -1303,6 +1303,7 @@ WHERE tenant_id = @tenant_id
             private readonly string _tenantId;
             private readonly List<PersistenceOperation> _operations;
             private readonly Dictionary<string, FileMetadata?> _originalMetadataByFileKey;
+            private readonly Dictionary<string, FileMetadata?> _stagedMetadataByFileKey;
             private bool _flushed;
 
             public DirectProjectionBatch(MetadataRepository repository, string tenantId)
@@ -1311,6 +1312,7 @@ WHERE tenant_id = @tenant_id
                 _tenantId = tenantId;
                 _operations = new List<PersistenceOperation>();
                 _originalMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
+                _stagedMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
             }
 
             public string TenantId => _tenantId;
@@ -1332,6 +1334,7 @@ WHERE tenant_id = @tenant_id
 
                 CaptureOriginalMetadata(metadata.FileKey);
                 _repository.UpdateCacheAndIndices(metadata);
+                _stagedMetadataByFileKey[metadata.FileKey] = metadata.Clone();
                 _operations.Add(_repository.CreatePersistenceUpsert(metadata));
                 return Task.CompletedTask;
             }
@@ -1351,10 +1354,31 @@ WHERE tenant_id = @tenant_id
 
                 var original = CaptureOriginalMetadata(fileKey);
                 var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
+                _stagedMetadataByFileKey[fileKey] = null;
                 if (removed || original != null)
                     _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
 
                 return Task.FromResult(removed || original != null);
+            }
+
+            public Task<FileMetadata?> TryGetProjectedFileAsync(string fileKey, CancellationToken ct = default)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (_repository._disposed)
+                    throw new ObjectDisposedException(nameof(MetadataRepository));
+
+                if (_flushed)
+                    throw new InvalidOperationException("Projection batch has already been flushed.");
+
+                if (string.IsNullOrWhiteSpace(fileKey))
+                    throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
+
+                if (_stagedMetadataByFileKey.TryGetValue(fileKey, out var staged))
+                    return Task.FromResult(staged?.Clone());
+
+                var original = CaptureOriginalMetadata(fileKey);
+                return Task.FromResult(original?.Clone());
             }
 
             public Task FlushAsync(CancellationToken ct = default)
@@ -1369,6 +1393,7 @@ WHERE tenant_id = @tenant_id
                 {
                     _repository.ExecuteDirectBatch(_tenantId, _operations);
                     _originalMetadataByFileKey.Clear();
+                    _stagedMetadataByFileKey.Clear();
                 }
                 catch
                 {

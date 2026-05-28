@@ -739,7 +739,6 @@ namespace Locus.Storage
             updated.AvailableForProcessingAt = null;
             updated.LastError = null;
             QueueProjectionMetadataState.ClearDeadLetterProjection(updated);
-            QueueProjectionMetadataState.ClearReleasedLease(updated);
 
             await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
         }
@@ -1007,6 +1006,15 @@ namespace Locus.Storage
 
         private Task<FileMetadata?> GetExistingMetadataAsync(QueueEventRecord record, CancellationToken ct)
         {
+            var currentBatch = _currentProjectionBatch.Value;
+            if (currentBatch != null)
+            {
+                if (!string.Equals(currentBatch.TenantId, record.TenantId, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Projection batch tenant does not match the projected record.");
+
+                return currentBatch.TryGetProjectedFileAsync(record.FileKey, ct);
+            }
+
             return _projectionStore.GetProjectedFileAsync(record.TenantId, record.FileKey, ct);
         }
 

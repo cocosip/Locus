@@ -390,6 +390,13 @@ namespace Locus.Storage
                     if (current == null)
                         throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, null);
 
+                    if (IsSameLeaseAlreadyFailed(current, lease.ProcessingStartTimeUtc))
+                    {
+                        transitionGuard.Release();
+                        transitionGuard = null;
+                        return;
+                    }
+
                     if (current.Status != FileProcessingStatus.Processing
                         || !current.ProcessingStartTime.HasValue
                         || current.ProcessingStartTime.Value != lease.ProcessingStartTimeUtc)
@@ -443,6 +450,9 @@ namespace Locus.Storage
                 var metadata = updated == null
                     ? await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false)
                     : null;
+                if (metadata != null && IsSameLeaseAlreadyFailed(metadata, lease.ProcessingStartTimeUtc))
+                    return;
+
                 if (updated == null)
                     throw CreateLeaseMismatchException(lease.FileKey, lease.ProcessingStartTimeUtc, metadata);
 
@@ -547,6 +557,23 @@ namespace Locus.Storage
         {
             var hash = StringComparer.Ordinal.GetHashCode(fileKey) & int.MaxValue;
             return _transitionGuardStripes[hash % _transitionGuardStripes.Length];
+        }
+
+        private static bool IsSameLeaseAlreadyFailed(FileMetadata metadata, DateTime processingStartTimeUtc)
+        {
+            if (metadata.ProcessingStartTime.HasValue)
+                return false;
+
+            if (metadata.Status != FileProcessingStatus.Pending
+                && metadata.Status != FileProcessingStatus.PermanentlyFailed
+                && metadata.Status != FileProcessingStatus.DeadLettered)
+            {
+                return false;
+            }
+
+            var releasedLeaseStart = QueueProjectionMetadataState.GetReleasedLeaseStartUtc(metadata);
+            return releasedLeaseStart.HasValue
+                && releasedLeaseStart.Value == processingStartTimeUtc;
         }
 
         private async Task<FileMetadata?> LeaseNextPendingFileWithRecoveryAsync(string tenantId, CancellationToken ct)
