@@ -135,6 +135,12 @@ namespace Locus
         public StoragePoolOptions StoragePool { get; set; } = new StoragePoolOptions();
 
         /// <summary>
+        /// Gets or sets in-process statistics options.
+        /// Supports appsettings binding under "Locus:Statistics".
+        /// </summary>
+        public LocusStatisticsOptions Statistics { get; set; } = new LocusStatisticsOptions();
+
+        /// <summary>
         /// Gets or sets durable queue journal options.
         /// Supports appsettings binding under "Locus:QueueEventJournal".
         /// </summary>

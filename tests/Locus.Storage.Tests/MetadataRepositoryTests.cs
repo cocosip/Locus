@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Dapper;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Storage.Statistics;
 using Locus.Storage.Data;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
@@ -49,6 +50,40 @@ namespace Locus.Storage.Tests
             Assert.NotNull(allocated);
             Assert.Equal(FileProcessingStatus.Processing, allocated!.Status);
             Assert.Equal(0, GetPendingCount(_repository, _tenantId));
+        }
+
+        [Fact]
+        public async Task AddOrUpdateAsync_WhenStatisticsRecorderProvided_RecordsInlineSqlitePersistenceBatch()
+        {
+            var statistics = new InMemoryLocusStatisticsRecorder(new LocusStatisticsOptions
+            {
+                Enabled = true,
+                WindowSize = TimeSpan.FromMinutes(1),
+                Retention = TimeSpan.FromMinutes(5),
+                Dimensions = new LocusStatisticsDimensionOptions
+                {
+                    TenantId = true
+                }
+            });
+            using var repository = new MetadataRepository(
+                _fileSystem,
+                new Mock<ILogger<MetadataRepository>>().Object,
+                Path.Combine(_metadataDir, "statistics-inline"),
+                enableBackgroundPersistence: false,
+                statisticsRecorder: statistics);
+
+            await repository.AddOrUpdateAsync(CreateMetadata("sqlite-statistics", FileProcessingStatus.Pending), CancellationToken.None);
+
+            var snapshot = statistics.GetSnapshot(new LocusStatisticsQuery
+            {
+                From = DateTimeOffset.UtcNow.AddMinutes(-1),
+                To = DateTimeOffset.UtcNow.AddMinutes(1),
+                TenantId = _tenantId
+            });
+
+            Assert.Equal(1, snapshot.SqlitePersistedOperationCount);
+            Assert.Contains(snapshot.Measurements, m => m.Name == "metadata.sqlite.persisted.batch.count" && m.Value == 1);
+            Assert.Contains(snapshot.Measurements, m => m.Name == "metadata.sqlite.persisted.operation.count" && m.Value == 1);
         }
 
         [Fact]

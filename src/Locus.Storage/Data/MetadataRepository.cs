@@ -13,6 +13,7 @@ using Dapper;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage;
+using Locus.Storage.Statistics;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -59,6 +60,7 @@ namespace Locus.Storage.Data
         private readonly ILogger<MetadataRepository> _logger;
         private readonly string _metadataDirectory;
         private readonly SqliteOptions _sqliteOptions;
+        private readonly ILocusStatisticsRecorder _statisticsRecorder;
 
         // Per-tenant in-memory cache for scheduler-critical hot states.
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, FileMetadata>> _activeFiles;
@@ -453,7 +455,8 @@ namespace Locus.Storage.Data
             int maxPersistenceQueueSize = DefaultMaxPersistenceQueueSize,
             int startupLoadBatchSize = DefaultStartupLoadBatchSize,
             int shutdownDrainTimeoutSeconds = DefaultShutdownDrainTimeoutSeconds,
-            int persistenceIntervalSeconds = DefaultPersistenceIntervalSeconds)
+            int persistenceIntervalSeconds = DefaultPersistenceIntervalSeconds,
+            ILocusStatisticsRecorder? statisticsRecorder = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -476,6 +479,7 @@ namespace Locus.Storage.Data
 
             _metadataDirectory = metadataDirectory;
             _sqliteOptions = sqliteOptions ?? new SqliteOptions();
+            _statisticsRecorder = statisticsRecorder ?? NoopLocusStatisticsRecorder.Instance;
             _enableBackgroundPersistence = enableBackgroundPersistence;
             _maxPersistenceQueueSize = maxPersistenceQueueSize;
             _maxDrainBatchSize = Math.Min(maxDrainBatchSize, _maxPersistenceQueueSize);
@@ -4274,8 +4278,24 @@ LIMIT @limit;";
 
                 var conn = GetDatabase(tenantId);
                 TryCheckpointAfterCommittedBatch(conn, tenantId);
+                RecordSqlitePersistenceStatistics(tenantId, ops.Count);
                 _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
             }
+        }
+
+        private void RecordSqlitePersistenceStatistics(string tenantId, int operationCount)
+        {
+            if (operationCount <= 0)
+                return;
+
+            var dimensions = new Dictionary<string, string?>
+            {
+                ["tenant_id"] = tenantId,
+                ["operation"] = "metadata"
+            };
+            var timestamp = DateTimeOffset.UtcNow;
+            _statisticsRecorder.Record("metadata.sqlite.persisted.batch.count", 1, timestamp, dimensions);
+            _statisticsRecorder.Record("metadata.sqlite.persisted.operation.count", operationCount, timestamp, dimensions);
         }
 
         private void ExecuteBatchCoreWithConnectionRecoveryNoLock(string tenantId, IReadOnlyList<PersistenceOperation> ops)

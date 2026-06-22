@@ -6,6 +6,7 @@ using Locus.FileSystem;
 using Locus.MultiTenant;
 using Locus.Storage;
 using Locus.Storage.Data;
+using Locus.Storage.Statistics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -102,10 +103,31 @@ namespace Locus
             options.MetadataRepository.Validate();
             options.StoragePool.Validate();
             options.QueueEventJournal.Validate();
+            options.Statistics.Validate();
 
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
             services.AddSingleton<StorageVolumeRegistry>();
+
+            if (options.Statistics.Enabled)
+            {
+                services.AddSingleton<InMemoryLocusStatisticsRecorder>(_ => new InMemoryLocusStatisticsRecorder(options.Statistics));
+                services.AddSingleton<ILocusStatisticsRecorder>(sp => sp.GetRequiredService<InMemoryLocusStatisticsRecorder>());
+                services.AddSingleton<ILocusStatisticsReader>(sp => sp.GetRequiredService<InMemoryLocusStatisticsRecorder>());
+            }
+            else
+            {
+                services.AddSingleton<ILocusStatisticsRecorder>(NoopLocusStatisticsRecorder.Instance);
+                services.AddSingleton<ILocusStatisticsReader>(NoopLocusStatisticsRecorder.Instance);
+            }
+
+            if (options.Statistics.Enabled && options.Statistics.Output.Enabled)
+            {
+                services.AddHostedService(sp => new LocusStatisticsOutputService(
+                    sp.GetRequiredService<ILocusStatisticsReader>(),
+                    options.Statistics,
+                    sp.GetRequiredService<ILogger<LocusStatisticsOutputService>>()));
+            }
 
             // Register repositories as singletons (they manage their own state)
             services.AddSingleton(sp =>
@@ -123,7 +145,8 @@ namespace Locus
                     maxPersistenceQueueSize: options.MetadataRepository.MaxQueueSize,
                     startupLoadBatchSize: options.MetadataRepository.StartupLoadBatchSize,
                     shutdownDrainTimeoutSeconds: options.MetadataRepository.ShutdownDrainTimeoutSeconds,
-                    persistenceIntervalSeconds: options.MetadataRepository.PersistenceIntervalSeconds);
+                    persistenceIntervalSeconds: options.MetadataRepository.PersistenceIntervalSeconds,
+                    statisticsRecorder: sp.GetRequiredService<ILocusStatisticsRecorder>());
             });
 
             services.AddSingleton<IQueueProjectionStore>(sp =>
@@ -214,7 +237,14 @@ namespace Locus
                 var storagePool = sp.GetRequiredService<IStoragePool>();
                 var tenantManager = sp.GetRequiredService<ITenantManager>();
                 var logger = sp.GetRequiredService<ILogger<FileWatcher>>();
-                return new FileWatcher(fileSystem, storagePool, tenantManager, logger, options.FileWatcherConfigurationDirectory);
+                var statisticsRecorder = sp.GetRequiredService<ILocusStatisticsRecorder>();
+                return new FileWatcher(
+                    fileSystem,
+                    storagePool,
+                    tenantManager,
+                    logger,
+                    options.FileWatcherConfigurationDirectory,
+                    statisticsRecorder);
             });
 
             // Register file scheduler
@@ -260,6 +290,7 @@ namespace Locus
                 var queueEventJournal = sp.GetService<IQueueEventJournal>();
                 var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
                 var projectionWriteStore = sp.GetRequiredService<IQueueProjectionWriteStore>();
+                var statisticsRecorder = sp.GetRequiredService<ILocusStatisticsRecorder>();
 
                 // Volumes are NOT mounted here. StorageVolumeInitializationService mounts
                 // them asynchronously in StartAsync, before requests are accepted.
@@ -275,7 +306,8 @@ namespace Locus
                     queueEventJournal,
                     projectionStore,
                     projectionWriteStore,
-                    options.QueueEventJournal.AllowLegacyNonJournalMode);
+                    options.QueueEventJournal.AllowLegacyNonJournalMode,
+                    statisticsRecorder);
             });
             services.AddSingleton<IStoragePool>(sp => sp.GetRequiredService<StoragePool>());
 

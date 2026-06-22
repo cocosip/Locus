@@ -152,6 +152,20 @@ namespace Locus
         }
 
         /// <summary>
+        /// Configures in-process statistics options.
+        /// </summary>
+        /// <param name="configure">Configuration action for statistics options.</param>
+        /// <returns>The builder for chaining.</returns>
+        public LocusBuilder WithStatisticsOptions(Action<LocusStatisticsOptions> configure)
+        {
+            if (configure == null)
+                throw new ArgumentNullException(nameof(configure));
+
+            configure(_options.Statistics);
+            return this;
+        }
+
+        /// <summary>
         /// Enables the background cleanup service.
         /// </summary>
         /// <returns>The builder for chaining.</returns>

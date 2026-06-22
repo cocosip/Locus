@@ -15,6 +15,7 @@
 - [appsettings.sample.json](../src/Locus/appsettings.sample.json)
 - [appsettings.json](../samples/Locus.Sample.Console/appsettings.json)
 - [appsettings-sample-reference.md](./appsettings-sample-reference.md)
+- [statistics.md](./statistics.md)
 
 ## 完整配置示例（JSONC 注释版）
 
@@ -89,6 +90,57 @@
       // 是否启用低频后台超时回收。
       // true 可以让超时 Processing 文件在队列未空时也逐步回到 Pending。
       "EnableBackgroundTimedOutReclaim": true
+    },
+
+    "Statistics": {
+      // 是否启用 Locus 进程内统计聚合。
+      // false：注册 no-op recorder，热路径只保留极低成本调用；默认关闭。
+      // true：在内存中按时间窗口聚合写入、读取、取走、SQLite 落盘、watcher 等统计。
+      "Enabled": false,
+
+      // 单个统计时间桶大小。
+      // 用于把事件归入固定窗口，例如 00:05:00 表示按 5 分钟窗口聚合。
+      // 文件写入、取走、watcher 导入等通常更适合分钟级趋势观察，而不是秒级抖动。
+      "WindowSize": "00:05:00",
+
+      // 内存统计桶保留时长。
+      // 查询范围超过该时长时，旧桶可能已经被裁剪。
+      "Retention": "01:00:00",
+
+      "Output": {
+        // 是否由 Locus 自己周期性输出统计摘要。
+        // false：宿主应用可通过 ILocusStatisticsReader 主动查询并自行输出。
+        // true：注册后台输出服务，按 Interval 查询 QueryWindow 并写入配置的 sink。
+        "Enabled": false,
+
+        // 输出目标。当前内置支持 Logging。
+        "Sink": "Logging",
+
+        // Locus 自输出间隔。
+        "Interval": "00:05:00",
+
+        // 每次输出统计覆盖的时间范围。
+        // 默认看最近 15 分钟，能更平滑地反映文件处理吞吐趋势。
+        "QueryWindow": "00:15:00",
+
+        // 是否输出全 0 的空统计摘要。
+        "IncludeEmptySnapshots": false
+      },
+
+      "Dimensions": {
+        // 是否保留 tenant_id 维度。
+        // 默认 false，避免租户数量大时造成高基数和额外内存占用。
+        "TenantId": false,
+
+        // 是否保留 volume_id 维度。
+        "VolumeId": true,
+
+        // 是否保留 watcher_id 维度。
+        "WatcherId": true,
+
+        // 是否保留 operation 维度。
+        "Operation": true
+      }
     },
 
     "QueueEventJournal": {
@@ -525,3 +577,7 @@
 - 更高吞吐但保留较小 flush 风险窗口：使用 `AckMode = Balanced`，再根据压测调整 `BalancedFlushWindow`。
 - 更偏压测/低一致性要求：可以使用 `AckMode = Async`，但要接受成功返回时 journal 可能尚未落盘。
 - SQLite 更强落盘语义：把 `Sqlite.SynchronousMode` 从 `NORMAL` 改为 `FULL` 或 `EXTRA`，代价是写入吞吐下降。
+- 统计默认关闭，只有确实需要按时间窗口观察写入 MB/s、文件取走数量、SQLite 落盘量或 watcher 导入量时再启用 `Statistics.Enabled`。
+- 维度会影响内存占用和基数，租户数量较大时建议保持 `Statistics.Dimensions.TenantId = false`。
+- 如果希望 Locus 自己周期性写统计摘要，启用 `Statistics.Output.Enabled`；如果宿主应用已有监控/日志出口，则优先通过 `ILocusStatisticsReader` 主动获取后自行输出。
+- 默认统计窗口偏向文件处理趋势观察：5 分钟桶、15 分钟输出窗口、1 小时保留。排障时如果需要更实时的波动，可以临时缩短 `Statistics.WindowSize` 和 `Statistics.Output.QueryWindow`。
