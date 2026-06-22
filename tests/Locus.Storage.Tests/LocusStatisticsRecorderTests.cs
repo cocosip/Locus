@@ -109,5 +109,59 @@ namespace Locus.Storage.Tests
             Assert.Equal("vol-001", snapshot.Measurements[0].Dimensions["volume_id"]);
             Assert.False(snapshot.Measurements[0].Dimensions.ContainsKey("tenant_id"));
         }
+
+        [Fact]
+        public void InMemoryRecorder_WhenManyEventsHitSameBucket_KeepsSingleAggregateMeasurement()
+        {
+            var options = new LocusStatisticsOptions
+            {
+                Enabled = true,
+                WindowSize = TimeSpan.FromMinutes(1),
+                Retention = TimeSpan.FromMinutes(5)
+            };
+            var recorder = new InMemoryLocusStatisticsRecorder(options);
+            var at = new DateTimeOffset(2026, 6, 22, 10, 0, 0, TimeSpan.Zero);
+            var dimensions = new Dictionary<string, string?>
+            {
+                ["volume_id"] = "vol-001"
+            };
+
+            for (var i = 0; i < 100_000; i++)
+                recorder.Record("storage.write.success.count", 1, at, dimensions);
+
+            var snapshot = recorder.GetSnapshot(new LocusStatisticsQuery
+            {
+                From = at,
+                To = at.AddMinutes(1)
+            });
+
+            Assert.Single(snapshot.Measurements);
+            Assert.Equal(100_000, snapshot.WriteFileCount);
+            Assert.Equal(100_000, snapshot.Measurements[0].Value);
+        }
+
+        [Fact]
+        public void InMemoryRecorder_WhenBucketExpiresBeforeNextWrite_QueryDoesNotRetainOldBucket()
+        {
+            var options = new LocusStatisticsOptions
+            {
+                Enabled = true,
+                WindowSize = TimeSpan.FromSeconds(10),
+                Retention = TimeSpan.FromMinutes(1)
+            };
+            var recorder = new InMemoryLocusStatisticsRecorder(options);
+            var old = DateTimeOffset.UtcNow.AddMinutes(-10);
+
+            recorder.Record("storage.write.success.count", 1, old);
+
+            var snapshot = recorder.GetSnapshot(new LocusStatisticsQuery
+            {
+                From = old.AddSeconds(-1),
+                To = old.AddSeconds(11)
+            });
+
+            Assert.Empty(snapshot.Measurements);
+            Assert.Equal(0, snapshot.WriteFileCount);
+        }
     }
 }

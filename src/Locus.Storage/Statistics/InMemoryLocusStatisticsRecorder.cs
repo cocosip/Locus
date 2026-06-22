@@ -53,6 +53,8 @@ namespace Locus.Storage.Statistics
             if (query.To <= query.From)
                 return snapshot;
 
+            Prune(DateTimeOffset.UtcNow);
+
             var totals = new Dictionary<AggregateKey, long>();
             foreach (var kvp in _counters)
             {
