@@ -411,7 +411,7 @@ namespace Locus.Storage
                 }
                 catch
                 {
-                    transitionGuard.Release();
+                    transitionGuard?.Release();
                     throw;
                 }
             }

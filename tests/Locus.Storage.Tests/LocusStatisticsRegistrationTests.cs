@@ -26,6 +26,7 @@ namespace Locus.Storage.Tests
 
             Assert.Equal(TimeSpan.FromMinutes(5), options.WindowSize);
             Assert.Equal(TimeSpan.FromHours(1), options.Retention);
+            Assert.Equal(LocusStatisticsOptions.DefaultMaxSeries, options.MaxSeries);
             Assert.Equal(TimeSpan.FromMinutes(5), options.Output.Interval);
             Assert.Equal(TimeSpan.FromMinutes(15), options.Output.QueryWindow);
         }
@@ -87,6 +88,23 @@ namespace Locus.Storage.Tests
             }));
 
             Assert.Contains("Statistics Retention", ex.Message, StringComparison.Ordinal);
+        }
+
+        [Theory]
+        [InlineData(1_023)]
+        [InlineData(262_145)]
+        public void AddLocus_WhenStatisticsMaxSeriesIsOutsideAllowedRange_Throws(int maxSeries)
+        {
+            var services = new ServiceCollection();
+
+            var ex = Assert.Throws<InvalidOperationException>(() => services.AddLocus(options =>
+            {
+                AddVolume(options);
+                options.Statistics.Enabled = true;
+                options.Statistics.MaxSeries = maxSeries;
+            }));
+
+            Assert.Contains("Statistics MaxSeries must be between 1024 and 262144", ex.Message, StringComparison.Ordinal);
         }
 
         private static void AddVolume(LocusOptions options)

@@ -36,6 +36,7 @@ Add or update the `Locus:Statistics` section in appsettings:
       "Enabled": false,
       "WindowSize": "00:05:00",
       "Retention": "01:00:00",
+      "MaxSeries": 16384,
       "Output": {
         "Enabled": false,
         "Sink": "Logging",
@@ -170,6 +171,8 @@ var watcher = reader.GetSnapshot(new LocusStatisticsQuery
 `WindowSize` controls the aggregation bucket size. It is not the duration of a single file operation. For example, `00:05:00` means events are grouped into 5-minute buckets.
 
 `Retention` controls how long in-memory buckets are kept. Queries can only return data that still exists in memory. The default `01:00:00` keeps a short operational window while avoiding a long-lived in-process history store.
+
+`MaxSeries` caps retained time-bucket and dimension series. It must be between `1024` and `262144`; the default is `16384`. When the cap is reached, new series are dropped until older time buckets expire; existing series continue to aggregate. The default is sized for the built-in measurements with the default 5-minute bucket, 1-hour retention window, volume and watcher dimensions enabled, and tenant dimensions disabled.
 
 `Output.QueryWindow` controls the time range used by Locus-owned periodic output. It can be larger than `WindowSize`; for example, the default 15-minute output window reads three 5-minute buckets.
 

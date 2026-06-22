@@ -163,5 +163,44 @@ namespace Locus.Storage.Tests
             Assert.Empty(snapshot.Measurements);
             Assert.Equal(0, snapshot.WriteFileCount);
         }
+
+        [Fact]
+        public void InMemoryRecorder_WhenCardinalityLimitExceeded_DropsNewSeries()
+        {
+            var options = new LocusStatisticsOptions
+            {
+                Enabled = true,
+                WindowSize = TimeSpan.FromMinutes(1),
+                Retention = TimeSpan.FromMinutes(5),
+                MaxSeries = LocusStatisticsOptions.MinMaxSeries,
+                Dimensions = new LocusStatisticsDimensionOptions
+                {
+                    VolumeId = true
+                }
+            };
+            var recorder = new InMemoryLocusStatisticsRecorder(options);
+            var at = new DateTimeOffset(2026, 6, 22, 10, 0, 0, TimeSpan.Zero);
+
+            for (var i = 0; i < LocusStatisticsOptions.MinMaxSeries + 1; i++)
+            {
+                recorder.Record(
+                    "storage.write.success.count",
+                    1,
+                    at,
+                    new Dictionary<string, string?>
+                    {
+                        ["volume_id"] = $"vol-{i}"
+                    });
+            }
+
+            var snapshot = recorder.GetSnapshot(new LocusStatisticsQuery
+            {
+                From = at,
+                To = at.AddMinutes(1)
+            });
+
+            Assert.Equal(LocusStatisticsOptions.MinMaxSeries, snapshot.Measurements.Count);
+            Assert.Equal(LocusStatisticsOptions.MinMaxSeries, snapshot.WriteFileCount);
+        }
     }
 }

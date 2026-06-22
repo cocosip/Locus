@@ -16,6 +16,7 @@ namespace Locus.Storage.Statistics
 
         private readonly LocusStatisticsOptions _options;
         private readonly ConcurrentDictionary<BucketKey, CounterCell> _counters;
+        private readonly object _seriesGate;
         private long _recordCount;
 
         /// <summary>
@@ -26,6 +27,7 @@ namespace Locus.Storage.Statistics
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _options.Validate();
             _counters = new ConcurrentDictionary<BucketKey, CounterCell>();
+            _seriesGate = new object();
         }
 
         /// <inheritdoc/>
@@ -39,7 +41,21 @@ namespace Locus.Storage.Statistics
                 return;
 
             var key = CreateKey(name, timestamp, dimensions);
-            var cell = _counters.GetOrAdd(key, _ => new CounterCell());
+            if (!_counters.TryGetValue(key, out var cell))
+            {
+                lock (_seriesGate)
+                {
+                    if (!_counters.TryGetValue(key, out cell))
+                    {
+                        Prune(timestamp);
+                        if (_counters.Count >= _options.MaxSeries)
+                            return;
+
+                        cell = _counters.GetOrAdd(key, _ => new CounterCell());
+                    }
+                }
+            }
+
             cell.Add(value);
 
             if (Interlocked.Increment(ref _recordCount) % PruneEveryRecords == 0)
