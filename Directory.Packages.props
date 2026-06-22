@@ -9,9 +9,10 @@
     <!-- Core dependencies -->
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.9" />
-    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
-    <PackageVersion Include="Dapper" Version="2.1.66" />
-    <PackageVersion Include="System.IO.Abstractions" Version="22.1.0" />
+    <!-- Third-party runtime dependencies use lower-bound ranges for consumer compatibility. -->
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="[3.0.3,4.0.0)" />
+    <PackageVersion Include="Dapper" Version="[2.1.66,3.0.0)" />
+    <PackageVersion Include="System.IO.Abstractions" Version="[22.1.0,23.0.0)" />
     <PackageVersion Include="System.Threading.Channels" Version="9.0.0" />
     <PackageVersion Include="System.Text.Json" Version="9.0.1" />
     <PackageVersion Include="System.Diagnostics.DiagnosticSource" Version="9.0.0" />
