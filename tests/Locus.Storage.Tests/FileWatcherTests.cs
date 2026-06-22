@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Storage.Statistics;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -1127,6 +1128,76 @@ namespace Locus.Storage.Tests
                 It.IsAny<Stream>(),
                 It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_WhenStatisticsRecorderProvided_RecordsScanResult()
+        {
+            var statistics = new InMemoryLocusStatisticsRecorder(new LocusStatisticsOptions
+            {
+                Enabled = true,
+                WindowSize = TimeSpan.FromMinutes(1),
+                Retention = TimeSpan.FromMinutes(5),
+                Dimensions = new LocusStatisticsDimensionOptions
+                {
+                    TenantId = true,
+                    WatcherId = true
+                }
+            });
+            var fileWatcher = new FileWatcher(
+                _fileSystem,
+                _storagePool.Object,
+                _tenantManager.Object,
+                _logger.Object,
+                Path.Combine(_configRoot, "statistics"),
+                statistics);
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-statistics";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(Path.Combine(watchPath, "file1.txt"), "content1");
+            _fileSystem.File.WriteAllText(Path.Combine(watchPath, "file2.txt"), "content2");
+            _fileSystem.File.SetLastWriteTimeUtc(Path.Combine(watchPath, "file1.txt"), DateTime.UtcNow.AddMinutes(-1));
+            _fileSystem.File.SetLastWriteTimeUtc(Path.Combine(watchPath, "file2.txt"), DateTime.UtcNow.AddMinutes(-1));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var config = new FileWatcherConfiguration
+            {
+                WatcherId = "watcher-statistics",
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                MinFileAge = TimeSpan.Zero,
+                MaxConcurrentImports = 1,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await fileWatcher.RegisterWatcherAsync(config, CancellationToken.None);
+            await fileWatcher.ScanNowAsync(config.WatcherId, CancellationToken.None);
+
+            var snapshot = statistics.GetSnapshot(new LocusStatisticsQuery
+            {
+                From = DateTimeOffset.UtcNow.AddMinutes(-1),
+                To = DateTimeOffset.UtcNow.AddMinutes(1),
+                TenantId = tenantId,
+                WatcherId = "watcher-statistics"
+            });
+
+            Assert.Equal(2, snapshot.WatcherImportedFileCount);
+            Assert.Equal(16, snapshot.WatcherImportedBytes);
+            Assert.Contains(snapshot.Measurements, m => m.Name == "watcher.scan.count" && m.Value == 1);
+            Assert.Contains(snapshot.Measurements, m => m.Name == "watcher.files.discovered" && m.Value == 2);
         }
 
         [Fact]

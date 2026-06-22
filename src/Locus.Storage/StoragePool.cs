@@ -11,6 +11,7 @@ using Locus.Core.Abstractions;
 using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
+using Locus.Storage.Statistics;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.Storage
@@ -33,6 +34,7 @@ namespace Locus.Storage
         private readonly StorageVolumeRegistry _volumeRegistry;
         private readonly IQueueEventJournal? _queueEventJournal;
         private readonly bool _allowLegacyNonJournalMode;
+        private readonly ILocusStatisticsRecorder _statisticsRecorder;
 
         // Cache a writable-volume snapshot and refresh periodically.
         // Selection then uses power-of-two choices to avoid pinning traffic to one volume.
@@ -74,7 +76,8 @@ namespace Locus.Storage
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
             IQueueProjectionWriteStore? projectionWriteStore = null,
-            bool allowLegacyNonJournalMode = false)
+            bool allowLegacyNonJournalMode = false,
+            ILocusStatisticsRecorder? statisticsRecorder = null)
             : this(
                 metadataRepository,
                 tenantQuotaManager,
@@ -87,7 +90,8 @@ namespace Locus.Storage
                 queueEventJournal,
                 projectionStore,
                 projectionWriteStore,
-                allowLegacyNonJournalMode)
+                allowLegacyNonJournalMode,
+                statisticsRecorder)
         {
         }
 
@@ -106,7 +110,8 @@ namespace Locus.Storage
             IQueueEventJournal? queueEventJournal = null,
             IQueueProjectionStore? projectionStore = null,
             IQueueProjectionWriteStore? projectionWriteStore = null,
-            bool allowLegacyNonJournalMode = false)
+            bool allowLegacyNonJournalMode = false,
+            ILocusStatisticsRecorder? statisticsRecorder = null)
         {
             if (metadataRepository == null)
                 throw new ArgumentNullException(nameof(metadataRepository));
@@ -121,6 +126,7 @@ namespace Locus.Storage
             _volumeRegistry = volumeRegistry ?? new StorageVolumeRegistry();
             _queueEventJournal = queueEventJournal;
             _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
+            _statisticsRecorder = statisticsRecorder ?? NoopLocusStatisticsRecorder.Instance;
             if (completionGuardStripeCount <= 0)
                 throw new ArgumentOutOfRangeException(nameof(completionGuardStripeCount), "Completion guard stripe count must be greater than zero.");
 
@@ -429,6 +435,8 @@ namespace Locus.Storage
                     volumeWriteTicks,
                     acceptanceTicks,
                     projectionEnqueueTicks);
+                RecordStatistic("storage.write.success.count", 1, metadata.TenantId, metadata.VolumeId);
+                RecordStatistic("storage.write.bytes", metadata.FileSize, metadata.TenantId, metadata.VolumeId);
 
                 _logger.LogDebug("File written successfully: {FileKey} for tenant {TenantId} at {PhysicalPath}",
                     fileKey, tenant.TenantId, physicalPath);
@@ -578,6 +586,7 @@ namespace Locus.Storage
 
             // 5. Read file from volume
             var stream = await ReadFileFromVolumeAsync(metadata, volume, ct).ConfigureAwait(false);
+            RecordStatistic("storage.file.read.count", 1, metadata.TenantId, metadata.VolumeId);
 
             _logger.LogDebug("File read successfully: {FileKey} for tenant {TenantId}", fileKey, tenant.TenantId);
 
@@ -738,6 +747,9 @@ namespace Locus.Storage
                 }
             }
 
+            if (location != null)
+                RecordStatistic("storage.file.dequeued.count", 1, location.TenantId, location.VolumeId);
+
             return location;
         }
 
@@ -777,6 +789,9 @@ namespace Locus.Storage
                     throw;
                 }
             }
+
+            foreach (var location in locations)
+                RecordStatistic("storage.file.dequeued.count", 1, location.TenantId, location.VolumeId);
 
             return locations;
         }
@@ -818,7 +833,10 @@ namespace Locus.Storage
                 await _fileScheduler.MarkAsCompletedAsync(lease, ct);
 
                 if (!ShouldAppendQueueEventsInStoragePool())
+                {
+                    RecordStatistic("storage.file.completed.count", 1, metadata.TenantId, metadata.VolumeId);
                     return;
+                }
 
                 var completed = await _projectionStore.GetProjectedFileAsync(lease.TenantId, lease.FileKey, ct).ConfigureAwait(false);
                 if (completed == null)
@@ -833,6 +851,7 @@ namespace Locus.Storage
                             QueueEventRecordFactory.CreateDeleteRequested(completed),
                         },
                         ct).ConfigureAwait(false);
+                    RecordStatistic("storage.file.completed.count", 1, completed.TenantId, completed.VolumeId);
                 }
                 catch
                 {
@@ -1251,6 +1270,19 @@ namespace Locus.Storage
             return _queueEventJournal != null
                 && !(_fileScheduler is IQueueEventManagedFileScheduler managedScheduler
                     && managedScheduler.HandlesQueueJournal);
+        }
+
+        private void RecordStatistic(string name, long value, string tenantId, string? volumeId)
+        {
+            _statisticsRecorder.Record(
+                name,
+                value,
+                DateTimeOffset.UtcNow,
+                new Dictionary<string, string?>
+                {
+                    ["tenant_id"] = tenantId,
+                    ["volume_id"] = volumeId
+                });
         }
 
         private void ValidateLegacyNonJournalMode()

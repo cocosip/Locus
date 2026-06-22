@@ -13,6 +13,7 @@ using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Locus.Storage;
 using Locus.Storage.Data;
+using Locus.Storage.Statistics;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -375,6 +376,107 @@ namespace Locus.Storage.Tests
                 Assert.Equal(1, metrics.GetMeasurementCount("locus.storage_pool.write.acceptance.duration"));
                 Assert.Equal(1, metrics.GetMeasurementCount("locus.storage_pool.write.duration"));
             }
+        }
+
+        [Fact]
+        public async Task StoragePool_WhenStatisticsRecorderProvided_RecordsWriteReadDequeueAndCompletion()
+        {
+            var statistics = new InMemoryLocusStatisticsRecorder(new LocusStatisticsOptions
+            {
+                Enabled = true,
+                WindowSize = TimeSpan.FromMinutes(1),
+                Retention = TimeSpan.FromMinutes(5),
+                Dimensions = new LocusStatisticsDimensionOptions
+                {
+                    TenantId = true,
+                    VolumeId = true
+                }
+            });
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                _fileScheduler.Object,
+                _logger.Object,
+                queueEventJournal: _queueEventJournal.Object,
+                statisticsRecorder: statistics);
+            await storagePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("statistics payload"));
+            var fileKey = await storagePool.WriteFileAsync(_tenant.Object, content, "statistics.dcm", CancellationToken.None);
+
+            using (await storagePool.ReadFileAsync(_tenant.Object, fileKey, CancellationToken.None))
+            {
+            }
+
+            var processingStart = DateTime.UtcNow;
+            var processingLocation = new FileLocation
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volume1Path, "tenant-001", fileKey + ".dcm"),
+                DirectoryPath = "/",
+                FileSize = content.Length,
+                CreatedAt = DateTime.UtcNow,
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
+            };
+            var projectionStore = new MetadataRepositoryQueueProjectionStore(_metadataRepository);
+            _fileScheduler
+                .Setup(s => s.GetNextFileForProcessingAsync(_tenant.Object, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(processingLocation);
+            await projectionStore.UpsertProjectedFileAsync(new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = processingLocation.PhysicalPath,
+                DirectoryPath = "/",
+                FileSize = content.Length,
+                CreatedAt = DateTime.UtcNow,
+                Status = FileProcessingStatus.Processing,
+                ProcessingStartTime = processingStart
+            }, CancellationToken.None);
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .Returns(async (FileProcessingLease lease, CancellationToken ct) =>
+                {
+                    await projectionStore.UpsertProjectedFileAsync(new FileMetadata
+                    {
+                        FileKey = lease.FileKey,
+                        TenantId = lease.TenantId,
+                        VolumeId = "vol-001",
+                        PhysicalPath = processingLocation.PhysicalPath,
+                        DirectoryPath = "/",
+                        FileSize = content.Length,
+                        CreatedAt = DateTime.UtcNow,
+                        Status = FileProcessingStatus.Completed,
+                        ProcessingStartTime = lease.ProcessingStartTimeUtc,
+                        CompletedAt = DateTime.UtcNow
+                    }, ct);
+                });
+
+            var dequeued = await storagePool.GetNextFileForProcessingAsync(_tenant.Object, CancellationToken.None);
+            Assert.NotNull(dequeued);
+            await storagePool.MarkAsCompletedAsync(
+                CreateLease("tenant-001", fileKey, processingStart),
+                CancellationToken.None);
+
+            var snapshot = statistics.GetSnapshot(new LocusStatisticsQuery
+            {
+                From = DateTimeOffset.UtcNow.AddMinutes(-5),
+                To = DateTimeOffset.UtcNow.AddMinutes(5),
+                TenantId = "tenant-001",
+                VolumeId = "vol-001"
+            });
+
+            Assert.Equal(1, snapshot.WriteFileCount);
+            Assert.Equal(content.Length, snapshot.WriteBytes);
+            Assert.Equal(1, snapshot.ReadFileCount);
+            Assert.Equal(1, snapshot.DequeuedFileCount);
+            Assert.Equal(1, snapshot.CompletedFileCount);
         }
 
         [Fact]

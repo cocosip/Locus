@@ -15,6 +15,7 @@ Locus is designed as a **file queue system** that provides:
 - **High concurrency** - Thread-safe operations with per-tenant SQLite databases and active-data caching
 - **Automatic management** - System handles directory structure, file placement, and cleanup
 - **Directory-level quota control** - Configurable file count limits per directory
+- **Operational statistics** - Optional low-overhead in-process statistics for write throughput, file queue flow, SQLite persistence, and watcher imports
 
 ## Key Concepts
 
@@ -147,6 +148,34 @@ Quota reconciliation is now treated as an explicit maintenance operation rather 
 runtime feature. The manual maintenance APIs on `IStorageCleanupService` remain available for operator
 repair flows and recovery tooling.
 
+## Statistics and Observability
+
+Locus includes optional in-process statistics for file-processing workloads. Statistics are disabled by
+default; when disabled, the hot paths use a no-op recorder. When enabled, Locus aggregates counters in
+memory by fixed time windows and exposes them through `ILocusStatisticsReader`.
+
+The statistics surface is intentionally separate from external Metrics and low-level diagnostics:
+
+- **Statistics** answer business/operations questions such as write MB/s over a query window, written
+  file count, dequeued file count, completed file count, SQLite persistence operations, and watcher
+  imported/skipped/failed files.
+- **Metrics** remain the external monitoring surface through existing `System.Diagnostics.Metrics`
+  instruments and any OpenTelemetry/Prometheus pipeline configured by the host.
+- **Diagnostics** such as `GetWritePathStatisticsSnapshot()` remain low-level implementation snapshots
+  for performance investigations.
+
+Default statistics windows are tuned for file-processing trends rather than per-second tracing:
+
+- `WindowSize = 00:05:00`
+- `Retention = 01:00:00`
+- `Output.Interval = 00:05:00`
+- `Output.QueryWindow = 00:15:00`
+
+Host applications can query `ILocusStatisticsReader` directly, and Locus can also write a periodic
+logging summary when `Statistics.Output.Enabled` is set to `true`. See
+[`docs/statistics.md`](docs/statistics.md) for the current measurement names, query example, and
+configuration guidance.
+
 ## Queue Journal Growth and Compaction
 
 `queue.log` is append-only during normal operation, so it grows as files move through the queue lifecycle.
@@ -180,11 +209,14 @@ Runtime options are bound from the `Locus` section. Keep these files aligned whe
 - [`src/Locus/appsettings.sample.json`](src/Locus/appsettings.sample.json) - package-level sample
 - [`samples/Locus.Sample.Console/appsettings.json`](samples/Locus.Sample.Console/appsettings.json) - runnable sample
 - [`docs/appsettings-sample-reference.md`](docs/appsettings-sample-reference.md) - field-by-field reference
+- [`docs/statistics.md`](docs/statistics.md) - statistics model, measurement names, and query/output examples
 
 The current sample includes the major runtime surfaces:
 
 - `MetadataRepository`, `StoragePool`, and `QueueEventJournal` tune write-behind persistence, timeout
   reclaim, journal ACK behavior, snapshots, projection, and compaction.
+- `Statistics` controls optional in-process aggregation, retained dimensions, and Locus-owned summary
+  output.
 - `Sqlite` controls WAL mode, synchronous behavior, cache size, busy timeout, and checkpoint policy.
 - `RetryPolicy`, `Volumes`, `Tenants`, and `FileWatchers` define retry cadence, physical storage,
   tenant bootstrap, and directory import behavior.
@@ -575,6 +607,7 @@ configuration reference kept in the repository:
   invalid database backups, and junk files
 - FileWatcher auto-import with single-tenant and multi-tenant modes
 - Sample console application with current appsettings defaults
+- Optional in-process statistics with external querying and configurable Locus-owned logging output
 
 ## Build Commands
 
@@ -597,6 +630,7 @@ dotnet pack src/Locus/Locus.csproj -c Release
 ### Core Documentation
 - **[CLAUDE.md](CLAUDE.md)** - Complete implementation guidelines, architecture decisions, API references, and FileWatcher usage guide
 - **[docs/appsettings-sample-reference.md](docs/appsettings-sample-reference.md)** - Current appsettings field reference with JSONC-style comments
+- **[docs/statistics.md](docs/statistics.md)** - Locus statistics model, configuration, measurements, and query/output examples
 - **[docs/storage-lifecycle-overview.md](docs/storage-lifecycle-overview.md)** - End-to-end lifecycle, projection, recovery, and cleanup flow
 - **[docs/queue-journal-observability.md](docs/queue-journal-observability.md)** - Queue journal metrics, state files, and recovery signals
 
@@ -621,6 +655,12 @@ dotnet pack src/Locus/Locus.csproj -c Release
 - Multi-tenant mode with automatic directory creation
 - Configurable polling intervals and concurrency
 - Post-import actions (Delete/Move/Keep)
+
+📊 **Operational Statistics**
+- Optional in-memory aggregation for write throughput, queue movement, SQLite persistence, and watcher imports
+- Queryable through `ILocusStatisticsReader`
+- Optional periodic logging output controlled by `Statistics.Output`
+- Separate from external Metrics and low-level diagnostics
 
 🧹 **Automatic Cleanup**
 - Completed-file reaping and empty directory cleanup

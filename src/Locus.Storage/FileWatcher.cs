@@ -13,6 +13,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Storage.Statistics;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.Storage
@@ -26,6 +27,7 @@ namespace Locus.Storage
         private readonly IStoragePool _storagePool;
         private readonly ITenantManager _tenantManager;
         private readonly ILogger<FileWatcher> _logger;
+        private readonly ILocusStatisticsRecorder _statisticsRecorder;
         private readonly string _configurationRoot;
 
         // Track imported files to avoid duplicates: filepath -> fileKey
@@ -96,12 +98,14 @@ namespace Locus.Storage
             IStoragePool storagePool,
             ITenantManager tenantManager,
             ILogger<FileWatcher> logger,
-            string? configurationRoot = null)
+            string? configurationRoot = null,
+            ILocusStatisticsRecorder? statisticsRecorder = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _storagePool = storagePool ?? throw new ArgumentNullException(nameof(storagePool));
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _statisticsRecorder = statisticsRecorder ?? NoopLocusStatisticsRecorder.Instance;
             _configurationRoot = configurationRoot ?? Path.Combine(".locus", "watchers");
 
             // Use case-insensitive comparison on Windows (NTFS is case-insensitive),
@@ -902,7 +906,26 @@ namespace Locus.Storage
             if (!configuration.Enabled)
                 throw new InvalidOperationException($"Watcher '{watcherId}' is disabled.");
 
-            return await ScanDirectoryAsync(configuration, ct);
+            var result = await ScanDirectoryAsync(configuration, ct);
+            RecordScanStatistics(configuration, result);
+            return result;
+        }
+
+        private void RecordScanStatistics(FileWatcherConfiguration configuration, FileWatcherScanResult result)
+        {
+            var dimensions = new Dictionary<string, string?>
+            {
+                ["tenant_id"] = configuration.MultiTenantMode ? null : configuration.TenantId,
+                ["watcher_id"] = configuration.WatcherId,
+                ["operation"] = "scan"
+            };
+            var timestamp = DateTimeOffset.UtcNow;
+            _statisticsRecorder.Record("watcher.scan.count", 1, timestamp, dimensions);
+            _statisticsRecorder.Record("watcher.files.discovered", result.FilesDiscovered, timestamp, dimensions);
+            _statisticsRecorder.Record("watcher.files.imported", result.FilesImported, timestamp, dimensions);
+            _statisticsRecorder.Record("watcher.files.skipped", result.FilesSkipped, timestamp, dimensions);
+            _statisticsRecorder.Record("watcher.files.failed", result.FilesFailed, timestamp, dimensions);
+            _statisticsRecorder.Record("watcher.bytes.imported", result.BytesImported, timestamp, dimensions);
         }
 
         private FileWatcherConfiguration? TryGetCachedWatcherConfiguration(string watcherId)
