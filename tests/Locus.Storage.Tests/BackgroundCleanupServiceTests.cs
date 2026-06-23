@@ -177,6 +177,19 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupAllJunkFilesAsync_DelegatesToLegacyEmptyDirectoryCleanup()
+        {
+            var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);
+            cleanupService
+                .Setup(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            await cleanupService.Object.CleanupAllJunkFilesAsync(CancellationToken.None);
+
+            cleanupService.Verify(s => s.CleanupAllEmptyDirectoriesAsync(It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
         public async Task ExecuteAsync_SkipsCleanupTasks_WhenDisabled()
         {
             var cleanupService = new Mock<IStorageCleanupService>(MockBehavior.Strict);

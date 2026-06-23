@@ -120,4 +120,25 @@ namespace Locus.Core.Abstractions
         /// <returns>Number of invalid database files removed and space freed in bytes.</returns>
         Task<(int FilesRemoved, long SpaceFreed)> CleanupInvalidDatabaseFilesAsync(CancellationToken ct = default);
     }
+
+    /// <summary>
+    /// Compatibility helpers for storage cleanup operations.
+    /// </summary>
+    public static class StorageCleanupServiceExtensions
+    {
+        /// <summary>
+        /// Runs the recursive junk-file sweep across all tenants.
+        /// </summary>
+        /// <param name="cleanupService">The cleanup service.</param>
+        /// <param name="ct">Cancellation token.</param>
+        public static Task CleanupAllJunkFilesAsync(
+            this IStorageCleanupService cleanupService,
+            CancellationToken ct = default)
+        {
+            if (cleanupService == null)
+                throw new ArgumentNullException(nameof(cleanupService));
+
+            return cleanupService.CleanupAllEmptyDirectoriesAsync(ct);
+        }
+    }
 }

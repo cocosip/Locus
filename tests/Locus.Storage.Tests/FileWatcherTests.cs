@@ -1131,6 +1131,92 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task UpdateWatcherAsync_ThrowsWhenTenantNotFound()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-update-validation";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            var configuration = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                PostImportAction = PostImportAction.Keep
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(configuration, CancellationToken.None);
+
+            configuration.TenantId = "missing-tenant";
+            _tenantManager.Setup(m => m.GetTenantAsync("missing-tenant", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => null!);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                _fileWatcher.UpdateWatcherAsync(configuration, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_PostImportMoveFailure_DoesNotSuppressRetry()
+        {
+            var tenantId = "tenant-001";
+            var watchPath = @"C:\watch-post-action-retry";
+            var blockedMoveTarget = @"C:\blocked-target";
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(blockedMoveTarget, "not-a-directory");
+
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            _fileSystem.File.WriteAllText(filePath, "content1");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
+
+            var mockTenant = new Mock<ITenantContext>();
+            mockTenant.Setup(t => t.TenantId).Returns(tenantId);
+            mockTenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(mockTenant.Object);
+
+            _storagePool.Setup(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+                .ReturnsAsync("generated-key");
+
+            var configuration = new FileWatcherConfiguration
+            {
+                TenantId = tenantId,
+                WatchPath = watchPath,
+                Enabled = true,
+                MultiTenantMode = false,
+                MinFileAge = TimeSpan.Zero,
+                MaxConcurrentImports = 1,
+                PostImportAction = PostImportAction.Move,
+                MoveToDirectory = blockedMoveTarget
+            };
+
+            await _fileWatcher.RegisterWatcherAsync(configuration, CancellationToken.None);
+
+            var firstResult = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+            var secondResult = await _fileWatcher.ScanNowAsync(configuration.WatcherId, CancellationToken.None);
+
+            Assert.Equal(1, firstResult.FilesImported);
+            Assert.Equal(1, firstResult.FilesFailed);
+            Assert.Equal(1, secondResult.FilesImported);
+            Assert.Equal(1, secondResult.FilesFailed);
+            _storagePool.Verify(s => s.WriteFileAsync(
+                It.IsAny<ITenantContext>(),
+                It.IsAny<Stream>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+
+        [Fact]
         public async Task ScanNowAsync_WhenStatisticsRecorderProvided_RecordsScanResult()
         {
             var statistics = new InMemoryLocusStatisticsRecorder(new LocusStatisticsOptions

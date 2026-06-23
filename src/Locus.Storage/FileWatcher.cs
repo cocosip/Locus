@@ -760,27 +760,7 @@ namespace Locus.Storage
 
             try
             {
-                // Validate tenant exists (only in single-tenant mode)
-                if (!configuration.MultiTenantMode)
-                {
-                    if (string.IsNullOrWhiteSpace(configuration.TenantId))
-                    {
-                        throw new ArgumentException("TenantId is required in single-tenant mode.", nameof(configuration));
-                    }
-
-                    var tenant = await _tenantManager.GetTenantAsync(configuration.TenantId, ct);
-                    if (tenant == null)
-                    {
-                        throw new InvalidOperationException($"Tenant '{configuration.TenantId}' not found.");
-                    }
-                }
-
-                // Ensure watch path exists (auto-create if missing)
-                if (!_fileSystem.Directory.Exists(configuration.WatchPath))
-                {
-                    _fileSystem.Directory.CreateDirectory(configuration.WatchPath);
-                    _logger.LogInformation("Created watch path directory: {WatchPath}", configuration.WatchPath);
-                }
+                await ValidateWatcherConfigurationAsync(configuration, ct).ConfigureAwait(false);
 
                 configuration.CreatedAt = DateTime.UtcNow;
                 configuration.UpdatedAt = DateTime.UtcNow;
@@ -812,6 +792,8 @@ namespace Locus.Storage
                     throw new InvalidOperationException($"Watcher '{configuration.WatcherId}' not found.");
                 }
 
+                await ValidateWatcherConfigurationAsync(configuration, ct).ConfigureAwait(false);
+
                 configuration.CreatedAt = existing.CreatedAt;
                 configuration.UpdatedAt = DateTime.UtcNow;
 
@@ -823,6 +805,34 @@ namespace Locus.Storage
             finally
             {
                 watcherLock.Release();
+            }
+        }
+
+        private async Task ValidateWatcherConfigurationAsync(FileWatcherConfiguration configuration, CancellationToken ct)
+        {
+            if (configuration == null)
+                throw new ArgumentNullException(nameof(configuration));
+
+            // Validate tenant exists (only in single-tenant mode)
+            if (!configuration.MultiTenantMode)
+            {
+                if (string.IsNullOrWhiteSpace(configuration.TenantId))
+                {
+                    throw new ArgumentException("TenantId is required in single-tenant mode.", nameof(configuration));
+                }
+
+                var tenant = await _tenantManager.GetTenantAsync(configuration.TenantId, ct).ConfigureAwait(false);
+                if (tenant == null)
+                {
+                    throw new InvalidOperationException($"Tenant '{configuration.TenantId}' not found.");
+                }
+            }
+
+            // Ensure watch path exists (auto-create if missing)
+            if (!_fileSystem.Directory.Exists(configuration.WatchPath))
+            {
+                _fileSystem.Directory.CreateDirectory(configuration.WatchPath);
+                _logger.LogInformation("Created watch path directory: {WatchPath}", configuration.WatchPath);
             }
         }
 
@@ -1377,8 +1387,6 @@ namespace Locus.Storage
                 {
                     var fileName = Path.GetFileName(filePath);
                     var fileKey = await _storagePool.WriteFileAsync(tenant, importStream, fileName, ct);
-                    UpsertImportedFileRecord(filePath, importFingerprint);
-                    importSlotTaken = false;
 
                     fileResult.FilesImported++;
                     fileResult.BytesImported += importSize;
@@ -1390,6 +1398,12 @@ namespace Locus.Storage
 
                 // Post-import action
                 await ExecutePostImportActionAsync(configuration, filePath, ct);
+                if (configuration.PostImportAction == PostImportAction.Keep)
+                    UpsertImportedFileRecord(filePath, importFingerprint);
+                else
+                    TryRemoveImportedFileRecord(filePath);
+
+                importSlotTaken = false;
             }
             catch (Exception ex)
             {
@@ -1399,9 +1413,7 @@ namespace Locus.Storage
             }
             finally
             {
-                // Release import slot if the import was not completed successfully.
-                // importSlotTaken is set to false after successful import (line 1284),
-                // so this block only runs when the import failed or was skipped.
+                // Release import slot if either import or the configured post-import action failed.
                 if (importSlotTaken)
                 {
                     // Only remove if the value is still the in-flight marker.
@@ -1746,9 +1758,6 @@ namespace Locus.Storage
                 case PostImportAction.Delete:
                     _fileSystem.File.Delete(filePath);
                     _logger.LogDebug("Deleted file {FilePath} after import", filePath);
-
-                    // Remove from history since file no longer exists
-                    TryRemoveImportedFileRecord(filePath);
                     break;
 
                 case PostImportAction.Move:
@@ -1776,9 +1785,6 @@ namespace Locus.Storage
 
                         _fileSystem.File.Move(filePath, targetPath);
                         _logger.LogDebug("Moved file {FilePath} to {TargetPath}", filePath, targetPath);
-
-                        // Remove from history since file is no longer in watch directory
-                        TryRemoveImportedFileRecord(filePath);
                     }
                     break;
 

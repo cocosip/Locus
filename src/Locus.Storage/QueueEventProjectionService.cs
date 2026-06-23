@@ -42,6 +42,7 @@ namespace Locus.Storage
         private readonly ILogger<QueueEventProjectionService> _logger;
         private readonly IStorageCleanupService? _storageCleanupService;
         private readonly IQuotaProjectionMaintenanceStore? _quotaMaintenanceStore;
+        private readonly LocusStartupCoordinator _startupCoordinator;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantProjectionLocks;
         private readonly ConcurrentDictionary<string, CachedProjectionCursor> _cursorCache;
         private readonly AsyncLocal<IQueueProjectionBatch?> _currentProjectionBatch;
@@ -60,7 +61,8 @@ namespace Locus.Storage
             ILogger<QueueEventProjectionService> logger,
             IStorageCleanupService? storageCleanupService = null,
             IQueueProjectionStore? projectionStore = null,
-            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null)
+            IQuotaProjectionMaintenanceStore? quotaMaintenanceStore = null,
+            LocusStartupCoordinator? startupCoordinator = null)
         {
             _journal = journal ?? throw new ArgumentNullException(nameof(journal));
             _projectionStore = projectionStore
@@ -75,6 +77,7 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _storageCleanupService = storageCleanupService;
             _quotaMaintenanceStore = quotaMaintenanceStore;
+            _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _tenantProjectionLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
             _cursorCache = new ConcurrentDictionary<string, CachedProjectionCursor>(StringComparer.Ordinal);
             _currentProjectionBatch = new AsyncLocal<IQueueProjectionBatch?>();
@@ -88,6 +91,15 @@ namespace Locus.Storage
                 _options.QueueDirectory,
                 _options.MaxRecordsPerTenantPerCycle,
                 _options.MaxTenantsPerCycle);
+
+            try
+            {
+                await _startupCoordinator.WaitForRuntimeReadyAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
 
             while (!stoppingToken.IsCancellationRequested)
             {

@@ -17,6 +17,7 @@ namespace Locus.Storage
         private readonly IFileScheduler _fileScheduler;
         private readonly ILogger<BackgroundCleanupService> _logger;
         private readonly CleanupOptions _options;
+        private readonly LocusStartupCoordinator _startupCoordinator;
         private DateTime _lastJunkFileCleanup;
         // Initialized to UtcNow so the first optimization is deferred by a full
         // DatabaseOptimizationInterval rather than running immediately on startup.
@@ -29,12 +30,14 @@ namespace Locus.Storage
             IStorageCleanupService cleanupService,
             IFileScheduler fileScheduler,
             CleanupOptions options,
-            ILogger<BackgroundCleanupService> logger)
+            ILogger<BackgroundCleanupService> logger,
+            LocusStartupCoordinator? startupCoordinator = null)
         {
             _cleanupService = cleanupService ?? throw new ArgumentNullException(nameof(cleanupService));
             _fileScheduler = fileScheduler ?? throw new ArgumentNullException(nameof(fileScheduler));
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _lastJunkFileCleanup = DateTime.MinValue;
             _lastDatabaseOptimization = DateTime.UtcNow;
         }
@@ -50,6 +53,15 @@ namespace Locus.Storage
 
             _logger.LogInformation("BackgroundCleanupService started");
 
+            try
+            {
+                await _startupCoordinator.WaitForRuntimeReadyAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+
             // Wait for initial delay before first cleanup
             await Task.Delay(_options.InitialDelay, stoppingToken);
 
@@ -64,7 +76,7 @@ namespace Locus.Storage
                     // status cleanup cadence.
                     if (_options.CleanupJunkFiles && ShouldCleanupJunkFiles())
                     {
-                        await _cleanupService.CleanupAllEmptyDirectoriesAsync(stoppingToken);
+                        await _cleanupService.CleanupAllJunkFilesAsync(stoppingToken);
                         _lastJunkFileCleanup = DateTime.UtcNow;
                     }
 

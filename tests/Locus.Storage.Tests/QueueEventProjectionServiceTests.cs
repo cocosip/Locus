@@ -72,6 +72,65 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ExecuteAsync_WaitsForStartupCoordinatorBeforeReadingJournal()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = new Mock<IQueueEventJournal>(MockBehavior.Strict);
+            var startupCoordinator = new LocusStartupCoordinator();
+
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal.Object,
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                startupCoordinator: startupCoordinator));
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await Task.Delay(100);
+                journal.Verify(j => j.GetTenantIdsAsync(It.IsAny<CancellationToken>()), Times.Never);
+
+                journal
+                    .Setup(j => j.GetTenantIdsAsync(It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(Array.Empty<string>());
+
+                startupCoordinator.MarkVolumesReady();
+                startupCoordinator.MarkTenantsReady();
+                startupCoordinator.MarkDatabaseHealthReady();
+
+                await WaitUntilAsync(() =>
+                {
+                    try
+                    {
+                        journal.Verify(j => j.GetTenantIdsAsync(It.IsAny<CancellationToken>()), Times.AtLeastOnce);
+                        return Task.FromResult(true);
+                    }
+                    catch (MockException)
+                    {
+                        return Task.FromResult(false);
+                    }
+                }, TimeSpan.FromSeconds(2));
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+        }
+
+        [Fact]
         public async Task ExecuteAsync_RebuildsAcceptedEventIntoMetadataAndQuota()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();

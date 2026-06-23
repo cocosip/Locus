@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Exceptions;
+using Locus.Storage;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -17,17 +18,20 @@ namespace Locus
         private readonly ITenantQuotaManager _tenantQuotaManager;
         private readonly ILogger<TenantInitializationService> _logger;
         private readonly LocusOptions _options;
+        private readonly LocusStartupCoordinator _startupCoordinator;
 
         public TenantInitializationService(
             ITenantManager tenantManager,
             ITenantQuotaManager tenantQuotaManager,
             ILogger<TenantInitializationService> logger,
-            LocusOptions options)
+            LocusOptions options,
+            LocusStartupCoordinator startupCoordinator)
         {
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
             _tenantQuotaManager = tenantQuotaManager ?? throw new ArgumentNullException(nameof(tenantQuotaManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _startupCoordinator = startupCoordinator ?? throw new ArgumentNullException(nameof(startupCoordinator));
         }
 
         public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -94,10 +98,12 @@ namespace Locus
                 }
 
                 _logger.LogInformation("Tenant initialization completed. AutoCreateTenants: {AutoCreate}", _options.AutoCreateTenants);
+                _startupCoordinator.MarkTenantsReady();
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to initialize tenants");
+                _startupCoordinator.Fail(ex);
                 throw;
             }
         }

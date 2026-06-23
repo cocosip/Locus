@@ -108,6 +108,14 @@ namespace Locus
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
             services.AddSingleton<StorageVolumeRegistry>();
+            services.AddSingleton(_ =>
+            {
+                var startupCoordinator = new LocusStartupCoordinator();
+                if (!options.EnableDatabaseHealthCheck)
+                    startupCoordinator.MarkDatabaseHealthReady();
+
+                return startupCoordinator;
+            });
 
             if (options.Statistics.Enabled)
             {
@@ -360,7 +368,8 @@ namespace Locus
                 sp.GetRequiredService<IFileSystem>(),
                 sp.GetRequiredService<ILogger<StorageVolumeInitializationService>>(),
                 options.Volumes,
-                sp));
+                sp,
+                sp.GetRequiredService<LocusStartupCoordinator>()));
 
             // Register database recovery service
             services.AddSingleton<IDatabaseRecoveryService, Locus.Storage.Data.DatabaseRecoveryService>(sp =>
@@ -425,7 +434,8 @@ namespace Locus
                         logger,
                         storageCleanupService,
                         projectionStore,
-                        quotaMaintenanceStore);
+                        quotaMaintenanceStore,
+                        sp.GetRequiredService<LocusStartupCoordinator>());
                 });
                 services.AddSingleton<IQueueProjectionMaintenanceService>(sp => sp.GetRequiredService<QueueEventProjectionService>());
 
@@ -438,14 +448,23 @@ namespace Locus
             // Register background cleanup service if enabled
             if (options.CleanupOptions.Enabled)
             {
-                services.AddHostedService<BackgroundCleanupService>();
+                services.AddHostedService(sp => new BackgroundCleanupService(
+                    sp.GetRequiredService<IStorageCleanupService>(),
+                    sp.GetRequiredService<IFileScheduler>(),
+                    options.CleanupOptions,
+                    sp.GetRequiredService<ILogger<BackgroundCleanupService>>(),
+                    sp.GetRequiredService<LocusStartupCoordinator>()));
             }
 
             // Register orphan file recovery service if enabled
             if (options.OrphanRecoveryOptions.Enabled)
             {
                 services.AddSingleton(options.OrphanRecoveryOptions);
-                services.AddHostedService<OrphanFileRecoveryService>();
+                services.AddHostedService(sp => new OrphanFileRecoveryService(
+                    sp.GetRequiredService<IStorageCleanupService>(),
+                    options.OrphanRecoveryOptions,
+                    sp.GetRequiredService<ILogger<OrphanFileRecoveryService>>(),
+                    sp.GetRequiredService<LocusStartupCoordinator>()));
             }
 
             // Register database health check service if enabled
@@ -459,7 +478,8 @@ namespace Locus
                     options.MetadataDirectory,
                     volumePaths,
                     options.AutoRecoverCorruptedDatabasesOnStartup,
-                    options.FailFastOnStartupRecoveryFailure));
+                    options.FailFastOnStartupRecoveryFailure,
+                    startupCoordinator: sp.GetRequiredService<LocusStartupCoordinator>()));
             }
 
             // Store LocusOptions for runtime access (e.g., AutoCreateTenants)
@@ -470,7 +490,8 @@ namespace Locus
                 sp.GetRequiredService<ITenantManager>(),
                 sp.GetRequiredService<ITenantQuotaManager>(),
                 sp.GetRequiredService<ILogger<TenantInitializationService>>(),
-                options));
+                options,
+                sp.GetRequiredService<LocusStartupCoordinator>()));
 
             // Initialize pre-configured file watchers on startup
             if (options.FileWatchers.Count > 0)
@@ -478,7 +499,8 @@ namespace Locus
                 services.AddHostedService(sp => new FileWatcherInitializationService(
                     sp.GetRequiredService<IFileWatcher>(),
                     sp.GetRequiredService<ILogger<FileWatcherInitializationService>>(),
-                    options));
+                    options,
+                    sp.GetRequiredService<LocusStartupCoordinator>()));
             }
 
             return services;

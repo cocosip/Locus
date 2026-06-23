@@ -24,6 +24,7 @@ namespace Locus
         private readonly ILogger<StorageVolumeInitializationService> _logger;
         private readonly IReadOnlyList<VolumeConfiguration> _volumeConfigs;
         private readonly IServiceProvider _serviceProvider;
+        private readonly LocusStartupCoordinator _startupCoordinator;
 
         public StorageVolumeInitializationService(
             StoragePool pool,
@@ -31,7 +32,8 @@ namespace Locus
             IFileSystem fileSystem,
             ILogger<StorageVolumeInitializationService> logger,
             IReadOnlyList<VolumeConfiguration> volumeConfigs,
-            IServiceProvider serviceProvider)
+            IServiceProvider serviceProvider,
+            LocusStartupCoordinator startupCoordinator)
         {
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
             _cleanupService = cleanupService ?? throw new ArgumentNullException(nameof(cleanupService));
@@ -39,6 +41,7 @@ namespace Locus
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumeConfigs = volumeConfigs ?? throw new ArgumentNullException(nameof(volumeConfigs));
             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+            _startupCoordinator = startupCoordinator ?? throw new ArgumentNullException(nameof(startupCoordinator));
         }
 
         /// <inheritdoc/>
@@ -50,9 +53,17 @@ namespace Locus
                 .Select(config => MountVolumeAsync(config, cancellationToken))
                 .ToArray();
 
-            await Task.WhenAll(mountTasks).ConfigureAwait(false);
-
-            _logger.LogInformation("All {Count} storage volume(s) mounted successfully.", _volumeConfigs.Count);
+            try
+            {
+                await Task.WhenAll(mountTasks).ConfigureAwait(false);
+                _startupCoordinator.MarkVolumesReady();
+                _logger.LogInformation("All {Count} storage volume(s) mounted successfully.", _volumeConfigs.Count);
+            }
+            catch (Exception ex)
+            {
+                _startupCoordinator.Fail(ex);
+                throw;
+            }
         }
 
         /// <inheritdoc/>

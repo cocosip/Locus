@@ -25,6 +25,7 @@ namespace Locus.Storage
         private readonly bool _autoRecoverCorruptedDatabases;
         private readonly bool _failFastOnRecoveryFailure;
         private readonly TimeSpan _startupDelay;
+        private readonly LocusStartupCoordinator _startupCoordinator;
         private const int HasAnyFilesMaxDepth = 3;
         private const int HasAnyFilesMaxDirectoryBudget = 2048;
 
@@ -39,7 +40,8 @@ namespace Locus.Storage
             IEnumerable<string> volumePaths,
             bool autoRecoverCorruptedDatabases = true,
             bool failFastOnRecoveryFailure = false,
-            TimeSpan? startupDelay = null)
+            TimeSpan? startupDelay = null,
+            LocusStartupCoordinator? startupCoordinator = null)
         {
             _recoveryService = recoveryService ?? throw new ArgumentNullException(nameof(recoveryService));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -49,12 +51,15 @@ namespace Locus.Storage
             _autoRecoverCorruptedDatabases = autoRecoverCorruptedDatabases;
             _failFastOnRecoveryFailure = failFastOnRecoveryFailure;
             _startupDelay = startupDelay ?? TimeSpan.FromSeconds(2);
+            _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
         }
 
         /// <inheritdoc/>
         public async Task StartAsync(CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Starting database health check...");
+
+            await _startupCoordinator.WaitForVolumesReadyAsync(cancellationToken).ConfigureAwait(false);
 
             // Add delay to avoid startup timing conflicts
             // Other services (MetadataRepository, etc.) need time to initialize
@@ -106,10 +111,17 @@ namespace Locus.Storage
                 {
                     LogCorruptionReport(report);
                 }
+
+                _startupCoordinator.MarkDatabaseHealthReady();
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error during database health check");
+
+                if (_failFastOnRecoveryFailure)
+                    _startupCoordinator.Fail(ex);
+                else
+                    _startupCoordinator.MarkDatabaseHealthReady();
 
                 if (_failFastOnRecoveryFailure)
                     throw;

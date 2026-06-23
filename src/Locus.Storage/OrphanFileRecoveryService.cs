@@ -17,6 +17,7 @@ namespace Locus.Storage
         private readonly IStorageCleanupService _cleanupService;
         private readonly ILogger<OrphanFileRecoveryService> _logger;
         private readonly OrphanRecoveryOptions _options;
+        private readonly LocusStartupCoordinator _startupCoordinator;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="OrphanFileRecoveryService"/> class.
@@ -24,11 +25,13 @@ namespace Locus.Storage
         public OrphanFileRecoveryService(
             IStorageCleanupService cleanupService,
             OrphanRecoveryOptions options,
-            ILogger<OrphanFileRecoveryService> logger)
+            ILogger<OrphanFileRecoveryService> logger,
+            LocusStartupCoordinator? startupCoordinator = null)
         {
             _cleanupService = cleanupService ?? throw new ArgumentNullException(nameof(cleanupService));
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
         }
 
         /// <inheritdoc/>
@@ -39,6 +42,15 @@ namespace Locus.Storage
                 _options.RunOnStartup,
                 _options.InitialDelay,
                 _options.RecoveryInterval);
+
+            try
+            {
+                await _startupCoordinator.WaitForRuntimeReadyAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
 
             var delayBeforeFirstRun = _options.RunOnStartup
                 ? _options.InitialDelay
