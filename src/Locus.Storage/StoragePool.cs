@@ -817,7 +817,10 @@ namespace Locus.Storage
                     return;
 
                 if (IsSameLeaseAlreadyReleased(metadata, lease.ProcessingStartTimeUtc))
+                {
+                    await CompleteReleasedLeaseAsync(metadata, lease.ProcessingStartTimeUtc, ct).ConfigureAwait(false);
                     return;
+                }
 
                 if (metadata.Status != FileProcessingStatus.Processing
                     || !metadata.ProcessingStartTime.HasValue
@@ -1177,6 +1180,49 @@ namespace Locus.Storage
             }
 
             return false;
+        }
+
+        private async Task CompleteReleasedLeaseAsync(
+            FileMetadata metadata,
+            DateTime processingStartTimeUtc,
+            CancellationToken ct)
+        {
+            var completedAtUtc = DateTime.UtcNow;
+            var completed = metadata.Clone();
+            completed.Status = FileProcessingStatus.Completed;
+            completed.ProcessingStartTime = null;
+            completed.CompletedAt = completedAtUtc;
+            completed.DeleteSucceededAt = null;
+            completed.DeadLetteredAt = null;
+            completed.AvailableForProcessingAt = null;
+            completed.LastError = null;
+            QueueProjectionMetadataState.ClearDeadLetterProjection(completed);
+            QueueProjectionMetadataState.MarkReleasedLease(completed, processingStartTimeUtc);
+
+            await _projectionWriteStore.QueueProjectedFileAsync(completed, ct).ConfigureAwait(false);
+
+            if (!ShouldAppendQueueEventsInStoragePool())
+            {
+                RecordStatistic("storage.file.completed.count", 1, completed.TenantId, completed.VolumeId);
+                return;
+            }
+
+            try
+            {
+                await AppendQueueEventsAsync(
+                    new[]
+                    {
+                        QueueEventRecordFactory.CreateProcessingCompleted(completed, processingStartTimeUtc, completedAtUtc),
+                        QueueEventRecordFactory.CreateDeleteRequested(completed, completedAtUtc),
+                    },
+                    ct).ConfigureAwait(false);
+                RecordStatistic("storage.file.completed.count", 1, completed.TenantId, completed.VolumeId);
+            }
+            catch
+            {
+                await RestoreProjectedMetadataAsync(metadata).ConfigureAwait(false);
+                throw;
+            }
         }
 
         private static bool IsSameLeaseAlreadyCompleted(FileMetadata metadata, DateTime processingStartTimeUtc)

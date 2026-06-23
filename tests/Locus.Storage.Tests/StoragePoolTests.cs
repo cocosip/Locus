@@ -1376,7 +1376,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task MarkAsCompletedAsync_WhenSameLeaseWasAlreadyFailed_IsIdempotent()
+        public async Task MarkAsCompletedAsync_WhenSameLeaseWasAlreadyFailed_CompletesReleasedLease()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("complete after fail"));
             var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
@@ -1390,7 +1390,7 @@ namespace Locus.Storage.Tests
 
             _fileScheduler
                 .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
-                .ThrowsAsync(new InvalidOperationException("completion should not run after failed release"));
+                .ThrowsAsync(new InvalidOperationException("released completion should be resolved in StoragePool"));
 
             _fileScheduler
                 .Setup(s => s.MarkAsFailedAsync(
@@ -1427,13 +1427,15 @@ namespace Locus.Storage.Tests
 
             var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.NotNull(metadataAfterRelease);
-            Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
+            Assert.Equal(FileProcessingStatus.Completed, metadataAfterRelease!.Status);
             Assert.Null(metadataAfterRelease.ProcessingStartTime);
-            Assert.Equal("decode failed", metadataAfterRelease.LastError);
+            Assert.NotNull(metadataAfterRelease.CompletedAt);
+            Assert.Null(metadataAfterRelease.LastError);
+            Assert.Null(metadataAfterRelease.AvailableForProcessingAt);
         }
 
         [Fact]
-        public async Task MarkAsCompletedAsync_WhenSameLeaseWasRecoveredToPending_IsIdempotent()
+        public async Task MarkAsCompletedAsync_WhenSameLeaseWasRecoveredToPending_CompletesReleasedLease()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("complete after timeout recovery"));
             var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
@@ -1455,7 +1457,7 @@ namespace Locus.Storage.Tests
 
             _fileScheduler
                 .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
-                .ThrowsAsync(new InvalidOperationException("completion should not run after timeout recovery"));
+                .ThrowsAsync(new InvalidOperationException("released completion should be resolved in StoragePool"));
 
             await _storagePool.MarkAsCompletedAsync(
                 CreateLease("tenant-001", fileKey, processingStart),
@@ -1467,8 +1469,10 @@ namespace Locus.Storage.Tests
 
             var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.NotNull(metadataAfterRelease);
-            Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
+            Assert.Equal(FileProcessingStatus.Completed, metadataAfterRelease!.Status);
             Assert.Null(metadataAfterRelease.ProcessingStartTime);
+            Assert.NotNull(metadataAfterRelease.CompletedAt);
+            Assert.Null(metadataAfterRelease.AvailableForProcessingAt);
         }
 
         [Fact]
@@ -1528,7 +1532,7 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task MarkAsCompletedAsync_WhenSameLeaseIsFailingConcurrently_WaitsAndReturnsIdempotently()
+        public async Task MarkAsCompletedAsync_WhenSameLeaseIsFailingConcurrently_WaitsAndCompletesReleasedLease()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("concurrent complete after fail"));
             var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
@@ -1544,7 +1548,7 @@ namespace Locus.Storage.Tests
 
             _fileScheduler
                 .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
-                .ThrowsAsync(new InvalidOperationException("completion should not run after failed release"));
+                .ThrowsAsync(new InvalidOperationException("released completion should be resolved in StoragePool"));
 
             _fileScheduler
                 .Setup(s => s.MarkAsFailedAsync(
@@ -1591,9 +1595,11 @@ namespace Locus.Storage.Tests
 
             var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
             Assert.NotNull(metadataAfterRelease);
-            Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
+            Assert.Equal(FileProcessingStatus.Completed, metadataAfterRelease!.Status);
             Assert.Null(metadataAfterRelease.ProcessingStartTime);
-            Assert.Equal("decode failed", metadataAfterRelease.LastError);
+            Assert.NotNull(metadataAfterRelease.CompletedAt);
+            Assert.Null(metadataAfterRelease.LastError);
+            Assert.Null(metadataAfterRelease.AvailableForProcessingAt);
         }
 
         [Fact]
