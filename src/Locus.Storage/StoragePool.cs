@@ -1201,12 +1201,6 @@ namespace Locus.Storage
 
             await _projectionWriteStore.QueueProjectedFileAsync(completed, ct).ConfigureAwait(false);
 
-            if (!ShouldAppendQueueEventsInStoragePool())
-            {
-                RecordStatistic("storage.file.completed.count", 1, completed.TenantId, completed.VolumeId);
-                return;
-            }
-
             try
             {
                 await AppendQueueEventsAsync(

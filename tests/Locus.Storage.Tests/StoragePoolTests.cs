@@ -1476,6 +1476,80 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenReleasedLeaseIsCompletedAndSchedulerHandlesJournal_AppendsCompletionEvents()
+        {
+            var managedScheduler = new Mock<IFileScheduler>();
+            managedScheduler
+                .As<IQueueEventManagedFileScheduler>()
+                .SetupGet(s => s.HandlesQueueJournal)
+                .Returns(true);
+            managedScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("released completion should be resolved in StoragePool"));
+
+            var storagePool = new StoragePool(
+                _metadataRepository,
+                _tenantQuotaManager.Object,
+                _directoryQuotaManager.Object,
+                _tenantManager.Object,
+                managedScheduler.Object,
+                _logger.Object,
+                queueEventJournal: _queueEventJournal.Object);
+            await storagePool.AddVolumeAsync(_volume1.Object, initialDelayMs: 0, healthCheckDelayMs: 0);
+
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("complete after scheduler-owned journal release"));
+            var fileKey = await storagePool.WriteFileAsync(_tenant.Object, content, "released.dcm", CancellationToken.None);
+            var processingStart = DateTime.UtcNow.AddMinutes(-1);
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Pending;
+            metadata.ProcessingStartTime = null;
+            metadata.LastError = "decode failed";
+            metadata.LastFailedAt = DateTime.UtcNow.AddSeconds(-30);
+            metadata.AvailableForProcessingAt = DateTime.UtcNow.AddMinutes(1);
+            metadata.OriginalFileName = "released.dcm";
+            metadata.FileExtension = ".dcm";
+            metadata.Metadata = new Dictionary<string, string>
+            {
+                ["queue.released_lease_start_utc"] = processingStart.ToString("O")
+            };
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            _queueEventJournal.Invocations.Clear();
+
+            await storagePool.MarkAsCompletedAsync(
+                CreateLease("tenant-001", fileKey, processingStart),
+                CancellationToken.None);
+
+            managedScheduler.Verify(
+                s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            _queueEventJournal.Verify(
+                m => m.AppendBatchAsync(
+                    It.Is<IReadOnlyList<QueueEventRecord>>(records =>
+                        records.Count == 2
+                        && records[0].EventType == QueueEventType.ProcessingCompleted
+                        && records[0].TenantId == "tenant-001"
+                        && records[0].FileKey == fileKey
+                        && records[0].Status == FileProcessingStatus.Completed
+                        && records[0].ProcessingStartTimeUtc == processingStart
+                        && records[0].FileExtension == ".dcm"
+                        && records[1].EventType == QueueEventType.DeleteRequested
+                        && records[1].TenantId == "tenant-001"
+                        && records[1].FileKey == fileKey
+                        && records[1].Status == FileProcessingStatus.DeleteRequested),
+                    It.IsAny<CancellationToken>()),
+                Times.Once);
+
+            var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadataAfterRelease);
+            Assert.Equal(FileProcessingStatus.Completed, metadataAfterRelease!.Status);
+            Assert.Null(metadataAfterRelease.ProcessingStartTime);
+            Assert.NotNull(metadataAfterRelease.CompletedAt);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_WhenDifferentLeaseWasAlreadyFailed_ThrowsLeaseMismatch()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("stale complete after different fail"));
