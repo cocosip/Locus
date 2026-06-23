@@ -532,6 +532,76 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ProjectionBatch_StalePendingUpsert_DoesNotOverwriteConcurrentProcessingLease()
+        {
+            const string fileKey = "batch-stale-pending";
+            var pending = CreateMetadata(fileKey, FileProcessingStatus.Pending);
+            pending.Metadata = new Dictionary<string, string>
+            {
+                ["queue.accepted_projection_applied"] = bool.FalseString
+            };
+            await _repository.AddOrUpdateAsync(pending, CancellationToken.None);
+
+            var batch = BeginProjectionBatch(_repository, _tenantId);
+            var staleProjection = await InvokeBatchTryGetProjectedFileAsync(batch, fileKey);
+            Assert.NotNull(staleProjection);
+
+            var leased = await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            Assert.NotNull(leased);
+            Assert.Equal(FileProcessingStatus.Processing, leased!.Status);
+            Assert.NotNull(leased.ProcessingStartTime);
+
+            staleProjection!.Metadata = new Dictionary<string, string>(staleProjection.Metadata!)
+            {
+                ["queue.accepted_projection_applied"] = bool.TrueString
+            };
+            await InvokeBatchUpsertProjectedFileAsync(batch, staleProjection);
+            await InvokeBatchFlushAsync(batch);
+
+            var current = await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None);
+
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Processing, current!.Status);
+            Assert.Equal(leased.ProcessingStartTime, current.ProcessingStartTime);
+            Assert.True(current.Metadata!.TryGetValue("queue.accepted_projection_applied", out var acceptedApplied));
+            Assert.Equal(bool.TrueString, acceptedApplied);
+        }
+
+        [Fact]
+        public async Task ProjectionBatch_RollbackAfterStalePendingUpsert_DoesNotRollbackConcurrentProcessingLease()
+        {
+            const string fileKey = "batch-stale-pending-failed";
+            var pending = CreateMetadata(fileKey, FileProcessingStatus.Pending);
+            pending.Metadata = new Dictionary<string, string>
+            {
+                ["queue.accepted_projection_applied"] = bool.FalseString
+            };
+            await _repository.AddOrUpdateAsync(pending, CancellationToken.None);
+
+            var batch = BeginProjectionBatch(_repository, _tenantId);
+            var staleProjection = await InvokeBatchTryGetProjectedFileAsync(batch, fileKey);
+            Assert.NotNull(staleProjection);
+
+            var leased = await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+            Assert.NotNull(leased);
+            Assert.Equal(FileProcessingStatus.Processing, leased!.Status);
+            Assert.NotNull(leased.ProcessingStartTime);
+
+            staleProjection!.Metadata = new Dictionary<string, string>(staleProjection.Metadata!)
+            {
+                ["queue.accepted_projection_applied"] = bool.TrueString
+            };
+            await InvokeBatchUpsertProjectedFileAsync(batch, staleProjection);
+            InvokeBatchRollbackInMemoryProjection(batch);
+
+            var current = await _repository.GetAsync(_tenantId, fileKey, CancellationToken.None);
+
+            Assert.NotNull(current);
+            Assert.Equal(FileProcessingStatus.Processing, current!.Status);
+            Assert.Equal(leased.ProcessingStartTime, current.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task ProjectionBatch_CommittedDelete_DoesNotRollbackWhenCheckpointFails()
         {
             const string tenantId = "tenant-checkpoint";
@@ -1660,6 +1730,14 @@ namespace Locus.Storage.Tests
             return (Task)method!.Invoke(batch, new object[] { metadata, CancellationToken.None })!;
         }
 
+        private static Task<FileMetadata?> InvokeBatchTryGetProjectedFileAsync(object batch, string fileKey)
+        {
+            var method = batch.GetType().GetMethod("TryGetProjectedFileAsync");
+            Assert.NotNull(method);
+
+            return (Task<FileMetadata?>)method!.Invoke(batch, new object[] { fileKey, CancellationToken.None })!;
+        }
+
         private static Task<bool> InvokeBatchRemoveProjectedFileAsync(object batch, string fileKey)
         {
             var method = batch.GetType().GetMethod("RemoveProjectedFileAsync");
@@ -1681,6 +1759,14 @@ namespace Locus.Storage.Tests
             {
                 return Task.FromException(ex.InnerException);
             }
+        }
+
+        private static void InvokeBatchRollbackInMemoryProjection(object batch)
+        {
+            var method = batch.GetType().GetMethod("RollbackInMemoryProjection", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(method);
+
+            method!.Invoke(batch, Array.Empty<object>());
         }
 
         private static void DisposeTenantDatabaseConnection(MetadataRepository repository, string tenantId)

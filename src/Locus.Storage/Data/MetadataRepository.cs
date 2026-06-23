@@ -1308,6 +1308,8 @@ WHERE tenant_id = @tenant_id
             private readonly List<PersistenceOperation> _operations;
             private readonly Dictionary<string, FileMetadata?> _originalMetadataByFileKey;
             private readonly Dictionary<string, FileMetadata?> _stagedMetadataByFileKey;
+            private readonly Dictionary<string, FileMetadata?> _rollbackMetadataByFileKey;
+            private readonly Dictionary<string, FileMetadata?> _appliedMetadataByFileKey;
             private bool _flushed;
 
             public DirectProjectionBatch(MetadataRepository repository, string tenantId)
@@ -1317,6 +1319,8 @@ WHERE tenant_id = @tenant_id
                 _operations = new List<PersistenceOperation>();
                 _originalMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
                 _stagedMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
+                _rollbackMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
+                _appliedMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
             }
 
             public string TenantId => _tenantId;
@@ -1336,10 +1340,24 @@ WHERE tenant_id = @tenant_id
                 if (!string.Equals(metadata.TenantId, _tenantId, StringComparison.Ordinal))
                     throw new ArgumentException("Metadata tenant does not match the active projection batch.", nameof(metadata));
 
-                CaptureOriginalMetadata(metadata.FileKey);
-                _repository.UpdateCacheAndIndices(metadata);
-                _stagedMetadataByFileKey[metadata.FileKey] = metadata.Clone();
-                _operations.Add(_repository.CreatePersistenceUpsert(metadata));
+                var original = CaptureOriginalMetadata(metadata.FileKey);
+                var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(metadata.FileKey, out var stagedProjection);
+                var expected = hasStagedProjection ? stagedProjection : original;
+                var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(metadata.FileKey);
+                var projected = ResolveConcurrentUpsert(metadata, expected, current);
+                if (projected == null)
+                {
+                    _stagedMetadataByFileKey[metadata.FileKey] = current?.Clone();
+                    return Task.CompletedTask;
+                }
+
+                CaptureRollbackMetadata(
+                    metadata.FileKey,
+                    hasStagedProjection ? ReadCurrentMetadata(metadata.FileKey) : current);
+                _repository.UpdateCacheAndIndices(projected);
+                _stagedMetadataByFileKey[metadata.FileKey] = projected.Clone();
+                _appliedMetadataByFileKey[metadata.FileKey] = projected.Clone();
+                _operations.Add(_repository.CreatePersistenceUpsert(projected));
                 return Task.CompletedTask;
             }
 
@@ -1357,8 +1375,21 @@ WHERE tenant_id = @tenant_id
                     throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
                 var original = CaptureOriginalMetadata(fileKey);
+                var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(fileKey, out var stagedProjection);
+                var expected = hasStagedProjection ? stagedProjection : original;
+                var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(fileKey);
+                if (!MetadataEquals(current, expected))
+                {
+                    _stagedMetadataByFileKey[fileKey] = current?.Clone();
+                    return Task.FromResult(false);
+                }
+
+                CaptureRollbackMetadata(
+                    fileKey,
+                    hasStagedProjection ? ReadCurrentMetadata(fileKey) : current);
                 var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
                 _stagedMetadataByFileKey[fileKey] = null;
+                _appliedMetadataByFileKey[fileKey] = null;
                 if (removed || original != null)
                     _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
 
@@ -1398,6 +1429,8 @@ WHERE tenant_id = @tenant_id
                     _repository.ExecuteDirectBatch(_tenantId, _operations);
                     _originalMetadataByFileKey.Clear();
                     _stagedMetadataByFileKey.Clear();
+                    _rollbackMetadataByFileKey.Clear();
+                    _appliedMetadataByFileKey.Clear();
                 }
                 catch
                 {
@@ -1421,10 +1454,56 @@ WHERE tenant_id = @tenant_id
                 return original;
             }
 
+            private void CaptureRollbackMetadata(string fileKey, FileMetadata? current)
+            {
+                if (!_rollbackMetadataByFileKey.ContainsKey(fileKey))
+                    _rollbackMetadataByFileKey[fileKey] = current?.Clone();
+            }
+
+            private FileMetadata? ReadCurrentMetadata(string fileKey)
+            {
+                var cache = _repository.GetCache(_tenantId);
+                return cache.TryGetValue(fileKey, out var current)
+                    ? current.Clone()
+                    : _repository.TryGetFromDatabase(_tenantId, fileKey)?.Clone();
+            }
+
+            private static FileMetadata? ResolveConcurrentUpsert(
+                FileMetadata metadata,
+                FileMetadata? expected,
+                FileMetadata? current)
+            {
+                if (MetadataEquals(current, expected))
+                    return metadata.Clone();
+
+                if (current == null)
+                    return null;
+
+                var merged = current.Clone();
+                if (metadata.Metadata == null || metadata.Metadata.Count == 0)
+                    return merged;
+
+                var mergedMetadata = merged.Metadata != null
+                    ? new Dictionary<string, string>(merged.Metadata, StringComparer.Ordinal)
+                    : new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var item in metadata.Metadata)
+                    mergedMetadata[item.Key] = item.Value;
+
+                merged.Metadata = mergedMetadata;
+                return merged;
+            }
+
             private void RollbackInMemoryProjection()
             {
-                foreach (var entry in _originalMetadataByFileKey)
+                foreach (var entry in _rollbackMetadataByFileKey)
                 {
+                    if (!_appliedMetadataByFileKey.TryGetValue(entry.Key, out var applied))
+                        continue;
+
+                    var current = ReadCurrentMetadata(entry.Key);
+                    if (!MetadataEquals(current, applied))
+                        continue;
+
                     if (entry.Value == null)
                     {
                         _repository.TryRemoveFromCacheAndIndices(_tenantId, entry.Key, out _);
@@ -1434,6 +1513,60 @@ WHERE tenant_id = @tenant_id
                         _repository.UpdateCacheAndIndices(entry.Value.Clone());
                     }
                 }
+            }
+
+            private static bool MetadataEquals(FileMetadata? left, FileMetadata? right)
+            {
+                if (ReferenceEquals(left, right))
+                    return true;
+
+                if (left == null || right == null)
+                    return false;
+
+                return string.Equals(left.FileKey, right.FileKey, StringComparison.Ordinal)
+                    && string.Equals(left.TenantId, right.TenantId, StringComparison.Ordinal)
+                    && string.Equals(left.VolumeId, right.VolumeId, StringComparison.Ordinal)
+                    && string.Equals(left.PhysicalPath, right.PhysicalPath, StringComparison.Ordinal)
+                    && string.Equals(left.DirectoryPath, right.DirectoryPath, StringComparison.Ordinal)
+                    && left.FileSize == right.FileSize
+                    && left.CreatedAt == right.CreatedAt
+                    && left.Status == right.Status
+                    && left.RetryCount == right.RetryCount
+                    && left.LastFailedAt == right.LastFailedAt
+                    && string.Equals(left.LastError, right.LastError, StringComparison.Ordinal)
+                    && left.ProcessingStartTime == right.ProcessingStartTime
+                    && left.CompletedAt == right.CompletedAt
+                    && left.DeleteSucceededAt == right.DeleteSucceededAt
+                    && left.DeadLetteredAt == right.DeadLetteredAt
+                    && left.AvailableForProcessingAt == right.AvailableForProcessingAt
+                    && string.Equals(left.OriginalFileName, right.OriginalFileName, StringComparison.Ordinal)
+                    && string.Equals(left.FileExtension, right.FileExtension, StringComparison.Ordinal)
+                    && MetadataDictionaryEquals(left.Metadata, right.Metadata);
+            }
+
+            private static bool MetadataDictionaryEquals(
+                Dictionary<string, string>? left,
+                Dictionary<string, string>? right)
+            {
+                if (ReferenceEquals(left, right))
+                    return true;
+
+                if (left == null || right == null)
+                    return left == null && right == null;
+
+                if (left.Count != right.Count)
+                    return false;
+
+                foreach (var item in left)
+                {
+                    if (!right.TryGetValue(item.Key, out var value)
+                        || !string.Equals(item.Value, value, StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
             }
         }
 
