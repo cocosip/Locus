@@ -1473,6 +1473,7 @@ WHERE tenant_id = @tenant_id
                 updated.Status = FileProcessingStatus.Pending;
                 updated.ProcessingStartTime = null;
                 updated.AvailableForProcessingAt = availableForProcessingAtUtc;
+                QueueProjectionMetadataState.MarkReleasedLease(updated, expectedProcessingStartTimeUtc);
 
                 if (!cache.TryUpdate(fileKey, updated, current))
                     return false;
@@ -2209,6 +2210,7 @@ WHERE tenant_id = @tenant_id
                 updated.Status = FileProcessingStatus.Processing;
                 updated.ProcessingStartTime = processingStartTimeUtc;
                 updated.AvailableForProcessingAt = null;
+                QueueProjectionMetadataState.ClearReleasedLease(updated);
 
                 if (!cache.TryUpdate(fileKey, updated, current))
                     return null;
@@ -3207,6 +3209,7 @@ LIMIT @limit;";
                     var updated = candidate.Clone();
                     updated.Status = FileProcessingStatus.Processing;
                     updated.ProcessingStartTime = now;
+                    QueueProjectionMetadataState.ClearReleasedLease(updated);
 
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
@@ -3357,6 +3360,7 @@ LIMIT @limit;";
                     var updated = candidate.Clone();
                     updated.Status = FileProcessingStatus.Processing;
                     updated.ProcessingStartTime = now;
+                    QueueProjectionMetadataState.ClearReleasedLease(updated);
 
                     cache[updated.FileKey] = updated;
                     _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
@@ -3454,6 +3458,7 @@ LIMIT @limit;";
                     // Clone before mutating - keeps the cache entry consistent for lock-free readers.
                     var updated = file.Clone();
                     updated.Status = FileProcessingStatus.Pending;
+                    QueueProjectionMetadataState.MarkReleasedLease(updated, file.ProcessingStartTime.Value);
                     updated.ProcessingStartTime = null;
                     updated.AvailableForProcessingAt = null;
 

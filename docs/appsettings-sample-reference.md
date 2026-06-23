@@ -121,7 +121,7 @@
         "Sink": "Logging",
 
         // Locus 自输出间隔。
-        "Interval": "00:05:00",
+        "Interval": "00:01:00",
 
         // 每次输出统计覆盖的时间范围。
         // 默认看最近 15 分钟，能更平滑地反映文件处理吞吐趋势。
@@ -584,4 +584,4 @@
 - 统计默认关闭，只有确实需要按时间窗口观察写入 MB/s、文件取走数量、SQLite 落盘量或 watcher 导入量时再启用 `Statistics.Enabled`。
 - 维度会影响内存占用和基数，租户数量较大时建议保持 `Statistics.Dimensions.TenantId = false`。
 - 如果希望 Locus 自己周期性写统计摘要，启用 `Statistics.Output.Enabled`；如果宿主应用已有监控/日志出口，则优先通过 `ILocusStatisticsReader` 主动获取后自行输出。
-- 默认统计窗口偏向文件处理趋势观察：5 分钟桶、15 分钟输出窗口、1 小时保留。排障时如果需要更实时的波动，可以临时缩短 `Statistics.WindowSize` 和 `Statistics.Output.QueryWindow`。
+- 默认统计窗口偏向文件处理趋势观察：5 分钟桶、1 分钟自输出间隔、15 分钟输出窗口、1 小时保留。排障时如果需要更实时的波动，可以临时缩短 `Statistics.WindowSize` 和 `Statistics.Output.QueryWindow`。

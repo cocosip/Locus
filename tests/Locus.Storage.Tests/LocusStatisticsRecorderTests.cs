@@ -37,7 +37,7 @@ namespace Locus.Storage.Tests
                 Retention = TimeSpan.FromMinutes(5)
             };
             var recorder = new InMemoryLocusStatisticsRecorder(options);
-            var at = new DateTimeOffset(2026, 6, 22, 10, 0, 5, TimeSpan.Zero);
+            var at = DateTimeOffset.UtcNow;
 
             recorder.Record("storage.write.success.count", 2, at);
             recorder.Record("storage.write.bytes", 4 * 1024 * 1024, at);
@@ -76,7 +76,7 @@ namespace Locus.Storage.Tests
                 }
             };
             var recorder = new InMemoryLocusStatisticsRecorder(options);
-            var at = new DateTimeOffset(2026, 6, 22, 10, 0, 0, TimeSpan.Zero);
+            var at = DateTimeOffset.UtcNow;
 
             recorder.Record(
                 "storage.write.success.count",
@@ -120,7 +120,7 @@ namespace Locus.Storage.Tests
                 Retention = TimeSpan.FromMinutes(5)
             };
             var recorder = new InMemoryLocusStatisticsRecorder(options);
-            var at = new DateTimeOffset(2026, 6, 22, 10, 0, 0, TimeSpan.Zero);
+            var at = DateTimeOffset.UtcNow;
             var dimensions = new Dictionary<string, string?>
             {
                 ["volume_id"] = "vol-001"
@@ -179,7 +179,7 @@ namespace Locus.Storage.Tests
                 }
             };
             var recorder = new InMemoryLocusStatisticsRecorder(options);
-            var at = new DateTimeOffset(2026, 6, 22, 10, 0, 0, TimeSpan.Zero);
+            var at = DateTimeOffset.UtcNow;
 
             for (var i = 0; i < LocusStatisticsOptions.MinMaxSeries + 1; i++)
             {

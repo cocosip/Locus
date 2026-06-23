@@ -20,7 +20,7 @@ namespace Locus.Core.Models
         /// <summary>
         /// Gets or sets the output interval.
         /// </summary>
-        public TimeSpan Interval { get; set; } = TimeSpan.FromMinutes(5);
+        public TimeSpan Interval { get; set; } = TimeSpan.FromMinutes(1);
 
         /// <summary>
         /// Gets or sets the time range included in each output.

@@ -40,7 +40,7 @@ Add or update the `Locus:Statistics` section in appsettings:
       "Output": {
         "Enabled": false,
         "Sink": "Logging",
-        "Interval": "00:05:00",
+        "Interval": "00:01:00",
         "QueryWindow": "00:15:00",
         "IncludeEmptySnapshots": false
       },
@@ -57,7 +57,7 @@ Add or update the `Locus:Statistics` section in appsettings:
 
 Keep high-cardinality dimensions off unless you need them. `TenantId` is disabled by default because large tenant counts can increase memory usage and monitoring cardinality. Locus never records file keys, file names, or physical paths as statistics dimensions.
 
-The default windows are tuned for file-processing workloads rather than per-second tracing: 5-minute aggregation buckets, 1-hour in-memory retention, and optional self-output every 5 minutes over the most recent 15 minutes. Use shorter windows only when you need near-real-time troubleshooting.
+The default windows are tuned for file-processing workloads rather than per-second tracing: 5-minute aggregation buckets, 1-hour in-memory retention, and optional self-output every 1 minute over the most recent 15 minutes. Use shorter windows only when you need near-real-time troubleshooting.
 
 Statistics do not replace the existing `System.Diagnostics.Metrics` instruments. Keep external Metrics and Locus statistics separate because they have different consumers, dimensions, and aggregation semantics.
 
@@ -89,7 +89,7 @@ Example:
       "Output": {
         "Enabled": true,
         "Sink": "Logging",
-        "Interval": "00:05:00",
+        "Interval": "00:01:00",
         "QueryWindow": "00:15:00",
         "IncludeEmptySnapshots": false
       }

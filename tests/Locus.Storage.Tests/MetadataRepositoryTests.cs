@@ -21,6 +21,7 @@ namespace Locus.Storage.Tests
 {
     public class MetadataRepositoryTests : IDisposable
     {
+        private const string ReleasedLeaseStartUtcKey = "queue.released_lease_start_utc";
         private readonly IFileSystem _fileSystem;
         private readonly MetadataRepository _repository;
         private readonly string _metadataDir;
@@ -126,6 +127,30 @@ namespace Locus.Storage.Tests
 
             Assert.True(reset);
             Assert.Equal(1, GetPendingCount(_repository, _tenantId));
+        }
+
+        [Fact]
+        public async Task TryResetTimedOutFileAsync_MarksReleasedLease()
+        {
+            var processingStart = DateTime.UtcNow.AddMinutes(-10);
+            var file = CreateMetadata("file-timeout-release", FileProcessingStatus.Processing);
+            file.ProcessingStartTime = processingStart;
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var reset = await _repository.TryResetTimedOutFileAsync(
+                _tenantId,
+                file.FileKey,
+                processingStart,
+                DateTime.UtcNow,
+                CancellationToken.None);
+
+            Assert.True(reset);
+
+            var metadata = await _repository.GetAsync(_tenantId, file.FileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            Assert.NotNull(metadata!.Metadata);
+            Assert.True(metadata.Metadata!.TryGetValue(ReleasedLeaseStartUtcKey, out var releasedLeaseStart));
+            Assert.Equal(processingStart, DateTime.Parse(releasedLeaseStart!, null, System.Globalization.DateTimeStyles.RoundtripKind));
         }
 
         [Fact]
@@ -811,6 +836,29 @@ namespace Locus.Storage.Tests
             Assert.NotNull(current);
             Assert.Equal(FileProcessingStatus.Processing, current!.Status);
             Assert.Equal(allocated.ProcessingStartTime, current.ProcessingStartTime);
+        }
+
+        [Fact]
+        public async Task GetNextPendingFileAsync_ClearsReleasedLeaseMarkerWhenReleasingAgain()
+        {
+            var releasedProcessingStart = DateTime.UtcNow.AddMinutes(-10);
+            var file = CreateMetadata("released-marker-clear", FileProcessingStatus.Pending);
+            file.AvailableForProcessingAt = DateTime.UtcNow.AddMilliseconds(-1);
+            file.Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [ReleasedLeaseStartUtcKey] = releasedProcessingStart.ToString("O")
+            };
+            await _repository.AddOrUpdateAsync(file, CancellationToken.None);
+
+            var allocated = await _repository.GetNextPendingFileAsync(_tenantId, CancellationToken.None);
+
+            Assert.NotNull(allocated);
+            Assert.Equal(FileProcessingStatus.Processing, allocated!.Status);
+            Assert.False(allocated.Metadata?.ContainsKey(ReleasedLeaseStartUtcKey) == true);
+
+            var current = await _repository.GetAsync(_tenantId, file.FileKey, CancellationToken.None);
+            Assert.NotNull(current);
+            Assert.False(current!.Metadata?.ContainsKey(ReleasedLeaseStartUtcKey) == true);
         }
 
         [Fact]

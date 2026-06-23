@@ -1433,6 +1433,45 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task MarkAsCompletedAsync_WhenSameLeaseWasRecoveredToPending_IsIdempotent()
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes("complete after timeout recovery"));
+            var fileKey = await _storagePool.WriteFileAsync(_tenant.Object, content, null, default);
+            var processingStart = DateTime.UtcNow;
+
+            var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadata);
+            metadata!.Status = FileProcessingStatus.Processing;
+            metadata.ProcessingStartTime = processingStart;
+            await _metadataRepository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var reset = await _metadataRepository.TryResetTimedOutFileAsync(
+                "tenant-001",
+                fileKey,
+                processingStart,
+                DateTime.UtcNow,
+                CancellationToken.None);
+            Assert.True(reset);
+
+            _fileScheduler
+                .Setup(s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("completion should not run after timeout recovery"));
+
+            await _storagePool.MarkAsCompletedAsync(
+                CreateLease("tenant-001", fileKey, processingStart),
+                CancellationToken.None);
+
+            _fileScheduler.Verify(
+                s => s.MarkAsCompletedAsync(It.IsAny<FileProcessingLease>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+
+            var metadataAfterRelease = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
+            Assert.NotNull(metadataAfterRelease);
+            Assert.Equal(FileProcessingStatus.Pending, metadataAfterRelease!.Status);
+            Assert.Null(metadataAfterRelease.ProcessingStartTime);
+        }
+
+        [Fact]
         public async Task MarkAsCompletedAsync_WhenDifferentLeaseWasAlreadyFailed_ThrowsLeaseMismatch()
         {
             var content = new MemoryStream(Encoding.UTF8.GetBytes("stale complete after different fail"));

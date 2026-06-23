@@ -168,7 +168,7 @@ Default statistics windows are tuned for file-processing trends rather than per-
 
 - `WindowSize = 00:05:00`
 - `Retention = 01:00:00`
-- `Output.Interval = 00:05:00`
+- `Output.Interval = 00:01:00`
 - `Output.QueryWindow = 00:15:00`
 
 Host applications can query `ILocusStatisticsReader` directly, and Locus can also write a periodic

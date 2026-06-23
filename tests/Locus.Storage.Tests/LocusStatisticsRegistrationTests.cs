@@ -27,7 +27,7 @@ namespace Locus.Storage.Tests
             Assert.Equal(TimeSpan.FromMinutes(5), options.WindowSize);
             Assert.Equal(TimeSpan.FromHours(1), options.Retention);
             Assert.Equal(LocusStatisticsOptions.DefaultMaxSeries, options.MaxSeries);
-            Assert.Equal(TimeSpan.FromMinutes(5), options.Output.Interval);
+            Assert.Equal(TimeSpan.FromMinutes(1), options.Output.Interval);
             Assert.Equal(TimeSpan.FromMinutes(15), options.Output.QueryWindow);
         }
 
