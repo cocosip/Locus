@@ -859,6 +859,96 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReplayTenantAsync_DeleteSucceededTreatsConcurrentMetadataRemovalAsProjected()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+            var projectionStore = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+
+            const string tenantId = "tenant-delete-concurrent-remove";
+            const string fileKey = "file-delete-concurrent-remove";
+            const string directoryPath = "/dicom";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "dicom", "file.dcm");
+            var completedAt = DateTime.UtcNow.AddMinutes(-2);
+            var deleteSucceededAt = DateTime.UtcNow.AddMinutes(-1);
+            var existing = new FileMetadata
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 4,
+                CreatedAt = completedAt.AddMinutes(-3),
+                Status = FileProcessingStatus.DeleteSucceeded,
+                CompletedAt = completedAt,
+                DeleteSucceededAt = deleteSucceededAt,
+                OriginalFileName = "study.dcm",
+                FileExtension = ".dcm"
+            };
+
+            await tenantQuotaManager.ApplyAcceptedProjectionAsync(tenantId, CancellationToken.None);
+            await directoryQuotaManager.ApplyAcceptedProjectionAsync(tenantId, directoryPath, CancellationToken.None);
+
+            await journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.DeleteSucceeded,
+                OccurredAtUtc = deleteSucceededAt,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 4,
+                Status = FileProcessingStatus.DeleteSucceeded,
+                OriginalFileName = "study.dcm",
+                FileExtension = ".dcm"
+            }, CancellationToken.None);
+
+            projectionStore
+                .SetupSequence(store => store.GetProjectedFileAsync(tenantId, fileKey, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(existing)
+                .ReturnsAsync((FileMetadata?)null);
+            projectionStore
+                .Setup(store => store.RemoveProjectedFileAsync(tenantId, fileKey, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(false);
+            projectionStore
+                .Setup(store => store.GetProjectedFilesAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+
+            var service = TrackDisposable(new QueueEventProjectionService(
+                journal,
+                metadataRepository: null,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                projectionStore: projectionStore.Object,
+                quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
+
+            var state = await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(0, state.LagBytes);
+            Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            projectionStore.Verify(
+                store => store.RemoveProjectedFileAsync(tenantId, fileKey, It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task ReplayTenantAsync_DeadLetteredEventAppliesQuotaDecrementAndKeepsMetadata()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();

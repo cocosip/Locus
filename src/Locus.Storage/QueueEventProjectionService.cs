@@ -775,13 +775,24 @@ namespace Locus.Storage
 
                 var metadataRemoved = await RemoveProjectedFileAsync(existing.TenantId, existing.FileKey, ct).ConfigureAwait(false);
                 if (!metadataRemoved)
+                {
+                    if (await WasProjectedMetadataRemovedConcurrentlyAsync(record, ct).ConfigureAwait(false))
+                        return;
+
                     throw new InvalidOperationException($"Failed to remove projected metadata for deleted file {existing.FileKey}.");
+                }
             }
             catch
             {
                 await RollbackDeleteSucceededProjectionAsync(existing.TenantId, directoryPath, tenantQuotaDecremented, directoryQuotaDecremented).ConfigureAwait(false);
                 throw;
             }
+        }
+
+        private async Task<bool> WasProjectedMetadataRemovedConcurrentlyAsync(QueueEventRecord record, CancellationToken ct)
+        {
+            var current = await GetExistingMetadataAsync(record, ct).ConfigureAwait(false);
+            return current == null;
         }
 
         private async Task RollbackDeleteSucceededProjectionAsync(
