@@ -6,9 +6,9 @@ Locus is a .NET solution organized by responsibility. Production libraries live 
 
 ## Build, Test, and Development Commands
 
-- `dotnet restore Locus.sln`: restore centrally managed NuGet packages.
-- `dotnet build Locus.sln`: build all source, test, benchmark, and sample projects.
-- `dotnet test Locus.sln --no-build`: run the full xUnit test suite after a build.
+- `dotnet restore Locus.slnx`: restore centrally managed NuGet packages.
+- `dotnet build Locus.slnx`: build all source, test, benchmark, and sample projects.
+- `dotnet test Locus.slnx --no-build`: run the full xUnit test suite after a build.
 - `dotnet test tests/Locus.Storage.Tests/Locus.Storage.Tests.csproj --no-restore`: run the storage-focused regression suite.
 - `dotnet run --project samples/Locus.Sample.Console`: run the console sample.
 - `dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.MetadataRepositoryBenchmarks*"`: run a targeted benchmark.

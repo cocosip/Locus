@@ -8,7 +8,7 @@
 
 ### CI/CD Pipeline (`ci-cd.yml`)
 
-该 workflow 包含两个主要 job：
+该 workflow 包含三个主要 job：
 
 #### 1. build-and-test (构建和测试)
 
@@ -25,7 +25,7 @@
 5. 运行所有测试
 6. 上传测试结果
 
-#### 2. pack-and-publish (打包和发布)
+#### 2. pack-nuget (打包和发布)
 
 **触发条件**:
 - 仅在 tag 推送时触发 (格式: `v*.*.*`)
@@ -48,6 +48,15 @@
    - 完整的 Changelog
    - NuGet 包文件附件
 
+#### 3. pack-debug-symbols (符号包)
+
+**触发条件**:
+- 仅在 tag 推送且 `pack-nuget` 成功后触发
+
+**执行步骤**:
+1. 使用 .NET 10 构建 `Locus.slnx`
+2. 生成并上传 `.snupkg` 符号包
+
 ## 配置步骤
 
 ### 1. 设置 NuGet API Key
@@ -65,7 +74,7 @@
 
 ### 2. 更新项目元数据
 
-编辑 `src/Directory.Build.props` 文件，更新以下信息：
+编辑根目录的 `common.props` 文件，更新以下信息：
 
 ```xml
 <Authors>Your Name or Organization</Authors>
@@ -150,7 +159,7 @@ test: Add integration tests for FileScheduler
 
 ### 测试失败
 - 检查 Actions 日志查看失败的测试
-- 在本地运行 `dotnet test` 重现问题
+- 在本地运行 `dotnet test Locus.slnx` 重现问题
 - 修复后推送到分支，CI 会自动重新运行
 
 ### 打包失败

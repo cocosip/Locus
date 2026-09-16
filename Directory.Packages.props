@@ -5,34 +5,34 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- Source Link for debugging -->
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.401" />
     <!-- Core dependencies -->
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
-    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <!-- Third-party runtime dependencies use lower-bound ranges for consumer compatibility. -->
-    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="[3.0.3,4.0.0)" />
-    <PackageVersion Include="Dapper" Version="[2.1.66,3.0.0)" />
-    <PackageVersion Include="System.IO.Abstractions" Version="[22.1.0,23.0.0)" />
-    <PackageVersion Include="System.Threading.Channels" Version="9.0.0" />
-    <PackageVersion Include="System.Text.Json" Version="9.0.1" />
-    <PackageVersion Include="System.Diagnostics.DiagnosticSource" Version="9.0.0" />
-    <!-- Microsoft Extensions (using 9.x for better compatibility with netstandard2.0) -->
-    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Options" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Logging" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="9.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.0" />
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="[3.0.5,4.0.0)" />
+    <PackageVersion Include="Dapper" Version="[2.1.86,3.0.0)" />
+    <PackageVersion Include="System.IO.Abstractions" Version="[22.2.0,23.0.0)" />
+    <PackageVersion Include="System.Threading.Channels" Version="10.0.12" />
+    <PackageVersion Include="System.Text.Json" Version="10.0.12" />
+    <PackageVersion Include="System.Diagnostics.DiagnosticSource" Version="10.0.12" />
+    <!-- Microsoft Extensions aligned with the .NET 10 servicing release. -->
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.12" />
     <!-- Testing dependencies -->
-    <PackageVersion Include="coverlet.collector" Version="6.0.0" />
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
-    <PackageVersion Include="xunit" Version="2.9.2" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="3.0.0" />
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0" />
     <PackageVersion Include="Moq" Version="4.20.72" />
-    <PackageVersion Include="System.IO.Abstractions.TestingHelpers" Version="22.1.0" />
+    <PackageVersion Include="System.IO.Abstractions.TestingHelpers" Version="22.2.0" />
   </ItemGroup>
 </Project>

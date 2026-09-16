@@ -1,0 +1,24 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/samples/">
+    <Project Path="samples/Locus.Sample.Console/Locus.Sample.Console.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Locus.Core/Locus.Core.csproj" />
+    <Project Path="src/Locus.FileSystem/Locus.FileSystem.csproj" />
+    <Project Path="src/Locus.MultiTenant/Locus.MultiTenant.csproj" />
+    <Project Path="src/Locus.Storage/Locus.Storage.csproj" />
+    <Project Path="src/Locus/Locus.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Locus.Benchmarks/Locus.Benchmarks.csproj" />
+    <Project Path="tests/Locus.FileSystem.Tests/Locus.FileSystem.Tests.csproj" />
+    <Project Path="tests/Locus.IntegrationTests/Locus.IntegrationTests.csproj" />
+    <Project Path="tests/Locus.MultiTenant.Tests/Locus.MultiTenant.Tests.csproj" />
+    <Project Path="tests/Locus.Storage.Tests/Locus.Storage.Tests.csproj" />
+  </Folder>
+</Solution>

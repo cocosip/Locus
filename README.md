@@ -4,7 +4,7 @@
 [![NuGet](https://img.shields.io/nuget/v/Locus.svg)](https://www.nuget.org/packages/Locus/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A high-performance, multi-tenant file storage pool system for .NET targeting netstandard2.0 with SQLite-based metadata management.
+A high-performance, multi-tenant file storage pool system targeting netstandard2.0 and validated on .NET 10, with SQLite-based metadata management.
 
 ## Overview
 
@@ -580,7 +580,7 @@ The solution is covered by focused xUnit projects and BenchmarkDotNet harnesses:
 - `tests/Locus.IntegrationTests`
 - `tests/Locus.Benchmarks`
 
-Use `dotnet test Locus.sln --no-build` after a successful build, or run a focused project such as
+Use `dotnet test Locus.slnx --no-build` after a successful build, or run a focused project such as
 `dotnet test tests/Locus.Storage.Tests/Locus.Storage.Tests.csproj --no-restore` while working on storage
 regressions.
 
@@ -613,13 +613,13 @@ configuration reference kept in the repository:
 
 ```bash
 # Build the solution
-dotnet build
+dotnet build Locus.slnx
 
 # Build in Release mode
-dotnet build -c Release
+dotnet build Locus.slnx -c Release
 
 # Run tests
-dotnet test
+dotnet test Locus.slnx
 
 # Pack NuGet package (includes all components)
 dotnet pack src/Locus/Locus.csproj -c Release
@@ -628,7 +628,6 @@ dotnet pack src/Locus/Locus.csproj -c Release
 ## Documentation
 
 ### Core Documentation
-- **[CLAUDE.md](CLAUDE.md)** - Complete implementation guidelines, architecture decisions, API references, and FileWatcher usage guide
 - **[docs/appsettings-sample-reference.md](docs/appsettings-sample-reference.md)** - Current appsettings field reference with JSONC-style comments
 - **[docs/statistics.md](docs/statistics.md)** - Locus statistics model, configuration, measurements, and query/output examples
 - **[docs/storage-lifecycle-overview.md](docs/storage-lifecycle-overview.md)** - End-to-end lifecycle, projection, recovery, and cleanup flow
