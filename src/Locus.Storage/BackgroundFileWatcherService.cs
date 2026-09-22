@@ -20,6 +20,7 @@ namespace Locus.Storage
         private readonly IFileWatcher _fileWatcher;
         private readonly IFileWatcherOptionsManager _optionsManager;
         private readonly ILogger<BackgroundFileWatcherService> _logger;
+        private readonly LocusStartupCoordinator _startupCoordinator;
         private readonly ConcurrentDictionary<string, DateTime> _nextScanDueByWatcherId;
         private readonly ConcurrentDictionary<string, byte> _warnedIntervalWatcherIds;
         private readonly ConcurrentDictionary<string, int> _recentWatcherErrorHashes;
@@ -30,11 +31,13 @@ namespace Locus.Storage
         public BackgroundFileWatcherService(
             IFileWatcher fileWatcher,
             IFileWatcherOptionsManager optionsManager,
-            ILogger<BackgroundFileWatcherService> logger)
+            ILogger<BackgroundFileWatcherService> logger,
+            LocusStartupCoordinator? startupCoordinator = null)
         {
             _fileWatcher = fileWatcher ?? throw new ArgumentNullException(nameof(fileWatcher));
             _optionsManager = optionsManager ?? throw new ArgumentNullException(nameof(optionsManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _nextScanDueByWatcherId = new ConcurrentDictionary<string, DateTime>(StringComparer.Ordinal);
             _warnedIntervalWatcherIds = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             _recentWatcherErrorHashes = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
@@ -43,7 +46,19 @@ namespace Locus.Storage
         /// <inheritdoc/>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
+            // Ensure StartAsync never performs watcher I/O inline with host startup.
+            await Task.Yield();
+
             _logger.LogInformation("Background File Watcher Service started");
+
+            try
+            {
+                await _startupCoordinator.WaitForRuntimeReadyAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
 
             while (!stoppingToken.IsCancellationRequested)
             {

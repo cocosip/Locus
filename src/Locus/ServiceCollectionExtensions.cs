@@ -254,6 +254,15 @@ namespace Locus
                     options.FileWatcherConfigurationDirectory,
                     statisticsRecorder);
             });
+            services.AddSingleton<IFileWatcherOptionsManager>(sp =>
+            {
+                var fileSystem = sp.GetRequiredService<IFileSystem>();
+                var logger = sp.GetRequiredService<ILogger<FileWatcherOptionsManager>>();
+                var configurationRoot = fileSystem.Path.Combine(
+                    options.FileWatcherConfigurationDirectory,
+                    ".service");
+                return new FileWatcherOptionsManager(fileSystem, logger, configurationRoot);
+            });
 
             // Register file scheduler
             services.AddSingleton<IFileScheduler>(sp =>
@@ -502,6 +511,10 @@ namespace Locus
                     options,
                     sp.GetRequiredService<LocusStartupCoordinator>()));
             }
+
+            // Periodically scan persisted and dynamically registered watchers. The hosted service
+            // asynchronously waits for runtime readiness and never performs work inside AddLocus.
+            services.AddHostedService<BackgroundFileWatcherService>();
 
             return services;
         }
