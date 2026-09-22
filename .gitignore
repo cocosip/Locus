@@ -355,3 +355,5 @@ ASALocalRun/
 ###### -- Custom Ignore Section, Make sure all files you add to the git repo are below this line  --  ######
 
 *.csproj.lscache
+.superpowers/
+docs/superpowers/
