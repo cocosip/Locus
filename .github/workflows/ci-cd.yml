@@ -30,39 +30,31 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
     - name: Cache NuGet packages
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ env.NUGET_PACKAGES }}
         key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
         restore-keys: |
           ${{ runner.os }}-nuget-
 
-    - name: Cache .NET SDK
-      uses: actions/cache@v4
-      with:
-        path: ~/.dotnet
-        key: ${{ runner.os }}-dotnet-${{ env.DOTNET_VERSION }}
-        restore-keys: |
-          ${{ runner.os }}-dotnet-
-
     - name: Restore dependencies
-      run: dotnet restore --verbosity minimal
+      run: dotnet restore Locus.sln --verbosity minimal
 
     - name: Build solution
-      run: dotnet build --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
+      run: dotnet build Locus.sln --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
 
     - name: Run tests with coverage
-      run: dotnet test --configuration ${{ env.CONFIGURATION }} --no-build --verbosity minimal
+      run: dotnet test Locus.sln --configuration ${{ env.CONFIGURATION }} --no-build --verbosity minimal
         --collect:"XPlat Code Coverage"
         --results-directory ./coverage
         --logger "trx;LogFileName=test-results.trx"
@@ -70,7 +62,7 @@ jobs:
 
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: test-results
         path: '**/test-results.trx'
@@ -78,7 +70,7 @@ jobs:
 
     - name: Upload coverage report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: coverage-report
         path: ./coverage/**/coverage.cobertura.xml
@@ -109,17 +101,17 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
     - name: Cache NuGet packages
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ env.NUGET_PACKAGES }}
         key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
@@ -127,10 +119,10 @@ jobs:
           ${{ runner.os }}-nuget-
 
     - name: Restore dependencies
-      run: dotnet restore --verbosity minimal
+      run: dotnet restore Locus.sln --verbosity minimal
 
     - name: Build solution
-      run: dotnet build --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
+      run: dotnet build Locus.sln --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
 
     - name: Pack NuGet packages
       run: |
@@ -148,7 +140,7 @@ jobs:
       run: ls -la ./packages/
 
     - name: Upload NuGet packages
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: nuget-packages
         path: ./packages/*.nupkg
@@ -183,7 +175,7 @@ jobs:
         } >> $GITHUB_OUTPUT
 
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         name: Release v${{ needs.build-and-test.outputs.version }}
         tag_name: v${{ needs.build-and-test.outputs.version }}
@@ -214,15 +206,15 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
     - name: Cache NuGet packages
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ env.NUGET_PACKAGES }}
         key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
@@ -231,8 +223,8 @@ jobs:
 
     - name: Restore and Build
       run: |
-        dotnet restore --verbosity minimal
-        dotnet build --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
+        dotnet restore Locus.sln --verbosity minimal
+        dotnet build Locus.sln --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
 
     - name: Pack Symbol Packages
       run: |
@@ -246,7 +238,7 @@ jobs:
           --verbosity minimal
 
     - name: Upload Symbol Packages
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: symbol-packages
         path: ./symbols/*.snupkg
