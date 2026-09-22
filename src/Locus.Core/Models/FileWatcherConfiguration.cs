@@ -103,6 +103,25 @@ namespace Locus.Core.Models
         public int MaxConcurrentImports { get; set; } = 4;
 
         /// <summary>
+        /// Gets or sets the maximum number of post-import action attempts after a successful import.
+        /// Once exhausted, the source remains suppressed from re-import until its fingerprint changes.
+        /// Default is 5.
+        /// </summary>
+        public int MaxPostImportActionRetryCount { get; set; } = 5;
+
+        /// <summary>
+        /// Gets or sets the initial delay before retrying a failed delete or move action.
+        /// Set to zero to retry on the next scan. Default is 5 seconds.
+        /// </summary>
+        public TimeSpan PostImportActionRetryInitialDelay { get; set; } = TimeSpan.FromSeconds(5);
+
+        /// <summary>
+        /// Gets or sets the maximum delay between failed delete or move action retries.
+        /// Default is 5 minutes.
+        /// </summary>
+        public TimeSpan PostImportActionRetryMaxDelay { get; set; } = TimeSpan.FromMinutes(5);
+
+        /// <summary>
         /// Gets or sets the delay used for file stability checks.
         /// A value less than or equal to zero disables the delayed second probe.
         /// Default is 100 milliseconds.

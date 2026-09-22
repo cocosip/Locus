@@ -27,7 +27,7 @@ namespace Locus.Storage
 
             record.SequenceNumber = sequenceNumber;
             record.PayloadCrc32 = ComputePayloadChecksum(record);
-            var line = JsonSerializer.Serialize(record, JsonOptions) + "\n";
+            var line = SerializePayload(record) + "\n";
             return Utf8NoBom.GetBytes(line);
         }
 
@@ -187,7 +187,34 @@ namespace Locus.Storage
         {
             var payload = CloneRecord(record);
             payload.PayloadCrc32 = null;
-            return QueueEventCrc32.Compute(JsonSerializer.Serialize(payload, JsonOptions));
+            return QueueEventCrc32.Compute(SerializePayload(payload));
+        }
+
+        private static string SerializePayload(QueueEventRecord record)
+        {
+            var json = JsonSerializer.Serialize(record, JsonOptions);
+            if (record.ImportOperationId != null)
+                return json;
+
+            using (var document = JsonDocument.Parse(json))
+            using (var stream = new MemoryStream())
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                foreach (var property in document.RootElement.EnumerateObject())
+                {
+                    if (property.NameEquals("importOperationId")
+                        && property.Value.ValueKind == JsonValueKind.Null)
+                    {
+                        continue;
+                    }
+
+                    property.WriteTo(writer);
+                }
+                writer.WriteEndObject();
+                writer.Flush();
+                return Utf8NoBom.GetString(stream.ToArray());
+            }
         }
 
         private static QueueEventRecord CloneRecord(QueueEventRecord record)
@@ -213,6 +240,7 @@ namespace Locus.Storage
                 ErrorMessage = record.ErrorMessage,
                 OriginalFileName = record.OriginalFileName,
                 FileExtension = record.FileExtension,
+                ImportOperationId = record.ImportOperationId,
             };
         }
 

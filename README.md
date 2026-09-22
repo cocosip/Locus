@@ -652,8 +652,9 @@ dotnet pack src/Locus/Locus.csproj -c Release
 
 📁 **FileWatcher Auto-Import**
 - Multi-tenant mode with automatic directory creation
-- Configurable polling intervals and concurrency
-- Post-import actions (Delete/Move/Keep)
+- Independent scheduling for multiple watchers with per-watcher non-overlap
+- Configurable global scan concurrency and per-watcher import concurrency
+- Durable, retryable post-import actions (Delete/Move/Keep) without repeating successful storage writes
 
 📊 **Operational Statistics**
 - Optional in-memory aggregation for write throughput, queue movement, SQLite persistence, and watcher imports

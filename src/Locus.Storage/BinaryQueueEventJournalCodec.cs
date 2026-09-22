@@ -12,7 +12,8 @@ namespace Locus.Storage
     internal sealed class BinaryQueueEventJournalCodec : IQueueEventJournalCodec
     {
         private const int RecordMagic = 0x474F4C51;
-        private const short RecordVersion = 1;
+        private const short MinimumRecordVersion = 1;
+        private const short RecordVersion = 2;
         private const short RecordFlags = 0;
         private const int HeaderSize = 24;
         private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
@@ -109,7 +110,8 @@ namespace Locus.Storage
                     }
 
                     if (magic != RecordMagic
-                        || version != RecordVersion
+                        || version < MinimumRecordVersion
+                        || version > RecordVersion
                         || flags != RecordFlags
                         || payloadLength < 0
                         || (stream.Length - stream.Position) < payloadLength)
@@ -128,7 +130,7 @@ namespace Locus.Storage
                     QueueEventRecord record;
                     try
                     {
-                        record = ReadPayload(payload, sequenceNumber, payloadChecksum);
+                        record = ReadPayload(payload, version, sequenceNumber, payloadChecksum);
                     }
                     catch (Exception) when (IsPayloadReadFailure())
                     {
@@ -181,7 +183,8 @@ namespace Locus.Storage
                     }
 
                     if (magic != RecordMagic
-                        || version != RecordVersion
+                        || version < MinimumRecordVersion
+                        || version > RecordVersion
                         || flags != RecordFlags
                         || payloadLength < 0
                         || (stream.Length - stream.Position) < payloadLength)
@@ -198,7 +201,7 @@ namespace Locus.Storage
 
                     try
                     {
-                        ReadPayload(payload, sequenceNumber, payloadChecksum);
+                        ReadPayload(payload, version, sequenceNumber, payloadChecksum);
                     }
                     catch (Exception) when (IsPayloadReadFailure())
                     {
@@ -259,7 +262,8 @@ namespace Locus.Storage
                     }
 
                     if (magic != RecordMagic
-                        || version != RecordVersion
+                        || version < MinimumRecordVersion
+                        || version > RecordVersion
                         || flags != RecordFlags
                         || payloadLength < 0
                         || (stream.Length - stream.Position) < payloadLength)
@@ -277,7 +281,7 @@ namespace Locus.Storage
 
                     try
                     {
-                        ReadPayload(payload, sequenceNumber, payloadChecksum);
+                        ReadPayload(payload, version, sequenceNumber, payloadChecksum);
                     }
                     catch (Exception) when (IsPayloadReadFailure())
                     {
@@ -346,9 +350,10 @@ namespace Locus.Storage
             WriteNullableString(buffer, ref offset, layout.ErrorMessage);
             WriteNullableString(buffer, ref offset, layout.OriginalFileName);
             WriteNullableString(buffer, ref offset, layout.FileExtension);
+            WriteNullableString(buffer, ref offset, layout.ImportOperationId);
         }
 
-        private static QueueEventRecord ReadPayload(byte[] payload, long sequenceNumber, uint payloadChecksum)
+        private static QueueEventRecord ReadPayload(byte[] payload, short recordVersion, long sequenceNumber, uint payloadChecksum)
         {
             using (var stream = new MemoryStream(payload, writable: false))
             using (var reader = new BinaryReader(stream, Utf8NoBom, leaveOpen: true))
@@ -372,6 +377,7 @@ namespace Locus.Storage
                     ErrorMessage = ReadNullableString(reader),
                     OriginalFileName = ReadNullableString(reader),
                     FileExtension = ReadNullableString(reader),
+                    ImportOperationId = recordVersion >= 2 ? ReadNullableString(reader) : null,
                     SequenceNumber = sequenceNumber,
                     PayloadCrc32 = payloadChecksum,
                 };
@@ -524,6 +530,7 @@ namespace Locus.Storage
                 ErrorMessage = new NullableStringEncodingInfo(record.ErrorMessage);
                 OriginalFileName = new NullableStringEncodingInfo(record.OriginalFileName);
                 FileExtension = new NullableStringEncodingInfo(record.FileExtension);
+                ImportOperationId = new NullableStringEncodingInfo(record.ImportOperationId);
                 PayloadLength =
                     FixedPayloadSize +
                     EventId.EncodedSize +
@@ -534,7 +541,8 @@ namespace Locus.Storage
                     DirectoryPath.EncodedSize +
                     ErrorMessage.EncodedSize +
                     OriginalFileName.EncodedSize +
-                    FileExtension.EncodedSize;
+                    FileExtension.EncodedSize +
+                    ImportOperationId.EncodedSize;
             }
 
             public NullableStringEncodingInfo EventId { get; }
@@ -554,6 +562,8 @@ namespace Locus.Storage
             public NullableStringEncodingInfo OriginalFileName { get; }
 
             public NullableStringEncodingInfo FileExtension { get; }
+
+            public NullableStringEncodingInfo ImportOperationId { get; }
 
             public int PayloadLength { get; }
         }

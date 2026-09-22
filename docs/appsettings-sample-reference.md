@@ -32,6 +32,27 @@
     // FileWatcher 运行时配置目录。FileWatcherOptionsManager 会在这里保存 watcher 全局选项。
     "FileWatcherConfigurationDirectory": "./locus-watchers",
 
+    // Watcher 全局调度默认值。仅在运行时选项文件尚不存在时作为初始值；
+    // 已持久化的 file-watcher-options.json 具有更高优先级。
+    "FileWatcherOptions": {
+      // 是否全局启用 Watcher 后台服务。
+      "Enabled": true,
+
+      // Watcher 未配置 PollingInterval 时使用的默认扫描间隔。
+      "DefaultPollingInterval": "00:00:30",
+
+      // 允许配置的最小和最大扫描间隔。
+      "MinimumPollingInterval": "00:00:05",
+      "MaximumPollingInterval": "01:00:00",
+
+      // 全局禁用时重新检查配置的间隔。
+      "DisabledCheckInterval": "00:01:00",
+
+      // 同一时刻最多运行多少个不同 Watcher 的扫描任务。
+      // 同一个 Watcher 永远不会重入；不同 Watcher 可在此上限内独立运行。
+      "MaxParallelWatcherScans": 4
+    },
+
     // 是否允许首次访问未知租户时自动创建租户。
     // false：必须预置或手动创建租户，生产环境更稳妥。
     // true：适合样例、测试或明确允许动态租户的场景。
@@ -418,6 +439,13 @@
         // 单个 watcher 最大并发导入数。调大可提升吞吐，也会增加磁盘和 CPU 压力。
         "MaxConcurrentImports": 4,
 
+        // Delete/Move 后处理失败后的最大尝试次数。重试仅执行后处理，不会再次写入存储池。
+        "MaxPostImportActionRetryCount": 5,
+
+        // 后处理重试采用指数退避；以下分别为初始延迟与最大延迟。
+        "PostImportActionRetryInitialDelay": "00:00:05",
+        "PostImportActionRetryMaxDelay": "00:05:00",
+
         // 是否节流 imported history 的过期清理。
         "EnableImportedFilesPruneThrottle": true,
 
@@ -458,6 +486,9 @@
         "FileStabilityCheckDelay": "00:00:00.200",
         "SkipStabilityCheckAfterAge": "00:02:00",
         "MaxConcurrentImports": 4,
+        "MaxPostImportActionRetryCount": 5,
+        "PostImportActionRetryInitialDelay": "00:00:05",
+        "PostImportActionRetryMaxDelay": "00:05:00",
         "EnableImportedFilesPruneThrottle": true,
         "ImportedFilesPruneInterval": "00:05:00",
         "EnableImportedFilesHistoryFlushDebounce": true,

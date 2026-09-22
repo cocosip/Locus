@@ -45,6 +45,7 @@ namespace Locus.Storage
                 ErrorMessage = metadata.LastError,
                 OriginalFileName = metadata.OriginalFileName,
                 FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata),
             };
         }
 
@@ -68,7 +69,8 @@ namespace Locus.Storage
                 RetryCount = metadata.RetryCount,
                 AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
 
@@ -89,7 +91,8 @@ namespace Locus.Storage
                 Status = FileProcessingStatus.DeleteRequested,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
 
@@ -114,7 +117,8 @@ namespace Locus.Storage
                 AvailableForProcessingAtUtc = metadata.AvailableForProcessingAt,
                 ErrorMessage = errorMessage,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
 

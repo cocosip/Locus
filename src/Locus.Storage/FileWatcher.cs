@@ -6,6 +6,8 @@ using System.IO.Abstractions;
 using System.Linq;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -21,7 +23,7 @@ namespace Locus.Storage
     /// <summary>
     /// Monitors directories for new files and automatically imports them into the storage pool.
     /// </summary>
-    public class FileWatcher : IFileWatcher
+    public class FileWatcher : IFileWatcher, IFileWatcherStateFlusher
     {
         private readonly IFileSystem _fileSystem;
         private readonly IStoragePool _storagePool;
@@ -29,6 +31,7 @@ namespace Locus.Storage
         private readonly ILogger<FileWatcher> _logger;
         private readonly ILocusStatisticsRecorder _statisticsRecorder;
         private readonly string _configurationRoot;
+        private readonly StringComparer _pathComparer;
 
         // Track imported files to avoid duplicates: filepath -> fileKey
         private readonly ConcurrentDictionary<string, string> _importedFiles;
@@ -69,8 +72,12 @@ namespace Locus.Storage
         private const int MinImportQueueCapacity = 64;
         private const int MaxImportQueueCapacity = 1024;
         private const int ImportStreamBufferSize = 256 * 1024;
-        private const string ImportedFileFingerprintPrefix = "fp:v2:";
-        private const string LegacyImportedFileFingerprintPrefix = "fp:v1:";
+        private const int FingerprintSampleSize = 4 * 1024;
+        private const string ImportedFileFingerprintPrefix = "fp:v3:";
+        private const string LegacyImportedFileFingerprintV2Prefix = "fp:v2:";
+        private const string LegacyImportedFileFingerprintV1Prefix = "fp:v1:";
+        private const string ImportedFileStatePrefix = "state:v1:";
+        private const string InFlightPostImportActionMarker = "__LOCUS_POST_IMPORT_ACTION_IN_FLIGHT__";
         private static readonly long WatchersCacheTtlTicks = TimeSpan.FromSeconds(2).Ticks;
         private static readonly TimeSpan DefaultAutoCreateTenantDirectoriesCacheTtl = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan DefaultImportedHistoryPruneInterval = TimeSpan.FromMinutes(5);
@@ -78,6 +85,7 @@ namespace Locus.Storage
 
         // Locks for configuration operations
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _watcherLocks;
+        private readonly SemaphoreSlim _watcherConfigurationMutationLock;
 
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
@@ -114,6 +122,7 @@ namespace Locus.Storage
             var pathComparer = isCaseInsensitivePlatform
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
+            _pathComparer = pathComparer;
             _tenantIdComparer = isCaseInsensitivePlatform
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
@@ -132,6 +141,7 @@ namespace Locus.Storage
             _pendingImportedHistoryReader = _pendingImportedHistoryChannel.Reader;
             _coalescedImportedHistoryOperations = new ConcurrentDictionary<string, ImportedHistoryOperation>(StringComparer.Ordinal);
             _watcherLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
+            _watcherConfigurationMutationLock = new SemaphoreSlim(1, 1);
             _patternMatcherCache = new ConcurrentDictionary<string, PatternMatcherCacheEntry>(StringComparer.Ordinal);
             _autoCreateTenantDirectoryCache = new ConcurrentDictionary<string, AutoCreateTenantDirectoryCacheEntry>(StringComparer.Ordinal);
             _historySaveLock = new SemaphoreSlim(1, 1);
@@ -400,6 +410,21 @@ namespace Locus.Storage
             }
 
             await SaveImportedFilesHistoryAsync(force, ct).ConfigureAwait(false);
+        }
+
+        internal Task PersistImportedFilesHistoryAsync(CancellationToken ct = default)
+        {
+            return SaveImportedFilesHistoryAsync(force: false, ct);
+        }
+
+        internal Task FlushImportedFilesHistoryAsync(CancellationToken ct = default)
+        {
+            return SaveImportedFilesHistoryAsync(force: true, ct);
+        }
+
+        Task IFileWatcherStateFlusher.FlushStateAsync(CancellationToken ct)
+        {
+            return FlushImportedFilesHistoryAsync(ct);
         }
 
         private static TimeSpan NormalizeInterval(TimeSpan configured, TimeSpan fallback)
@@ -760,13 +785,21 @@ namespace Locus.Storage
 
             try
             {
-                await ValidateWatcherConfigurationAsync(configuration, ct).ConfigureAwait(false);
+                await _watcherConfigurationMutationLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    await ValidateWatcherConfigurationAsync(configuration, ct).ConfigureAwait(false);
 
-                configuration.CreatedAt = DateTime.UtcNow;
-                configuration.UpdatedAt = DateTime.UtcNow;
+                    configuration.CreatedAt = DateTime.UtcNow;
+                    configuration.UpdatedAt = DateTime.UtcNow;
 
-                await SaveConfigurationAsync(configuration, ct);
-                InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
+                    await SaveConfigurationAsync(configuration, ct);
+                    InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
+                }
+                finally
+                {
+                    _watcherConfigurationMutationLock.Release();
+                }
 
                 _logger.LogInformation(
                     "Registered file watcher {WatcherId} for tenant {TenantId} at path {WatchPath}",
@@ -786,19 +819,27 @@ namespace Locus.Storage
 
             try
             {
-                var existing = await LoadConfigurationAsync(configuration.WatcherId, ct);
-                if (existing == null)
+                await _watcherConfigurationMutationLock.WaitAsync(ct).ConfigureAwait(false);
+                try
                 {
-                    throw new InvalidOperationException($"Watcher '{configuration.WatcherId}' not found.");
+                    var existing = await LoadConfigurationAsync(configuration.WatcherId, ct);
+                    if (existing == null)
+                    {
+                        throw new InvalidOperationException($"Watcher '{configuration.WatcherId}' not found.");
+                    }
+
+                    await ValidateWatcherConfigurationAsync(configuration, ct).ConfigureAwait(false);
+
+                    configuration.CreatedAt = existing.CreatedAt;
+                    configuration.UpdatedAt = DateTime.UtcNow;
+
+                    await SaveConfigurationAsync(configuration, ct);
+                    InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
                 }
-
-                await ValidateWatcherConfigurationAsync(configuration, ct).ConfigureAwait(false);
-
-                configuration.CreatedAt = existing.CreatedAt;
-                configuration.UpdatedAt = DateTime.UtcNow;
-
-                await SaveConfigurationAsync(configuration, ct);
-                InvalidateAutoCreateTenantDirectoryCache(configuration.WatcherId);
+                finally
+                {
+                    _watcherConfigurationMutationLock.Release();
+                }
 
                 _logger.LogInformation("Updated file watcher {WatcherId}", configuration.WatcherId);
             }
@@ -834,6 +875,47 @@ namespace Locus.Storage
                 _fileSystem.Directory.CreateDirectory(configuration.WatchPath);
                 _logger.LogInformation("Created watch path directory: {WatchPath}", configuration.WatchPath);
             }
+
+            var existingWatchers = await GetAllWatchersAsync(ct).ConfigureAwait(false);
+            var overlappingWatcher = existingWatchers.FirstOrDefault(existing =>
+                !string.Equals(existing.WatcherId, configuration.WatcherId, StringComparison.Ordinal)
+                && WatchPathsOverlap(existing, configuration));
+            if (overlappingWatcher != null)
+            {
+                throw new InvalidOperationException(
+                    $"Watcher '{configuration.WatcherId}' path '{configuration.WatchPath}' overlaps " +
+                    $"watcher '{overlappingWatcher.WatcherId}' path '{overlappingWatcher.WatchPath}'.");
+            }
+        }
+
+        private bool WatchPathsOverlap(
+            FileWatcherConfiguration first,
+            FileWatcherConfiguration second)
+        {
+            var firstPath = NormalizeWatchPath(first.WatchPath);
+            var secondPath = NormalizeWatchPath(second.WatchPath);
+
+            if (_pathComparer.Equals(firstPath, secondPath))
+                return true;
+
+            return (first.IncludeSubdirectories && IsDescendantPath(secondPath, firstPath))
+                || (second.IncludeSubdirectories && IsDescendantPath(firstPath, secondPath));
+        }
+
+        private string NormalizeWatchPath(string path)
+        {
+            return _fileSystem.Path.GetFullPath(path)
+                .TrimEnd(_fileSystem.Path.DirectorySeparatorChar, _fileSystem.Path.AltDirectorySeparatorChar);
+        }
+
+        private bool IsDescendantPath(string candidatePath, string parentPath)
+        {
+            var parentWithSeparator = parentPath + _fileSystem.Path.DirectorySeparatorChar;
+            return candidatePath.StartsWith(
+                parentWithSeparator,
+                _pathComparer == StringComparer.OrdinalIgnoreCase
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal);
         }
 
         /// <inheritdoc/>
@@ -1356,6 +1438,16 @@ namespace Locus.Storage
                 var importFingerprint = CreateImportedFileFingerprint(fileInfo);
 
                 // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
+                if (await TryProcessPendingPostImportActionAsync(
+                    configuration,
+                    filePath,
+                    importFingerprint,
+                    fileResult,
+                    ct).ConfigureAwait(false))
+                {
+                    return fileResult;
+                }
+
                 if (!TryAcquireImportSlot(filePath, importFingerprint))
                 {
                     fileResult.FilesSkipped++;
@@ -1383,10 +1475,28 @@ namespace Locus.Storage
                 }
 
                 // Import file
+                string fileKey;
                 using (importStream)
                 {
                     var fileName = Path.GetFileName(filePath);
-                    var fileKey = await _storagePool.WriteFileAsync(tenant, importStream, fileName, ct);
+                    if (_storagePool is IIdempotentStoragePool idempotentStoragePool)
+                    {
+                        var operationId = CreateImportOperationId(
+                            tenant.TenantId,
+                            filePath,
+                            importFingerprint);
+                        fileKey = await idempotentStoragePool.WriteFileIdempotentlyAsync(
+                            tenant,
+                            importStream,
+                            fileName,
+                            operationId,
+                            ct).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        fileKey = await _storagePool.WriteFileAsync(tenant, importStream, fileName, ct)
+                            .ConfigureAwait(false);
+                    }
 
                     fileResult.FilesImported++;
                     fileResult.BytesImported += importSize;
@@ -1396,12 +1506,50 @@ namespace Locus.Storage
                         filePath, fileKey, tenant.TenantId);
                 }
 
-                // Post-import action
-                await ExecutePostImportActionAsync(configuration, filePath, ct);
                 if (configuration.PostImportAction == PostImportAction.Keep)
+                {
                     UpsertImportedFileRecord(filePath, importFingerprint);
+                    await PersistImportedFilesHistoryAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
                 else
+                {
+                    var pendingAction = new ImportedFileStateRecord
+                    {
+                        Fingerprint = importFingerprint,
+                        FileKey = fileKey,
+                        WatcherId = configuration.WatcherId,
+                        TenantId = tenant.TenantId,
+                        PostImportAction = configuration.PostImportAction,
+                        MoveTargetPath = ResolveMoveTargetPath(configuration, filePath)
+                    };
+
+                    UpsertImportedFileRecord(filePath, SerializeImportedFileState(pendingAction));
+                    await PersistImportedFilesHistoryAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+
+                    try
+                    {
+                        await ExecutePostImportActionAsync(
+                            pendingAction.PostImportAction,
+                            filePath,
+                            pendingAction.MoveTargetPath,
+                            ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (await RecordPostImportActionFailureAsync(configuration, filePath, pendingAction, ex)
+                            .ConfigureAwait(false))
+                        {
+                            fileResult.FilesQuarantined++;
+                        }
+                        throw;
+                    }
+
                     TryRemoveImportedFileRecord(filePath);
+                    await PersistImportedFilesHistoryAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
 
                 importSlotTaken = false;
             }
@@ -1437,6 +1585,8 @@ namespace Locus.Storage
             target.FilesImported += source.FilesImported;
             target.FilesSkipped += source.FilesSkipped;
             target.FilesFailed += source.FilesFailed;
+            target.PostImportActionsRetried += source.PostImportActionsRetried;
+            target.FilesQuarantined += source.FilesQuarantined;
             target.BytesImported += source.BytesImported;
 
             foreach (var error in source.Errors)
@@ -1589,7 +1739,14 @@ namespace Locus.Storage
                     return TryAddImportedFileValue(filePath, InFlightImportMarker);
 
                 if (string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal)
+                    || string.Equals(currentValue, InFlightPostImportActionMarker, StringComparison.Ordinal)
                     || string.Equals(currentValue, fingerprint, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                if (TryDeserializeImportedFileState(currentValue, out var state)
+                    && string.Equals(state.Fingerprint, fingerprint, StringComparison.Ordinal))
                 {
                     return false;
                 }
@@ -1609,6 +1766,15 @@ namespace Locus.Storage
                 var fileInfo = _fileSystem.FileInfo.New(path);
                 var currentFingerprint = CreateImportedFileFingerprint(fileInfo);
 
+                if (TryDeserializeImportedFileState(storedFingerprint, out var state))
+                {
+                    if (!FingerprintsMatch(state.Fingerprint, fileInfo))
+                        return null;
+
+                    state.Fingerprint = currentFingerprint;
+                    return SerializeImportedFileState(state);
+                }
+
                 if (!IsFingerprintValue(storedFingerprint))
                     return currentFingerprint;
 
@@ -1626,18 +1792,28 @@ namespace Locus.Storage
         {
             return !string.IsNullOrWhiteSpace(value)
                 && (value.StartsWith(ImportedFileFingerprintPrefix, StringComparison.Ordinal)
-                    || value.StartsWith(LegacyImportedFileFingerprintPrefix, StringComparison.Ordinal));
+                    || value.StartsWith(LegacyImportedFileFingerprintV2Prefix, StringComparison.Ordinal)
+                    || value.StartsWith(LegacyImportedFileFingerprintV1Prefix, StringComparison.Ordinal));
         }
 
-        private static string CreateImportedFileFingerprint(IFileInfo fileInfo)
+        private string CreateImportedFileFingerprint(IFileInfo fileInfo)
         {
             if (fileInfo == null)
                 throw new ArgumentNullException(nameof(fileInfo));
 
-            return CreateImportedFileFingerprint(fileInfo.Length, fileInfo.LastWriteTimeUtc, fileInfo.CreationTimeUtc);
+            var contentSampleHash = ComputeContentSampleHash(fileInfo.FullName, fileInfo.Length);
+            return CreateImportedFileFingerprint(
+                fileInfo.Length,
+                fileInfo.LastWriteTimeUtc,
+                fileInfo.CreationTimeUtc,
+                contentSampleHash);
         }
 
-        private static string CreateImportedFileFingerprint(long fileSize, DateTime lastWriteTimeUtc, DateTime creationTimeUtc)
+        private static string CreateImportedFileFingerprint(
+            long fileSize,
+            DateTime lastWriteTimeUtc,
+            DateTime creationTimeUtc,
+            string contentSampleHash)
         {
             var normalizedLastWrite = NormalizeFingerprintTimestamp(lastWriteTimeUtc);
             var normalizedCreation = NormalizeFingerprintTimestamp(creationTimeUtc);
@@ -1645,17 +1821,18 @@ namespace Locus.Storage
                 ? normalizedCreation
                 : normalizedLastWrite;
 
-            return $"{ImportedFileFingerprintPrefix}{fileSize}:{normalizedLastWrite.Ticks}:{effectiveCreation.Ticks}";
+            return $"{ImportedFileFingerprintPrefix}{fileSize}:{normalizedLastWrite.Ticks}:{effectiveCreation.Ticks}:{contentSampleHash}";
         }
 
-        private static bool FingerprintsMatch(string storedFingerprint, IFileInfo fileInfo)
+        private bool FingerprintsMatch(string storedFingerprint, IFileInfo fileInfo)
         {
             if (!TryParseImportedFileFingerprint(
                     storedFingerprint,
                     out var version,
                     out var storedFileSize,
                     out var storedLastWriteTicks,
-                    out var storedCreationTicks))
+                    out var storedCreationTicks,
+                    out var storedContentSampleHash))
             {
                 return false;
             }
@@ -1664,14 +1841,21 @@ namespace Locus.Storage
             if (storedFileSize != fileInfo.Length || storedLastWriteTicks != normalizedLastWrite.Ticks)
                 return false;
 
-            if (version <= 1)
+            if (version == 1)
                 return true;
 
             var normalizedCreation = NormalizeFingerprintTimestamp(fileInfo.CreationTimeUtc);
             var effectiveCreationTicks = (normalizedCreation > DateTime.MinValue
                 ? normalizedCreation
                 : normalizedLastWrite).Ticks;
-            return storedCreationTicks == effectiveCreationTicks;
+            if (storedCreationTicks != effectiveCreationTicks)
+                return false;
+
+            if (version == 2)
+                return true;
+
+            var currentContentSampleHash = ComputeContentSampleHash(fileInfo.FullName, fileInfo.Length);
+            return string.Equals(storedContentSampleHash, currentContentSampleHash, StringComparison.Ordinal);
         }
 
         private static bool TryParseImportedFileFingerprint(
@@ -1679,12 +1863,14 @@ namespace Locus.Storage
             out int version,
             out long fileSize,
             out long lastWriteTicks,
-            out long creationTicks)
+            out long creationTicks,
+            out string contentSampleHash)
         {
             version = 0;
             fileSize = 0;
             lastWriteTicks = 0;
             creationTicks = 0;
+            contentSampleHash = string.Empty;
 
             if (string.IsNullOrWhiteSpace(value))
                 return false;
@@ -1692,13 +1878,18 @@ namespace Locus.Storage
             string payload;
             if (value.StartsWith(ImportedFileFingerprintPrefix, StringComparison.Ordinal))
             {
-                version = 2;
+                version = 3;
                 payload = value.Substring(ImportedFileFingerprintPrefix.Length);
             }
-            else if (value.StartsWith(LegacyImportedFileFingerprintPrefix, StringComparison.Ordinal))
+            else if (value.StartsWith(LegacyImportedFileFingerprintV2Prefix, StringComparison.Ordinal))
+            {
+                version = 2;
+                payload = value.Substring(LegacyImportedFileFingerprintV2Prefix.Length);
+            }
+            else if (value.StartsWith(LegacyImportedFileFingerprintV1Prefix, StringComparison.Ordinal))
             {
                 version = 1;
-                payload = value.Substring(LegacyImportedFileFingerprintPrefix.Length);
+                payload = value.Substring(LegacyImportedFileFingerprintV1Prefix.Length);
             }
             else
             {
@@ -1713,10 +1904,79 @@ namespace Locus.Storage
                     && long.TryParse(parts[1], out lastWriteTicks);
             }
 
-            return parts.Length == 3
-                && long.TryParse(parts[0], out fileSize)
-                && long.TryParse(parts[1], out lastWriteTicks)
-                && long.TryParse(parts[2], out creationTicks);
+            if (version == 2)
+            {
+                return parts.Length == 3
+                    && long.TryParse(parts[0], out fileSize)
+                    && long.TryParse(parts[1], out lastWriteTicks)
+                    && long.TryParse(parts[2], out creationTicks);
+            }
+
+            if (parts.Length != 4
+                || !long.TryParse(parts[0], out fileSize)
+                || !long.TryParse(parts[1], out lastWriteTicks)
+                || !long.TryParse(parts[2], out creationTicks)
+                || string.IsNullOrWhiteSpace(parts[3]))
+            {
+                return false;
+            }
+
+            contentSampleHash = parts[3];
+            return true;
+        }
+
+        private string ComputeContentSampleHash(string filePath, long fileSize)
+        {
+            using (var source = _fileSystem.File.OpenRead(filePath))
+            using (var samples = new MemoryStream(FingerprintSampleSize * 3))
+            {
+                var positions = new[]
+                {
+                    0L,
+                    Math.Max(0L, (fileSize - FingerprintSampleSize) / 2L),
+                    Math.Max(0L, fileSize - FingerprintSampleSize)
+                };
+                var buffer = new byte[FingerprintSampleSize];
+                var visitedPositions = new HashSet<long>();
+
+                foreach (var position in positions)
+                {
+                    if (!visitedPositions.Add(position))
+                        continue;
+
+                    source.Position = position;
+                    var remaining = (int)Math.Min(FingerprintSampleSize, Math.Max(0L, fileSize - position));
+                    while (remaining > 0)
+                    {
+                        var read = source.Read(buffer, 0, Math.Min(buffer.Length, remaining));
+                        if (read == 0)
+                            break;
+
+                        samples.Write(buffer, 0, read);
+                        remaining -= read;
+                    }
+                }
+
+                using (var sha256 = SHA256.Create())
+                {
+                    var hash = sha256.ComputeHash(samples.ToArray());
+                    return Convert.ToBase64String(hash);
+                }
+            }
+        }
+
+        private string CreateImportOperationId(string tenantId, string filePath, string fingerprint)
+        {
+            var normalizedPath = _fileSystem.Path.GetFullPath(filePath);
+            var payload = $"{tenantId}\n{normalizedPath}\n{fingerprint}";
+            using (var sha256 = SHA256.Create())
+            {
+                var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(payload));
+                var builder = new StringBuilder(hash.Length * 2);
+                foreach (var value in hash)
+                    builder.Append(value.ToString("x2"));
+                return builder.ToString();
+            }
         }
 
         private static DateTime NormalizeFingerprintTimestamp(DateTime timestampUtc)
@@ -1751,9 +2011,161 @@ namespace Locus.Storage
             return created;
         }
 
-        private Task ExecutePostImportActionAsync(FileWatcherConfiguration configuration, string filePath, CancellationToken ct = default)
+        private async Task<bool> TryProcessPendingPostImportActionAsync(
+            FileWatcherConfiguration configuration,
+            string filePath,
+            string fingerprint,
+            FileWatcherScanResult result,
+            CancellationToken ct)
         {
-            switch (configuration.PostImportAction)
+            while (_importedFiles.TryGetValue(filePath, out var currentValue))
+            {
+                if (!TryDeserializeImportedFileState(currentValue, out var state)
+                    || !string.Equals(state.Fingerprint, fingerprint, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                if (state.IsQuarantined
+                    || (state.NextAttemptUtc.HasValue && state.NextAttemptUtc.Value > DateTime.UtcNow))
+                {
+                    result.FilesSkipped++;
+                    if (state.IsQuarantined)
+                        result.FilesQuarantined++;
+                    return true;
+                }
+
+                if (!_importedFiles.TryUpdate(filePath, InFlightPostImportActionMarker, currentValue))
+                    continue;
+
+                try
+                {
+                    result.PostImportActionsRetried++;
+                    await ExecutePostImportActionAsync(
+                        state.PostImportAction,
+                        filePath,
+                        state.MoveTargetPath,
+                        ct).ConfigureAwait(false);
+                    TryRemoveImportedFileRecord(filePath);
+                    await PersistImportedFilesHistoryAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                    result.FilesSkipped++;
+                }
+                catch (Exception ex)
+                {
+                    if (await RecordPostImportActionFailureAsync(configuration, filePath, state, ex)
+                        .ConfigureAwait(false))
+                    {
+                        result.FilesQuarantined++;
+                    }
+                    result.FilesFailed++;
+                    AppendError(result, $"{filePath}: {ex.Message}");
+                    _logger.LogError(ex, "Failed to retry post-import action for file {FilePath}", filePath);
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private async Task<bool> RecordPostImportActionFailureAsync(
+            FileWatcherConfiguration configuration,
+            string filePath,
+            ImportedFileStateRecord state,
+            Exception exception)
+        {
+            state.FailureCount++;
+            state.LastError = exception.Message;
+
+            var maxAttempts = Math.Max(1, configuration.MaxPostImportActionRetryCount);
+            state.IsQuarantined = state.FailureCount >= maxAttempts;
+            state.NextAttemptUtc = state.IsQuarantined
+                ? (DateTime?)null
+                : DateTime.UtcNow.Add(CalculatePostImportActionRetryDelay(configuration, state.FailureCount));
+
+            UpsertImportedFileRecord(filePath, SerializeImportedFileState(state));
+            await PersistImportedFilesHistoryAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            return state.IsQuarantined;
+        }
+
+        private static TimeSpan CalculatePostImportActionRetryDelay(
+            FileWatcherConfiguration configuration,
+            int failureCount)
+        {
+            var initialDelay = configuration.PostImportActionRetryInitialDelay;
+            if (initialDelay <= TimeSpan.Zero)
+                return TimeSpan.Zero;
+
+            var maximumDelay = configuration.PostImportActionRetryMaxDelay > TimeSpan.Zero
+                ? configuration.PostImportActionRetryMaxDelay
+                : initialDelay;
+            var exponent = Math.Min(Math.Max(0, failureCount - 1), 30);
+            var multiplier = 1L << exponent;
+            var delayTicks = initialDelay.Ticks > long.MaxValue / multiplier
+                ? long.MaxValue
+                : initialDelay.Ticks * multiplier;
+            return TimeSpan.FromTicks(Math.Min(delayTicks, maximumDelay.Ticks));
+        }
+
+        private string? ResolveMoveTargetPath(FileWatcherConfiguration configuration, string filePath)
+        {
+            if (configuration.PostImportAction != PostImportAction.Move
+                || string.IsNullOrEmpty(configuration.MoveToDirectory))
+            {
+                return null;
+            }
+
+            var fileName = _fileSystem.Path.GetFileName(filePath);
+            var targetPath = _fileSystem.Path.Combine(configuration.MoveToDirectory!, fileName);
+            var counter = 1;
+            while (_fileSystem.File.Exists(targetPath))
+            {
+                var nameWithoutExt = _fileSystem.Path.GetFileNameWithoutExtension(fileName);
+                var extension = _fileSystem.Path.GetExtension(fileName);
+                fileName = $"{nameWithoutExt}_{counter}{extension}";
+                targetPath = _fileSystem.Path.Combine(configuration.MoveToDirectory!, fileName);
+                counter++;
+            }
+
+            return targetPath;
+        }
+
+        private static string SerializeImportedFileState(ImportedFileStateRecord state)
+        {
+            return ImportedFileStatePrefix + JsonSerializer.Serialize(state, HistoryJournalJsonOptions);
+        }
+
+        private static bool TryDeserializeImportedFileState(string value, out ImportedFileStateRecord state)
+        {
+            state = null!;
+            if (string.IsNullOrWhiteSpace(value)
+                || !value.StartsWith(ImportedFileStatePrefix, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            try
+            {
+                state = JsonSerializer.Deserialize<ImportedFileStateRecord>(
+                    value.Substring(ImportedFileStatePrefix.Length),
+                    HistoryJournalJsonOptions)!;
+                return state != null && !string.IsNullOrWhiteSpace(state.Fingerprint);
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
+        }
+
+        private Task ExecutePostImportActionAsync(
+            PostImportAction postImportAction,
+            string filePath,
+            string? moveTargetPath,
+            CancellationToken ct = default)
+        {
+            switch (postImportAction)
             {
                 case PostImportAction.Delete:
                     _fileSystem.File.Delete(filePath);
@@ -1761,26 +2173,29 @@ namespace Locus.Storage
                     break;
 
                 case PostImportAction.Move:
-                    if (!string.IsNullOrEmpty(configuration.MoveToDirectory))
+                    if (!string.IsNullOrEmpty(moveTargetPath))
                     {
-                        var moveToDir = configuration.MoveToDirectory!;
+                        var targetPath = moveTargetPath!;
+                        var moveToDir = _fileSystem.Path.GetDirectoryName(targetPath)!;
                         if (!_fileSystem.Directory.Exists(moveToDir))
                         {
                             _fileSystem.Directory.CreateDirectory(moveToDir);
                         }
 
-                        var fileName = _fileSystem.Path.GetFileName(filePath);
-                        var targetPath = _fileSystem.Path.Combine(moveToDir, fileName);
-
-                        // Handle duplicate filenames
-                        var counter = 1;
-                        while (_fileSystem.File.Exists(targetPath))
+                        if (_fileSystem.File.Exists(targetPath))
                         {
-                            var nameWithoutExt = _fileSystem.Path.GetFileNameWithoutExtension(fileName);
-                            var extension = _fileSystem.Path.GetExtension(fileName);
-                            fileName = $"{nameWithoutExt}_{counter}{extension}";
-                            targetPath = _fileSystem.Path.Combine(moveToDir, fileName);
-                            counter++;
+                            if (!FilesHaveEquivalentContent(filePath, targetPath))
+                            {
+                                throw new IOException(
+                                    $"Move target '{targetPath}' already exists with different content.");
+                            }
+
+                            _fileSystem.File.Delete(filePath);
+                            _logger.LogDebug(
+                                "Move target {TargetPath} already contains file content; deleted source {FilePath}",
+                                targetPath,
+                                filePath);
+                            break;
                         }
 
                         _fileSystem.File.Move(filePath, targetPath);
@@ -1794,6 +2209,18 @@ namespace Locus.Storage
             }
 
             return Task.CompletedTask;
+        }
+
+        private bool FilesHaveEquivalentContent(string firstPath, string secondPath)
+        {
+            var first = _fileSystem.FileInfo.New(firstPath);
+            var second = _fileSystem.FileInfo.New(secondPath);
+            if (first.Length != second.Length)
+                return false;
+
+            var firstHash = ComputeContentSampleHash(firstPath, first.Length);
+            var secondHash = ComputeContentSampleHash(secondPath, second.Length);
+            return string.Equals(firstHash, secondHash, StringComparison.Ordinal);
         }
 
         private async Task UpdateWatcherStatusAsync(string watcherId, bool enabled, CancellationToken ct = default)
@@ -1963,6 +2390,29 @@ namespace Locus.Storage
             public string Path { get; set; } = string.Empty;
 
             public string? FileKey { get; set; }
+        }
+
+        private sealed class ImportedFileStateRecord
+        {
+            public string Fingerprint { get; set; } = string.Empty;
+
+            public string FileKey { get; set; } = string.Empty;
+
+            public string WatcherId { get; set; } = string.Empty;
+
+            public string TenantId { get; set; } = string.Empty;
+
+            public PostImportAction PostImportAction { get; set; }
+
+            public string? MoveTargetPath { get; set; }
+
+            public int FailureCount { get; set; }
+
+            public string? LastError { get; set; }
+
+            public DateTime? NextAttemptUtc { get; set; }
+
+            public bool IsQuarantined { get; set; }
         }
 
         private enum ImportedHistoryOperationType

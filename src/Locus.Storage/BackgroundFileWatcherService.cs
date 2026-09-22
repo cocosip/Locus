@@ -3,7 +3,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
@@ -22,6 +21,8 @@ namespace Locus.Storage
         private readonly ILogger<BackgroundFileWatcherService> _logger;
         private readonly LocusStartupCoordinator _startupCoordinator;
         private readonly ConcurrentDictionary<string, DateTime> _nextScanDueByWatcherId;
+        private readonly ConcurrentDictionary<string, byte> _runningWatcherIds;
+        private readonly ConcurrentDictionary<string, Task> _runningScanTasks;
         private readonly ConcurrentDictionary<string, byte> _warnedIntervalWatcherIds;
         private readonly ConcurrentDictionary<string, int> _recentWatcherErrorHashes;
 
@@ -39,6 +40,8 @@ namespace Locus.Storage
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _nextScanDueByWatcherId = new ConcurrentDictionary<string, DateTime>(StringComparer.Ordinal);
+            _runningWatcherIds = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            _runningScanTasks = new ConcurrentDictionary<string, Task>(StringComparer.Ordinal);
             _warnedIntervalWatcherIds = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             _recentWatcherErrorHashes = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         }
@@ -92,6 +95,9 @@ namespace Locus.Storage
                 }
             }
 
+            await WaitForRunningScansAsync().ConfigureAwait(false);
+            await FlushWatcherStateAsync().ConfigureAwait(false);
+
             _logger.LogInformation("Background File Watcher Service stopped");
         }
 
@@ -120,49 +126,81 @@ namespace Locus.Storage
             _logger.LogDebug("Scanning {DueCount} due watchers (enabled total: {EnabledCount})",
                 dueWatchers.Count, enabledWatchers.Count);
 
+            RemoveCompletedScanTasks();
             var maxParallel = Math.Max(1, options.MaxParallelWatcherScans);
-            if (maxParallel == 1 || dueWatchers.Count == 1)
+            var availableSlots = Math.Max(0, maxParallel - _runningWatcherIds.Count);
+            foreach (var watcher in dueWatchers)
             {
-                foreach (var watcher in dueWatchers)
-                {
-                    if (ct.IsCancellationRequested)
-                        break;
-                    await ScanWatcherAsync(watcher, options, ct);
-                }
-            }
-            else
-            {
-                var queue = Channel.CreateBounded<FileWatcherConfiguration>(new BoundedChannelOptions(dueWatchers.Count)
-                {
-                    SingleReader = false,
-                    SingleWriter = true,
-                    FullMode = BoundedChannelFullMode.Wait,
-                    AllowSynchronousContinuations = false
-                });
+                if (ct.IsCancellationRequested || availableSlots == 0)
+                    break;
 
-                foreach (var watcher in dueWatchers)
-                {
-                    if (!queue.Writer.TryWrite(watcher))
-                        await queue.Writer.WriteAsync(watcher, ct);
-                }
-                queue.Writer.Complete();
+                if (!_runningWatcherIds.TryAdd(watcher.WatcherId, 0))
+                    continue;
 
-                var workerCount = Math.Min(maxParallel, dueWatchers.Count);
-                var workers = Enumerable.Range(0, workerCount).Select(_ => Task.Run(async () =>
-                {
-                    while (!ct.IsCancellationRequested && await queue.Reader.WaitToReadAsync(ct))
-                    {
-                        if (!queue.Reader.TryRead(out var watcher))
-                            continue;
-
-                        await ScanWatcherAsync(watcher, options, ct);
-                    }
-                }, ct)).ToArray();
-
-                await Task.WhenAll(workers);
+                availableSlots--;
+                var scanTask = RunWatcherScanAsync(watcher, options, ct);
+                _runningScanTasks[watcher.WatcherId] = scanTask;
             }
 
             return GetDelayUntilNextDue(enabledWatchers, options, DateTime.UtcNow);
+        }
+
+        private async Task RunWatcherScanAsync(
+            FileWatcherConfiguration watcher,
+            FileWatcherOptions options,
+            CancellationToken ct)
+        {
+            try
+            {
+                await ScanWatcherAsync(watcher, options, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _runningWatcherIds.TryRemove(watcher.WatcherId, out _);
+            }
+        }
+
+        private void RemoveCompletedScanTasks()
+        {
+            foreach (var entry in _runningScanTasks)
+            {
+                if (entry.Value.IsCompleted)
+                    _runningScanTasks.TryRemove(entry.Key, out _);
+            }
+        }
+
+        private async Task WaitForRunningScansAsync()
+        {
+            var tasks = _runningScanTasks.Values.ToArray();
+            if (tasks.Length == 0)
+                return;
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Host shutdown cancellation is expected.
+            }
+        }
+
+        private async Task FlushWatcherStateAsync()
+        {
+            if (!(_fileWatcher is IFileWatcherStateFlusher stateFlusher))
+                return;
+
+            using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+            {
+                try
+                {
+                    await stateFlusher.FlushStateAsync(timeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to flush file watcher state during shutdown");
+                }
+            }
         }
 
         private void PruneSchedule(List<FileWatcherConfiguration> enabledWatchers)
@@ -173,8 +211,11 @@ namespace Locus.Storage
             foreach (var watcherId in staleIds)
             {
                 _nextScanDueByWatcherId.TryRemove(watcherId, out _);
-                _recentWatcherErrorHashes.TryRemove(watcherId, out _);
-                _warnedIntervalWatcherIds.TryRemove(watcherId, out _);
+                if (!_runningWatcherIds.ContainsKey(watcherId))
+                {
+                    _recentWatcherErrorHashes.TryRemove(watcherId, out _);
+                    _warnedIntervalWatcherIds.TryRemove(watcherId, out _);
+                }
             }
         }
 
@@ -311,7 +352,8 @@ namespace Locus.Storage
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error scanning watcher {WatcherId}", watcher.WatcherId);
+                if (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+                    _logger.LogError(ex, "Error scanning watcher {WatcherId}", watcher.WatcherId);
             }
             finally
             {

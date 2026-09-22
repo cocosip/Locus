@@ -1925,7 +1925,8 @@ namespace Locus.Storage
                 ProcessingStartTimeUtc = metadata.ProcessingStartTime,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
 
@@ -1948,7 +1949,8 @@ namespace Locus.Storage
                 RetryCount = metadata.RetryCount,
                 ErrorMessage = metadata.LastError,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
 
@@ -1968,7 +1970,8 @@ namespace Locus.Storage
                 ProcessingStartTimeUtc = metadata.ProcessingStartTime,
                 RetryCount = metadata.RetryCount,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
 

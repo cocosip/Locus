@@ -159,7 +159,8 @@ namespace Locus.Storage.Tests
                 Status = FileProcessingStatus.Pending,
                 RetryCount = 0,
                 OriginalFileName = "scan.dcm",
-                FileExtension = ".dcm"
+                FileExtension = ".dcm",
+                ImportOperationId = "watcher-operation-replay"
             }, CancellationToken.None);
 
             var service = TrackDisposable(new QueueEventProjectionService(
@@ -187,7 +188,8 @@ namespace Locus.Storage.Tests
                 await WaitUntilAsync(async () =>
                 {
                     var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
-                    return metadata != null;
+                    var cursorPath = Path.Combine(_queueDirectory, tenantId, "projector.cursor.json");
+                    return metadata != null && _fileSystem.File.Exists(cursorPath);
                 }, TimeSpan.FromSeconds(2));
             }
             finally
@@ -204,6 +206,7 @@ namespace Locus.Storage.Tests
             Assert.Equal(fileKey, rebuilt!.FileKey);
             Assert.Equal(physicalPath, rebuilt.PhysicalPath);
             Assert.Equal(".dcm", rebuilt.FileExtension);
+            Assert.Equal("watcher-operation-replay", rebuilt.Metadata!["locus.import_operation_id"]);
             Assert.Equal(1, tenantCount);
             Assert.Equal(1, directoryCount);
             Assert.True(_fileSystem.File.Exists(cursorPath));
