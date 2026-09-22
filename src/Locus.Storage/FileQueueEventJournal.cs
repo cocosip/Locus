@@ -1016,6 +1016,7 @@ namespace Locus.Storage
                 ErrorMessage = record.ErrorMessage,
                 OriginalFileName = record.OriginalFileName,
                 FileExtension = record.FileExtension,
+                ImportOperationId = record.ImportOperationId,
             };
         }
 
@@ -1040,6 +1041,7 @@ namespace Locus.Storage
             total += record.ErrorMessage?.Length ?? 0;
             total += record.OriginalFileName?.Length ?? 0;
             total += record.FileExtension?.Length ?? 0;
+            total += record.ImportOperationId?.Length ?? 0;
             return total;
         }
 

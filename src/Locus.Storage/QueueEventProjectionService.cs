@@ -998,7 +998,7 @@ namespace Locus.Storage
         {
             var normalizedDirectoryPath = NormalizeDirectoryPath(record.DirectoryPath);
 
-            return new FileMetadata
+            var metadata = new FileMetadata
             {
                 FileKey = record.FileKey,
                 TenantId = record.TenantId,
@@ -1025,6 +1025,8 @@ namespace Locus.Storage
                 OriginalFileName = record.OriginalFileName,
                 FileExtension = record.FileExtension,
             };
+            ImportOperationMetadata.SetOperationId(metadata, record.ImportOperationId);
+            return metadata;
         }
 
         private Task<FileMetadata?> GetExistingMetadataAsync(QueueEventRecord record, CancellationToken ct)

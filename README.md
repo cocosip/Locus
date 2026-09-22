@@ -628,7 +628,6 @@ dotnet pack src/Locus/Locus.csproj -c Release
 ## Documentation
 
 ### Core Documentation
-- **[CLAUDE.md](CLAUDE.md)** - Complete implementation guidelines, architecture decisions, API references, and FileWatcher usage guide
 - **[docs/appsettings-sample-reference.md](docs/appsettings-sample-reference.md)** - Current appsettings field reference with JSONC-style comments
 - **[docs/statistics.md](docs/statistics.md)** - Locus statistics model, configuration, measurements, and query/output examples
 - **[docs/storage-lifecycle-overview.md](docs/storage-lifecycle-overview.md)** - End-to-end lifecycle, projection, recovery, and cleanup flow
@@ -653,8 +652,9 @@ dotnet pack src/Locus/Locus.csproj -c Release
 
 📁 **FileWatcher Auto-Import**
 - Multi-tenant mode with automatic directory creation
-- Configurable polling intervals and concurrency
-- Post-import actions (Delete/Move/Keep)
+- Independent scheduling for multiple watchers with per-watcher non-overlap
+- Configurable global scan concurrency and per-watcher import concurrency
+- Durable, retryable post-import actions (Delete/Move/Keep) without repeating successful storage writes
 
 📊 **Operational Statistics**
 - Optional in-memory aggregation for write throughput, queue movement, SQLite persistence, and watcher imports

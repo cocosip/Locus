@@ -41,6 +41,42 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task StopAsync_FlushesFileWatcherState()
+        {
+            var fileWatcher = new Mock<IFileWatcher>(MockBehavior.Strict);
+            var stateFlusher = fileWatcher.As<IFileWatcherStateFlusher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>(MockBehavior.Strict);
+            var optionsRead = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            optionsManager
+                .Setup(manager => manager.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() =>
+                {
+                    optionsRead.TrySetResult(true);
+                    return new FileWatcherOptions
+                    {
+                        Enabled = false,
+                        DisabledCheckInterval = TimeSpan.FromMinutes(1)
+                    };
+                });
+            stateFlusher
+                .Setup(flusher => flusher.FlushStateAsync(It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                NullLogger<BackgroundFileWatcherService>.Instance);
+
+            await service.StartAsync(CancellationToken.None);
+            await optionsRead.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            await service.StopAsync(CancellationToken.None);
+
+            stateFlusher.Verify(
+                flusher => flusher.FlushStateAsync(It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+
+        [Fact]
         public async Task ExecuteAsync_WhenScanExceedsPollingInterval_DoesNotOverlapSameWatcher()
         {
             var options = new FileWatcherOptions
@@ -257,6 +293,82 @@ namespace Locus.Storage.Tests
 
             Assert.True(fastCount >= 4, $"Fast watcher should scan repeatedly; actual count={fastCount}.");
             Assert.Equal(1, slowCount);
+        }
+
+        [Fact]
+        public async Task ExecuteAsync_WhenSlowScanIsRunning_FastWatcherContinuesOnItsOwnSchedule()
+        {
+            var options = new FileWatcherOptions
+            {
+                Enabled = true,
+                DefaultPollingInterval = TimeSpan.FromMilliseconds(100),
+                MinimumPollingInterval = TimeSpan.FromMilliseconds(10),
+                MaximumPollingInterval = TimeSpan.FromSeconds(10),
+                DisabledCheckInterval = TimeSpan.FromMilliseconds(100),
+                MaxParallelWatcherScans = 2
+            };
+            var fastWatcher = new FileWatcherConfiguration
+            {
+                WatcherId = "fast-running",
+                Enabled = true,
+                PollingInterval = TimeSpan.FromMilliseconds(20),
+                WatchPath = "/watch/fast-running"
+            };
+            var slowWatcher = new FileWatcherConfiguration
+            {
+                WatcherId = "slow-running",
+                Enabled = true,
+                PollingInterval = TimeSpan.FromSeconds(5),
+                WatchPath = "/watch/slow-running"
+            };
+            var fileWatcher = new Mock<IFileWatcher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            var slowStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseSlow = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var fastScanCount = 0;
+
+            optionsManager
+                .Setup(manager => manager.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(options);
+            fileWatcher
+                .Setup(w => w.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { fastWatcher, slowWatcher });
+            fileWatcher
+                .Setup(w => w.ScanNowAsync(It.IsAny<FileWatcherConfiguration>(), It.IsAny<CancellationToken>()))
+                .Returns<FileWatcherConfiguration, CancellationToken>(async (watcher, token) =>
+                {
+                    if (watcher.WatcherId == slowWatcher.WatcherId)
+                    {
+                        slowStarted.TrySetResult(true);
+                        await releaseSlow.Task;
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref fastScanCount);
+                    }
+
+                    return new FileWatcherScanResult();
+                });
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                NullLogger<BackgroundFileWatcherService>.Instance);
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+                await WaitUntilAsync(
+                    () => Volatile.Read(ref fastScanCount) >= 3,
+                    TimeSpan.FromMilliseconds(500),
+                    "Fast watcher was blocked by a concurrently running slow watcher.");
+            }
+            finally
+            {
+                releaseSlow.TrySetResult(true);
+                await service.StopAsync(CancellationToken.None);
+            }
         }
 
         [Fact]

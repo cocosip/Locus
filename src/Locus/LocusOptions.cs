@@ -117,6 +117,12 @@ namespace Locus
         public string FileWatcherConfigurationDirectory { get; set; } = "./locus-watchers";
 
         /// <summary>
+        /// Gets or sets global file watcher scheduling options.
+        /// These values seed the runtime options file when it does not yet exist.
+        /// </summary>
+        public FileWatcherOptions FileWatcherOptions { get; set; } = new FileWatcherOptions();
+
+        /// <summary>
         /// Gets or sets the SQLite configuration options.
         /// Controls journal mode, synchronous level, cache size and checkpoint behavior.
         /// </summary>

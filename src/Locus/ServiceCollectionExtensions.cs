@@ -261,7 +261,11 @@ namespace Locus
                 var configurationRoot = fileSystem.Path.Combine(
                     options.FileWatcherConfigurationDirectory,
                     ".service");
-                return new FileWatcherOptionsManager(fileSystem, logger, configurationRoot);
+                return new FileWatcherOptionsManager(
+                    fileSystem,
+                    logger,
+                    configurationRoot,
+                    options.FileWatcherOptions);
             });
 
             // Register file scheduler

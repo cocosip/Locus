@@ -113,6 +113,17 @@ namespace Locus.Core.Abstractions
         public int FilesFailed { get; set; }
 
         /// <summary>
+        /// Gets or sets the number of post-import delete or move actions retried.
+        /// </summary>
+        public int PostImportActionsRetried { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of imported source files currently quarantined after
+        /// exhausting post-import action retries.
+        /// </summary>
+        public int FilesQuarantined { get; set; }
+
+        /// <summary>
         /// Gets or sets the total bytes imported.
         /// </summary>
         public long BytesImported { get; set; }

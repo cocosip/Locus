@@ -18,6 +18,7 @@ namespace Locus.Storage
         private readonly IFileSystem _fileSystem;
         private readonly ILogger<FileWatcherOptionsManager> _logger;
         private readonly string _configurationRoot;
+        private readonly FileWatcherOptions _configuredDefaults;
         private readonly SemaphoreSlim _lock;
         private FileWatcherOptions? _cachedOptions;
 
@@ -33,11 +34,13 @@ namespace Locus.Storage
         public FileWatcherOptionsManager(
             IFileSystem fileSystem,
             ILogger<FileWatcherOptionsManager> logger,
-            string? configurationRoot = null)
+            string? configurationRoot = null,
+            FileWatcherOptions? configuredDefaults = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _configurationRoot = configurationRoot ?? Path.Combine(".locus", "config");
+            _configuredDefaults = CloneOptions(configuredDefaults ?? new FileWatcherOptions());
             _lock = new SemaphoreSlim(1, 1);
 
             // Ensure configuration directory exists
@@ -157,7 +160,7 @@ namespace Locus.Storage
             if (!_fileSystem.File.Exists(configPath))
             {
                 _logger.LogDebug("File watcher options file not found, creating default configuration");
-                var defaultOptions = new FileWatcherOptions();
+                var defaultOptions = CloneOptions(_configuredDefaults);
                 await SaveOptionsAsync(defaultOptions, ct);
                 return defaultOptions;
             }
@@ -190,6 +193,19 @@ namespace Locus.Storage
         private string GetConfigurationPath()
         {
             return _fileSystem.Path.Combine(_configurationRoot, "file-watcher-options.json");
+        }
+
+        private static FileWatcherOptions CloneOptions(FileWatcherOptions source)
+        {
+            return new FileWatcherOptions
+            {
+                Enabled = source.Enabled,
+                DefaultPollingInterval = source.DefaultPollingInterval,
+                MinimumPollingInterval = source.MinimumPollingInterval,
+                MaximumPollingInterval = source.MaximumPollingInterval,
+                DisabledCheckInterval = source.DisabledCheckInterval,
+                MaxParallelWatcherScans = source.MaxParallelWatcherScans
+            };
         }
     }
 }

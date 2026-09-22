@@ -21,7 +21,7 @@ namespace Locus.Storage
     /// Provides unified API for both basic storage operations and queue-based processing workflow.
     /// Volumes are configured at startup and managed internally.
     /// </summary>
-    public class StoragePool : IStoragePool, IDisposable
+    public class StoragePool : IStoragePool, IIdempotentStoragePool, IDisposable
     {
         private readonly ConcurrentDictionary<string, IStorageVolume> _volumes;
         private readonly IQueueProjectionStore _projectionStore;
@@ -51,6 +51,10 @@ namespace Locus.Storage
 
         // Serialize completion for the same file key to keep quota decrement idempotent.
         private readonly SemaphoreSlim[] _completionGuards;
+        private readonly SemaphoreSlim[] _idempotentWriteGuards;
+        private readonly SemaphoreSlim[] _importIndexInitializationGuards;
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> _importOperationFileKeys;
+        private readonly ConcurrentDictionary<string, byte> _initializedImportOperationTenants;
         private readonly ushort _fileKeyShardSeed;
         private long _fileKeySequence;
         private const int FileKeyShardReuseWindow = 32;
@@ -134,6 +138,14 @@ namespace Locus.Storage
             _completionGuards = Enumerable.Range(0, completionGuardStripeCount)
                 .Select(_ => new SemaphoreSlim(1, 1))
                 .ToArray();
+            _idempotentWriteGuards = Enumerable.Range(0, completionGuardStripeCount)
+                .Select(_ => new SemaphoreSlim(1, 1))
+                .ToArray();
+            _importIndexInitializationGuards = Enumerable.Range(0, completionGuardStripeCount)
+                .Select(_ => new SemaphoreSlim(1, 1))
+                .ToArray();
+            _importOperationFileKeys = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>(StringComparer.Ordinal);
+            _initializedImportOperationTenants = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             _fileKeyShardSeed = unchecked((ushort)Guid.NewGuid().GetHashCode());
             ValidateLegacyNonJournalMode();
         }
@@ -227,7 +239,7 @@ namespace Locus.Storage
         /// <inheritdoc/>
         public async Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct = default)
         {
-            return await WriteFileAsync(tenant, content, originalFileName, null, ct).ConfigureAwait(false);
+            return await WriteFileCoreAsync(tenant, content, originalFileName, null, null, ct).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -237,6 +249,58 @@ namespace Locus.Storage
             string? originalFileName,
             string? logicalDirectoryPath,
             CancellationToken ct = default)
+        {
+            return await WriteFileCoreAsync(tenant, content, originalFileName, logicalDirectoryPath, null, ct).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> WriteFileIdempotentlyAsync(
+            ITenantContext tenant,
+            Stream content,
+            string? originalFileName,
+            string operationId,
+            CancellationToken ct = default)
+        {
+            if (tenant == null)
+                throw new ArgumentNullException(nameof(tenant));
+
+            if (content == null)
+                throw new ArgumentNullException(nameof(content));
+
+            if (string.IsNullOrWhiteSpace(operationId))
+                throw new ArgumentException("Import operation ID cannot be empty.", nameof(operationId));
+
+            var guard = GetIdempotentWriteGuard(tenant.TenantId, operationId);
+            await guard.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var operationIndex = await GetImportOperationIndexAsync(tenant.TenantId, ct).ConfigureAwait(false);
+                if (operationIndex.TryGetValue(operationId, out var existingFileKey))
+                    return existingFileKey;
+
+                var fileKey = await WriteFileCoreAsync(
+                    tenant,
+                    content,
+                    originalFileName,
+                    null,
+                    operationId,
+                    ct).ConfigureAwait(false);
+                operationIndex[operationId] = fileKey;
+                return fileKey;
+            }
+            finally
+            {
+                guard.Release();
+            }
+        }
+
+        private async Task<string> WriteFileCoreAsync(
+            ITenantContext tenant,
+            Stream content,
+            string? originalFileName,
+            string? logicalDirectoryPath,
+            string? importOperationId,
+            CancellationToken ct)
         {
             if (tenant == null)
                 throw new ArgumentNullException(nameof(tenant));
@@ -380,6 +444,7 @@ namespace Locus.Storage
                     OriginalFileName = originalFileName,
                     FileExtension = fileExtension
                 };
+                ImportOperationMetadata.SetOperationId(metadata, importOperationId);
 
                 if (_queueEventJournal != null)
                 {
@@ -1118,10 +1183,56 @@ namespace Locus.Storage
             _logger.LogDebug("Write failed on volume {VolumeId}; volume-selection cache invalidated", volume.VolumeId);
         }
 
+        private async Task<ConcurrentDictionary<string, string>> GetImportOperationIndexAsync(
+            string tenantId,
+            CancellationToken ct)
+        {
+            var operationIndex = _importOperationFileKeys.GetOrAdd(
+                tenantId,
+                _ => new ConcurrentDictionary<string, string>(StringComparer.Ordinal));
+            if (_initializedImportOperationTenants.ContainsKey(tenantId))
+                return operationIndex;
+
+            var initializationGuard = GetImportIndexInitializationGuard(tenantId);
+            await initializationGuard.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (_initializedImportOperationTenants.ContainsKey(tenantId))
+                    return operationIndex;
+
+                var metadata = await _projectionStore.GetProjectedFilesAsync(tenantId, ct).ConfigureAwait(false);
+                foreach (var item in metadata.OrderBy(item => item.CreatedAt))
+                {
+                    var operationId = ImportOperationMetadata.GetOperationId(item);
+                    if (operationId != null)
+                        operationIndex.TryAdd(operationId, item.FileKey);
+                }
+
+                _initializedImportOperationTenants.TryAdd(tenantId, 0);
+                return operationIndex;
+            }
+            finally
+            {
+                initializationGuard.Release();
+            }
+        }
+
         private SemaphoreSlim GetCompletionGuard(string fileKey)
         {
             var hash = StringComparer.Ordinal.GetHashCode(fileKey) & int.MaxValue;
             return _completionGuards[hash % _completionGuards.Length];
+        }
+
+        private SemaphoreSlim GetIdempotentWriteGuard(string tenantId, string operationId)
+        {
+            var hash = StringComparer.Ordinal.GetHashCode(tenantId + "\n" + operationId) & int.MaxValue;
+            return _idempotentWriteGuards[hash % _idempotentWriteGuards.Length];
+        }
+
+        private SemaphoreSlim GetImportIndexInitializationGuard(string tenantId)
+        {
+            var hash = StringComparer.Ordinal.GetHashCode(tenantId) & int.MaxValue;
+            return _importIndexInitializationGuards[hash % _importIndexInitializationGuards.Length];
         }
 
         private static void EnsureLease(FileLocation location)
@@ -1300,7 +1411,8 @@ namespace Locus.Storage
                     Status = metadata.Status,
                     RetryCount = metadata.RetryCount,
                     OriginalFileName = metadata.OriginalFileName,
-                    FileExtension = metadata.FileExtension
+                    FileExtension = metadata.FileExtension,
+                    ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
                 },
                 ct).ConfigureAwait(false);
         }
@@ -1548,6 +1660,10 @@ namespace Locus.Storage
         public void Dispose()
         {
             foreach (var guard in _completionGuards)
+                guard.Dispose();
+            foreach (var guard in _idempotentWriteGuards)
+                guard.Dispose();
+            foreach (var guard in _importIndexInitializationGuards)
                 guard.Dispose();
         }
     }

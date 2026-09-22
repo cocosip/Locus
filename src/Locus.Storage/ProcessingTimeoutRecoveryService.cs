@@ -134,7 +134,8 @@ namespace Locus.Storage
                 RetryCount = metadata.RetryCount,
                 AvailableForProcessingAtUtc = availableForProcessingAtUtc,
                 OriginalFileName = metadata.OriginalFileName,
-                FileExtension = metadata.FileExtension
+                FileExtension = metadata.FileExtension,
+                ImportOperationId = ImportOperationMetadata.GetOperationId(metadata)
             };
         }
     }

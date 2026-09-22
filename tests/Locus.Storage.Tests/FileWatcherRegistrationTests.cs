@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Xunit;
@@ -36,6 +38,46 @@ namespace Locus.Storage.Tests
                     && descriptor.ImplementationType == typeof(BackgroundFileWatcherService));
 
             Assert.False(Directory.Exists(watchRoot));
+        }
+
+        [Fact]
+        public async Task AddLocus_FromConfiguration_BindsWatcherDefaultsWithoutStartingServices()
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            var watchRoot = Path.Combine(Path.GetTempPath(), $"locus-watcher-configuration-{Guid.NewGuid():N}");
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Locus:Volumes:0:VolumeId"] = "vol-001",
+                    ["Locus:Volumes:0:MountPath"] = Path.Combine(watchRoot, "volume"),
+                    ["Locus:Volumes:0:VolumeType"] = "LocalFileSystem",
+                    ["Locus:Volumes:0:InitialDelayMs"] = "0",
+                    ["Locus:Volumes:0:HealthCheckDelayMs"] = "0",
+                    ["Locus:FileWatcherConfigurationDirectory"] = Path.Combine(watchRoot, "watchers"),
+                    ["Locus:FileWatcherOptions:DefaultPollingInterval"] = "00:00:17",
+                    ["Locus:FileWatcherOptions:MaxParallelWatcherScans"] = "2"
+                })
+                .Build();
+
+            services.AddLocus(configuration);
+
+            Assert.False(Directory.Exists(watchRoot));
+
+            try
+            {
+                using var provider = services.BuildServiceProvider();
+                var manager = provider.GetRequiredService<IFileWatcherOptionsManager>();
+                var options = await manager.GetOptionsAsync(CancellationToken.None);
+
+                Assert.Equal(TimeSpan.FromSeconds(17), options.DefaultPollingInterval);
+                Assert.Equal(2, options.MaxParallelWatcherScans);
+            }
+            finally
+            {
+                if (Directory.Exists(watchRoot))
+                    Directory.Delete(watchRoot, recursive: true);
+            }
         }
     }
 }

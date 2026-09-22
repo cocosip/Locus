@@ -50,6 +50,33 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetOptionsAsync_WhenConfigurationFileIsMissing_UsesConfiguredDefaults()
+        {
+            var configuredDefaults = new FileWatcherOptions
+            {
+                Enabled = true,
+                DefaultPollingInterval = TimeSpan.FromSeconds(12),
+                MinimumPollingInterval = TimeSpan.FromSeconds(4),
+                MaximumPollingInterval = TimeSpan.FromMinutes(20),
+                DisabledCheckInterval = TimeSpan.FromSeconds(45),
+                MaxParallelWatcherScans = 2
+            };
+            var manager = new FileWatcherOptionsManager(
+                _fileSystem,
+                _logger.Object,
+                _configRoot,
+                configuredDefaults);
+
+            var options = await manager.GetOptionsAsync(CancellationToken.None);
+
+            Assert.Equal(TimeSpan.FromSeconds(12), options.DefaultPollingInterval);
+            Assert.Equal(TimeSpan.FromSeconds(4), options.MinimumPollingInterval);
+            Assert.Equal(TimeSpan.FromMinutes(20), options.MaximumPollingInterval);
+            Assert.Equal(TimeSpan.FromSeconds(45), options.DisabledCheckInterval);
+            Assert.Equal(2, options.MaxParallelWatcherScans);
+        }
+
+        [Fact]
         public async Task UpdateOptionsAsync_SavesConfiguration()
         {
             // Arrange

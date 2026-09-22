@@ -322,6 +322,115 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task WriteFileIdempotentlyAsync_WhenOperationIdRepeats_ReturnsOriginalFileKey()
+        {
+            using var firstContent = new MemoryStream(Encoding.UTF8.GetBytes("idempotent content"));
+            using var secondContent = new MemoryStream(Encoding.UTF8.GetBytes("idempotent content"));
+
+            var firstFileKey = await _storagePool.WriteFileIdempotentlyAsync(
+                _tenant.Object,
+                firstContent,
+                "capture.dcm",
+                "watcher-operation-001",
+                CancellationToken.None);
+            var secondFileKey = await _storagePool.WriteFileIdempotentlyAsync(
+                _tenant.Object,
+                secondContent,
+                "capture.dcm",
+                "watcher-operation-001",
+                CancellationToken.None);
+
+            Assert.Equal(firstFileKey, secondFileKey);
+            _tenantQuotaManager.Verify(
+                manager => manager.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            _queueEventJournal.Verify(
+                journal => journal.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()),
+                Times.Once);
+            var physicalWriteCount = _volume1.Invocations.Count(invocation => invocation.Method.Name == nameof(IStorageVolume.WriteAsync))
+                + _volume2.Invocations.Count(invocation => invocation.Method.Name == nameof(IStorageVolume.WriteAsync));
+            Assert.Equal(1, physicalWriteCount);
+        }
+
+        [Fact]
+        public async Task WriteFileIdempotentlyAsync_WhenOperationIdIsConcurrent_WritesOnce()
+        {
+            using var firstContent = new MemoryStream(Encoding.UTF8.GetBytes("concurrent idempotent content"));
+            using var secondContent = new MemoryStream(Encoding.UTF8.GetBytes("concurrent idempotent content"));
+
+            var writes = new[]
+            {
+                _storagePool.WriteFileIdempotentlyAsync(
+                    _tenant.Object,
+                    firstContent,
+                    "capture.dcm",
+                    "watcher-operation-concurrent",
+                    CancellationToken.None),
+                _storagePool.WriteFileIdempotentlyAsync(
+                    _tenant.Object,
+                    secondContent,
+                    "capture.dcm",
+                    "watcher-operation-concurrent",
+                    CancellationToken.None)
+            };
+
+            var fileKeys = await Task.WhenAll(writes);
+
+            Assert.Equal(fileKeys[0], fileKeys[1]);
+            _tenantQuotaManager.Verify(
+                manager => manager.IncrementFileCountAsync("tenant-001", It.IsAny<CancellationToken>()),
+                Times.Once);
+            _queueEventJournal.Verify(
+                journal => journal.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()),
+                Times.Once);
+            var physicalWriteCount = _volume1.Invocations.Count(invocation => invocation.Method.Name == nameof(IStorageVolume.WriteAsync))
+                + _volume2.Invocations.Count(invocation => invocation.Method.Name == nameof(IStorageVolume.WriteAsync));
+            Assert.Equal(1, physicalWriteCount);
+        }
+
+        [Fact]
+        public async Task WriteFileIdempotentlyAsync_WhenOperationWasProjected_ReturnsProjectedFileKey()
+        {
+            const string existingFileKey = "projected-idempotent-file";
+            await _metadataRepository.AddOrUpdateAsync(new FileMetadata
+            {
+                FileKey = existingFileKey,
+                TenantId = "tenant-001",
+                VolumeId = "vol-001",
+                PhysicalPath = Path.Combine(_volume1Path, "tenant-001", "projected.dcm"),
+                DirectoryPath = "/",
+                FileSize = 18,
+                CreatedAt = DateTime.UtcNow,
+                Status = FileProcessingStatus.Pending,
+                OriginalFileName = "projected.dcm",
+                FileExtension = ".dcm",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["locus.import_operation_id"] = "watcher-operation-projected"
+                }
+            }, CancellationToken.None);
+            using var content = new MemoryStream(Encoding.UTF8.GetBytes("idempotent content"));
+
+            var fileKey = await _storagePool.WriteFileIdempotentlyAsync(
+                _tenant.Object,
+                content,
+                "projected.dcm",
+                "watcher-operation-projected",
+                CancellationToken.None);
+
+            Assert.Equal(existingFileKey, fileKey);
+            _tenantQuotaManager.Verify(
+                manager => manager.IncrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            _queueEventJournal.Verify(
+                journal => journal.AppendAsync(It.IsAny<QueueEventRecord>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            var physicalWriteCount = _volume1.Invocations.Count(invocation => invocation.Method.Name == nameof(IStorageVolume.WriteAsync))
+                + _volume2.Invocations.Count(invocation => invocation.Method.Name == nameof(IStorageVolume.WriteAsync));
+            Assert.Equal(0, physicalWriteCount);
+        }
+
+        [Fact]
         public async Task WriteFileAsync_ReusesShardPrefixWithinSmallSequentialBurst()
         {
             var fileKeys = new List<string>();

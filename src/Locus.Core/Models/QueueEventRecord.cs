@@ -101,5 +101,10 @@ namespace Locus.Core.Models
         /// Gets or sets the file extension.
         /// </summary>
         public string? FileExtension { get; set; }
+
+        /// <summary>
+        /// Gets or sets the stable import operation identifier used to deduplicate retried writes.
+        /// </summary>
+        public string? ImportOperationId { get; set; }
     }
 }
