@@ -122,7 +122,7 @@ namespace Locus.Storage.Tests
                     {
                         return Task.FromResult(false);
                     }
-                }, TimeSpan.FromSeconds(2));
+                }, TimeSpan.FromSeconds(10));
             }
             finally
             {

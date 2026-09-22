@@ -360,8 +360,8 @@ namespace Locus.Storage.Tests
             {
                 await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
                 await WaitUntilAsync(
-                    () => Volatile.Read(ref fastScanCount) >= 3,
-                    TimeSpan.FromMilliseconds(500),
+                    () => Volatile.Read(ref fastScanCount) >= 10,
+                    TimeSpan.FromSeconds(1),
                     "Fast watcher was blocked by a concurrently running slow watcher.");
             }
             finally

@@ -240,6 +240,7 @@ namespace Locus.Storage
             DateTime now)
         {
             var nextDueUtc = enabledWatchers
+                .Where(w => !_runningWatcherIds.ContainsKey(w.WatcherId))
                 .Select(w => GetNextDueUtc(w, options, now))
                 .DefaultIfEmpty(now.Add(options.DefaultPollingInterval))
                 .Min();
