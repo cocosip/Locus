@@ -15,6 +15,7 @@
     <PackageReference Include="Moq" />
     <PackageReference Include="System.IO.Abstractions.TestingHelpers" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
     <PackageReference Include="Microsoft.Extensions.Logging" />
   </ItemGroup>
 
