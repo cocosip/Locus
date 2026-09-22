@@ -416,7 +416,7 @@
         "SkipStabilityCheckAfterAge": "00:02:00",
 
         // 单个 watcher 最大并发导入数。调大可提升吞吐，也会增加磁盘和 CPU 压力。
-        "MaxConcurrentImports": 16,
+        "MaxConcurrentImports": 4,
 
         // 是否节流 imported history 的过期清理。
         "EnableImportedFilesPruneThrottle": true,
@@ -457,7 +457,7 @@
         "MinFileAge": "00:00:05",
         "FileStabilityCheckDelay": "00:00:00.200",
         "SkipStabilityCheckAfterAge": "00:02:00",
-        "MaxConcurrentImports": 12,
+        "MaxConcurrentImports": 4,
         "EnableImportedFilesPruneThrottle": true,
         "ImportedFilesPruneInterval": "00:05:00",
         "EnableImportedFilesHistoryFlushDebounce": true,
