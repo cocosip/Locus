@@ -123,6 +123,11 @@ namespace Locus
         public FileWatcherOptions FileWatcherOptions { get; set; } = new FileWatcherOptions();
 
         /// <summary>
+        /// Gets or sets the independent source-file cleanup worker options.
+        /// </summary>
+        public SourceCleanupOptions SourceCleanup { get; set; } = new SourceCleanupOptions();
+
+        /// <summary>
         /// Gets or sets the SQLite configuration options.
         /// Controls journal mode, synchronous level, cache size and checkpoint behavior.
         /// </summary>

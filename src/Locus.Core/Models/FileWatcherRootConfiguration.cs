@@ -51,6 +51,11 @@ namespace Locus.Core.Models
         public string? MoveToDirectory { get; set; }
 
         /// <summary>
+        /// Gets or sets the directory used when source cleanup retries are exhausted.
+        /// </summary>
+        public string? SourceCleanupFailureDirectory { get; set; } = "./locus-source-failed";
+
+        /// <summary>
         /// Gets or sets the polling interval for directory scanning.
         /// Default is 30 seconds.
         /// </summary>

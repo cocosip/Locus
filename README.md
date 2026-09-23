@@ -220,6 +220,9 @@ The current sample includes the major runtime surfaces:
 - `Sqlite` controls WAL mode, synchronous behavior, cache size, busy timeout, and checkpoint policy.
 - `RetryPolicy`, `Volumes`, `Tenants`, and `FileWatchers` define retry cadence, physical storage,
   tenant bootstrap, and directory import behavior.
+- `SourceCleanup` controls the independent watcher source-file cleanup queue. It stores only active
+  Delete/Move work in `source-cleanup.db`; completed rows are removed, so continuous ingestion does
+  not create an unbounded import-history JSON file.
 - `OrphanRecoveryOptions` and `CleanupOptions` cover startup/periodic recovery, timeout reset,
   completed-file reaping, dead-letter handling, retired-volume metadata handling, invalid database
   backup cleanup, database optimization, and junk-file cleanup.
@@ -227,6 +230,21 @@ The current sample includes the major runtime surfaces:
 `CleanupOptions.CleanupJunkFiles` enables a background recursive sweep for common system files such as
 `Thumbs.db`, `.DS_Store`, and `desktop.ini`. `JunkFileCleanupInterval` controls the minimum time between
 those heavier volume scans, independent from the normal status cleanup cadence.
+
+### Continuous FileWatcher ingestion
+
+`FileWatcher` imports each stable source file into the storage pool and then enqueues its configured
+`PostImportAction` (`Delete`, `Move`, or `Keep`) in the bounded source-cleanup queue. The scan continues
+with other files while cleanup runs independently. A source path is suppressed only while its active
+cleanup job has the same fingerprint; if the producer reuses the path with different content, the old
+job is discarded before the new import is considered.
+
+The source-cleanup worker runs only when `SourceCleanup.Enabled` is true, the persisted
+`FileWatcherOptions.Enabled` is true, and at least one enabled watcher configuration exists. Failed source
+Delete/Move operations are retried using the watcher post-import retry settings. After the configured
+attempts, the worker moves the still-matching source into `<FailureDirectory>/<WatcherId>/` so it cannot
+block unrelated new files. This queue is separate from `RetryPolicy`: `RetryPolicy` applies to downstream
+Locus file processing (`GetNextFileForProcessingAsync`/`MarkAsFailedAsync`), not to watcher source cleanup.
 
 ## Core APIs
 
@@ -654,7 +672,8 @@ dotnet pack src/Locus/Locus.csproj -c Release
 - Multi-tenant mode with automatic directory creation
 - Independent scheduling for multiple watchers with per-watcher non-overlap
 - Configurable global scan concurrency and per-watcher import concurrency
-- Durable, retryable post-import actions (Delete/Move/Keep) without repeating successful storage writes
+- Independent durable source-cleanup queue for post-import actions (Delete/Move/Keep)
+- Failure-directory quarantine after exhausted source cleanup retries, with fingerprint protection
 
 📊 **Operational Statistics**
 - Optional in-memory aggregation for write throughput, queue movement, SQLite persistence, and watcher imports

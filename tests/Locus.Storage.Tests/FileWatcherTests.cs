@@ -216,6 +216,52 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_WithSourceCleanupStore_EnqueuesCleanupAndDoesNotReimportPendingSource()
+        {
+            var tenantId = "tenant-cleanup";
+            var watchPath = @"C:\watch-cleanup";
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            var databasePath = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"), "source-cleanup.db");
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(filePath, "content");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-1));
+
+            var tenant = new Mock<ITenantContext>();
+            tenant.Setup(t => t.TenantId).Returns(tenantId);
+            tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>())).ReturnsAsync(tenant.Object);
+            _storagePool.Setup(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("file-key");
+
+            using (var store = new SourceCleanupStore(databasePath))
+            {
+                var watcher = new FileWatcher(_fileSystem, _storagePool.Object, _tenantManager.Object, _logger.Object, _configRoot, sourceCleanupStore: store);
+                var configuration = new FileWatcherConfiguration
+                {
+                    WatcherId = "cleanup-watcher",
+                    TenantId = tenantId,
+                    WatchPath = watchPath,
+                    MinFileAge = TimeSpan.Zero,
+                    MaxConcurrentImports = 1,
+                    PostImportAction = PostImportAction.Delete
+                };
+
+                await watcher.RegisterWatcherAsync(configuration);
+                var first = await watcher.ScanNowAsync(configuration.WatcherId);
+                var second = await watcher.ScanNowAsync(configuration.WatcherId);
+
+                Assert.Equal(1, first.FilesImported);
+                Assert.Equal(1, second.FilesSkipped);
+                _storagePool.Verify(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
+                var active = await store.GetActiveAsync(filePath, "ignored");
+                Assert.NotNull(active);
+                Assert.Equal("file-key", active!.FileKey);
+            }
+        }
+
+        [Fact]
         public async Task ScanNowAsync_ConfigurationOverload_DoesNotRequireReloadFromDisk()
         {
             var tenantId = "tenant-001";

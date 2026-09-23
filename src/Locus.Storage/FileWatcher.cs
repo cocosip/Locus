@@ -30,6 +30,7 @@ namespace Locus.Storage
         private readonly ITenantManager _tenantManager;
         private readonly ILogger<FileWatcher> _logger;
         private readonly ILocusStatisticsRecorder _statisticsRecorder;
+        private readonly ISourceCleanupStore? _sourceCleanupStore;
         private readonly string _configurationRoot;
         private readonly StringComparer _pathComparer;
 
@@ -107,13 +108,15 @@ namespace Locus.Storage
             ITenantManager tenantManager,
             ILogger<FileWatcher> logger,
             string? configurationRoot = null,
-            ILocusStatisticsRecorder? statisticsRecorder = null)
+            ILocusStatisticsRecorder? statisticsRecorder = null,
+            ISourceCleanupStore? sourceCleanupStore = null)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _storagePool = storagePool ?? throw new ArgumentNullException(nameof(storagePool));
             _tenantManager = tenantManager ?? throw new ArgumentNullException(nameof(tenantManager));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _statisticsRecorder = statisticsRecorder ?? NoopLocusStatisticsRecorder.Instance;
+            _sourceCleanupStore = sourceCleanupStore;
             _configurationRoot = configurationRoot ?? Path.Combine(".locus", "watchers");
 
             // Use case-insensitive comparison on Windows (NTFS is case-insensitive),
@@ -153,8 +156,10 @@ namespace Locus.Storage
                 _fileSystem.Directory.CreateDirectory(_configurationRoot);
             }
 
-            // Load imported files history from persistent storage
-            LoadImportedFilesHistory();
+            // The production watcher uses the bounded source-cleanup store. The legacy
+            // history remains available only for callers that construct FileWatcher without it.
+            if (_sourceCleanupStore == null)
+                LoadImportedFilesHistory();
         }
 
         /// <summary>
@@ -1438,7 +1443,25 @@ namespace Locus.Storage
                 var importFingerprint = CreateImportedFileFingerprint(fileInfo);
 
                 // Acquire import slot atomically to prevent duplicate imports under concurrent scans.
-                if (await TryProcessPendingPostImportActionAsync(
+                if (_sourceCleanupStore != null)
+                {
+                    var existingCleanup = await _sourceCleanupStore
+                        .GetActiveAsync(filePath, importFingerprint, ct)
+                        .ConfigureAwait(false);
+                    if (existingCleanup != null)
+                    {
+                        if (string.Equals(existingCleanup.Fingerprint, importFingerprint, StringComparison.Ordinal))
+                        {
+                            fileResult.FilesSkipped++;
+                            return fileResult;
+                        }
+
+                        // The producer reused the same source path for new content. The old
+                        // cleanup job must not be allowed to delete the replacement file.
+                        await _sourceCleanupStore.RemoveAsync(existingCleanup.Id, ct).ConfigureAwait(false);
+                    }
+                }
+                else if (await TryProcessPendingPostImportActionAsync(
                     configuration,
                     filePath,
                     importFingerprint,
@@ -1506,7 +1529,29 @@ namespace Locus.Storage
                         filePath, fileKey, tenant.TenantId);
                 }
 
-                if (configuration.PostImportAction == PostImportAction.Keep)
+                if (_sourceCleanupStore != null)
+                {
+                    await _sourceCleanupStore.UpsertAsync(
+                        new SourceCleanupJob
+                        {
+                            WatcherId = configuration.WatcherId,
+                            TenantId = tenant.TenantId,
+                            SourcePath = filePath,
+                            Fingerprint = importFingerprint,
+                            FileKey = fileKey,
+                            Action = (SourceCleanupJobAction)configuration.PostImportAction,
+                            MoveTargetPath = ResolveMoveTargetPath(configuration, filePath),
+                            FailureDirectory = configuration.SourceCleanupFailureDirectory,
+                            MaxAttempts = Math.Max(1, configuration.MaxPostImportActionRetryCount),
+                            RetryInitialDelay = configuration.PostImportActionRetryInitialDelay,
+                            RetryMaxDelay = configuration.PostImportActionRetryMaxDelay,
+                            State = SourceCleanupJobState.Pending,
+                            NextAttemptUtc = DateTime.UtcNow
+                        },
+                        ct).ConfigureAwait(false);
+                    importSlotTaken = false;
+                }
+                else if (configuration.PostImportAction == PostImportAction.Keep)
                 {
                     UpsertImportedFileRecord(filePath, importFingerprint);
                     await PersistImportedFilesHistoryAsync(CancellationToken.None)
