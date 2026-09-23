@@ -15,6 +15,8 @@
 - [appsettings.sample.json](../src/Locus/appsettings.sample.json)
 - [appsettings.json](../samples/Locus.Sample.Console/appsettings.json)
 - [appsettings-sample-reference.md](./appsettings-sample-reference.md)
+- [README.md](../README.md)
+- [storage-lifecycle-overview.md](./storage-lifecycle-overview.md)
 - [statistics.md](./statistics.md)
 
 ## 完整配置示例（JSONC 注释版）
@@ -32,13 +34,46 @@
     // FileWatcher 运行时配置目录。FileWatcherOptionsManager 会在这里保存 watcher 全局选项。
     "FileWatcherConfigurationDirectory": "./locus-watchers",
 
-    // 源文件后处理队列。只保存尚未完成的 Delete/Move 任务，成功后立即删除记录。
-    // worker 还要求 FileWatcherOptions.Enabled=true 且至少存在一个启用的 watcher 配置。
+    // 源文件后处理队列。导入前先写入 Importing 预留；导入成功后再转为 Delete/Move
+    // 后处理任务或 Keep 抑制记录。完成的 Delete/Move 任务立即删除，终态 Keep/Failed
+    // 记录按保留期分批裁剪，避免持续导入时 SQLite 无界增长。
+    // worker 仅在本配置 Enabled=true、持久化的 FileWatcherOptions.Enabled=true，且至少
+    // 存在一个启用的 watcher 配置时执行任务、裁剪和数据库优化。
     "SourceCleanup": {
+      // 是否启用 durable 源文件后处理。false 时不注册 source-cleanup store/worker，
+      // Watcher 使用原有的同步后处理与 imported-files 状态路径。
       "Enabled": true,
+
+      // durable cleanup SQLite 路径。不要放进 NuGet 包内容或临时发布目录。
       "DatabasePath": "./locus-watchers/source-cleanup.db",
+
+      // worker 扫描到期任务的间隔。
       "PollingInterval": "00:00:05",
-      "MaxConcurrentActions": 2
+
+      // 同时执行的 Delete/Move/恢复任务数量。
+      "MaxConcurrentActions": 2,
+
+      // 数据库允许保留的最大任务/抑制记录数。达到上限后，Watcher 不再向 Locus
+      // 写入新文件，而是跳过本轮并等待后续扫描；这是保护 SQLite 的硬背压上限。
+      // 该计数包含 Importing、待处理任务及尚在保留期内的 Keep/Failed 终态记录。
+      "MaxActiveJobs": 10000,
+
+      // Keep/Failed 终态记录保留多久。到期裁剪后，同路径同内容不再被该记录抑制；
+      // 如果源文件仍留在 watcher 目录，后续扫描可能重新导入它。
+      "TerminalJobRetentionPeriod": "1.00:00:00",
+
+      // Importing 预留多久未更新即视为进程中断。过期预留只会被释放，让 Watcher
+      // 重新导入；不会把未确认导入成功的源文件直接删除或移动。
+      "ImportReservationTimeout": "00:10:00",
+
+      // 是否按周期对 source-cleanup.db 执行 VACUUM，以归还裁剪后空闲页。
+      "EnableDatabaseOptimization": true,
+
+      // 两次 SQLite VACUUM 之间的最小间隔。
+      "DatabaseOptimizationInterval": "1.00:00:00",
+
+      // 每轮最多裁剪多少条过期 Keep/Failed 记录，限制单轮数据库工作量。
+      "TerminalPruneBatchSize": 5000
     },
 
     // Watcher 全局调度默认值。仅在运行时选项文件尚不存在时作为初始值；

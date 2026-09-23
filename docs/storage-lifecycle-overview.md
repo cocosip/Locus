@@ -190,16 +190,26 @@ flowchart TD
 
 ### FileWatcher 源文件后处理
 
-`FileWatcher` 导入成功后只记录一个带源路径、指纹和 `fileKey` 的活动 cleanup job，然后立即继续
-扫描目录。Delete/Move 不在扫描线程中执行，因此某个源文件删除失败不会阻塞同一 watcher 目录中尚未
-导入的文件。cleanup worker 从 `source-cleanup.db` 独立领取任务并按 watcher 的后处理重试配置退避重试。
+`FileWatcher` 在写入 Locus 之前先在 `source-cleanup.db` 原子预留一个 `Importing` 记录。预留成功后才执行
+Locus 写入；写入完成后把同一记录转换为带源路径、指纹和 `fileKey` 的 Delete/Move cleanup job，或 Keep
+终态抑制记录。`MaxActiveJobs` 是数据库总记录数的硬上限；达到上限时该文件本轮不会写入 Locus，而是等待
+后续扫描重试。Delete/Move 不在扫描线程中执行，因此某个源文件删除失败不会阻塞同一 watcher 目录中尚未
+导入的其他文件，只会占用一个 cleanup 容量槽位。cleanup worker 从数据库独立领取任务并按 watcher 的
+后处理重试配置退避重试。
 
 worker 只有在 `SourceCleanup.Enabled`、持久化的 `FileWatcherOptions.Enabled` 都为 true，且至少存在一个
-启用的 watcher 配置时才处理任务。重试耗尽后，若源文件仍与记录的指纹一致，则移动到配置的
+启用的 watcher 配置时才处理任务、裁剪终态记录或优化数据库。重试耗尽后，若源文件仍与记录的指纹一致，则移动到配置的
 `<SourceCleanupFailureDirectory>/<WatcherId>/`；如果路径已被生产者复用为不同内容，旧任务会被丢弃，
-不会移动新文件。成功完成的 Delete/Move job 会被立即删除，Keep job 作为活跃抑制标记保留。如果 `SourceCleanup.Enabled=false`，
-Watcher 不创建 durable cleanup job 或 SQLite 数据库，而是继续在扫描线程执行原有的后处理动作；如果没有配置失败隔离目录，
-重试耗尽的 job 会进入终态并继续抑制该源路径，不会无限重试。
+不会移动新文件。成功完成的 Delete/Move job 会被立即删除。Keep 和无失败隔离目录的 Failed job 只在
+`TerminalJobRetentionPeriod` 内抑制同路径同指纹文件，并由 worker 按 `TerminalPruneBatchSize` 分批删除；
+到期后若源文件仍存在，后续扫描可能再次导入。`EnableDatabaseOptimization` 启用时，worker 至少间隔
+`DatabaseOptimizationInterval` 执行一次 SQLite `VACUUM`，回收裁剪后空闲页。
+
+`ImportReservationTimeout` 用于恢复进程中断留下的 `Importing` 预留。由于预留发生在 Locus 写入之前，超时
+不能证明导入已经完成，因此 worker 只删除预留并允许 watcher 重试，绝不会据此删除或移动源文件。底层存储池
+支持幂等写入时，相同 import operation id 会避免“写入已完成但状态切换前崩溃”造成重复文件。如果
+`SourceCleanup.Enabled=false`，Watcher 不创建 durable cleanup job 或 SQLite 数据库，而是继续在扫描线程执行
+原有的后处理动作。
 
 这条链路与下面的 Locus 业务处理重试不同：`RetryPolicy` 只处理已写入 Locus 后由消费者领取的文件，
 不会控制 watcher 源文件的删除或移动。

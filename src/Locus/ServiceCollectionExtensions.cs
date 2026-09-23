@@ -104,6 +104,7 @@ namespace Locus
             options.StoragePool.Validate();
             options.QueueEventJournal.Validate();
             options.Statistics.Validate();
+            options.SourceCleanup.Validate();
 
             // Register file system abstraction
             services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
@@ -253,7 +254,8 @@ namespace Locus
                     logger,
                     options.FileWatcherConfigurationDirectory,
                     statisticsRecorder,
-                    sp.GetService<ISourceCleanupStore>());
+                    sp.GetService<ISourceCleanupStore>(),
+                    options.SourceCleanup);
             });
             services.AddSingleton<IFileWatcherOptionsManager>(sp =>
             {

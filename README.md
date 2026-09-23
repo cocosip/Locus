@@ -221,9 +221,11 @@ The current sample includes the major runtime surfaces:
 - `RetryPolicy`, `Volumes`, `Tenants`, and `FileWatchers` define retry cadence, physical storage,
   tenant bootstrap, and directory import behavior.
 - `SourceCleanup` controls the independent watcher source-file cleanup queue. When enabled, it stores
-  only active Delete/Move work plus Keep suppression markers in `source-cleanup.db`; completed rows
-  are removed, so continuous Delete/Move ingestion does not create an unbounded import-history JSON
-  file. When disabled, the watcher uses its synchronous post-import action path and does not create
+  an import reservation before writing to Locus, then converts it to active Delete/Move work or a
+  terminal Keep suppression marker in `source-cleanup.db`. Completed Delete/Move rows are removed;
+  expired Keep/Failed rows are pruned in bounded batches and SQLite can be periodically compacted, so
+  continuous ingestion does not create an unbounded import-history JSON file or an unbounded cleanup
+  database. When disabled, the watcher uses its synchronous post-import action path and does not create
   the cleanup database.
 - `OrphanRecoveryOptions` and `CleanupOptions` cover startup/periodic recovery, timeout reset,
   completed-file reaping, dead-letter handling, retired-volume metadata handling, invalid database
@@ -236,17 +238,23 @@ those heavier volume scans, independent from the normal status cleanup cadence.
 ### Continuous FileWatcher ingestion
 
 `FileWatcher` imports each stable source file into the storage pool and then enqueues its configured
-`PostImportAction` (`Delete`, `Move`, or `Keep`) in the bounded source-cleanup queue. The scan continues
-with other files while cleanup runs independently. A source path is suppressed only while its active
-cleanup job has the same fingerprint; if the producer reuses the path with different content, the old
-job is discarded before the new import is considered.
+`PostImportAction` (`Delete`, `Move`, or `Keep`) in the bounded source-cleanup queue. Capacity is reserved
+before the Locus write; when `MaxActiveJobs` is reached, that file is deferred without being imported and
+will be reconsidered by a later scan. The scan continues with other files while cleanup runs independently.
+A source path is suppressed only while its tracked cleanup row has the same fingerprint; if the producer
+reuses the path with different content, the old row is discarded before the new import is considered.
 
 The source-cleanup worker runs only when `SourceCleanup.Enabled` is true, the persisted
-`FileWatcherOptions.Enabled` is true, and at least one enabled watcher configuration exists. Failed source
-Delete/Move operations are retried using the watcher post-import retry settings. After the configured
-attempts, the worker moves the still-matching source into `<FailureDirectory>/<WatcherId>/`; when no
-failure directory is configured, the job becomes a terminal suppression marker instead. This queue is separate from `RetryPolicy`: `RetryPolicy` applies to downstream
-Locus file processing (`GetNextFileForProcessingAsync`/`MarkAsFailedAsync`), not to watcher source cleanup.
+`FileWatcherOptions.Enabled` is true, and at least one enabled watcher configuration exists; the same gate
+also prevents terminal pruning and database optimization while Watcher is inactive. Failed source Delete/Move
+operations are retried using the watcher post-import retry settings. After the configured attempts, the worker
+moves the still-matching source into `<FailureDirectory>/<WatcherId>/`; when no failure directory is configured,
+the job becomes a terminal suppression marker instead. Stale import reservations are released after
+`ImportReservationTimeout` so the watcher can retry the import; they never authorize deletion of a source whose
+Locus write was not durably confirmed. `TerminalJobRetentionPeriod` bounds Keep/Failed suppression history, so
+an unchanged retained source can be imported again after its marker is pruned. This queue is separate from
+`RetryPolicy`: `RetryPolicy` applies to downstream Locus file processing
+(`GetNextFileForProcessingAsync`/`MarkAsFailedAsync`), not to watcher source cleanup.
 
 ## Core APIs
 

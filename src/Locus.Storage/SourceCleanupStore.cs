@@ -56,10 +56,37 @@ namespace Locus.Storage
             return Task.FromResult(Upsert(job, ct));
         }
 
+        /// <summary>Reserves a bounded source cleanup slot before import.</summary>
+        public Task<bool> TryReserveAsync(
+            SourceCleanupJob job,
+            int maxActiveJobs,
+            DateTime reservationUntilUtc,
+            CancellationToken ct = default)
+        {
+            return Task.FromResult(TryReserve(job, maxActiveJobs, reservationUntilUtc, ct));
+        }
+
+        /// <summary>Gets the current number of active source cleanup rows.</summary>
+        public Task<int> GetActiveCountAsync(CancellationToken ct = default)
+        {
+            return Task.FromResult(GetActiveCount(ct));
+        }
+
         /// <inheritdoc />
         public Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(DateTime nowUtc, int limit, CancellationToken ct = default)
         {
-            return Task.FromResult<IReadOnlyList<SourceCleanupJob>>(GetDue(nowUtc, limit, ct));
+            return Task.FromResult<IReadOnlyList<SourceCleanupJob>>(GetDue(nowUtc, limit, null, ct));
+        }
+
+        /// <summary>Gets due jobs together with stale import reservations.</summary>
+        public Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(
+            DateTime nowUtc,
+            int limit,
+            DateTime staleImportCutoffUtc,
+            CancellationToken ct = default)
+        {
+            return Task.FromResult<IReadOnlyList<SourceCleanupJob>>(
+                GetDue(nowUtc, limit, staleImportCutoffUtc, ct));
         }
 
         /// <inheritdoc />
@@ -80,6 +107,18 @@ namespace Locus.Storage
         {
             Remove(id, ct);
             return Task.CompletedTask;
+        }
+
+        /// <summary>Removes terminal suppression rows older than the supplied cutoff.</summary>
+        public Task<int> PruneTerminalAsync(DateTime cutoffUtc, int limit, CancellationToken ct = default)
+        {
+            return Task.FromResult(PruneTerminal(cutoffUtc, limit, ct));
+        }
+
+        /// <summary>Runs SQLite VACUUM and returns the database size before and after.</summary>
+        public Task<(long SizeBefore, long SizeAfter)> OptimizeAsync(CancellationToken ct = default)
+        {
+            return Task.FromResult(Optimize(ct));
         }
 
         private void InitializeSchema()
@@ -185,7 +224,94 @@ SELECT id FROM source_cleanup_jobs WHERE watcher_id = $watcher_id AND source_pat
             }
         }
 
-        private IReadOnlyList<SourceCleanupJob> GetDue(DateTime nowUtc, int limit, CancellationToken ct)
+        private bool TryReserve(
+            SourceCleanupJob job,
+            int maxActiveJobs,
+            DateTime reservationUntilUtc,
+            CancellationToken ct)
+        {
+            if (job == null)
+                throw new ArgumentNullException(nameof(job));
+            if (string.IsNullOrWhiteSpace(job.WatcherId)
+                || string.IsNullOrWhiteSpace(job.SourcePath)
+                || string.IsNullOrWhiteSpace(job.Fingerprint))
+            {
+                throw new ArgumentException("Reservation watcher, source path and fingerprint are required.", nameof(job));
+            }
+
+            lock (_gate)
+            {
+                ct.ThrowIfCancellationRequested();
+                using (var transaction = _connection.BeginTransaction())
+                using (var countCommand = _connection.CreateCommand())
+                {
+                    countCommand.Transaction = transaction;
+                    countCommand.CommandText = "SELECT COUNT(*) FROM source_cleanup_jobs;";
+                    var activeCount = Convert.ToInt32(countCommand.ExecuteScalar(), CultureInfo.InvariantCulture);
+                    if (maxActiveJobs > 0 && activeCount >= maxActiveJobs)
+                    {
+                        transaction.Rollback();
+                        return false;
+                    }
+
+                    job.State = SourceCleanupJobState.Importing;
+                    job.FileKey = string.Empty;
+                    job.AttemptCount = 0;
+                    job.NextAttemptUtc = reservationUntilUtc;
+                    job.LeaseUntilUtc = null;
+                    job.UpdatedAtUtc = DateTime.UtcNow;
+                    job.CreatedAtUtc = job.CreatedAtUtc == default(DateTime) ? job.UpdatedAtUtc : job.CreatedAtUtc;
+
+                    using (var insertCommand = _connection.CreateCommand())
+                    {
+                        insertCommand.Transaction = transaction;
+                        insertCommand.CommandText = @"
+INSERT OR IGNORE INTO source_cleanup_jobs
+(watcher_id, tenant_id, source_path, fingerprint, file_key, action, move_target_path,
+ failure_directory, max_attempts, retry_initial_delay_ticks, retry_max_delay_ticks,
+ attempt_count, state, next_attempt_utc, last_error, created_at_utc, updated_at_utc, lease_until_utc)
+VALUES ($watcher_id, $tenant_id, $source_path, $fingerprint, $file_key, $action, $move_target_path,
+ $failure_directory, $max_attempts, $retry_initial_delay_ticks, $retry_max_delay_ticks,
+ $attempt_count, $state, $next_attempt_utc, $last_error, $created_at_utc, $updated_at_utc, $lease_until_utc);";
+                        Bind(insertCommand, job);
+                        if (insertCommand.ExecuteNonQuery() != 1)
+                        {
+                            transaction.Rollback();
+                            return false;
+                        }
+                    }
+
+                    using (var idCommand = _connection.CreateCommand())
+                    {
+                        idCommand.Transaction = transaction;
+                        idCommand.CommandText = "SELECT last_insert_rowid();";
+                        job.Id = Convert.ToInt64(idCommand.ExecuteScalar(), CultureInfo.InvariantCulture);
+                    }
+
+                    transaction.Commit();
+                    return true;
+                }
+            }
+        }
+
+        private int GetActiveCount(CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                ct.ThrowIfCancellationRequested();
+                using (var command = _connection.CreateCommand())
+                {
+                    command.CommandText = "SELECT COUNT(*) FROM source_cleanup_jobs;";
+                    return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+            }
+        }
+
+        private IReadOnlyList<SourceCleanupJob> GetDue(
+            DateTime nowUtc,
+            int limit,
+            DateTime? staleImportCutoffUtc,
+            CancellationToken ct)
         {
             var jobs = new List<SourceCleanupJob>();
             lock (_gate)
@@ -194,16 +320,23 @@ SELECT id FROM source_cleanup_jobs WHERE watcher_id = $watcher_id AND source_pat
                 using (var command = _connection.CreateCommand())
                 {
                     command.CommandText = @"SELECT * FROM source_cleanup_jobs
-WHERE (next_attempt_utc IS NULL OR next_attempt_utc <= $now)
-  AND (lease_until_utc IS NULL OR lease_until_utc <= $now)
-  AND action <> $keep
-  AND state IN ($pending, $retrying, $move_pending)
+WHERE (lease_until_utc IS NULL OR lease_until_utc <= $now)
+  AND (
+      (action <> $keep
+       AND (next_attempt_utc IS NULL OR next_attempt_utc <= $now)
+       AND state IN ($pending, $retrying, $move_pending))
+      OR (state = $importing AND updated_at_utc <= $stale_import_cutoff)
+  )
 ORDER BY updated_at_utc, id LIMIT $limit";
                     command.Parameters.AddWithValue("$now", Format(nowUtc));
                     command.Parameters.AddWithValue("$pending", (int)SourceCleanupJobState.Pending);
                     command.Parameters.AddWithValue("$retrying", (int)SourceCleanupJobState.Retrying);
                     command.Parameters.AddWithValue("$move_pending", (int)SourceCleanupJobState.MovePending);
+                    command.Parameters.AddWithValue("$importing", (int)SourceCleanupJobState.Importing);
                     command.Parameters.AddWithValue("$keep", (int)SourceCleanupJobAction.Keep);
+                    command.Parameters.AddWithValue(
+                        "$stale_import_cutoff",
+                        (object?)(staleImportCutoffUtc.HasValue ? Format(staleImportCutoffUtc.Value) : null) ?? DBNull.Value);
                     command.Parameters.AddWithValue("$limit", Math.Max(1, limit));
                     using (var reader = command.ExecuteReader())
                         while (reader.Read())
@@ -239,10 +372,11 @@ WHERE id = $id AND (lease_until_utc IS NULL OR lease_until_utc <= $now)";
                 using (var command = _connection.CreateCommand())
                 {
                     command.CommandText = @"UPDATE source_cleanup_jobs SET
-attempt_count = $attempt_count, state = $state, next_attempt_utc = $next_attempt_utc,
+file_key = $file_key, attempt_count = $attempt_count, state = $state, next_attempt_utc = $next_attempt_utc,
 last_error = $last_error, updated_at_utc = $updated_at_utc, lease_until_utc = NULL,
 move_target_path = $move_target_path WHERE id = $id";
                     command.Parameters.AddWithValue("$id", job.Id);
+                    command.Parameters.AddWithValue("$file_key", job.FileKey);
                     command.Parameters.AddWithValue("$attempt_count", job.AttemptCount);
                     command.Parameters.AddWithValue("$state", (int)job.State);
                     command.Parameters.AddWithValue("$next_attempt_utc", (object?)FormatNullable(job.NextAttemptUtc) ?? DBNull.Value);
@@ -265,6 +399,47 @@ move_target_path = $move_target_path WHERE id = $id";
                     command.Parameters.AddWithValue("$id", id);
                     command.ExecuteNonQuery();
                 }
+            }
+        }
+
+        private int PruneTerminal(DateTime cutoffUtc, int limit, CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                ct.ThrowIfCancellationRequested();
+                using (var command = _connection.CreateCommand())
+                {
+                    command.CommandText = @"DELETE FROM source_cleanup_jobs
+WHERE id IN (
+    SELECT id FROM source_cleanup_jobs
+    WHERE updated_at_utc <= $cutoff
+      AND (action = $keep OR state = $failed)
+    ORDER BY updated_at_utc, id
+    LIMIT $limit
+);";
+                    command.Parameters.AddWithValue("$cutoff", Format(cutoffUtc));
+                    command.Parameters.AddWithValue("$keep", (int)SourceCleanupJobAction.Keep);
+                    command.Parameters.AddWithValue("$failed", (int)SourceCleanupJobState.Failed);
+                    command.Parameters.AddWithValue("$limit", Math.Max(1, limit));
+                    return command.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private (long SizeBefore, long SizeAfter) Optimize(CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                ct.ThrowIfCancellationRequested();
+                var sizeBefore = File.Exists(_databasePath) ? new System.IO.FileInfo(_databasePath).Length : 0L;
+                using (var command = _connection.CreateCommand())
+                {
+                    command.CommandText = "VACUUM;";
+                    command.ExecuteNonQuery();
+                }
+
+                var sizeAfter = File.Exists(_databasePath) ? new System.IO.FileInfo(_databasePath).Length : 0L;
+                return (sizeBefore, sizeAfter);
             }
         }
 

@@ -26,6 +26,7 @@ namespace Locus.Storage
         private readonly LocusStartupCoordinator _startupCoordinator;
         private readonly IFileWatcher? _fileWatcher;
         private readonly IFileWatcherOptionsManager? _fileWatcherOptionsManager;
+        private DateTime _lastOptimizationUtc;
 
         /// <summary>
         /// Initializes a new source cleanup worker.
@@ -53,6 +54,7 @@ namespace Locus.Storage
             _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _fileWatcher = fileWatcher;
             _fileWatcherOptionsManager = fileWatcherOptionsManager;
+            _lastOptimizationUtc = DateTime.UtcNow;
         }
 
         /// <inheritdoc />
@@ -89,10 +91,53 @@ namespace Locus.Storage
 
         internal async Task ProcessDueJobsAsync(CancellationToken ct)
         {
-            if (!_options.Enabled || !await IsRuntimeEnabledAsync(ct).ConfigureAwait(false))
+            if (!_options.Enabled)
                 return;
 
-            var jobs = await _store.GetDueAsync(DateTime.UtcNow, Math.Max(1, _options.MaxConcurrentActions), ct)
+            if (!await IsRuntimeEnabledAsync(ct).ConfigureAwait(false))
+                return;
+
+            var now = DateTime.UtcNow;
+            try
+            {
+                var retention = _options.TerminalJobRetentionPeriod > TimeSpan.Zero
+                    ? _options.TerminalJobRetentionPeriod
+                    : TimeSpan.FromDays(1);
+                var pruned = await _store.PruneTerminalAsync(
+                    now.Subtract(retention),
+                    Math.Max(1, _options.TerminalPruneBatchSize),
+                    ct).ConfigureAwait(false);
+                if (pruned > 0)
+                    _logger.LogInformation("Pruned {Count} terminal source cleanup records", pruned);
+
+                if (_options.EnableDatabaseOptimization
+                    && (now - _lastOptimizationUtc) >= NormalizeOptimizationInterval())
+                {
+                    var sizes = await _store.OptimizeAsync(ct).ConfigureAwait(false);
+                    _lastOptimizationUtc = now;
+                    _logger.LogDebug(
+                        "Optimized source cleanup database: {Before} -> {After} bytes",
+                        sizes.SizeBefore,
+                        sizes.SizeAfter);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Source cleanup database maintenance failed");
+            }
+
+            var importReservationTimeout = _options.ImportReservationTimeout > TimeSpan.Zero
+                ? _options.ImportReservationTimeout
+                : TimeSpan.FromMinutes(10);
+            var jobs = await _store.GetDueAsync(
+                    now,
+                    Math.Max(1, _options.MaxConcurrentActions),
+                    now.Subtract(importReservationTimeout),
+                    ct)
                 .ConfigureAwait(false);
             if (jobs.Count == 0)
                 return;
@@ -130,6 +175,17 @@ namespace Locus.Storage
 
                 try
                 {
+                    if (job.State == SourceCleanupJobState.Importing)
+                    {
+                        // The reservation is written before the Locus import starts, so a crash
+                        // leaves no durable proof that the source was imported successfully.
+                        // Releasing the stale reservation lets the watcher retry safely. When the
+                        // storage pool supports idempotent writes, the operation id also prevents
+                        // duplication if the previous import completed before the crash.
+                        await _store.RemoveAsync(job.Id, ct).ConfigureAwait(false);
+                        return;
+                    }
+
                     if (job.State == SourceCleanupJobState.MovePending)
                     {
                         if (await TryMoveToFailureDirectoryAsync(job, ct).ConfigureAwait(false))
@@ -372,6 +428,13 @@ namespace Locus.Storage
             return _options.PollingInterval > TimeSpan.Zero
                 ? _options.PollingInterval
                 : TimeSpan.FromSeconds(5);
+        }
+
+        private TimeSpan NormalizeOptimizationInterval()
+        {
+            return _options.DatabaseOptimizationInterval > TimeSpan.Zero
+                ? _options.DatabaseOptimizationInterval
+                : TimeSpan.FromDays(1);
         }
     }
 }

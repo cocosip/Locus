@@ -313,6 +313,66 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_WhenSourceCleanupCapacityIsFull_DefersImport()
+        {
+            var tenantId = "tenant-cleanup-capacity";
+            var watchPath = Path.Combine(Path.GetTempPath(), "locus-watch-cleanup", Guid.NewGuid().ToString("N"));
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            var databasePath = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"), "source-cleanup.db");
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(filePath, "content");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-1));
+
+            var tenant = new Mock<ITenantContext>();
+            tenant.Setup(t => t.TenantId).Returns(tenantId);
+            tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>())).ReturnsAsync(tenant.Object);
+            _storagePool.Setup(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("file-key");
+
+            using (var store = new SourceCleanupStore(databasePath))
+            {
+                await store.UpsertAsync(new SourceCleanupJob
+                {
+                    WatcherId = "other-watcher",
+                    TenantId = tenantId,
+                    SourcePath = Path.Combine(watchPath, "already-queued.txt"),
+                    Fingerprint = "fp:v3:1:2:3:queued",
+                    Action = SourceCleanupJobAction.Delete,
+                    State = SourceCleanupJobState.Pending,
+                    NextAttemptUtc = DateTime.UtcNow
+                });
+
+                var watcher = new FileWatcher(
+                    _fileSystem,
+                    _storagePool.Object,
+                    _tenantManager.Object,
+                    _logger.Object,
+                    _configRoot,
+                    sourceCleanupStore: store,
+                    sourceCleanupOptions: new SourceCleanupOptions { MaxActiveJobs = 1 });
+                var configuration = new FileWatcherConfiguration
+                {
+                    WatcherId = "capacity-watcher",
+                    TenantId = tenantId,
+                    WatchPath = watchPath,
+                    MinFileAge = TimeSpan.Zero,
+                    MaxConcurrentImports = 1,
+                    PostImportAction = PostImportAction.Delete
+                };
+
+                await watcher.RegisterWatcherAsync(configuration);
+                var result = await watcher.ScanNowAsync(configuration.WatcherId);
+
+                Assert.Equal(1, result.FilesSkipped);
+                Assert.Equal(0, result.FilesImported);
+                _storagePool.Verify(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+            }
+        }
+
+        [Fact]
         public async Task ScanNowAsync_ConfigurationOverload_DoesNotRequireReloadFromDisk()
         {
             var tenantId = "tenant-001";
