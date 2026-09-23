@@ -219,7 +219,7 @@ namespace Locus.Storage.Tests
         public async Task ScanNowAsync_WithSourceCleanupStore_EnqueuesCleanupAndDoesNotReimportPendingSource()
         {
             var tenantId = "tenant-cleanup";
-            var watchPath = @"C:\watch-cleanup";
+            var watchPath = Path.Combine(Path.GetTempPath(), "locus-watch-cleanup", Guid.NewGuid().ToString("N"));
             var filePath = Path.Combine(watchPath, "file1.txt");
             var databasePath = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"), "source-cleanup.db");
             _fileSystem.Directory.CreateDirectory(watchPath);
@@ -258,6 +258,57 @@ namespace Locus.Storage.Tests
                 var active = await store.GetActiveAsync(filePath, "ignored");
                 Assert.NotNull(active);
                 Assert.Equal("file-key", active!.FileKey);
+            }
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_WithCompletedSourceCleanup_AllowsReusingSourcePath()
+        {
+            var tenantId = "tenant-cleanup-reuse";
+            var watchPath = Path.Combine(Path.GetTempPath(), "locus-watch-cleanup", Guid.NewGuid().ToString("N"));
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            var databasePath = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"), "source-cleanup.db");
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(filePath, "content-v1");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-1));
+
+            var tenant = new Mock<ITenantContext>();
+            tenant.Setup(t => t.TenantId).Returns(tenantId);
+            tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>())).ReturnsAsync(tenant.Object);
+            _storagePool.SetupSequence(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("file-key-1")
+                .ReturnsAsync("file-key-2");
+
+            using (var store = new SourceCleanupStore(databasePath))
+            {
+                var watcher = new FileWatcher(_fileSystem, _storagePool.Object, _tenantManager.Object, _logger.Object, _configRoot, sourceCleanupStore: store);
+                var configuration = new FileWatcherConfiguration
+                {
+                    WatcherId = "cleanup-reuse-watcher",
+                    TenantId = tenantId,
+                    WatchPath = watchPath,
+                    MinFileAge = TimeSpan.Zero,
+                    MaxConcurrentImports = 1,
+                    PostImportAction = PostImportAction.Delete
+                };
+
+                await watcher.RegisterWatcherAsync(configuration);
+                var first = await watcher.ScanNowAsync(configuration.WatcherId);
+                var active = await store.GetActiveAsync(filePath, "ignored");
+                Assert.Equal(1, first.FilesImported);
+                Assert.NotNull(active);
+                await store.RemoveAsync(active!.Id);
+
+                _fileSystem.File.WriteAllText(filePath, "content-v2");
+                _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-1));
+
+                var second = await watcher.ScanNowAsync(configuration.WatcherId);
+
+                Assert.Equal(1, second.FilesImported);
+                _storagePool.Verify(s => s.WriteFileAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
             }
         }
 

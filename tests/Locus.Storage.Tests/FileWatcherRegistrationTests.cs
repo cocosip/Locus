@@ -79,5 +79,25 @@ namespace Locus.Storage.Tests
                     Directory.Delete(watchRoot, recursive: true);
             }
         }
+
+        [Fact]
+        public void AddLocus_WhenSourceCleanupDisabled_DoesNotRegisterDurableCleanupStore()
+        {
+            var services = new ServiceCollection();
+            services.AddLocus(options =>
+            {
+                options.Volumes.Add(new VolumeConfiguration
+                {
+                    VolumeId = "vol-001",
+                    MountPath = Path.Combine(Path.GetTempPath(), $"locus-source-cleanup-disabled-{Guid.NewGuid():N}"),
+                    VolumeType = "LocalFileSystem",
+                    InitialDelayMs = 0,
+                    HealthCheckDelayMs = 0
+                });
+                options.SourceCleanup.Enabled = false;
+            });
+
+            Assert.DoesNotContain(services, descriptor => descriptor.ServiceType == typeof(ISourceCleanupStore));
+        }
     }
 }

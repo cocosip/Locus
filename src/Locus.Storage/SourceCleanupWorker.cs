@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -176,17 +178,24 @@ namespace Locus.Storage
             job.LastError = error;
             job.UpdatedAtUtc = DateTime.UtcNow;
 
-            if (!movePending && job.AttemptCount >= Math.Max(1, job.MaxAttempts)
-                && !string.IsNullOrWhiteSpace(job.FailureDirectory))
+            if (job.AttemptCount >= Math.Max(1, job.MaxAttempts))
             {
-                if (await TryMoveToFailureDirectoryAsync(job, ct).ConfigureAwait(false))
+                if (!string.IsNullOrWhiteSpace(job.FailureDirectory)
+                    && !await TryMoveToFailureDirectoryAsync(job, ct).ConfigureAwait(false))
+                {
+                    job.State = SourceCleanupJobState.MovePending;
+                    job.NextAttemptUtc = DateTime.UtcNow.Add(CalculateDelay(job));
+                }
+                else if (!string.IsNullOrWhiteSpace(job.FailureDirectory))
                 {
                     await _store.RemoveAsync(job.Id, ct).ConfigureAwait(false);
                     return;
                 }
-
-                job.State = SourceCleanupJobState.MovePending;
-                job.NextAttemptUtc = DateTime.UtcNow.Add(CalculateDelay(job));
+                else
+                {
+                    job.State = SourceCleanupJobState.Failed;
+                    job.NextAttemptUtc = null;
+                }
             }
             else
             {
@@ -263,14 +272,38 @@ namespace Locus.Storage
         {
             var parts = job.Fingerprint.Split(':');
             if (parts.Length < 4 || !parts[0].Equals("fp", StringComparison.Ordinal)
-                || !long.TryParse(parts[2], out var size)
-                || !long.TryParse(parts[3], out var lastWriteTicks))
+                || !long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var size)
+                || !long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var lastWriteTicks))
                 return false;
 
             try
             {
                 var info = _fileSystem.FileInfo.New(job.SourcePath);
-                return info.Length == size && info.LastWriteTimeUtc.Ticks == lastWriteTicks;
+                if (info.Length != size || info.LastWriteTimeUtc.Ticks != lastWriteTicks)
+                    return false;
+
+                if (string.Equals(parts[1], "v1", StringComparison.Ordinal))
+                    return true;
+
+                if (parts.Length < 5
+                    || !long.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var creationTicks))
+                    return false;
+
+                var creationTime = info.CreationTimeUtc == DateTime.MinValue
+                    ? info.LastWriteTimeUtc
+                    : info.CreationTimeUtc;
+                if (creationTime.Ticks != creationTicks)
+                    return false;
+
+                if (string.Equals(parts[1], "v2", StringComparison.Ordinal))
+                    return true;
+
+                if (!string.Equals(parts[1], "v3", StringComparison.Ordinal)
+                    || parts.Length != 6
+                    || string.IsNullOrWhiteSpace(parts[5]))
+                    return false;
+
+                return string.Equals(parts[5], ComputeContentSampleHash(job.SourcePath, info.Length), StringComparison.Ordinal);
             }
             catch (IOException)
             {
@@ -279,6 +312,44 @@ namespace Locus.Storage
             catch (UnauthorizedAccessException)
             {
                 return false;
+            }
+        }
+
+        private string ComputeContentSampleHash(string filePath, long fileSize)
+        {
+            const int sampleSize = 4 * 1024;
+            using (var source = _fileSystem.File.OpenRead(filePath))
+            using (var samples = new MemoryStream(sampleSize * 3))
+            {
+                var positions = new[]
+                {
+                    0L,
+                    Math.Max(0L, (fileSize - sampleSize) / 2L),
+                    Math.Max(0L, fileSize - sampleSize)
+                };
+                var buffer = new byte[sampleSize];
+                var visitedPositions = new HashSet<long>();
+
+                foreach (var position in positions)
+                {
+                    if (!visitedPositions.Add(position))
+                        continue;
+
+                    source.Position = position;
+                    var remaining = (int)Math.Min(sampleSize, Math.Max(0L, fileSize - position));
+                    while (remaining > 0)
+                    {
+                        var read = source.Read(buffer, 0, Math.Min(buffer.Length, remaining));
+                        if (read == 0)
+                            break;
+
+                        samples.Write(buffer, 0, read);
+                        remaining -= read;
+                    }
+                }
+
+                using (var sha256 = SHA256.Create())
+                    return Convert.ToBase64String(sha256.ComputeHash(samples.ToArray()));
             }
         }
 

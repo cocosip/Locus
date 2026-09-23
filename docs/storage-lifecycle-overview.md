@@ -197,7 +197,9 @@ flowchart TD
 worker 只有在 `SourceCleanup.Enabled`、持久化的 `FileWatcherOptions.Enabled` 都为 true，且至少存在一个
 启用的 watcher 配置时才处理任务。重试耗尽后，若源文件仍与记录的指纹一致，则移动到配置的
 `<SourceCleanupFailureDirectory>/<WatcherId>/`；如果路径已被生产者复用为不同内容，旧任务会被丢弃，
-不会移动新文件。成功完成的 Delete/Move job 会被立即删除，Keep job 作为活跃抑制标记保留。
+不会移动新文件。成功完成的 Delete/Move job 会被立即删除，Keep job 作为活跃抑制标记保留。如果 `SourceCleanup.Enabled=false`，
+Watcher 不创建 durable cleanup job 或 SQLite 数据库，而是继续在扫描线程执行原有的后处理动作；如果没有配置失败隔离目录，
+重试耗尽的 job 会进入终态并继续抑制该源路径，不会无限重试。
 
 这条链路与下面的 Locus 业务处理重试不同：`RetryPolicy` 只处理已写入 Locus 后由消费者领取的文件，
 不会控制 watcher 源文件的删除或移动。

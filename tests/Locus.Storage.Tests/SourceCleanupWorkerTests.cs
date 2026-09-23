@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.IO.Abstractions;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
@@ -209,6 +210,72 @@ namespace Locus.Storage.Tests
             }
         }
 
+        [Fact]
+        public async Task ProcessDueJobsAsync_SameMetadataDifferentContent_DoesNotDeleteReplacement()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "same-metadata.dcm");
+                File.WriteAllText(sourcePath, "original");
+                var originalInfo = new System.IO.FileInfo(sourcePath);
+                var fingerprint = FingerprintFor(sourcePath);
+                File.WriteAllText(sourcePath, "replace!");
+                File.SetLastWriteTimeUtc(sourcePath, originalInfo.LastWriteTimeUtc);
+
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, fingerprint);
+                    await store.UpsertAsync(job);
+                    var worker = CreateWorker(store);
+
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.True(File.Exists(sourcePath));
+                    Assert.Null(await store.GetActiveAsync(sourcePath, fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_ExhaustedCleanupWithoutFailureDirectory_SuppressesFurtherAttempts()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "no-quarantine.dcm");
+                File.WriteAllText(sourcePath, "content");
+                var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                job.Action = SourceCleanupJobAction.Move;
+                job.MoveTargetPath = directory;
+                job.FailureDirectory = null;
+                job.MaxAttempts = 1;
+
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var jobId = await store.UpsertAsync(job);
+                    var worker = CreateWorker(store);
+
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    var active = await store.GetActiveAsync(sourcePath, job.Fingerprint);
+                    Assert.NotNull(active);
+                    Assert.Equal(jobId, active!.Id);
+                    Assert.Equal(SourceCleanupJobState.Failed, active.State);
+                    Assert.Empty(await store.GetDueAsync(DateTime.UtcNow.AddMinutes(1), 10));
+                    Assert.True(File.Exists(sourcePath));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
         private static SourceCleanupWorker CreateWorker(
             ISourceCleanupStore store,
             bool? globalEnabled = null,
@@ -260,7 +327,9 @@ namespace Locus.Storage.Tests
         private static string FingerprintFor(string path)
         {
             var info = new System.IO.FileInfo(path);
-            return $"fp:v3:{info.Length}:{info.LastWriteTimeUtc.Ticks}:{info.CreationTimeUtc.Ticks}:hash";
+            using (var sha256 = SHA256.Create())
+            using (var stream = File.OpenRead(path))
+                return $"fp:v3:{info.Length}:{info.LastWriteTimeUtc.Ticks}:{info.CreationTimeUtc.Ticks}:{Convert.ToBase64String(sha256.ComputeHash(stream))}";
         }
 
         private static string CreateDirectory()
