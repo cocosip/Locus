@@ -141,6 +141,13 @@ jobs:
     - name: List packages
       run: ls -la ./packages/
 
+    - name: Verify NuGet packages exclude test artifacts
+      run: |
+        if unzip -l ./packages/*.nupkg | grep -Eiq '(^|/)(coverage|test-results)(/|$)|\.trx$|coverage\.cobertura\.xml$'; then
+          echo "NuGet package contains test or coverage artifacts"
+          exit 1
+        fi
+
     - name: Upload NuGet packages
       uses: actions/upload-artifact@v7
       with:

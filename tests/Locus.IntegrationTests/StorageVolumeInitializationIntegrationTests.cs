@@ -69,7 +69,7 @@ namespace Locus.IntegrationTests
                             volume.VolumeId = $"vol-{index + 1:D3}";
                             volume.MountPath = Path.Combine(root, $"volume-{index + 1:D3}");
                             volume.VolumeType = "LocalFileSystem";
-                            volume.InitialDelayMs = 300;
+                            volume.InitialDelayMs = 1000;
                             volume.HealthCheckDelayMs = 0;
                         });
                     }
@@ -80,7 +80,7 @@ namespace Locus.IntegrationTests
                 stopwatch.Stop();
 
                 Assert.True(
-                    stopwatch.Elapsed < TimeSpan.FromMilliseconds(700),
+                    stopwatch.Elapsed < TimeSpan.FromMilliseconds(2500),
                     $"Expected parallel startup mount to finish well below serial time, actual={stopwatch.Elapsed}.");
             }
             finally

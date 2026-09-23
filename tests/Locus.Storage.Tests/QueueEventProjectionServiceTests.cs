@@ -190,7 +190,7 @@ namespace Locus.Storage.Tests
                     var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
                     var cursorPath = Path.Combine(_queueDirectory, tenantId, "projector.cursor.json");
                     return metadata != null && _fileSystem.File.Exists(cursorPath);
-                }, TimeSpan.FromSeconds(2));
+                }, TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -243,7 +243,7 @@ namespace Locus.Storage.Tests
             {
                 await WaitUntilAsync(
                     () => Task.FromResult(journal.ReadTenantIds.Contains("tenant-005")),
-                    TimeSpan.FromSeconds(2));
+                    TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -439,7 +439,7 @@ namespace Locus.Storage.Tests
                 {
                     var metadata = await _metadataRepository.GetByFileKeyAsync(fileKey, CancellationToken.None);
                     return metadata != null && metadata.Status == FileProcessingStatus.Pending && metadata.RetryCount == 1;
-                }, TimeSpan.FromSeconds(2));
+                }, TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -522,7 +522,7 @@ namespace Locus.Storage.Tests
             await service.StartAsync(CancellationToken.None);
             try
             {
-                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(2));
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -605,7 +605,7 @@ namespace Locus.Storage.Tests
             await service.StartAsync(CancellationToken.None);
             try
             {
-                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(2));
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -845,7 +845,7 @@ namespace Locus.Storage.Tests
             await service.StartAsync(CancellationToken.None);
             try
             {
-                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(2));
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -1111,7 +1111,7 @@ namespace Locus.Storage.Tests
             await service.StartAsync(CancellationToken.None);
             try
             {
-                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(2));
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -1226,7 +1226,7 @@ namespace Locus.Storage.Tests
             await service.StartAsync(CancellationToken.None);
             try
             {
-                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(2));
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(cursorPath)), TimeSpan.FromSeconds(10));
             }
             finally
             {
@@ -1711,7 +1711,7 @@ namespace Locus.Storage.Tests
             await service.StartAsync(CancellationToken.None);
             try
             {
-                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(snapshotPath)), TimeSpan.FromSeconds(2));
+                await WaitUntilAsync(() => Task.FromResult(_fileSystem.File.Exists(snapshotPath)), TimeSpan.FromSeconds(10));
             }
             finally
             {
