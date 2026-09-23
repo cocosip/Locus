@@ -1533,6 +1533,126 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ScanNowAsync_AfterKeepMarkerIsPruned_UsesNewImportOperationId()
+        {
+            var tenantId = "tenant-pruned-operation";
+            var watchPath = @"C:\watch-pruned-operation";
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(filePath, "content1");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
+
+            var tenant = new Mock<ITenantContext>();
+            tenant.Setup(t => t.TenantId).Returns(tenantId);
+            tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(tenant.Object);
+
+            var operationIds = new List<string>();
+            var storagePool = new Mock<IStoragePool>();
+            storagePool.As<IIdempotentStoragePool>()
+                .Setup(s => s.WriteFileIdempotentlyAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(),
+                    It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Callback<ITenantContext, Stream, string?, string, CancellationToken>(
+                    (_, _, _, operationId, _) => operationIds.Add(operationId))
+                .ReturnsAsync(() => $"file-{operationIds.Count}");
+
+            var databasePath = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"), "state.db");
+            using (var store = new SourceCleanupStore(databasePath))
+            {
+                var watcher = new FileWatcher(
+                    _fileSystem, storagePool.Object, _tenantManager.Object, _logger.Object,
+                    Path.Combine(_configRoot, "pruned-operation"), sourceCleanupStore: store);
+                var configuration = new FileWatcherConfiguration
+                {
+                    WatcherId = "pruned-operation-watcher",
+                    TenantId = tenantId,
+                    WatchPath = watchPath,
+                    MinFileAge = TimeSpan.Zero,
+                    SkipStabilityCheckAfterAge = TimeSpan.Zero,
+                    PostImportAction = PostImportAction.Keep
+                };
+
+                await watcher.RegisterWatcherAsync(configuration);
+                Assert.Equal(1, (await watcher.ScanNowAsync(configuration.WatcherId)).FilesImported);
+
+                var active = await store.GetActiveAsync(filePath, "ignored");
+                Assert.NotNull(active);
+                active!.UpdatedAtUtc = DateTime.UtcNow.AddDays(-2);
+                await store.UpdateAsync(active);
+                Assert.Equal(1, await store.PruneTerminalAsync(DateTime.UtcNow.AddDays(-1), 10));
+
+                Assert.Equal(1, (await watcher.ScanNowAsync(configuration.WatcherId)).FilesImported);
+            }
+
+            Assert.Equal(2, operationIds.Count);
+            Assert.NotEqual(operationIds[0], operationIds[1]);
+        }
+
+        [Fact]
+        public async Task ScanNowAsync_WhenImportReservationExpires_ReusesPersistedImportOperationId()
+        {
+            var tenantId = "tenant-resumed-operation";
+            var watchPath = @"C:\watch-resumed-operation";
+            var filePath = Path.Combine(watchPath, "file1.txt");
+            _fileSystem.Directory.CreateDirectory(watchPath);
+            _fileSystem.File.WriteAllText(filePath, "content1");
+            _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
+
+            var tenant = new Mock<ITenantContext>();
+            tenant.Setup(t => t.TenantId).Returns(tenantId);
+            tenant.Setup(t => t.Status).Returns(TenantStatus.Enabled);
+            _tenantManager.Setup(m => m.GetTenantAsync(tenantId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(tenant.Object);
+
+            var operationIds = new List<string>();
+            var attempts = 0;
+            var storagePool = new Mock<IStoragePool>();
+            storagePool.As<IIdempotentStoragePool>()
+                .Setup(s => s.WriteFileIdempotentlyAsync(
+                    It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(),
+                    It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Callback<ITenantContext, Stream, string?, string, CancellationToken>(
+                    (_, _, _, operationId, _) => operationIds.Add(operationId))
+                .Returns(() => ++attempts == 1
+                    ? Task.FromException<string>(new IOException("interrupted import"))
+                    : Task.FromResult("file-key"));
+
+            var databasePath = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"), "state.db");
+            using (var store = new SourceCleanupStore(databasePath))
+            {
+                var watcher = new FileWatcher(
+                    _fileSystem, storagePool.Object, _tenantManager.Object, _logger.Object,
+                    Path.Combine(_configRoot, "resumed-operation"), sourceCleanupStore: store,
+                    sourceCleanupOptions: new SourceCleanupOptions { ImportReservationTimeout = TimeSpan.FromMilliseconds(1) });
+                var configuration = new FileWatcherConfiguration
+                {
+                    WatcherId = "resumed-operation-watcher",
+                    TenantId = tenantId,
+                    WatchPath = watchPath,
+                    MinFileAge = TimeSpan.Zero,
+                    SkipStabilityCheckAfterAge = TimeSpan.Zero,
+                    PostImportAction = PostImportAction.Delete
+                };
+
+                await watcher.RegisterWatcherAsync(configuration);
+                Assert.Equal(1, (await watcher.ScanNowAsync(configuration.WatcherId)).FilesFailed);
+
+                var reservation = await store.GetActiveAsync(filePath, "ignored");
+                Assert.NotNull(reservation);
+                Assert.False(string.IsNullOrWhiteSpace(reservation!.ImportOperationId));
+                reservation.UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-1);
+                await store.UpdateAsync(reservation);
+
+                Assert.Equal(1, (await watcher.ScanNowAsync(configuration.WatcherId)).FilesImported);
+            }
+
+            Assert.Equal(2, operationIds.Count);
+            Assert.Equal(operationIds[0], operationIds[1]);
+        }
+
+        [Fact]
         public async Task ScanNowAsync_PostImportMoveFailure_RespectsActionRetryBackoff()
         {
             var tenantId = "tenant-001";

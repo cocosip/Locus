@@ -210,7 +210,45 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
-        public async Task ProcessDueJobsAsync_StaleImportReservation_ReleasesReservationWithoutDeletingSource()
+        public async Task ProcessDueJobsAsync_WhenBacklogExceedsConcurrency_DrainsAllCurrentlyDueJobs()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var sourcePaths = new[]
+                    {
+                        Path.Combine(directory, "one.dcm"),
+                        Path.Combine(directory, "two.dcm"),
+                        Path.Combine(directory, "three.dcm")
+                    };
+                    foreach (var sourcePath in sourcePaths)
+                    {
+                        File.WriteAllText(sourcePath, sourcePath);
+                        await store.UpsertAsync(CreateJob(directory, sourcePath, FingerprintFor(sourcePath)));
+                    }
+
+                    var worker = new SourceCleanupWorker(
+                        store,
+                        new System.IO.Abstractions.FileSystem(),
+                        new SourceCleanupOptions { Enabled = true, MaxConcurrentActions = 1 },
+                        NullLogger<SourceCleanupWorker>.Instance);
+
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.All(sourcePaths, sourcePath => Assert.False(File.Exists(sourcePath)));
+                    Assert.Empty(await store.GetDueAsync(DateTime.UtcNow.AddMinutes(1), 10));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_StaleImportReservation_PreservesTransactionIdentity()
         {
             var directory = CreateDirectory();
             try
@@ -221,6 +259,7 @@ namespace Locus.Storage.Tests
                 {
                     var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
                     job.FileKey = string.Empty;
+                    job.ImportOperationId = "interrupted-operation";
                     job.State = SourceCleanupJobState.Importing;
                     job.NextAttemptUtc = DateTime.UtcNow.AddMinutes(-20);
                     job.UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-20);
@@ -230,7 +269,9 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.True(File.Exists(sourcePath));
-                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    var active = await store.GetActiveAsync(sourcePath, job.Fingerprint);
+                    Assert.NotNull(active);
+                    Assert.Equal("interrupted-operation", active!.ImportOperationId);
                 }
             }
             finally

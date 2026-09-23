@@ -26,6 +26,7 @@ namespace Locus.Storage
         private readonly LocusStartupCoordinator _startupCoordinator;
         private readonly IFileWatcher? _fileWatcher;
         private readonly IFileWatcherOptionsManager? _fileWatcherOptionsManager;
+        private readonly ISourceFileRelocator _sourceFileRelocator;
         private DateTime _lastOptimizationUtc;
 
         /// <summary>
@@ -46,6 +47,27 @@ namespace Locus.Storage
             LocusStartupCoordinator? startupCoordinator = null,
             IFileWatcher? fileWatcher = null,
             IFileWatcherOptionsManager? fileWatcherOptionsManager = null)
+            : this(
+                store,
+                fileSystem,
+                options,
+                logger,
+                startupCoordinator,
+                fileWatcher,
+                fileWatcherOptionsManager,
+                new SourceFileRelocator(fileSystem))
+        {
+        }
+
+        internal SourceCleanupWorker(
+            ISourceCleanupStore store,
+            IFileSystem fileSystem,
+            SourceCleanupOptions options,
+            ILogger<SourceCleanupWorker> logger,
+            LocusStartupCoordinator? startupCoordinator,
+            IFileWatcher? fileWatcher,
+            IFileWatcherOptionsManager? fileWatcherOptionsManager,
+            ISourceFileRelocator sourceFileRelocator)
         {
             _store = store ?? throw new ArgumentNullException(nameof(store));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -54,6 +76,7 @@ namespace Locus.Storage
             _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _fileWatcher = fileWatcher;
             _fileWatcherOptionsManager = fileWatcherOptionsManager;
+            _sourceFileRelocator = sourceFileRelocator ?? throw new ArgumentNullException(nameof(sourceFileRelocator));
             _lastOptimizationUtc = DateTime.UtcNow;
         }
 
@@ -130,22 +153,25 @@ namespace Locus.Storage
                 _logger.LogWarning(ex, "Source cleanup database maintenance failed");
             }
 
-            var importReservationTimeout = _options.ImportReservationTimeout > TimeSpan.Zero
-                ? _options.ImportReservationTimeout
-                : TimeSpan.FromMinutes(10);
-            var jobs = await _store.GetDueAsync(
-                    now,
-                    Math.Max(1, _options.MaxConcurrentActions),
-                    now.Subtract(importReservationTimeout),
-                    ct)
-                .ConfigureAwait(false);
-            if (jobs.Count == 0)
-                return;
-
-            using (var semaphore = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrentActions)))
+            var maxConcurrentActions = Math.Max(1, _options.MaxConcurrentActions);
+            using (var semaphore = new SemaphoreSlim(maxConcurrentActions))
             {
-                var tasks = jobs.Select(job => ProcessClaimedJobAsync(job, semaphore, ct)).ToArray();
-                await Task.WhenAll(tasks).ConfigureAwait(false);
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var batchNow = DateTime.UtcNow;
+                    var jobs = await _store.GetDueAsync(
+                            batchNow,
+                            maxConcurrentActions,
+                            ct)
+                        .ConfigureAwait(false);
+                    if (jobs.Count == 0)
+                        return;
+
+                    var tasks = jobs.Select(job => ProcessClaimedJobAsync(job, semaphore, ct)).ToArray();
+                    await Task.WhenAll(tasks).ConfigureAwait(false);
+                    await Task.Yield();
+                }
             }
         }
 
@@ -177,12 +203,8 @@ namespace Locus.Storage
                 {
                     if (job.State == SourceCleanupJobState.Importing)
                     {
-                        // The reservation is written before the Locus import starts, so a crash
-                        // leaves no durable proof that the source was imported successfully.
-                        // Releasing the stale reservation lets the watcher retry safely. When the
-                        // storage pool supports idempotent writes, the operation id also prevents
-                        // duplication if the previous import completed before the crash.
-                        await _store.RemoveAsync(job.Id, ct).ConfigureAwait(false);
+                        // Import reservations are resumed by the watcher, which owns the source
+                        // validation and the durable idempotent operation identifier.
                         return;
                     }
 
@@ -283,13 +305,10 @@ namespace Locus.Storage
             var directory = _fileSystem.Path.Combine(failureDirectory, job.WatcherId);
             var fileName = _fileSystem.Path.GetFileName(job.SourcePath);
             var target = _fileSystem.Path.Combine(directory, fileName);
-            if (_fileSystem.File.Exists(target))
-                target = _fileSystem.Path.Combine(directory, job.FileKey + "-" + fileName);
-
             try
             {
                 _fileSystem.Directory.CreateDirectory(directory);
-                _fileSystem.File.Move(job.SourcePath, target);
+                await _sourceFileRelocator.RelocateAsync(job.SourcePath, target, ct).ConfigureAwait(false);
                 return true;
             }
             catch (IOException)
@@ -310,7 +329,7 @@ namespace Locus.Storage
             }
         }
 
-        private Task MoveAsync(string sourcePath, string? targetPath, CancellationToken ct)
+        private async Task MoveAsync(string sourcePath, string? targetPath, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
             if (string.IsNullOrWhiteSpace(targetPath))
@@ -320,8 +339,7 @@ namespace Locus.Storage
             var directory = _fileSystem.Path.GetDirectoryName(destinationPath);
             if (directory is string directoryPath)
                 _fileSystem.Directory.CreateDirectory(directoryPath);
-            _fileSystem.File.Move(sourcePath, destinationPath);
-            return Task.CompletedTask;
+            await _sourceFileRelocator.RelocateAsync(sourcePath, destinationPath, ct).ConfigureAwait(false);
         }
 
         private bool FingerprintMetadataMatches(SourceCleanupJob job)

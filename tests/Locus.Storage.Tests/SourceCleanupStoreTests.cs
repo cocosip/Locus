@@ -27,6 +27,7 @@ namespace Locus.Storage.Tests
                         SourcePath = sourcePath,
                         Fingerprint = "fp:v3:10:20:30:hash",
                         FileKey = "file-1",
+                        ImportOperationId = "operation-1",
                         Action = SourceCleanupJobAction.Delete,
                         NextAttemptUtc = DateTime.UtcNow
                     });
@@ -41,9 +42,83 @@ namespace Locus.Storage.Tests
                     var due = await reloaded.GetDueAsync(DateTime.UtcNow.AddMinutes(1), 10);
                     Assert.Single(due);
                     Assert.Equal("file-1", due[0].FileKey);
+                    Assert.Equal("operation-1", due[0].ImportOperationId);
 
                     await reloaded.RemoveAsync(jobId);
                     Assert.Null(await reloaded.GetActiveAsync(sourcePath, "fp:v3:10:20:30:hash"));
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+            }
+        }
+
+        [Fact]
+        public async Task OpeningLegacyDatabase_AddsImportOperationIdColumnWithoutLosingJobs()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));
+            var databasePath = Path.Combine(directory, "source-cleanup.db");
+            Directory.CreateDirectory(directory);
+
+            try
+            {
+                using (var connection = new Microsoft.Data.Sqlite.SqliteConnection(
+                    new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                    {
+                        DataSource = databasePath,
+                        Pooling = false
+                    }.ToString()))
+                {
+                    connection.Open();
+                    using var command = connection.CreateCommand();
+                    command.CommandText = @"
+CREATE TABLE source_cleanup_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    watcher_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    file_key TEXT NOT NULL,
+    action INTEGER NOT NULL,
+    move_target_path TEXT,
+    failure_directory TEXT,
+    max_attempts INTEGER NOT NULL,
+    retry_initial_delay_ticks INTEGER NOT NULL,
+    retry_max_delay_ticks INTEGER NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    state INTEGER NOT NULL,
+    next_attempt_utc TEXT,
+    last_error TEXT,
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    lease_until_utc TEXT,
+    UNIQUE(watcher_id, source_path)
+);
+INSERT INTO source_cleanup_jobs
+(watcher_id, tenant_id, source_path, fingerprint, file_key, action, max_attempts,
+ retry_initial_delay_ticks, retry_max_delay_ticks, attempt_count, state,
+ created_at_utc, updated_at_utc)
+VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0, 0, 5,
+        '2026-09-22T00:00:00.0000000Z', '2026-09-22T00:00:00.0000000Z');";
+                    command.ExecuteNonQuery();
+                }
+
+                using (var store = new SourceCleanupStore(databasePath))
+                {
+                    var job = await store.GetActiveAsync("legacy.dcm", "ignored");
+                    Assert.NotNull(job);
+                    Assert.Null(job!.ImportOperationId);
+
+                    job.ImportOperationId = "upgraded-operation";
+                    await store.UpdateAsync(job);
+                }
+
+                using (var reloaded = new SourceCleanupStore(databasePath))
+                {
+                    var job = await reloaded.GetActiveAsync("legacy.dcm", "ignored");
+                    Assert.Equal("upgraded-operation", job!.ImportOperationId);
                 }
             }
             finally

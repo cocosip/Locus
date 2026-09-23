@@ -239,6 +239,9 @@ namespace Locus
             });
             services.AddSingleton<ITenantQuotaManager>(sp => sp.GetRequiredService<TenantQuotaManager>());
 
+            services.AddSingleton<ISourceFileRelocator>(sp =>
+                new SourceFileRelocator(sp.GetRequiredService<IFileSystem>()));
+
             // Register file watcher
             services.AddSingleton<IFileWatcher>(sp =>
             {
@@ -255,7 +258,8 @@ namespace Locus
                     options.FileWatcherConfigurationDirectory,
                     statisticsRecorder,
                     sp.GetService<ISourceCleanupStore>(),
-                    options.SourceCleanup);
+                    options.SourceCleanup,
+                    sp.GetRequiredService<ISourceFileRelocator>());
             });
             services.AddSingleton<IFileWatcherOptionsManager>(sp =>
             {
@@ -474,7 +478,8 @@ namespace Locus
                     sp.GetRequiredService<ILogger<SourceCleanupWorker>>(),
                     sp.GetRequiredService<LocusStartupCoordinator>(),
                     sp.GetRequiredService<IFileWatcher>(),
-                    sp.GetRequiredService<IFileWatcherOptionsManager>()));
+                    sp.GetRequiredService<IFileWatcherOptionsManager>(),
+                    sp.GetRequiredService<ISourceFileRelocator>()));
             }
 
             // Register background cleanup service if enabled

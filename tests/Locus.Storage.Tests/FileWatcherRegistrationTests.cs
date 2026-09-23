@@ -32,6 +32,10 @@ namespace Locus.Storage.Tests
             });
 
             Assert.Contains(services, descriptor => descriptor.ServiceType == typeof(IFileWatcherOptionsManager));
+            var relocator = Assert.Single(
+                services,
+                descriptor => descriptor.ServiceType == typeof(ISourceFileRelocator));
+            Assert.Equal(ServiceLifetime.Singleton, relocator.Lifetime);
             Assert.Contains(
                 services,
                 descriptor => descriptor.ServiceType == typeof(IHostedService)
@@ -98,6 +102,10 @@ namespace Locus.Storage.Tests
             });
 
             Assert.DoesNotContain(services, descriptor => descriptor.ServiceType == typeof(ISourceCleanupStore));
+            Assert.Contains(
+                services,
+                descriptor => descriptor.ServiceType == typeof(ISourceFileRelocator)
+                    && descriptor.Lifetime == ServiceLifetime.Singleton);
         }
     }
 }

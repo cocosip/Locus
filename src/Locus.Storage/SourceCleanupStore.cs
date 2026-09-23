@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS source_cleanup_jobs (
     source_path TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     file_key TEXT NOT NULL,
+    import_operation_id TEXT,
     action INTEGER NOT NULL,
     move_target_path TEXT,
     failure_directory TEXT,
@@ -154,7 +155,46 @@ CREATE INDEX IF NOT EXISTS idx_source_cleanup_due
     ON source_cleanup_jobs(state, next_attempt_utc, lease_until_utc);";
                     command.ExecuteNonQuery();
                 }
+
+                EnsureColumnExists("import_operation_id", "TEXT");
             }
+        }
+
+        private void EnsureColumnExists(string columnName, string columnDefinition)
+        {
+            if (ColumnExists(columnName))
+                return;
+
+            try
+            {
+                using (var alter = _connection.CreateCommand())
+                {
+                    alter.CommandText = $"ALTER TABLE source_cleanup_jobs ADD COLUMN {columnName} {columnDefinition};";
+                    alter.ExecuteNonQuery();
+                }
+            }
+            catch (SqliteException) when (ColumnExists(columnName))
+            {
+                // Another store instance completed the same idempotent schema upgrade.
+            }
+        }
+
+        private bool ColumnExists(string columnName)
+        {
+            using (var query = _connection.CreateCommand())
+            {
+                query.CommandText = "PRAGMA table_info(source_cleanup_jobs);";
+                using (var reader = query.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private SourceCleanupJob? GetActive(string sourcePath, string fingerprint, CancellationToken ct)
@@ -195,16 +235,17 @@ WHERE source_path = $source_path LIMIT 1";
                 {
                     command.CommandText = @"
 INSERT INTO source_cleanup_jobs
-(watcher_id, tenant_id, source_path, fingerprint, file_key, action, move_target_path,
+ (watcher_id, tenant_id, source_path, fingerprint, file_key, import_operation_id, action, move_target_path,
  failure_directory, max_attempts, retry_initial_delay_ticks, retry_max_delay_ticks,
  attempt_count, state, next_attempt_utc, last_error, created_at_utc, updated_at_utc, lease_until_utc)
-VALUES ($watcher_id, $tenant_id, $source_path, $fingerprint, $file_key, $action, $move_target_path,
+ VALUES ($watcher_id, $tenant_id, $source_path, $fingerprint, $file_key, $import_operation_id, $action, $move_target_path,
  $failure_directory, $max_attempts, $retry_initial_delay_ticks, $retry_max_delay_ticks,
  $attempt_count, $state, $next_attempt_utc, $last_error, $created_at_utc, $updated_at_utc, $lease_until_utc)
 ON CONFLICT(watcher_id, source_path) DO UPDATE SET
  tenant_id = excluded.tenant_id,
  fingerprint = excluded.fingerprint,
  file_key = excluded.file_key,
+ import_operation_id = excluded.import_operation_id,
  action = excluded.action,
  move_target_path = excluded.move_target_path,
  failure_directory = excluded.failure_directory,
@@ -267,10 +308,10 @@ SELECT id FROM source_cleanup_jobs WHERE watcher_id = $watcher_id AND source_pat
                         insertCommand.Transaction = transaction;
                         insertCommand.CommandText = @"
 INSERT OR IGNORE INTO source_cleanup_jobs
-(watcher_id, tenant_id, source_path, fingerprint, file_key, action, move_target_path,
+ (watcher_id, tenant_id, source_path, fingerprint, file_key, import_operation_id, action, move_target_path,
  failure_directory, max_attempts, retry_initial_delay_ticks, retry_max_delay_ticks,
  attempt_count, state, next_attempt_utc, last_error, created_at_utc, updated_at_utc, lease_until_utc)
-VALUES ($watcher_id, $tenant_id, $source_path, $fingerprint, $file_key, $action, $move_target_path,
+ VALUES ($watcher_id, $tenant_id, $source_path, $fingerprint, $file_key, $import_operation_id, $action, $move_target_path,
  $failure_directory, $max_attempts, $retry_initial_delay_ticks, $retry_max_delay_ticks,
  $attempt_count, $state, $next_attempt_utc, $last_error, $created_at_utc, $updated_at_utc, $lease_until_utc);";
                         Bind(insertCommand, job);
@@ -372,11 +413,13 @@ WHERE id = $id AND (lease_until_utc IS NULL OR lease_until_utc <= $now)";
                 using (var command = _connection.CreateCommand())
                 {
                     command.CommandText = @"UPDATE source_cleanup_jobs SET
-file_key = $file_key, attempt_count = $attempt_count, state = $state, next_attempt_utc = $next_attempt_utc,
+ file_key = $file_key, import_operation_id = $import_operation_id,
+ attempt_count = $attempt_count, state = $state, next_attempt_utc = $next_attempt_utc,
 last_error = $last_error, updated_at_utc = $updated_at_utc, lease_until_utc = NULL,
 move_target_path = $move_target_path WHERE id = $id";
                     command.Parameters.AddWithValue("$id", job.Id);
                     command.Parameters.AddWithValue("$file_key", job.FileKey);
+                    command.Parameters.AddWithValue("$import_operation_id", (object?)job.ImportOperationId ?? DBNull.Value);
                     command.Parameters.AddWithValue("$attempt_count", job.AttemptCount);
                     command.Parameters.AddWithValue("$state", (int)job.State);
                     command.Parameters.AddWithValue("$next_attempt_utc", (object?)FormatNullable(job.NextAttemptUtc) ?? DBNull.Value);
@@ -450,6 +493,7 @@ WHERE id IN (
             command.Parameters.AddWithValue("$source_path", job.SourcePath);
             command.Parameters.AddWithValue("$fingerprint", job.Fingerprint);
             command.Parameters.AddWithValue("$file_key", job.FileKey);
+            command.Parameters.AddWithValue("$import_operation_id", (object?)job.ImportOperationId ?? DBNull.Value);
             command.Parameters.AddWithValue("$action", (int)job.Action);
             command.Parameters.AddWithValue("$move_target_path", (object?)job.MoveTargetPath ?? DBNull.Value);
             command.Parameters.AddWithValue("$failure_directory", (object?)job.FailureDirectory ?? DBNull.Value);
@@ -475,6 +519,7 @@ WHERE id IN (
                 SourcePath = reader.GetString(reader.GetOrdinal("source_path")),
                 Fingerprint = reader.GetString(reader.GetOrdinal("fingerprint")),
                 FileKey = reader.GetString(reader.GetOrdinal("file_key")),
+                ImportOperationId = ReadNullableString(reader, "import_operation_id"),
                 Action = (SourceCleanupJobAction)reader.GetInt32(reader.GetOrdinal("action")),
                 MoveTargetPath = ReadNullableString(reader, "move_target_path"),
                 FailureDirectory = ReadNullableString(reader, "failure_directory"),
