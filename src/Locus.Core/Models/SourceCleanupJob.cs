@@ -23,7 +23,9 @@ namespace Locus.Core.Models
         /// <summary>Cleanup retries are exhausted and the source awaits failure-directory move.</summary>
         MovePending = 3,
         /// <summary>Cleanup retries are exhausted and no further action is scheduled.</summary>
-        Failed = 4
+        Failed = 4,
+        /// <summary>The source import has been reserved but is not yet ready for cleanup.</summary>
+        Importing = 5
     }
 
     /// <summary>

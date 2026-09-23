@@ -24,12 +24,21 @@ namespace Locus.Storage
         /// <returns>The persisted job identifier.</returns>
         Task<long> UpsertAsync(SourceCleanupJob job, CancellationToken ct = default);
 
+        /// <summary>Reserves capacity for a source import before writing the Locus file.</summary>
+        Task<bool> TryReserveAsync(SourceCleanupJob job, int maxActiveJobs, DateTime reservationUntilUtc, CancellationToken ct = default);
+
+        /// <summary>Gets the number of active source cleanup records.</summary>
+        Task<int> GetActiveCountAsync(CancellationToken ct = default);
+
         /// <summary>Gets due non-keep jobs up to the requested limit.</summary>
         /// <param name="nowUtc">The current UTC time.</param>
         /// <param name="limit">The maximum number of jobs to return.</param>
         /// <param name="ct">Cancellation token.</param>
         /// <returns>Due cleanup jobs.</returns>
         Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(DateTime nowUtc, int limit, CancellationToken ct = default);
+
+        /// <summary>Gets due cleanup jobs and stale interrupted import reservations.</summary>
+        Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(DateTime nowUtc, int limit, DateTime staleImportCutoffUtc, CancellationToken ct = default);
 
         /// <summary>Attempts to acquire a lease for a cleanup job.</summary>
         /// <param name="id">The cleanup job identifier.</param>
@@ -48,5 +57,11 @@ namespace Locus.Storage
         /// <param name="id">The cleanup job identifier.</param>
         /// <param name="ct">Cancellation token.</param>
         Task RemoveAsync(long id, CancellationToken ct = default);
+
+        /// <summary>Removes expired terminal suppression records.</summary>
+        Task<int> PruneTerminalAsync(DateTime cutoffUtc, int limit, CancellationToken ct = default);
+
+        /// <summary>Compacts the source cleanup database and returns size statistics.</summary>
+        Task<(long SizeBefore, long SizeAfter)> OptimizeAsync(CancellationToken ct = default);
     }
 }

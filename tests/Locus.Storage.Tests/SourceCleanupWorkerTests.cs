@@ -99,6 +99,35 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ProcessDueJobsAsync_GlobalFileWatcherDisabled_DoesNotPruneTerminalJobs()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "disabled-terminal.dcm");
+                File.WriteAllText(sourcePath, "content");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    job.Action = SourceCleanupJobAction.Keep;
+                    job.State = SourceCleanupJobState.Failed;
+                    job.NextAttemptUtc = null;
+                    job.UpdatedAtUtc = DateTime.UtcNow.AddDays(-2);
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store, globalEnabled: false);
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
         public async Task ProcessDueJobsAsync_NoWatcherConfigurations_DoesNotProcessJobs()
         {
             var directory = CreateDirectory();
@@ -171,6 +200,36 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.False(File.Exists(sourcePath));
+                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_StaleImportReservation_ReleasesReservationWithoutDeletingSource()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "interrupted-import.dcm");
+                File.WriteAllText(sourcePath, "content");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    job.FileKey = string.Empty;
+                    job.State = SourceCleanupJobState.Importing;
+                    job.NextAttemptUtc = DateTime.UtcNow.AddMinutes(-20);
+                    job.UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-20);
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store);
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.True(File.Exists(sourcePath));
                     Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
                 }
             }
