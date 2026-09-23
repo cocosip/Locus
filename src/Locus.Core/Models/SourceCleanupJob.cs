@@ -51,6 +51,8 @@ namespace Locus.Core.Models
         /// <summary>Gets or sets the Locus file key produced by the import.</summary>
         public string FileKey { get; set; } = string.Empty;
 
+        internal string? ImportOperationId { get; set; }
+
         /// <summary>Gets or sets the post-import source action.</summary>
         public SourceCleanupJobAction Action { get; set; }
 

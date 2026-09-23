@@ -1,4 +1,4 @@
 using System.Runtime.CompilerServices;
 
+[assembly: InternalsVisibleTo("Locus.Storage")]
 [assembly: InternalsVisibleTo("Locus.Storage.Tests")]
-[assembly: InternalsVisibleTo("Locus")]

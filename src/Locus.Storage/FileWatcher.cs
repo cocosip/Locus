@@ -32,6 +32,7 @@ namespace Locus.Storage
         private readonly ILocusStatisticsRecorder _statisticsRecorder;
         private readonly ISourceCleanupStore? _sourceCleanupStore;
         private readonly SourceCleanupOptions? _sourceCleanupOptions;
+        private readonly ISourceFileRelocator _sourceFileRelocator;
         private readonly string _configurationRoot;
         private readonly StringComparer _pathComparer;
 
@@ -112,6 +113,29 @@ namespace Locus.Storage
             ILocusStatisticsRecorder? statisticsRecorder = null,
             ISourceCleanupStore? sourceCleanupStore = null,
             SourceCleanupOptions? sourceCleanupOptions = null)
+            : this(
+                fileSystem,
+                storagePool,
+                tenantManager,
+                logger,
+                configurationRoot,
+                statisticsRecorder,
+                sourceCleanupStore,
+                sourceCleanupOptions,
+                new SourceFileRelocator(fileSystem))
+        {
+        }
+
+        internal FileWatcher(
+            IFileSystem fileSystem,
+            IStoragePool storagePool,
+            ITenantManager tenantManager,
+            ILogger<FileWatcher> logger,
+            string? configurationRoot,
+            ILocusStatisticsRecorder? statisticsRecorder,
+            ISourceCleanupStore? sourceCleanupStore,
+            SourceCleanupOptions? sourceCleanupOptions,
+            ISourceFileRelocator sourceFileRelocator)
         {
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _storagePool = storagePool ?? throw new ArgumentNullException(nameof(storagePool));
@@ -120,6 +144,7 @@ namespace Locus.Storage
             _statisticsRecorder = statisticsRecorder ?? NoopLocusStatisticsRecorder.Instance;
             _sourceCleanupStore = sourceCleanupStore;
             _sourceCleanupOptions = sourceCleanupOptions;
+            _sourceFileRelocator = sourceFileRelocator ?? throw new ArgumentNullException(nameof(sourceFileRelocator));
             _configurationRoot = configurationRoot ?? Path.Combine(".locus", "watchers");
 
             // Use case-insensitive comparison on Windows (NTFS is case-insensitive),
@@ -1406,6 +1431,7 @@ namespace Locus.Storage
             var importSlotTaken = false;
             long? sourceCleanupReservationId = null;
             SourceCleanupJob? sourceCleanupReservation = null;
+            var preserveSourceCleanupReservation = false;
 
             try
             {
@@ -1457,31 +1483,54 @@ namespace Locus.Storage
                     {
                         if (string.Equals(existingCleanup.Fingerprint, importFingerprint, StringComparison.Ordinal))
                         {
+                            var reservationExpired = existingCleanup.State == SourceCleanupJobState.Importing
+                                && existingCleanup.UpdatedAtUtc.Add(GetImportReservationTimeout()) <= DateTime.UtcNow;
+                            if (!reservationExpired)
+                            {
+                                fileResult.FilesSkipped++;
+                                return fileResult;
+                            }
+
+                            sourceCleanupReservation = existingCleanup;
+                            if (string.IsNullOrWhiteSpace(sourceCleanupReservation.ImportOperationId))
+                            {
+                                sourceCleanupReservation.ImportOperationId = CreateImportOperationId(
+                                    tenant.TenantId,
+                                    filePath,
+                                    importFingerprint);
+                            }
+                            sourceCleanupReservation.UpdatedAtUtc = DateTime.UtcNow;
+                            sourceCleanupReservation.NextAttemptUtc = DateTime.UtcNow.Add(GetImportReservationTimeout());
+                            await _sourceCleanupStore.UpdateAsync(sourceCleanupReservation, ct).ConfigureAwait(false);
+                            sourceCleanupReservationId = sourceCleanupReservation.Id;
+                        }
+                        else
+                        {
+                            // The producer reused the same source path for new content. The old
+                            // cleanup job must not be allowed to delete the replacement file.
+                            await _sourceCleanupStore.RemoveAsync(existingCleanup.Id, ct).ConfigureAwait(false);
+                        }
+                    }
+
+                    if (sourceCleanupReservation == null)
+                    {
+                        sourceCleanupReservation = CreateSourceCleanupReservation(configuration, tenant, filePath, importFingerprint);
+                        var reserved = await _sourceCleanupStore.TryReserveAsync(
+                            sourceCleanupReservation,
+                            _sourceCleanupOptions?.MaxActiveJobs ?? 0,
+                            DateTime.UtcNow.Add(GetImportReservationTimeout()),
+                            ct).ConfigureAwait(false);
+                        if (!reserved)
+                        {
                             fileResult.FilesSkipped++;
+                            _logger.LogWarning(
+                                "Deferring watcher import for {FilePath} because source cleanup capacity is full",
+                                filePath);
                             return fileResult;
                         }
 
-                        // The producer reused the same source path for new content. The old
-                        // cleanup job must not be allowed to delete the replacement file.
-                        await _sourceCleanupStore.RemoveAsync(existingCleanup.Id, ct).ConfigureAwait(false);
+                        sourceCleanupReservationId = sourceCleanupReservation.Id;
                     }
-
-                    sourceCleanupReservation = CreateSourceCleanupReservation(configuration, tenant, filePath, importFingerprint);
-                    var reserved = await _sourceCleanupStore.TryReserveAsync(
-                        sourceCleanupReservation,
-                        _sourceCleanupOptions?.MaxActiveJobs ?? 0,
-                        DateTime.UtcNow.Add(GetImportReservationTimeout()),
-                        ct).ConfigureAwait(false);
-                    if (!reserved)
-                    {
-                        fileResult.FilesSkipped++;
-                        _logger.LogWarning(
-                            "Deferring watcher import for {FilePath} because source cleanup capacity is full",
-                            filePath);
-                        return fileResult;
-                    }
-
-                    sourceCleanupReservationId = sourceCleanupReservation.Id;
                 }
                 else if (await TryProcessPendingPostImportActionAsync(
                     configuration,
@@ -1526,10 +1575,16 @@ namespace Locus.Storage
                     var fileName = Path.GetFileName(filePath);
                     if (_storagePool is IIdempotentStoragePool idempotentStoragePool)
                     {
-                        var operationId = CreateImportOperationId(
-                            tenant.TenantId,
-                            filePath,
-                            importFingerprint);
+                        var operationId = sourceCleanupReservation?.ImportOperationId ?? string.Empty;
+                        if (string.IsNullOrWhiteSpace(operationId))
+                        {
+                            operationId = CreateImportOperationId(
+                                tenant.TenantId,
+                                filePath,
+                                importFingerprint);
+                        }
+
+                        preserveSourceCleanupReservation = sourceCleanupReservationId.HasValue;
                         fileKey = await idempotentStoragePool.WriteFileIdempotentlyAsync(
                             tenant,
                             importStream,
@@ -1566,6 +1621,7 @@ namespace Locus.Storage
                     sourceCleanupReservation.UpdatedAtUtc = DateTime.UtcNow;
                     await _sourceCleanupStore.UpdateAsync(sourceCleanupReservation, ct).ConfigureAwait(false);
                     sourceCleanupReservationId = null;
+                    preserveSourceCleanupReservation = false;
                     ReleaseImportSlot(filePath);
                     importSlotTaken = false;
                 }
@@ -1624,7 +1680,9 @@ namespace Locus.Storage
             }
             finally
             {
-                if (sourceCleanupReservationId.HasValue && _sourceCleanupStore != null)
+                if (sourceCleanupReservationId.HasValue
+                    && _sourceCleanupStore != null
+                    && !preserveSourceCleanupReservation)
                 {
                     try
                     {
@@ -1671,6 +1729,7 @@ namespace Locus.Storage
                 Action = (SourceCleanupJobAction)configuration.PostImportAction,
                 MoveTargetPath = ResolveMoveTargetPath(configuration, filePath),
                 FailureDirectory = configuration.SourceCleanupFailureDirectory,
+                ImportOperationId = Guid.NewGuid().ToString("N"),
                 MaxAttempts = Math.Max(1, configuration.MaxPostImportActionRetryCount),
                 RetryInitialDelay = configuration.PostImportActionRetryInitialDelay,
                 RetryMaxDelay = configuration.PostImportActionRetryMaxDelay,
@@ -2231,18 +2290,7 @@ namespace Locus.Storage
             }
 
             var fileName = _fileSystem.Path.GetFileName(filePath);
-            var targetPath = _fileSystem.Path.Combine(configuration.MoveToDirectory!, fileName);
-            var counter = 1;
-            while (_fileSystem.File.Exists(targetPath))
-            {
-                var nameWithoutExt = _fileSystem.Path.GetFileNameWithoutExtension(fileName);
-                var extension = _fileSystem.Path.GetExtension(fileName);
-                fileName = $"{nameWithoutExt}_{counter}{extension}";
-                targetPath = _fileSystem.Path.Combine(configuration.MoveToDirectory!, fileName);
-                counter++;
-            }
-
-            return targetPath;
+            return _fileSystem.Path.Combine(configuration.MoveToDirectory!, fileName);
         }
 
         private static string SerializeImportedFileState(ImportedFileStateRecord state)
@@ -2272,7 +2320,7 @@ namespace Locus.Storage
             }
         }
 
-        private Task ExecutePostImportActionAsync(
+        private async Task ExecutePostImportActionAsync(
             PostImportAction postImportAction,
             string filePath,
             string? moveTargetPath,
@@ -2295,24 +2343,10 @@ namespace Locus.Storage
                             _fileSystem.Directory.CreateDirectory(moveToDir);
                         }
 
-                        if (_fileSystem.File.Exists(targetPath))
-                        {
-                            if (!FilesHaveEquivalentContent(filePath, targetPath))
-                            {
-                                throw new IOException(
-                                    $"Move target '{targetPath}' already exists with different content.");
-                            }
-
-                            _fileSystem.File.Delete(filePath);
-                            _logger.LogDebug(
-                                "Move target {TargetPath} already contains file content; deleted source {FilePath}",
-                                targetPath,
-                                filePath);
-                            break;
-                        }
-
-                        _fileSystem.File.Move(filePath, targetPath);
-                        _logger.LogDebug("Moved file {FilePath} to {TargetPath}", filePath, targetPath);
+                        var actualTargetPath = await _sourceFileRelocator
+                            .RelocateAsync(filePath, targetPath, ct)
+                            .ConfigureAwait(false);
+                        _logger.LogDebug("Relocated file {FilePath} to {TargetPath}", filePath, actualTargetPath);
                     }
                     break;
 
@@ -2321,19 +2355,6 @@ namespace Locus.Storage
                     break;
             }
 
-            return Task.CompletedTask;
-        }
-
-        private bool FilesHaveEquivalentContent(string firstPath, string secondPath)
-        {
-            var first = _fileSystem.FileInfo.New(firstPath);
-            var second = _fileSystem.FileInfo.New(secondPath);
-            if (first.Length != second.Length)
-                return false;
-
-            var firstHash = ComputeContentSampleHash(firstPath, first.Length);
-            var secondHash = ComputeContentSampleHash(secondPath, second.Length);
-            return string.Equals(firstHash, secondHash, StringComparison.Ordinal);
         }
 
         private async Task UpdateWatcherStatusAsync(string watcherId, bool enabled, CancellationToken ct = default)
