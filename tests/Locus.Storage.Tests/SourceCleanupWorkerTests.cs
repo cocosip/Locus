@@ -1,0 +1,279 @@
+using System;
+using System.IO;
+using System.IO.Abstractions;
+using System.Threading;
+using System.Threading.Tasks;
+using Locus.Core.Abstractions;
+using Locus.Core.Models;
+using Moq;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace Locus.Storage.Tests
+{
+    public sealed class SourceCleanupWorkerTests
+    {
+        [Fact]
+        public async Task ProcessDueJobsAsync_DeletesSourceAndRemovesCompletedJob()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "one.dcm");
+                File.WriteAllText(sourcePath, "content");
+                var fingerprint = FingerprintFor(sourcePath);
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    await store.UpsertAsync(CreateJob(directory, sourcePath, fingerprint));
+                    var worker = CreateWorker(store);
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.False(File.Exists(sourcePath));
+                    Assert.Null(await store.GetActiveAsync(sourcePath, fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_ExhaustedCleanupMovesSourceToFailureDirectory()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "one.dcm");
+                File.WriteAllText(sourcePath, "content");
+                var failureDirectory = Path.Combine(directory, "failed");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    job.FailureDirectory = failureDirectory;
+                    job.Action = SourceCleanupJobAction.Move;
+                    var invalidMoveTarget = Path.Combine(directory, "invalid-target");
+                    Directory.CreateDirectory(invalidMoveTarget);
+                    job.MoveTargetPath = invalidMoveTarget;
+                    job.MaxAttempts = 1;
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store);
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.False(File.Exists(sourcePath));
+                    Assert.True(File.Exists(Path.Combine(failureDirectory, "watcher", "one.dcm")));
+                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_GlobalFileWatcherDisabled_DoesNotProcessJobs()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "disabled.dcm");
+                File.WriteAllText(sourcePath, "content");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store, globalEnabled: false);
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.True(File.Exists(sourcePath));
+                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_NoWatcherConfigurations_DoesNotProcessJobs()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "no-watcher.dcm");
+                File.WriteAllText(sourcePath, "content");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store, watchers: Array.Empty<FileWatcherConfiguration>());
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.True(File.Exists(sourcePath));
+                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_AllWatcherConfigurationsDisabled_DoesNotProcessJobs()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "disabled-watcher.dcm");
+                File.WriteAllText(sourcePath, "content");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store, watchers: new[]
+                    {
+                        new FileWatcherConfiguration { WatcherId = "watcher", Enabled = false }
+                    });
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.True(File.Exists(sourcePath));
+                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_GlobalWatcherAndConfigurationEnabled_ProcessesJobs()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "enabled.dcm");
+                File.WriteAllText(sourcePath, "content");
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                    await store.UpsertAsync(job);
+
+                    var worker = CreateWorker(store, globalEnabled: true,
+                        watchers: new[] { new FileWatcherConfiguration { WatcherId = "watcher", Enabled = true } });
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.False(File.Exists(sourcePath));
+                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobsAsync_MovePendingJob_DoesNotMoveReplacementContent()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var sourcePath = Path.Combine(directory, "reused.dcm");
+                File.WriteAllText(sourcePath, "original");
+                var job = CreateJob(directory, sourcePath, FingerprintFor(sourcePath));
+                job.State = SourceCleanupJobState.MovePending;
+                job.FailureDirectory = Path.Combine(directory, "failed");
+                File.WriteAllText(sourcePath, "replacement-content");
+
+                using (var store = new SourceCleanupStore(Path.Combine(directory, "state.db")))
+                {
+                    await store.UpsertAsync(job);
+                    var worker = CreateWorker(store);
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                    Assert.True(File.Exists(sourcePath));
+                    Assert.False(File.Exists(Path.Combine(job.FailureDirectory!, "watcher", "reused.dcm")));
+                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                }
+            }
+            finally
+            {
+                DeleteDirectory(directory);
+            }
+        }
+
+        private static SourceCleanupWorker CreateWorker(
+            ISourceCleanupStore store,
+            bool? globalEnabled = null,
+            IEnumerable<FileWatcherConfiguration>? watchers = null)
+        {
+            if (!globalEnabled.HasValue && watchers == null)
+            {
+                return new SourceCleanupWorker(
+                    store,
+                    new System.IO.Abstractions.FileSystem(),
+                    new SourceCleanupOptions { Enabled = true, MaxConcurrentActions = 1 },
+                    NullLogger<SourceCleanupWorker>.Instance);
+            }
+
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            optionsManager
+                .Setup(manager => manager.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new FileWatcherOptions { Enabled = globalEnabled ?? true });
+            var fileWatcher = new Mock<IFileWatcher>();
+            fileWatcher
+                .Setup(watcher => watcher.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(watchers ?? new[] { new FileWatcherConfiguration { WatcherId = "watcher" } });
+
+            return new SourceCleanupWorker(
+                store,
+                new System.IO.Abstractions.FileSystem(),
+                new SourceCleanupOptions { Enabled = true, MaxConcurrentActions = 1 },
+                NullLogger<SourceCleanupWorker>.Instance,
+                fileWatcher: fileWatcher.Object,
+                fileWatcherOptionsManager: optionsManager.Object);
+        }
+
+        private static SourceCleanupJob CreateJob(string directory, string sourcePath, string fingerprint)
+        {
+            return new SourceCleanupJob
+            {
+                WatcherId = "watcher",
+                TenantId = "tenant",
+                SourcePath = sourcePath,
+                Fingerprint = fingerprint,
+                FileKey = "file-1",
+                Action = SourceCleanupJobAction.Delete,
+                RetryInitialDelay = TimeSpan.Zero,
+                RetryMaxDelay = TimeSpan.Zero,
+                NextAttemptUtc = DateTime.UtcNow
+            };
+        }
+
+        private static string FingerprintFor(string path)
+        {
+            var info = new System.IO.FileInfo(path);
+            return $"fp:v3:{info.Length}:{info.LastWriteTimeUtc.Ticks}:{info.CreationTimeUtc.Ticks}:hash";
+        }
+
+        private static string CreateDirectory()
+        {
+            var path = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(path);
+            return path;
+        }
+
+        private static void DeleteDirectory(string path)
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+    }
+}

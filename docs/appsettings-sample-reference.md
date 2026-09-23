@@ -32,6 +32,15 @@
     // FileWatcher 运行时配置目录。FileWatcherOptionsManager 会在这里保存 watcher 全局选项。
     "FileWatcherConfigurationDirectory": "./locus-watchers",
 
+    // 源文件后处理队列。只保存尚未完成的 Delete/Move 任务，成功后立即删除记录。
+    // worker 还要求 FileWatcherOptions.Enabled=true 且至少存在一个启用的 watcher 配置。
+    "SourceCleanup": {
+      "Enabled": true,
+      "DatabasePath": "./locus-watchers/source-cleanup.db",
+      "PollingInterval": "00:00:05",
+      "MaxConcurrentActions": 2
+    },
+
     // Watcher 全局调度默认值。仅在运行时选项文件尚不存在时作为初始值；
     // 已持久化的 file-watcher-options.json 具有更高优先级。
     "FileWatcherOptions": {
@@ -421,6 +430,9 @@
         // 使用 Move 时需要同时配置 MoveToDirectory。
         "PostImportAction": "Delete",
 
+        // Delete/Move 重试耗尽后，将仍匹配原指纹的源文件移动到该目录下的 watcher 子目录。
+        "SourceCleanupFailureDirectory": "./locus-source-failed",
+
         // 目录扫描间隔。
         "PollingInterval": "00:00:20",
 
@@ -480,6 +492,7 @@
           "*.bmp"
         ],
         "PostImportAction": "Delete",
+        "SourceCleanupFailureDirectory": "./locus-source-failed",
         "PollingInterval": "00:00:30",
         "MaxFileSizeBytes": 536870912,
         "MinFileAge": "00:00:05",

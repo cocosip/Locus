@@ -252,7 +252,8 @@ namespace Locus
                     tenantManager,
                     logger,
                     options.FileWatcherConfigurationDirectory,
-                    statisticsRecorder);
+                    statisticsRecorder,
+                    sp.GetRequiredService<ISourceCleanupStore>());
             });
             services.AddSingleton<IFileWatcherOptionsManager>(sp =>
             {
@@ -457,6 +458,22 @@ namespace Locus
             }
 
             services.AddSingleton(options.CleanupOptions);
+
+            services.AddSingleton(options.SourceCleanup);
+            services.AddSingleton<ISourceCleanupStore>(sp =>
+                new SourceCleanupStore(options.SourceCleanup.DatabasePath));
+
+            if (options.SourceCleanup.Enabled)
+            {
+                services.AddHostedService(sp => new SourceCleanupWorker(
+                    sp.GetRequiredService<ISourceCleanupStore>(),
+                    sp.GetRequiredService<IFileSystem>(),
+                    options.SourceCleanup,
+                    sp.GetRequiredService<ILogger<SourceCleanupWorker>>(),
+                    sp.GetRequiredService<LocusStartupCoordinator>(),
+                    sp.GetRequiredService<IFileWatcher>(),
+                    sp.GetRequiredService<IFileWatcherOptionsManager>()));
+            }
 
             // Register background cleanup service if enabled
             if (options.CleanupOptions.Enabled)

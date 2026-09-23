@@ -122,6 +122,11 @@ namespace Locus.Core.Models
         public TimeSpan PostImportActionRetryMaxDelay { get; set; } = TimeSpan.FromMinutes(5);
 
         /// <summary>
+        /// Gets or sets the directory used when source cleanup retries are exhausted.
+        /// </summary>
+        public string? SourceCleanupFailureDirectory { get; set; } = "./locus-source-failed";
+
+        /// <summary>
         /// Gets or sets the delay used for file stability checks.
         /// A value less than or equal to zero disables the delayed second probe.
         /// Default is 100 milliseconds.

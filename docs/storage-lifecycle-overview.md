@@ -76,6 +76,7 @@ flowchart LR
 - `Storage Volume` 保存文件真实字节内容，是文件内容的最终载体。
 - `queue.log` 保存队列状态迁移事件，是队列状态机的持久事实来源。
 - SQLite 保存可查询、可重建的本地投影，不负责承载文件二进制内容。
+- watcher 源文件的 Delete/Move/Keep 后处理保存在独立的 `source-cleanup.db` 活动任务表中；任务成功后立即删除，不形成无限增长的导入历史。
 - 进程内内存缓存承担热路径查询与调度加速，当前进程内优先命中它。
 
 ## 队列事件类型
@@ -186,6 +187,20 @@ flowchart TD
 - durable journal 模式下，系统会尽量保证“物理文件写入成功”和“Accepted 事件写入成功”同时成立
 - 如果物理文件写入成功了，但 `Accepted` 没能完成，系统会尽量删除刚写入的物理文件并回滚预占配额
 - 如果 SQLite 暂时不可用，物理文件仍然是安全的，后续可以通过 orphan recovery 补回 metadata
+
+### FileWatcher 源文件后处理
+
+`FileWatcher` 导入成功后只记录一个带源路径、指纹和 `fileKey` 的活动 cleanup job，然后立即继续
+扫描目录。Delete/Move 不在扫描线程中执行，因此某个源文件删除失败不会阻塞同一 watcher 目录中尚未
+导入的文件。cleanup worker 从 `source-cleanup.db` 独立领取任务并按 watcher 的后处理重试配置退避重试。
+
+worker 只有在 `SourceCleanup.Enabled`、持久化的 `FileWatcherOptions.Enabled` 都为 true，且至少存在一个
+启用的 watcher 配置时才处理任务。重试耗尽后，若源文件仍与记录的指纹一致，则移动到配置的
+`<SourceCleanupFailureDirectory>/<WatcherId>/`；如果路径已被生产者复用为不同内容，旧任务会被丢弃，
+不会移动新文件。成功完成的 Delete/Move job 会被立即删除，Keep job 作为活跃抑制标记保留。
+
+这条链路与下面的 Locus 业务处理重试不同：`RetryPolicy` 只处理已写入 Locus 后由消费者领取的文件，
+不会控制 watcher 源文件的删除或移动。
 
 ## 二、直接读取流程
 
