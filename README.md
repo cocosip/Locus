@@ -220,9 +220,11 @@ The current sample includes the major runtime surfaces:
 - `Sqlite` controls WAL mode, synchronous behavior, cache size, busy timeout, and checkpoint policy.
 - `RetryPolicy`, `Volumes`, `Tenants`, and `FileWatchers` define retry cadence, physical storage,
   tenant bootstrap, and directory import behavior.
-- `SourceCleanup` controls the independent watcher source-file cleanup queue. It stores only active
-  Delete/Move work in `source-cleanup.db`; completed rows are removed, so continuous ingestion does
-  not create an unbounded import-history JSON file.
+- `SourceCleanup` controls the independent watcher source-file cleanup queue. When enabled, it stores
+  only active Delete/Move work plus Keep suppression markers in `source-cleanup.db`; completed rows
+  are removed, so continuous Delete/Move ingestion does not create an unbounded import-history JSON
+  file. When disabled, the watcher uses its synchronous post-import action path and does not create
+  the cleanup database.
 - `OrphanRecoveryOptions` and `CleanupOptions` cover startup/periodic recovery, timeout reset,
   completed-file reaping, dead-letter handling, retired-volume metadata handling, invalid database
   backup cleanup, database optimization, and junk-file cleanup.
@@ -242,8 +244,8 @@ job is discarded before the new import is considered.
 The source-cleanup worker runs only when `SourceCleanup.Enabled` is true, the persisted
 `FileWatcherOptions.Enabled` is true, and at least one enabled watcher configuration exists. Failed source
 Delete/Move operations are retried using the watcher post-import retry settings. After the configured
-attempts, the worker moves the still-matching source into `<FailureDirectory>/<WatcherId>/` so it cannot
-block unrelated new files. This queue is separate from `RetryPolicy`: `RetryPolicy` applies to downstream
+attempts, the worker moves the still-matching source into `<FailureDirectory>/<WatcherId>/`; when no
+failure directory is configured, the job becomes a terminal suppression marker instead. This queue is separate from `RetryPolicy`: `RetryPolicy` applies to downstream
 Locus file processing (`GetNextFileForProcessingAsync`/`MarkAsFailedAsync`), not to watcher source cleanup.
 
 ## Core APIs

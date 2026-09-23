@@ -1549,6 +1549,7 @@ namespace Locus.Storage
                             NextAttemptUtc = DateTime.UtcNow
                         },
                         ct).ConfigureAwait(false);
+                    ReleaseImportSlot(filePath);
                     importSlotTaken = false;
                 }
                 else if (configuration.PostImportAction == PostImportAction.Keep)
@@ -1798,6 +1799,15 @@ namespace Locus.Storage
 
                 if (_importedFiles.TryUpdate(filePath, InFlightImportMarker, currentValue))
                     return true;
+            }
+        }
+
+        private void ReleaseImportSlot(string filePath)
+        {
+            if (_importedFiles.TryGetValue(filePath, out var currentValue)
+                && string.Equals(currentValue, InFlightImportMarker, StringComparison.Ordinal))
+            {
+                _importedFiles.TryRemove(filePath, out _);
             }
         }
 

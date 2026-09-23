@@ -21,7 +21,9 @@ namespace Locus.Core.Models
         /// <summary>The cleanup action failed and is waiting for another attempt.</summary>
         Retrying = 2,
         /// <summary>Cleanup retries are exhausted and the source awaits failure-directory move.</summary>
-        MovePending = 3
+        MovePending = 3,
+        /// <summary>Cleanup retries are exhausted and no further action is scheduled.</summary>
+        Failed = 4
     }
 
     /// <summary>

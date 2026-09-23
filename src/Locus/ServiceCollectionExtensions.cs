@@ -253,7 +253,7 @@ namespace Locus
                     logger,
                     options.FileWatcherConfigurationDirectory,
                     statisticsRecorder,
-                    sp.GetRequiredService<ISourceCleanupStore>());
+                    sp.GetService<ISourceCleanupStore>());
             });
             services.AddSingleton<IFileWatcherOptionsManager>(sp =>
             {
@@ -460,11 +460,11 @@ namespace Locus
             services.AddSingleton(options.CleanupOptions);
 
             services.AddSingleton(options.SourceCleanup);
-            services.AddSingleton<ISourceCleanupStore>(sp =>
-                new SourceCleanupStore(options.SourceCleanup.DatabasePath));
 
             if (options.SourceCleanup.Enabled)
             {
+                services.AddSingleton<ISourceCleanupStore>(sp =>
+                    new SourceCleanupStore(options.SourceCleanup.DatabasePath));
                 services.AddHostedService(sp => new SourceCleanupWorker(
                     sp.GetRequiredService<ISourceCleanupStore>(),
                     sp.GetRequiredService<IFileSystem>(),
