@@ -1536,8 +1536,11 @@ namespace Locus.Storage.Tests
         public async Task ScanNowAsync_AfterKeepMarkerIsPruned_UsesNewImportOperationId()
         {
             var tenantId = "tenant-pruned-operation";
-            var watchPath = @"C:\watch-pruned-operation";
-            var filePath = Path.Combine(watchPath, "file1.txt");
+            var watchPath = Path.Combine(
+                Path.GetTempPath(),
+                "locus-watch-pruned-operation",
+                Guid.NewGuid().ToString("N"));
+            var filePath = _fileSystem.Path.Combine(watchPath, "file1.txt");
             _fileSystem.Directory.CreateDirectory(watchPath);
             _fileSystem.File.WriteAllText(filePath, "content1");
             _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
@@ -1575,7 +1578,11 @@ namespace Locus.Storage.Tests
                 };
 
                 await watcher.RegisterWatcherAsync(configuration);
-                Assert.Equal(1, (await watcher.ScanNowAsync(configuration.WatcherId)).FilesImported);
+                var first = await watcher.ScanNowAsync(configuration.WatcherId);
+
+                Assert.Equal(1, first.FilesImported);
+                Assert.Equal(0, first.FilesFailed);
+                Assert.Empty(first.Errors);
 
                 var active = await store.GetActiveAsync(filePath, "ignored");
                 Assert.NotNull(active);
@@ -1594,8 +1601,11 @@ namespace Locus.Storage.Tests
         public async Task ScanNowAsync_WhenImportReservationExpires_ReusesPersistedImportOperationId()
         {
             var tenantId = "tenant-resumed-operation";
-            var watchPath = @"C:\watch-resumed-operation";
-            var filePath = Path.Combine(watchPath, "file1.txt");
+            var watchPath = Path.Combine(
+                Path.GetTempPath(),
+                "locus-watch-resumed-operation",
+                Guid.NewGuid().ToString("N"));
+            var filePath = _fileSystem.Path.Combine(watchPath, "file1.txt");
             _fileSystem.Directory.CreateDirectory(watchPath);
             _fileSystem.File.WriteAllText(filePath, "content1");
             _fileSystem.File.SetLastWriteTimeUtc(filePath, DateTime.UtcNow.AddMinutes(-5));
@@ -1637,7 +1647,11 @@ namespace Locus.Storage.Tests
                 };
 
                 await watcher.RegisterWatcherAsync(configuration);
-                Assert.Equal(1, (await watcher.ScanNowAsync(configuration.WatcherId)).FilesFailed);
+                var first = await watcher.ScanNowAsync(configuration.WatcherId);
+
+                Assert.Equal(0, first.FilesImported);
+                Assert.Equal(1, first.FilesFailed);
+                Assert.Contains(first.Errors, error => error.Contains("interrupted import", StringComparison.Ordinal));
 
                 var reservation = await store.GetActiveAsync(filePath, "ignored");
                 Assert.NotNull(reservation);
