@@ -1,6 +1,7 @@
 using System.Collections;
 using System.IO.Abstractions;
 using System.Reflection;
+using Locus.Core.Abstractions;
 using Locus.Core.Models;
 using Locus.Storage.Data;
 using Microsoft.Data.Sqlite;
@@ -317,11 +318,213 @@ public sealed class MetadataPersistenceOrderingTests : IDisposable
         var enabled = typeof(MetadataRepository).GetField("_enableBackgroundPersistence", BindingFlags.Instance | BindingFlags.NonPublic)!;
         enabled.SetValue(repository, true);
         Invoke(repository, "TryWritePersistenceOperation", operation);
-        Assert.False(Drain(repository));
+        Assert.True(Drain(repository));
         enabled.SetValue(repository, false);
         await repository.AddOrUpdateAsync(Completed(old));
         while (Drain(repository)) { }
         Assert.Equal((long)FileProcessingStatus.Completed, ReadStatus(old.FileKey));
+        AssertTrackingReleased(repository);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ProjectionBatch_RepeatedMutation_PreservesConcurrentLease(bool delete, bool abandon)
+    {
+        using var repository = CreateRepository();
+        var pending = Metadata("repeated");
+        await repository.AddOrUpdateAsync(pending);
+        var batch = repository.BeginProjectionBatch(Tenant);
+        var staged = pending.Clone();
+        staged.Metadata = new Dictionary<string, string> { ["first"] = "1" };
+        await batch.UpsertProjectedFileAsync(staged);
+        var leased = await repository.GetNextPendingFileAsync(Tenant);
+        Assert.NotNull(leased);
+
+        if (delete)
+            Assert.False(await batch.RemoveProjectedFileAsync(pending.FileKey));
+        else
+        {
+            staged.Metadata["second"] = "2";
+            await batch.UpsertProjectedFileAsync(staged);
+        }
+
+        if (abandon)
+            ((IDisposable)batch).Dispose();
+        else
+            await batch.FlushAsync();
+
+        var current = await repository.GetAsync(Tenant, pending.FileKey);
+        Assert.NotNull(current);
+        Assert.Equal(FileProcessingStatus.Processing, current.Status);
+        Assert.Equal(leased.ProcessingStartTime, current.ProcessingStartTime);
+        Assert.Equal((long)FileProcessingStatus.Processing, ReadStatus(pending.FileKey));
+        AssertTrackingReleased(repository);
+    }
+
+    [Fact]
+    public async Task ProjectionBatch_StagedColdCreation_IsDeletedBeforeCommit()
+    {
+        using var repository = CreateRepository();
+        var completed = Completed(Metadata("staged-cold"));
+        var batch = repository.BeginProjectionBatch(Tenant);
+        await batch.UpsertProjectedFileAsync(completed);
+        Assert.Equal(FileProcessingStatus.Completed, (await batch.TryGetProjectedFileAsync(completed.FileKey))!.Status);
+        Assert.True(await batch.RemoveProjectedFileAsync(completed.FileKey));
+        Assert.Null(await batch.TryGetProjectedFileAsync(completed.FileKey));
+        await batch.FlushAsync();
+        Assert.Null(await repository.GetAsync(Tenant, completed.FileKey));
+        Assert.Null(ReadStatus(completed.FileKey));
+        AssertTrackingReleased(repository);
+    }
+
+    [Fact]
+    public async Task ProjectionBatch_OldJournalFailure_PreservesConcurrentLease()
+    {
+        using var repository = CreateRepository();
+        var pending = Metadata("journal-race");
+        await repository.AddOrUpdateAsync(pending);
+        var batch = repository.BeginProjectionBatch(Tenant);
+        await batch.UpsertProjectedFileAsync(pending);
+        var leased = await repository.GetNextPendingFileAsync(Tenant);
+        Assert.NotNull(leased);
+
+        using var service = new QueueEventProjectionService(
+            new Moq.Mock<IQueueEventJournal>(Moq.MockBehavior.Strict).Object, repository,
+            new Moq.Mock<ITenantQuotaManager>(Moq.MockBehavior.Strict).Object,
+            new Moq.Mock<IDirectoryQuotaManager>(Moq.MockBehavior.Strict).Object,
+            new System.IO.Abstractions.FileSystem(),
+            new QueueEventJournalOptions { QueueDirectory = Path.Combine(_directory, "queue") },
+            NullLogger<QueueEventProjectionService>.Instance);
+        var context = (AsyncLocal<IQueueProjectionBatch?>)typeof(QueueEventProjectionService)
+            .GetField("_currentProjectionBatch", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(service)!;
+        context.Value = batch;
+        try
+        {
+            var oldFailure = new QueueEventRecord
+            {
+                TenantId = Tenant, FileKey = pending.FileKey, EventType = QueueEventType.ProcessingFailed,
+                Status = FileProcessingStatus.Pending,
+                ProcessingStartTimeUtc = leased.ProcessingStartTime!.Value.AddHours(-1),
+                OccurredAtUtc = leased.ProcessingStartTime.Value.AddMinutes(-1),
+                RetryCount = 1, ErrorMessage = "old failure"
+            };
+            await (Task)typeof(QueueEventProjectionService)
+                .GetMethod("ProjectRecordAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(service, new object[] { oldFailure, CancellationToken.None })!;
+            await batch.FlushAsync();
+        }
+        finally
+        {
+            context.Value = null;
+            ((IDisposable)batch).Dispose();
+        }
+
+        var current = await repository.GetAsync(Tenant, pending.FileKey);
+        Assert.NotNull(current);
+        Assert.Equal(FileProcessingStatus.Processing, current.Status);
+        Assert.Equal(leased.ProcessingStartTime, current.ProcessingStartTime);
+        Assert.Equal(0, current.RetryCount);
+        Assert.Equal((long)FileProcessingStatus.Processing, ReadStatus(pending.FileKey));
+        AssertTrackingReleased(repository);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ProjectionBatch_RollbackAboveOlderColdRow_RestoresPending(bool delete, bool cancelFlush)
+    {
+        using var repository = CreateRepository();
+        var completed = Completed(Metadata("cold-rollback"));
+        await repository.AddOrUpdateAsync(completed);
+        var enabled = typeof(MetadataRepository).GetField("_enableBackgroundPersistence", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        // Queue the reset without starting a background task so the older cold row remains on disk.
+        enabled.SetValue(repository, true);
+        try
+        {
+            Assert.NotNull(await repository.TryResetFileToPendingAsync(Tenant, completed.FileKey));
+            var batch = repository.BeginProjectionBatch(Tenant);
+            if (delete)
+                Assert.True(await batch.RemoveProjectedFileAsync(completed.FileKey));
+            else
+                await batch.UpsertProjectedFileAsync(Completed(Metadata(completed.FileKey)));
+
+            if (cancelFlush)
+            {
+                using var cancellation = new CancellationTokenSource();
+                cancellation.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => batch.FlushAsync(cancellation.Token));
+            }
+            else
+                ((IDisposable)batch).Dispose();
+
+            Assert.Equal(FileProcessingStatus.Pending, (await repository.GetAsync(Tenant, completed.FileKey))!.Status);
+            while (Drain(repository)) { }
+            Assert.Equal((long)FileProcessingStatus.Pending, ReadStatus(completed.FileKey));
+            Assert.Equal(FileProcessingStatus.Pending, (await repository.GetAsync(Tenant, completed.FileKey))!.Status);
+            enabled.SetValue(repository, false);
+            Assert.NotNull(await repository.GetNextPendingFileAsync(Tenant));
+            AssertTrackingReleased(repository);
+        }
+        finally { enabled.SetValue(repository, false); }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task ProjectionBatch_DiagnosticFailureAfterCommit_PreservesCommittedState(bool statisticsFailure, bool fallbackFailure)
+    {
+        var armed = false;
+        var logger = new Moq.Mock<Microsoft.Extensions.Logging.ILogger<MetadataRepository>>();
+        logger.Setup(l => l.Log(Moq.It.IsAny<Microsoft.Extensions.Logging.LogLevel>(), Moq.It.IsAny<Microsoft.Extensions.Logging.EventId>(),
+                Moq.It.IsAny<Moq.It.IsAnyType>(), Moq.It.IsAny<Exception?>(), Moq.It.IsAny<Func<Moq.It.IsAnyType, Exception?, string>>()))
+            .Callback(new Moq.InvocationAction(invocation =>
+            {
+                var level = (Microsoft.Extensions.Logging.LogLevel)invocation.Arguments[0];
+                var message = invocation.Arguments[2].ToString()!;
+                if (armed && !statisticsFailure && message.StartsWith("Flushed 1 persistence operations"))
+                {
+                    armed = false;
+                    throw new InvalidOperationException("Injected post-commit log failure");
+                }
+                if (fallbackFailure && level == Microsoft.Extensions.Logging.LogLevel.Warning)
+                    throw new InvalidOperationException("Injected fallback log failure");
+            }));
+        var statistics = new Moq.Mock<ILocusStatisticsRecorder>();
+        statistics.Setup(s => s.Record(Moq.It.IsAny<string>(), Moq.It.IsAny<long>(), Moq.It.IsAny<DateTimeOffset>(),
+                Moq.It.IsAny<IReadOnlyDictionary<string, string?>?>()))
+            .Callback<string, long, DateTimeOffset, IReadOnlyDictionary<string, string?>?>((name, _, _, _) =>
+            {
+                if (armed && statisticsFailure && name == "metadata.sqlite.persisted.batch.count")
+                {
+                    armed = false;
+                    throw new InvalidOperationException("Injected post-commit statistics failure");
+                }
+            });
+        using var repository = new MetadataRepository(new System.IO.Abstractions.FileSystem(), logger.Object,
+            _directory, enableBackgroundPersistence: false, statisticsRecorder: statistics.Object);
+        var pending = Metadata("committed-diagnostic");
+        await repository.AddOrUpdateAsync(pending);
+        var processing = pending.Clone();
+        processing.Status = FileProcessingStatus.Processing;
+        processing.ProcessingStartTime = DateTime.UtcNow;
+        var batch = repository.BeginProjectionBatch(Tenant);
+        await batch.UpsertProjectedFileAsync(processing);
+        armed = true;
+        await batch.FlushAsync();
+        ((IDisposable)batch).Dispose();
+
+        var current = await repository.GetAsync(Tenant, pending.FileKey);
+        Assert.NotNull(current);
+        Assert.Equal(FileProcessingStatus.Processing, current.Status);
+        Assert.Equal(processing.ProcessingStartTime, current.ProcessingStartTime);
+        Assert.Equal((long)FileProcessingStatus.Processing, ReadStatus(pending.FileKey));
+        Assert.Null(await repository.GetNextPendingFileAsync(Tenant));
         AssertTrackingReleased(repository);
     }
 
