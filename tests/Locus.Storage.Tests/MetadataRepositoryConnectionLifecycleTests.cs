@@ -4,6 +4,7 @@ using Locus.Core.Models;
 using Locus.Storage.Data;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using Moq;
 
 namespace Locus.Storage.Tests;
@@ -165,6 +166,102 @@ public sealed class MetadataRepositoryConnectionLifecycleTests : IDisposable
 
     private MetadataRepository CreateRepository(IFileSystem? fileSystem = null) =>
         new(fileSystem ?? _fileSystem, NullLogger<MetadataRepository>.Instance, _directory, enableBackgroundPersistence: false);
+
+    [Fact]
+    public async Task ConnectionReopen_DoesNotOverwriteNewerProcessingState()
+    {
+        SeedDatabase();
+        using var repository = CreateRepository();
+        Assert.NotNull(await repository.GetAsync(TenantId, "existing"));
+        await repository.OptimizeDatabaseAsync(TenantId);
+        var metadata = CreateMetadata("existing");
+        metadata.Status = FileProcessingStatus.Processing;
+        metadata.ProcessingStartTime = DateTime.UtcNow;
+        await repository.AddOrUpdateAsync(metadata);
+
+        var actual = await repository.GetAsync(TenantId, "existing");
+        Assert.Equal(FileProcessingStatus.Processing, actual!.Status);
+        Assert.Equal(metadata.ProcessingStartTime, actual.ProcessingStartTime);
+        Assert.Null(await repository.GetNextPendingFileAsync(TenantId));
+        using var reopened = CreateRepository();
+        Assert.Equal(FileProcessingStatus.Processing, (await reopened.GetAsync(TenantId, "existing"))!.Status);
+    }
+
+    [Theory]
+    [InlineData(FileProcessingStatus.Processing)]
+    [InlineData(FileProcessingStatus.Completed)]
+    public async Task FirstLoad_PreservesNewerInMemoryState(FileProcessingStatus status)
+    {
+        SeedDatabase();
+        using var repository = CreateRepository();
+        var metadata = CreateMetadata("existing");
+        metadata.Status = status;
+        metadata.ProcessingStartTime = DateTime.UtcNow;
+        metadata.CompletedAt = DateTime.UtcNow;
+        await repository.AddOrUpdateAsync(metadata);
+
+        Assert.Equal(status, (await repository.GetAsync(TenantId, "existing"))!.Status);
+        Assert.Null(await repository.GetNextPendingFileAsync(TenantId));
+    }
+
+    [Fact]
+    public async Task ConnectionReopen_DoesNotResurrectRemovedFile()
+    {
+        SeedDatabase();
+        using var repository = CreateRepository();
+        Assert.NotNull(await repository.GetAsync(TenantId, "existing"));
+        await repository.OptimizeDatabaseAsync(TenantId);
+        Assert.True(await repository.RemoveAsync(TenantId, "existing"));
+        Assert.Null(await repository.GetAsync(TenantId, "existing"));
+        Assert.Null(await repository.GetNextPendingFileAsync(TenantId));
+    }
+
+    [Fact]
+    public async Task StartupLoadRetry_DoesNotDuplicatePendingIndexesOrOverwriteUpdates()
+    {
+        SeedDatabase();
+        var logger = new Mock<ILogger<MetadataRepository>>();
+        logger.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+        var failures = 0;
+        logger.Setup(l => l.Log(It.IsAny<LogLevel>(), It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((state, type) => state.ToString()!.StartsWith("Loaded ")),
+                It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Callback(() =>
+            {
+                if (Interlocked.Increment(ref failures) == 1)
+                    throw new SqliteException("Injected failure after startup hydration.", 5);
+            });
+        using var repository = new MetadataRepository(_fileSystem, logger.Object, _directory,
+            enableBackgroundPersistence: false, startupLoadBatchSize: 1);
+        await Assert.ThrowsAsync<SqliteException>(() => repository.GetAsync(TenantId, "existing"));
+        var newer = CreateMetadata("existing");
+        newer.Status = FileProcessingStatus.Completed;
+        newer.CompletedAt = DateTime.UtcNow;
+        await repository.AddOrUpdateAsync(newer);
+        Assert.Equal(FileProcessingStatus.Completed, (await repository.GetAsync(TenantId, "existing"))!.Status);
+        Assert.Null(await repository.GetNextPendingFileAsync(TenantId));
+
+        var another = CreateMetadata("another");
+        await repository.AddOrUpdateAsync(another);
+        Assert.Equal("another", (await repository.GetNextPendingFileAsync(TenantId))!.FileKey);
+        Assert.Null(await repository.GetNextPendingFileAsync(TenantId));
+    }
+
+    [Fact]
+    public async Task InitializationRetry_PreservesProcessingWrittenBeforeFirstSuccessfulLoad()
+    {
+        SeedDatabase();
+        using var repository = new FailingInitializationRepository(_fileSystem, _directory, 5);
+        var newer = CreateMetadata("existing");
+        newer.Status = FileProcessingStatus.Processing;
+        newer.ProcessingStartTime = DateTime.UtcNow;
+        await repository.AddOrUpdateAsync(newer);
+        Assert.Equal(1, repository.OpenAttempts);
+        var actual = await repository.GetAsync(TenantId, "existing");
+        Assert.Equal(FileProcessingStatus.Processing, actual!.Status);
+        Assert.Equal(newer.ProcessingStartTime, actual.ProcessingStartTime);
+        Assert.Null(await repository.GetNextPendingFileAsync(TenantId));
+    }
 
     private void SeedDatabase()
     {

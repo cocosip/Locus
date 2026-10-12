@@ -1009,6 +1009,118 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task RecoverOrphanedFiles_WhenSnapshotMissesNewProcessingFile_PreservesLeaseAndQuota()
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            Directory.CreateDirectory(tenantPath);
+            var path = Path.Combine(tenantPath, "raced.dat");
+            File.WriteAllText(path, "content");
+            var current = new FileMetadata
+            {
+                TenantId = "tenant-001", FileKey = "raced", VolumeId = "vol-001", PhysicalPath = path,
+                DirectoryPath = "/", Status = FileProcessingStatus.Processing, CreatedAt = DateTime.UtcNow,
+                ProcessingStartTime = DateTime.UtcNow, RetryCount = 3
+            };
+            var projection = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projection.Setup(s => s.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    await _metadataRepository.AddOrUpdateAsync(current);
+                    await SeedProjectedCountsAsync("tenant-001", "/");
+                    return Array.Empty<FileMetadata>();
+                });
+            projection.Setup(s => s.GetProjectedFileAsync("tenant-001", "raced", It.IsAny<CancellationToken>()))
+                .Returns(() => _metadataRepository.GetAsync("tenant-001", "raced"));
+            projection.Setup(s => s.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+                .Returns<FileMetadata, CancellationToken>((file, ct) => _metadataRepository.AddOrUpdateAsync(file, ct));
+            var cleanup = new StorageCleanupService(_metadataRepository, _quotaRepository, _tenantQuotaManager,
+                _fileSystem, _logger.Object, _metadataDir, _quotaDir, tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager, projectionStore: projection.Object,
+                allowLegacyNonJournalMode: true);
+            cleanup.RegisterVolume(_volume.Object);
+
+            await cleanup.RecoverOrphanedFilesAsync(_tenant.Object);
+
+            var actual = await _metadataRepository.GetAsync("tenant-001", "raced");
+            Assert.Equal(FileProcessingStatus.Processing, actual!.Status);
+            Assert.Equal(current.ProcessingStartTime, actual.ProcessingStartTime);
+            Assert.Equal(3, actual.RetryCount);
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001"));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/")).CurrentCount);
+            Assert.Equal(0, (await cleanup.GetCleanupStatisticsAsync()).OrphanedFilesRecovered);
+            projection.Verify(s => s.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task RecoverOrphanedFiles_WhenConditionalCreateLosesRace_RollsBackOnlyRecoveryQuota(bool fail)
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            Directory.CreateDirectory(tenantPath);
+            var path = Path.Combine(tenantPath, "race.dat");
+            File.WriteAllText(path, "content");
+            var projection = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projection.Setup(s => s.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projection.Setup(s => s.GetProjectedFileAsync("tenant-001", "race", It.IsAny<CancellationToken>()))
+                .ReturnsAsync((FileMetadata?)null);
+            var lease = DateTime.UtcNow;
+            projection.As<IQueueProjectionRecoveryStore>()
+                .Setup(s => s.TryAddRecoveredFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+                .Returns<FileMetadata, CancellationToken>(async (candidate, ct) =>
+                {
+                    var newer = candidate.Clone();
+                    newer.Status = FileProcessingStatus.Processing;
+                    newer.ProcessingStartTime = lease;
+                    newer.RetryCount = 4;
+                    await _metadataRepository.AddOrUpdateAsync(newer, ct);
+                    await SeedProjectedCountsAsync("tenant-001", "/");
+                    if (fail) throw new SqliteException("Injected creation failure", 5);
+                    return await new MetadataRepositoryQueueProjectionStore(_metadataRepository).TryAddRecoveredFileAsync(candidate, ct);
+                });
+            var cleanup = new StorageCleanupService(_metadataRepository, _quotaRepository, _tenantQuotaManager,
+                _fileSystem, _logger.Object, _metadataDir, _quotaDir, tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager, projectionStore: projection.Object,
+                allowLegacyNonJournalMode: true);
+            cleanup.RegisterVolume(_volume.Object);
+
+            await cleanup.RecoverOrphanedFilesAsync(_tenant.Object);
+
+            var current = await _metadataRepository.GetAsync("tenant-001", "race");
+            Assert.Equal(FileProcessingStatus.Processing, current!.Status);
+            Assert.Equal(lease, current.ProcessingStartTime);
+            Assert.Equal(4, current.RetryCount);
+            Assert.Equal(1, await _tenantQuotaManager.GetFileCountAsync("tenant-001"));
+            Assert.Equal(1, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/")).CurrentCount);
+            Assert.Equal(0, (await cleanup.GetCleanupStatisticsAsync()).OrphanedFilesRecovered);
+        }
+
+        [Fact]
+        public async Task RecoverOrphanedFiles_WhenCustomStoreHasNoAtomicCreate_DefersWithoutQuotaChanges()
+        {
+            var tenantPath = Path.Combine(_volumePath, "tenant-001");
+            Directory.CreateDirectory(tenantPath);
+            var path = Path.Combine(tenantPath, "unsupported.dat");
+            File.WriteAllText(path, "content");
+            var projection = new Mock<IQueueProjectionStore>(MockBehavior.Strict);
+            projection.Setup(s => s.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<FileMetadata>());
+            projection.Setup(s => s.GetProjectedFileAsync("tenant-001", "unsupported", It.IsAny<CancellationToken>()))
+                .ReturnsAsync((FileMetadata?)null);
+            var cleanup = new StorageCleanupService(_metadataRepository, _quotaRepository, _tenantQuotaManager,
+                _fileSystem, _logger.Object, _metadataDir, _quotaDir, tenantManager: _tenantManager.Object,
+                directoryQuotaManager: _directoryQuotaManager, projectionStore: projection.Object,
+                allowLegacyNonJournalMode: true);
+            cleanup.RegisterVolume(_volume.Object);
+            await cleanup.RecoverOrphanedFilesAsync(_tenant.Object);
+            Assert.True(File.Exists(path));
+            Assert.Null(await _metadataRepository.GetAsync("tenant-001", "unsupported"));
+            Assert.Equal(0, await _tenantQuotaManager.GetFileCountAsync("tenant-001"));
+            Assert.Equal(0, (await _quotaRepository.GetOrCreateAsync("tenant-001", "/")).CurrentCount);
+        }
+
+        [Fact]
         public async Task RecoverOrphanedFilesAsync_PreservesMeaningfulNestedLogicalDirectory()
         {
             var nestedPath = Path.Combine(_volumePath, "tenant-001", "incoming", "studies");
@@ -1659,10 +1771,10 @@ namespace Locus.Storage.Tests
             projectionStore
                 .Setup(store => store.GetProjectedFileAsync("tenant-001", "projection-store", It.IsAny<CancellationToken>()))
                 .ReturnsAsync((FileMetadata?)null);
-            projectionStore
-                .Setup(store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+            projectionStore.As<IQueueProjectionRecoveryStore>()
+                .Setup(store => store.TryAddRecoveredFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
                 .Callback<FileMetadata, CancellationToken>((metadata, _) => capturedMetadata = metadata.Clone())
-                .Returns(Task.CompletedTask);
+                .ReturnsAsync(true);
 
             var cleanupService = new StorageCleanupService(
                 _metadataRepository,
@@ -1696,8 +1808,8 @@ namespace Locus.Storage.Tests
             projectionStore.Verify(
                 store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()),
                 Times.Once);
-            projectionStore.Verify(
-                store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()),
+            projectionStore.As<IQueueProjectionRecoveryStore>().Verify(
+                store => store.TryAddRecoveredFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()),
                 Times.Once);
         }
 
@@ -1829,10 +1941,10 @@ namespace Locus.Storage.Tests
                 projectionStore
                     .Setup(store => store.GetProjectedFileAsync("tenant-001", "rebuild-me", It.IsAny<CancellationToken>()))
                     .ReturnsAsync((FileMetadata?)null);
-                projectionStore
-                    .Setup(store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
+                projectionStore.As<IQueueProjectionRecoveryStore>()
+                    .Setup(store => store.TryAddRecoveredFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()))
                     .Callback<FileMetadata, CancellationToken>((metadata, _) => capturedMetadata = metadata)
-                    .Returns(Task.CompletedTask);
+                    .ReturnsAsync(true);
 
                 var cleanupService = new StorageCleanupService(
                     _metadataRepository,
@@ -1857,7 +1969,7 @@ namespace Locus.Storage.Tests
                 Assert.Equal(orphanPath, capturedMetadata.PhysicalPath);
                 Assert.Equal("rebuild-me", capturedMetadata.FileKey);
                 projectionStore.Verify(store => store.GetProjectedFilesAsync("tenant-001", It.IsAny<CancellationToken>()), Times.Once);
-                projectionStore.Verify(store => store.UpsertProjectedFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()), Times.Once);
+                projectionStore.As<IQueueProjectionRecoveryStore>().Verify(store => store.TryAddRecoveredFileAsync(It.IsAny<FileMetadata>(), It.IsAny<CancellationToken>()), Times.Once);
             }
             finally
             {

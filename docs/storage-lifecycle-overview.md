@@ -57,6 +57,16 @@ This keeps memory proportional to the active processing working set instead of t
 
 `Pending` and `Processing` scheduling still uses in-memory queues and indexes. Completed-file cleanup, permanently-failed cleanup, physical-path existence checks for cold rows, and broad management listings use SQLite-backed queries.
 
+### 连接重开、持久化重试与恢复边界
+
+每个租户只在首次成功初始化时加载热状态。VACUUM 或事务恢复引起的连接重开不会重新加载旧的 SQLite 行，也不会把较新的 `Processing` 状态退回 `Pending`。首次加载或加载失败重试时，已经发生的内存更新优先；未接纳的旧行不再加入调度索引。
+
+后台持久化与直接投影写入共享每文件操作顺序。较新的操作提交后，跨批次重排的旧 upsert/delete 会被跳过，防止状态回退或已删除记录复活。顺序信息只保留到该文件的未结清操作全部处理完毕；失败或取消的投影批次会释放跟踪并回滚仍由本批次持有的内存状态。
+
+orphan 扫描使用路径快照减少查询，但恢复前仍查询当前元数据。同路径记录已经存在时保留其状态、租约和配额；真正缺失的记录通过可选 `IQueueProjectionRecoveryStore.TryAddRecoveredFileAsync` 条件创建，同时检查热缓存、未结清操作和 SQLite。默认投影存储提供此能力。自定义 `IQueueProjectionStore` 无需新增必实现成员，但如果不实现原子创建能力，orphan 恢复会延后并记录日志。创建未成功时回滚本次已完成的配额补偿；补偿回滚失败会分别记录错误，需要后续配额核对。
+
+源文件指纹检查中的 `IOException`（文件已缺失除外）或权限异常表示暂时无法验证，进入现有清理失败与退避流程，保留任务和 `ImportOperationId`。达到重试上限后的隔离检查也遵循此规则，暂时无法验证时保留 `MovePending`。只有已确认源缺失或指纹不匹配时才结束旧任务；取消不计为普通失败。既有 `Keep`/`Failed` 保留期、数据库结构与 journal 格式不变。
+
 ```mermaid
 flowchart LR
     Client["调用方 / Worker"] --> Pool["StoragePool / IStoragePool"]

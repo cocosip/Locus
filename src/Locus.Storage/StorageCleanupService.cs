@@ -472,6 +472,9 @@ namespace Locus.Storage
                                             .GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, ct)
                                             .ConfigureAwait(false);
                                         if (existingMetadata != null
+                                            && PathsEqual(existingMetadata.PhysicalPath, metadata.PhysicalPath))
+                                            continue;
+                                        if (existingMetadata != null
                                             && !PathsEqual(existingMetadata.PhysicalPath, metadata.PhysicalPath))
                                         {
                                             if (ShouldRepairExistingMetadataPath(existingMetadata.PhysicalPath, metadata.PhysicalPath))
@@ -509,27 +512,45 @@ namespace Locus.Storage
                                             continue;
                                         }
 
+                                        if (!(_projectionStore is IQueueProjectionRecoveryStore recoveryStore))
+                                        {
+                                            _logger.LogWarning("Deferring orphan recovery: projection store has no atomic creation capability. Tenant={TenantId}, FileKey={FileKey}", metadata.TenantId, metadata.FileKey);
+                                            continue;
+                                        }
+
                                         var tenantReservationConsumed = false;
                                         var directoryReservationConsumed = false;
+                                        var tenantCompensationApplied = false;
+                                        var directoryCompensationApplied = false;
                                         try
                                         {
                                             tenantReservationConsumed = await ApplyAcceptedTenantProjectionAsync(metadata.TenantId, default);
+                                            tenantCompensationApplied = true;
                                             directoryReservationConsumed = await ApplyAcceptedDirectoryProjectionAsync(
                                                 metadata.TenantId,
                                                 metadata.DirectoryPath,
                                                 default);
+                                            directoryCompensationApplied = true;
                                             QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
 
                                             // Persist rebuilt metadata only after quota compensation succeeds so we never
                                             // re-queue a file whose quota counters still under-report real usage.
-                                            await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
+                                            if (!await recoveryStore.TryAddRecoveredFileAsync(metadata, ct).ConfigureAwait(false))
+                                            {
+                                                await RollbackRebuiltFileQuotaCompensationAsync(
+                                                    metadata, tenantReservationConsumed, directoryReservationConsumed,
+                                                    tenantCompensationApplied, directoryCompensationApplied);
+                                                continue;
+                                            }
                                         }
                                         catch
                                         {
                                             await RollbackRebuiltFileQuotaCompensationAsync(
                                                 metadata,
                                                 tenantReservationConsumed,
-                                                directoryReservationConsumed);
+                                                directoryReservationConsumed,
+                                                tenantCompensationApplied,
+                                                directoryCompensationApplied);
                                             throw;
                                         }
 
@@ -960,19 +981,24 @@ namespace Locus.Storage
         private async Task RollbackRebuiltFileQuotaCompensationAsync(
             FileMetadata metadata,
             bool tenantRestoreReservation,
-            bool directoryRestoreReservation)
+            bool directoryRestoreReservation,
+            bool tenantCompensationApplied,
+            bool directoryCompensationApplied)
         {
             var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
 
-            if (directoryRestoreReservation)
+            if (directoryCompensationApplied)
             {
                 try
                 {
-                    await RollbackAcceptedDirectoryProjectionAsync(
+                    if (_directoryQuotaManager is IDirectoryQuotaProjectionManager)
+                        await RollbackAcceptedDirectoryProjectionAsync(
                         metadata.TenantId,
                         normalizedDirectoryPath,
                         directoryRestoreReservation,
                         default);
+                    else
+                        await _quotaMaintenanceStore.DecrementAsync(metadata.TenantId, normalizedDirectoryPath, default);
                 }
                 catch (Exception ex)
                 {
@@ -985,11 +1011,14 @@ namespace Locus.Storage
                 }
             }
 
-            if (tenantRestoreReservation)
+            if (tenantCompensationApplied)
             {
                 try
                 {
-                    await RollbackAcceptedTenantProjectionAsync(metadata.TenantId, tenantRestoreReservation, default);
+                    if (_tenantQuotaManager is ITenantQuotaProjectionManager)
+                        await RollbackAcceptedTenantProjectionAsync(metadata.TenantId, tenantRestoreReservation, default);
+                    else
+                        await _tenantQuotaManager.DecrementFileCountAsync(metadata.TenantId, default);
                 }
                 catch (Exception ex)
                 {

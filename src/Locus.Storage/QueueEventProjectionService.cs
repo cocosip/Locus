@@ -448,6 +448,7 @@ namespace Locus.Storage
                 return;
 
             _currentProjectionBatch.Value = null;
+            (batch as IDisposable)?.Dispose();
         }
 
         private Task UpsertProjectedFileAsync(FileMetadata metadata, CancellationToken ct)
