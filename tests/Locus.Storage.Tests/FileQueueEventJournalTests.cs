@@ -1360,12 +1360,19 @@ namespace Locus.Storage.Tests
                 allowJournalScanCatchUp: false);
             Assert.True(GetJournalStateTailOffset(initialState) > 0);
 
+            var statePath = Path.Combine(queueDirectory, tenantId, "queue.state.json");
+            var initialLastWriteTimeUtc = _fileSystem.File.GetLastWriteTimeUtc(statePath);
+
             await writer.AppendAsync(new QueueEventRecord
             {
                 TenantId = tenantId,
                 FileKey = "file-002",
                 EventType = QueueEventType.Accepted,
             }, CancellationToken.None);
+
+            // Rapid same-size state replacements can retain the same timestamp on Windows.
+            // Establish the changed-stamp precondition without relying on clock granularity.
+            _fileSystem.File.SetLastWriteTimeUtc(statePath, initialLastWriteTimeUtc.AddSeconds(1));
 
             var reloadedState = InvokeLoadJournalStateForLockedOperation(
                 reader,
