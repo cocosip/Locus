@@ -13,6 +13,112 @@ namespace Locus.Storage.Tests
 {
     public sealed class SourceCleanupWorkerTests
     {
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(true, false)]
+        [InlineData(false, true)]
+        public async Task ProcessDueJobs_WhenSourceReadIsLocked_RetainsJobForRetry(bool movePending, bool exhausted)
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var source = Path.Combine(directory, "locked.dcm");
+                File.WriteAllText(source, "content");
+                var job = CreateJob(directory, source, FingerprintFor(source));
+                job.ImportOperationId = "same-import";
+                job.RetryInitialDelay = job.RetryMaxDelay = TimeSpan.FromMinutes(1);
+                job.FailureDirectory = Path.Combine(directory, "failed");
+                job.MaxAttempts = exhausted ? 1 : 3;
+                job.State = movePending ? SourceCleanupJobState.MovePending : SourceCleanupJobState.Pending;
+                using var store = new SourceCleanupStore(Path.Combine(directory, "state.db"));
+                var id = await store.UpsertAsync(job);
+                var worker = CreateWorker(store);
+                using (File.Open(source, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                var retained = await store.GetActiveAsync(source, job.Fingerprint);
+                Assert.NotNull(retained);
+                Assert.Equal(id, retained!.Id);
+                Assert.Equal("same-import", retained.ImportOperationId);
+                Assert.Equal(1, retained.AttemptCount);
+                Assert.Equal(movePending || exhausted ? SourceCleanupJobState.MovePending : SourceCleanupJobState.Retrying, retained.State);
+                Assert.NotNull(retained.NextAttemptUtc);
+                Assert.False(string.IsNullOrWhiteSpace(retained.LastError));
+                retained.NextAttemptUtc = DateTime.UtcNow.AddSeconds(-1);
+                await store.UpdateAsync(retained);
+                await worker.ProcessDueJobsAsync(CancellationToken.None);
+                Assert.False(File.Exists(source));
+                Assert.Null(await store.GetActiveAsync(source, job.Fingerprint));
+                if (movePending || exhausted)
+                    Assert.True(File.Exists(Path.Combine(job.FailureDirectory, "watcher", "locked.dcm")));
+            }
+            finally { DeleteDirectory(directory); }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobs_WhenFingerprintReadIsUnauthorized_RetriesInsteadOfCompleting()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var source = Path.Combine(directory, "permission.dcm");
+                File.WriteAllText(source, "content");
+                var job = CreateJob(directory, source, FingerprintFor(source));
+                job.RetryInitialDelay = job.RetryMaxDelay = TimeSpan.FromMinutes(1);
+                using var store = new SourceCleanupStore(Path.Combine(directory, "state.db"));
+                await store.UpsertAsync(job);
+                var file = new Mock<IFile>();
+                file.Setup(f => f.Exists(source)).Returns(true);
+                file.Setup(f => f.OpenRead(source)).Throws(new UnauthorizedAccessException("Injected permission failure"));
+                var fs = new Mock<IFileSystem>();
+                fs.SetupGet(f => f.File).Returns(file.Object);
+                fs.SetupGet(f => f.FileInfo).Returns(new System.IO.Abstractions.FileSystem().FileInfo);
+                var worker = new SourceCleanupWorker(store, fs.Object,
+                    new SourceCleanupOptions { Enabled = true }, NullLogger<SourceCleanupWorker>.Instance);
+
+                await worker.ProcessDueJobsAsync(CancellationToken.None);
+
+                var retained = await store.GetActiveAsync(source, job.Fingerprint);
+                Assert.Equal(SourceCleanupJobState.Retrying, retained!.State);
+                Assert.Equal(1, retained.AttemptCount);
+                file.Verify(f => f.Delete(It.IsAny<string>()), Times.Never);
+            }
+            finally { DeleteDirectory(directory); }
+        }
+
+        [Fact]
+        public async Task ProcessDueJobs_WhenCancelledDuringFingerprintRead_DoesNotRecordFailure()
+        {
+            var directory = CreateDirectory();
+            try
+            {
+                var source = Path.Combine(directory, "cancelled.dcm");
+                File.WriteAllText(source, "content");
+                var job = CreateJob(directory, source, FingerprintFor(source));
+                using var store = new SourceCleanupStore(Path.Combine(directory, "state.db"));
+                await store.UpsertAsync(job);
+                using var cancellation = new CancellationTokenSource();
+                var file = new Mock<IFile>();
+                file.Setup(f => f.Exists(source)).Returns(true);
+                file.Setup(f => f.OpenRead(source)).Returns(() =>
+                {
+                    cancellation.Cancel();
+                    throw new OperationCanceledException(cancellation.Token);
+                });
+                var fs = new Mock<IFileSystem>();
+                fs.SetupGet(f => f.File).Returns(file.Object);
+                fs.SetupGet(f => f.FileInfo).Returns(new System.IO.Abstractions.FileSystem().FileInfo);
+                var worker = new SourceCleanupWorker(store, fs.Object,
+                    new SourceCleanupOptions { Enabled = true }, NullLogger<SourceCleanupWorker>.Instance);
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.ProcessDueJobsAsync(cancellation.Token));
+                var retained = await store.GetActiveAsync(source, job.Fingerprint);
+                Assert.Equal(0, retained!.AttemptCount);
+                Assert.Null(retained.LastError);
+                Assert.True(File.Exists(source));
+            }
+            finally { DeleteDirectory(directory); }
+        }
+
         [Fact]
         public async Task ProcessDueJobsAsync_DeletesSourceAndRemovesCompletedJob()
         {

@@ -239,9 +239,13 @@ namespace Locus.Storage
 
                     await _store.RemoveAsync(job.Id, ct).ConfigureAwait(false);
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
-                    await RecordFailureAsync(job, ex.Message, movePending: false, ct).ConfigureAwait(false);
+                    await RecordFailureAsync(job, ex.Message, movePending: job.State == SourceCleanupJobState.MovePending, ct).ConfigureAwait(false);
                 }
             }
             finally
@@ -293,11 +297,6 @@ namespace Locus.Storage
             if (!_fileSystem.File.Exists(job.SourcePath))
                 return true;
 
-            // A producer may have reused the path while this job was waiting. Treat the
-            // old job as complete rather than moving the replacement file to quarantine.
-            if (!FingerprintMetadataMatches(job))
-                return true;
-
             if (string.IsNullOrWhiteSpace(job.FailureDirectory))
                 return false;
 
@@ -307,6 +306,9 @@ namespace Locus.Storage
             var target = _fileSystem.Path.Combine(directory, fileName);
             try
             {
+                // Verification failures keep MovePending; only a proven replacement completes it.
+                if (!FingerprintMetadataMatches(job))
+                    return true;
                 _fileSystem.Directory.CreateDirectory(directory);
                 await _sourceFileRelocator.RelocateAsync(job.SourcePath, target, ct).ConfigureAwait(false);
                 return true;
@@ -379,11 +381,11 @@ namespace Locus.Storage
 
                 return string.Equals(parts[5], ComputeContentSampleHash(job.SourcePath, info.Length), StringComparison.Ordinal);
             }
-            catch (IOException)
+            catch (FileNotFoundException)
             {
                 return false;
             }
-            catch (UnauthorizedAccessException)
+            catch (DirectoryNotFoundException)
             {
                 return false;
             }

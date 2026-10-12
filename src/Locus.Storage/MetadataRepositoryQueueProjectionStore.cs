@@ -10,7 +10,7 @@ namespace Locus.Storage
     /// <summary>
     /// Adapts <see cref="MetadataRepository"/> to the scheduler-facing projection store contract.
     /// </summary>
-    public sealed class MetadataRepositoryQueueProjectionStore : IQueueProjectionStore, IProjectionSnapshotSource, IQueueProjectionBatchStore
+    public sealed class MetadataRepositoryQueueProjectionStore : IQueueProjectionStore, IProjectionSnapshotSource, IQueueProjectionBatchStore, IQueueProjectionRecoveryStore
     {
         private readonly MetadataRepository _repository;
 
@@ -88,6 +88,12 @@ namespace Locus.Storage
         public Task UpsertProjectedFileAsync(FileMetadata metadata, CancellationToken ct = default)
         {
             return _repository.AddOrUpdateDirectAsync(metadata, ct);
+        }
+
+        /// <inheritdoc/>
+        public Task<bool> TryAddRecoveredFileAsync(FileMetadata metadata, CancellationToken ct = default)
+        {
+            return _repository.TryAddRecoveredFileAsync(metadata, ct);
         }
 
         /// <inheritdoc/>

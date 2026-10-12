@@ -79,6 +79,10 @@ namespace Locus.Storage.Data
         // Per-tenant SQLite connections (using Lazy for thread-safe initialization)
         private readonly ConcurrentDictionary<string, Lazy<SqliteConnection>> _databases;
         private readonly ConcurrentDictionary<string, object> _databaseLocks;
+        // Cache hydration is a tenant lifecycle, independent of connection lifetime.
+        private readonly ConcurrentDictionary<string, object> _cacheMutationLocks = new();
+        private readonly ConcurrentDictionary<string, bool> _hydratedTenants = new();
+        private readonly ConcurrentDictionary<string, HashSet<string>> _startupMutatedKeys = new();
 
         // Per-tenant locks for concurrent file allocation.
         // NOTE: Locks are intentionally retained for the lifetime of the repository even if a
@@ -163,6 +167,14 @@ namespace Locus.Storage.Data
         private int _persistenceChannelPeakDepth;
         private int _coalescedDepth;
         private long _persistenceOperationSequence;
+        private readonly object _persistenceOrderLock = new();
+        private readonly Dictionary<(string TenantId, string FileKey), PersistenceOrderState> _persistenceOrder = new();
+
+        private sealed class PersistenceOrderState
+        {
+            public readonly HashSet<long> Outstanding = new();
+            public long CommittedSequence;
+        }
 
         private volatile bool _disposed;
 
@@ -616,7 +628,15 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                         _logger.LogDebug("Created/opened SQLite database for tenant {TenantId} at {Path}", tid, dbPath);
 
                         // Load active files into memory on first access
-                        LoadActiveFilesForTenant(tid, conn);
+                        if (!_hydratedTenants.ContainsKey(tid))
+                        {
+                            LoadActiveFilesForTenant(tid, conn);
+                            lock (GetCacheMutationLock(tid))
+                            {
+                                _hydratedTenants[tid] = true;
+                                _startupMutatedKeys.TryRemove(tid, out _);
+                            }
+                        }
 
                         return conn;
                     }
@@ -641,6 +661,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                             if (_activeFiles.TryRemove(tid, out var staleTenantCache))
                                 RemoveTenantFromGlobalIndex(staleTenantCache);
                             _physicalPathIndex.TryRemove(tid, out _);
+                            _hydratedTenants.TryRemove(tid, out _);
 
                             // Rebuild database without acquiring the tenant lock (we may be called
                             // from within the Lazy factory which is already locked via ExecutionAndPublication).
@@ -827,9 +848,6 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             if (totalLoaded == 0)
                 return;
 
-            // Seed the O(1) pending count so CompactPendingQueues can check bloat without scanning.
-            _pendingFileCounts[tenantId] = pendingCount;
-
             _logger.LogInformation(
                 "Loaded {Count} hot metadata files for tenant {TenantId} into memory in {BatchCount} startup batch(es) (batchSize={BatchSize})",
                 totalLoaded, tenantId, batchCount, _startupLoadBatchSize);
@@ -908,27 +926,45 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             DateTime nowUtc,
             ref int pendingCount)
         {
-            foreach (var file in batch)
+            var admitted = 0;
+            lock (GetCacheMutationLock(tenantId))
             {
-                cache[file.FileKey] = file;
-                _fileKeyTenantIndex[file.FileKey] = tenantId;
-                IndexPhysicalPathCandidate(tenantId, file.FileKey, previous: null, file);
-                IndexStatusCandidate(null, file);
+                foreach (var file in batch)
+                {
+                    if ((_startupMutatedKeys.TryGetValue(tenantId, out var mutated) && mutated.Contains(file.FileKey))
+                        || !cache.TryAdd(file.FileKey, file))
+                        continue;
 
-                if (file.Status != FileProcessingStatus.Pending)
-                    continue;
+                    admitted++;
+                    _fileKeyTenantIndex[file.FileKey] = tenantId;
+                    IndexPhysicalPathCandidate(tenantId, file.FileKey, previous: null, file);
+                    IndexStatusCandidate(null, file);
 
-                var generation = GetOrCreatePendingGeneration(tenantId, file.FileKey);
-                var entry = new PendingQueueEntry(file.FileKey, generation);
-                if (file.AvailableForProcessingAt.HasValue && file.AvailableForProcessingAt.Value > nowUtc)
-                    EnqueueDelayed(tenantId, entry, file.AvailableForProcessingAt.Value);
-                else
-                    pendingQueue.Enqueue(entry);
+                    if (file.Status != FileProcessingStatus.Pending)
+                        continue;
 
-                pendingCount++;
+                    var generation = GetOrCreatePendingGeneration(tenantId, file.FileKey);
+                    var entry = new PendingQueueEntry(file.FileKey, generation);
+                    if (file.AvailableForProcessingAt.HasValue && file.AvailableForProcessingAt.Value > nowUtc)
+                        EnqueueDelayed(tenantId, entry, file.AvailableForProcessingAt.Value);
+                    else
+                        pendingQueue.Enqueue(entry);
+
+                    pendingCount++;
+                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, count) => count + 1);
+                }
             }
 
-            return batch.Count;
+            return admitted;
+        }
+
+        private object GetCacheMutationLock(string tenantId) =>
+            _cacheMutationLocks.GetOrAdd(tenantId, _ => new object());
+
+        private void RecordStartupMutation(string tenantId, string fileKey)
+        {
+            if (!_hydratedTenants.ContainsKey(tenantId))
+                _startupMutatedKeys.GetOrAdd(tenantId, _ => new HashSet<string>(StringComparer.Ordinal)).Add(fileKey);
         }
 
         private static bool IsHotCachedStatus(FileProcessingStatus status)
@@ -972,7 +1008,12 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                 Stopwatch.GetTimestamp() - validationStarted);
 
             // 1. Update hot in-memory state FIRST -- always succeeds, immediately visible to schedulers.
-            UpdateCacheAndIndices(metadata, observeProjectionWritePath: true);
+            PersistenceOperation persistenceOperation;
+            lock (GetCacheMutationLock(metadata.TenantId))
+            {
+                UpdateCacheAndIndices(metadata, observeProjectionWritePath: true);
+                persistenceOperation = CreatePersistenceUpsert(metadata);
+            }
 
             _logger.LogDebug("Added/updated metadata for file: {FileKey}, Tenant: {TenantId}, Status: {Status}",
                 metadata.FileKey, metadata.TenantId, metadata.Status);
@@ -981,7 +1022,6 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             // in memory, so enqueue them through the same ordered path and drain immediately
             // so DB-backed cleanup and management queries can observe the latest state.
             var persistenceEnqueueStarted = Stopwatch.GetTimestamp();
-            var persistenceOperation = CreatePersistenceUpsert(metadata);
             EnqueuePersistence(persistenceOperation);
             if (!IsHotCachedStatus(metadata.Status) && _enableBackgroundPersistence)
                 DrainPersistenceQueue();
@@ -1008,6 +1048,36 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             return new DirectProjectionBatch(this, tenantId);
         }
 
+        internal Task<bool> TryAddRecoveredFileAsync(FileMetadata metadata, CancellationToken ct = default)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MetadataRepository));
+            ValidateUpsertMetadata(metadata);
+            ct.ThrowIfCancellationRequested();
+            lock (GetDatabaseLock(metadata.TenantId))
+            {
+                var conn = GetDatabase(metadata.TenantId);
+                lock (GetCacheMutationLock(metadata.TenantId))
+                {
+                    if (_activeFiles.TryGetValue(metadata.TenantId, out var cache) && cache.ContainsKey(metadata.FileKey))
+                        return Task.FromResult(false);
+                    lock (_persistenceOrderLock)
+                    {
+                        if (_persistenceOrder.ContainsKey((metadata.TenantId, metadata.FileKey)))
+                            return Task.FromResult(false);
+                    }
+
+                    // SQLite arbitrates concurrent creators in other repository instances too.
+                    using var txn = conn.BeginTransaction();
+                    var added = UpsertFile(conn, txn, metadata, insertOnly: true);
+                    txn.Commit();
+                    if (added)
+                        UpdateCacheAndIndices(metadata.Clone());
+                    return Task.FromResult(added);
+                }
+            }
+        }
+
         /// <summary>
         /// Adds or updates file metadata with immediate synchronous SQLite write.
         /// Bypasses the Write-Behind queue -- use only for maintenance operations such as
@@ -1019,12 +1089,18 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                 throw new ObjectDisposedException(nameof(MetadataRepository));
 
             ValidateUpsertMetadata(metadata);
+            ct.ThrowIfCancellationRequested();
 
             // Update in-memory cache (same logic as AddOrUpdateAsync).
-            UpdateCacheAndIndices(metadata);
+            PersistenceOperation operation;
+            lock (GetCacheMutationLock(metadata.TenantId))
+            {
+                UpdateCacheAndIndices(metadata);
+                operation = CreatePersistenceUpsert(metadata);
+            }
 
             // Write directly to SQLite (synchronous -- required for rebuild correctness)
-            ExecuteDirectBatch(metadata.TenantId, new List<PersistenceOperation> { CreatePersistenceUpsert(metadata) });
+            ExecuteDirectBatch(metadata.TenantId, new List<PersistenceOperation> { operation });
 
             return Task.CompletedTask;
         }
@@ -1054,6 +1130,15 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
         /// </list>
         /// </summary>
         private void UpdateCacheAndIndices(FileMetadata metadata, bool observeProjectionWritePath = false)
+        {
+            lock (GetCacheMutationLock(metadata.TenantId))
+            {
+                RecordStartupMutation(metadata.TenantId, metadata.FileKey);
+                UpdateCacheAndIndicesCore(metadata, observeProjectionWritePath);
+            }
+        }
+
+        private void UpdateCacheAndIndicesCore(FileMetadata metadata, bool observeProjectionWritePath)
         {
             var cacheAndIndexStarted = observeProjectionWritePath
                 ? Stopwatch.GetTimestamp()
@@ -1192,28 +1277,32 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
             ct.ThrowIfCancellationRequested();
-            var removed = TryRemoveFromCacheAndIndices(tenantId, fileKey, out var removedMetadata);
-
-            if (removed)
+            lock (GetDatabaseLock(tenantId))
+            lock (GetCacheMutationLock(tenantId))
             {
-                // No explicit removal from _pendingKeys: ConcurrentQueue does not support
-                // O(1) keyed removal. The stale entry (if any) will be skipped by the
-                // dequeue-and-validate loop in GetNextPendingFileAsync.
+                var removed = TryRemoveFromCacheAndIndices(tenantId, fileKey, out var removedMetadata);
 
-                // Queue SQLite deletion -- caller is not blocked by disk I/O
-                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
+                if (removed)
+                {
+                    // No explicit removal from _pendingKeys: ConcurrentQueue does not support
+                    // O(1) keyed removal. The stale entry (if any) will be skipped by the
+                    // dequeue-and-validate loop in GetNextPendingFileAsync.
 
-                _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                    // Queue SQLite deletion -- caller is not blocked by disk I/O
+                    EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
+
+                    _logger.LogDebug("Removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                }
+                else if (TryDeleteFromDatabase(tenantId, fileKey))
+                {
+                    removed = true;
+                    _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                    InvalidatePendingGeneration(tenantId, fileKey);
+                    _logger.LogDebug("Removed cold metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                }
+
+                return Task.FromResult(removed);
             }
-            else if (TryDeleteFromDatabase(tenantId, fileKey))
-            {
-                removed = true;
-                _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                InvalidatePendingGeneration(tenantId, fileKey);
-                _logger.LogDebug("Removed cold metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
-            }
-
-            return Task.FromResult(removed);
         }
 
         /// <summary>
@@ -1230,28 +1319,42 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            if (TryRemoveFromCacheAndIndices(tenantId, fileKey, out _))
+            lock (GetDatabaseLock(tenantId))
+            lock (GetCacheMutationLock(tenantId))
             {
-                ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { CreatePersistenceDelete(tenantId, fileKey) });
+                if (TryRemoveFromCacheAndIndices(tenantId, fileKey, out _))
+                {
+                    ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { CreatePersistenceDelete(tenantId, fileKey) });
 
-                _logger.LogDebug("Directly removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
-                return Task.FromResult(true);
+                    _logger.LogDebug("Directly removed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                    return Task.FromResult(true);
+                }
+
+                if (TryGetFromDatabase(tenantId, fileKey) != null)
+                {
+                    ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { CreatePersistenceDelete(tenantId, fileKey) });
+
+                    _logger.LogDebug("Directly removed cold metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                    return Task.FromResult(true);
+                }
+
             }
-
-            if (TryGetFromDatabase(tenantId, fileKey) != null)
-            {
-                ExecuteDirectBatch(tenantId, new List<PersistenceOperation> { CreatePersistenceDelete(tenantId, fileKey) });
-
-                _logger.LogDebug("Directly removed cold metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
-                return Task.FromResult(true);
-            }
-
             return Task.FromResult(false);
         }
 
         private bool TryRemoveFromCacheAndIndices(string tenantId, string fileKey, out FileMetadata? removedMetadata)
         {
             var cache = GetCache(tenantId);
+            lock (GetCacheMutationLock(tenantId))
+            {
+                RecordStartupMutation(tenantId, fileKey);
+                return TryRemoveFromCacheAndIndicesCore(tenantId, fileKey, cache, out removedMetadata);
+            }
+        }
+
+        private bool TryRemoveFromCacheAndIndicesCore(string tenantId, string fileKey,
+            ConcurrentDictionary<string, FileMetadata> cache, out FileMetadata? removedMetadata)
+        {
             var removed = cache.TryRemove(fileKey, out removedMetadata);
             if (!removed)
                 return false;
@@ -1316,11 +1419,11 @@ WHERE tenant_id = @tenant_id
   AND file_key = @file_key;";
                 cmd.Parameters.AddWithValue("@tenant_id", tenantId);
                 cmd.Parameters.AddWithValue("@file_key", fileKey);
-                return cmd.ExecuteNonQuery() > 0;
+                return ExecuteOrderedDelete(cmd, tenantId, fileKey);
             }
         }
 
-        private sealed class DirectProjectionBatch : IQueueProjectionBatch
+        private sealed class DirectProjectionBatch : IQueueProjectionBatch, IDisposable
         {
             private readonly MetadataRepository _repository;
             private readonly string _tenantId;
@@ -1359,25 +1462,29 @@ WHERE tenant_id = @tenant_id
                 if (!string.Equals(metadata.TenantId, _tenantId, StringComparison.Ordinal))
                     throw new ArgumentException("Metadata tenant does not match the active projection batch.", nameof(metadata));
 
-                var original = CaptureOriginalMetadata(metadata.FileKey);
-                var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(metadata.FileKey, out var stagedProjection);
-                var expected = hasStagedProjection ? stagedProjection : original;
-                var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(metadata.FileKey);
-                var projected = ResolveConcurrentUpsert(metadata, expected, current);
-                if (projected == null)
+                lock (_repository.GetDatabaseLock(_tenantId))
+                lock (_repository.GetCacheMutationLock(_tenantId))
                 {
-                    _stagedMetadataByFileKey[metadata.FileKey] = current?.Clone();
+                    var original = CaptureOriginalMetadata(metadata.FileKey);
+                    var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(metadata.FileKey, out var stagedProjection);
+                    var expected = hasStagedProjection ? stagedProjection : original;
+                    var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(metadata.FileKey);
+                    var projected = ResolveConcurrentUpsert(metadata, expected, current);
+                    if (projected == null)
+                    {
+                        _stagedMetadataByFileKey[metadata.FileKey] = current?.Clone();
+                        return Task.CompletedTask;
+                    }
+
+                    CaptureRollbackMetadata(
+                        metadata.FileKey,
+                        hasStagedProjection ? ReadCurrentMetadata(metadata.FileKey) : current);
+                    _repository.UpdateCacheAndIndices(projected);
+                    _stagedMetadataByFileKey[metadata.FileKey] = projected.Clone();
+                    _appliedMetadataByFileKey[metadata.FileKey] = projected.Clone();
+                    _operations.Add(_repository.CreatePersistenceUpsert(projected));
                     return Task.CompletedTask;
                 }
-
-                CaptureRollbackMetadata(
-                    metadata.FileKey,
-                    hasStagedProjection ? ReadCurrentMetadata(metadata.FileKey) : current);
-                _repository.UpdateCacheAndIndices(projected);
-                _stagedMetadataByFileKey[metadata.FileKey] = projected.Clone();
-                _appliedMetadataByFileKey[metadata.FileKey] = projected.Clone();
-                _operations.Add(_repository.CreatePersistenceUpsert(projected));
-                return Task.CompletedTask;
             }
 
             public Task<bool> RemoveProjectedFileAsync(string fileKey, CancellationToken ct = default)
@@ -1393,26 +1500,30 @@ WHERE tenant_id = @tenant_id
                 if (string.IsNullOrWhiteSpace(fileKey))
                     throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-                var original = CaptureOriginalMetadata(fileKey);
-                var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(fileKey, out var stagedProjection);
-                var expected = hasStagedProjection ? stagedProjection : original;
-                var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(fileKey);
-                if (!MetadataEquals(current, expected))
+                lock (_repository.GetDatabaseLock(_tenantId))
+                lock (_repository.GetCacheMutationLock(_tenantId))
                 {
-                    _stagedMetadataByFileKey[fileKey] = current?.Clone();
-                    return Task.FromResult(false);
+                    var original = CaptureOriginalMetadata(fileKey);
+                    var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(fileKey, out var stagedProjection);
+                    var expected = hasStagedProjection ? stagedProjection : original;
+                    var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(fileKey);
+                    if (!MetadataEquals(current, expected))
+                    {
+                        _stagedMetadataByFileKey[fileKey] = current?.Clone();
+                        return Task.FromResult(false);
+                    }
+
+                    CaptureRollbackMetadata(
+                        fileKey,
+                        hasStagedProjection ? ReadCurrentMetadata(fileKey) : current);
+                    var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
+                    _stagedMetadataByFileKey[fileKey] = null;
+                    _appliedMetadataByFileKey[fileKey] = null;
+                    if (removed || original != null)
+                        _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
+
+                    return Task.FromResult(removed || original != null);
                 }
-
-                CaptureRollbackMetadata(
-                    fileKey,
-                    hasStagedProjection ? ReadCurrentMetadata(fileKey) : current);
-                var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
-                _stagedMetadataByFileKey[fileKey] = null;
-                _appliedMetadataByFileKey[fileKey] = null;
-                if (removed || original != null)
-                    _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
-
-                return Task.FromResult(removed || original != null);
             }
 
             public Task<FileMetadata?> TryGetProjectedFileAsync(string fileKey, CancellationToken ct = default)
@@ -1437,15 +1548,14 @@ WHERE tenant_id = @tenant_id
 
             public Task FlushAsync(CancellationToken ct = default)
             {
-                ct.ThrowIfCancellationRequested();
-
                 if (_flushed)
                     return Task.CompletedTask;
 
                 _flushed = true;
                 try
                 {
-                    _repository.ExecuteDirectBatch(_tenantId, _operations);
+                    ct.ThrowIfCancellationRequested();
+                    _repository.ExecuteDirectBatch(_tenantId, _operations, settleOnFailure: false);
                     _originalMetadataByFileKey.Clear();
                     _stagedMetadataByFileKey.Clear();
                     _rollbackMetadataByFileKey.Clear();
@@ -1456,8 +1566,28 @@ WHERE tenant_id = @tenant_id
                     RollbackInMemoryProjection();
                     throw;
                 }
+                finally
+                {
+                    foreach (var operation in _operations)
+                        _repository.SettlePersistenceOperation(operation, committed: false);
+                    _operations.Clear();
+                }
 
                 return Task.CompletedTask;
+            }
+
+            public void Dispose()
+            {
+                if (_flushed)
+                    return;
+                _flushed = true;
+                try { RollbackInMemoryProjection(); }
+                finally
+                {
+                    foreach (var operation in _operations)
+                        _repository.SettlePersistenceOperation(operation, committed: false);
+                    _operations.Clear();
+                }
             }
 
             private FileMetadata? CaptureOriginalMetadata(string fileKey)
@@ -1514,22 +1644,35 @@ WHERE tenant_id = @tenant_id
 
             private void RollbackInMemoryProjection()
             {
-                foreach (var entry in _rollbackMetadataByFileKey)
+                lock (_repository.GetDatabaseLock(_tenantId))
+                lock (_repository.GetCacheMutationLock(_tenantId))
                 {
-                    if (!_appliedMetadataByFileKey.TryGetValue(entry.Key, out var applied))
-                        continue;
-
-                    var current = ReadCurrentMetadata(entry.Key);
-                    if (!MetadataEquals(current, applied))
-                        continue;
-
-                    if (entry.Value == null)
+                    foreach (var entry in _rollbackMetadataByFileKey)
                     {
-                        _repository.TryRemoveFromCacheAndIndices(_tenantId, entry.Key, out _);
-                    }
-                    else
-                    {
-                        _repository.UpdateCacheAndIndices(entry.Value.Clone());
+                        if (!_appliedMetadataByFileKey.TryGetValue(entry.Key, out var applied))
+                            continue;
+
+                        var current = ReadCurrentMetadata(entry.Key);
+                        var operation = _operations.LastOrDefault(op => op.FileKey == entry.Key);
+                        if (operation.Sequence == 0)
+                            continue;
+                        if (_repository.HasNewerPersistenceOperation(operation))
+                            continue;
+                        if (!MetadataEquals(current, applied))
+                        {
+                            // Cold staged states evict the hot entry before their SQL commit.
+                            if (current != null || applied == null || IsHotCachedStatus(applied.Status))
+                                continue;
+                        }
+
+                        if (entry.Value == null)
+                        {
+                            _repository.TryRemoveFromCacheAndIndices(_tenantId, entry.Key, out _);
+                        }
+                        else
+                        {
+                            _repository.UpdateCacheAndIndices(entry.Value.Clone());
+                        }
                     }
                 }
             }
@@ -1610,31 +1753,35 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return false;
-
-                if (current.Status != FileProcessingStatus.Processing
-                    || !current.ProcessingStartTime.HasValue
-                    || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    return false;
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return false;
+
+                    if (current.Status != FileProcessingStatus.Processing
+                        || !current.ProcessingStartTime.HasValue
+                        || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                    {
+                        return false;
+                    }
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.Pending;
+                    updated.ProcessingStartTime = null;
+                    updated.AvailableForProcessingAt = availableForProcessingAtUtc;
+                    QueueProjectionMetadataState.MarkReleasedLease(updated, expectedProcessingStartTimeUtc);
+
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return false;
+
+                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                    IndexStatusCandidate(current, updated);
+                    EnqueuePersistence(CreatePersistenceUpsert(updated));
+                    EnqueuePendingCandidate(updated, refreshGeneration: false);
+                    return true;
                 }
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.Pending;
-                updated.ProcessingStartTime = null;
-                updated.AvailableForProcessingAt = availableForProcessingAtUtc;
-                QueueProjectionMetadataState.MarkReleasedLease(updated, expectedProcessingStartTimeUtc);
-
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return false;
-
-                _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-                IndexStatusCandidate(current, updated);
-                EnqueuePersistence(CreatePersistenceUpsert(updated));
-                EnqueuePendingCandidate(updated, refreshGeneration: false);
-                return true;
             }
             finally
             {
@@ -1662,31 +1809,35 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return TryDeletePermanentlyFailedFromDatabase(tenantId, fileKey, expectedLastFailedAtUtc);
-
-                if (current.Status != FileProcessingStatus.PermanentlyFailed
-                    || !current.LastFailedAt.HasValue
-                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    return false;
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return TryDeletePermanentlyFailedFromDatabase(tenantId, fileKey, expectedLastFailedAtUtc);
+
+                    if (current.Status != FileProcessingStatus.PermanentlyFailed
+                        || !current.LastFailedAt.HasValue
+                        || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                    {
+                        return false;
+                    }
+
+                    var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
+                        .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
+                    if (!removed)
+                        return false;
+
+                    _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                    RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
+
+                    // PermanentlyFailed files are never in the Pending queue, so _pendingFileCounts
+                    // does not need adjustment here. The guard is intentionally omitted.
+                    InvalidatePendingGeneration(tenantId, fileKey);
+                    EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
+                    _logger.LogDebug("Conditionally removed permanently failed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                    return true;
                 }
-
-                var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
-                    .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
-                if (!removed)
-                    return false;
-
-                _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
-
-                // PermanentlyFailed files are never in the Pending queue, so _pendingFileCounts
-                // does not need adjustment here. The guard is intentionally omitted.
-                InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
-                _logger.LogDebug("Conditionally removed permanently failed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
-                return true;
             }
             finally
             {
@@ -1716,41 +1867,45 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return TryMarkPermanentlyFailedDeleteSucceededInDatabase(
-                        tenantId,
-                        fileKey,
-                        expectedLastFailedAtUtc,
-                        deleteSucceededAtUtc);
-
-                if (current.Status != FileProcessingStatus.PermanentlyFailed
-                    || !current.LastFailedAt.HasValue
-                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
-                {
-                    return false;
-                }
-
-                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
-                    return true;
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.DeleteSucceeded;
-                updated.CompletedAt = updated.CompletedAt ?? deleteSucceededAtUtc;
-                updated.DeleteSucceededAt = deleteSucceededAtUtc;
-
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return false;
-
-                IndexStatusCandidate(current, updated);
-
                 lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    var conn = GetDatabase(tenantId);
-                    UpsertFile(conn, updated);
-                }
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return TryMarkPermanentlyFailedDeleteSucceededInDatabase(
+                            tenantId,
+                            fileKey,
+                            expectedLastFailedAtUtc,
+                            deleteSucceededAtUtc);
 
-                return true;
+                    if (current.Status != FileProcessingStatus.PermanentlyFailed
+                        || !current.LastFailedAt.HasValue
+                        || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                    {
+                        return false;
+                    }
+
+                    if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                        return true;
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.DeleteSucceeded;
+                    updated.CompletedAt = updated.CompletedAt ?? deleteSucceededAtUtc;
+                    updated.DeleteSucceededAt = deleteSucceededAtUtc;
+
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return false;
+
+                    IndexStatusCandidate(current, updated);
+
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        var conn = GetDatabase(tenantId);
+                        UpsertFile(conn, updated);
+                    }
+
+                    return true;
+                }
             }
             finally
             {
@@ -1782,37 +1937,41 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return TryConvergeMissingFileToDeleteSucceededInDatabase(
-                        tenantId,
-                        fileKey,
-                        expectedPhysicalPath,
-                        deleteSucceededAtUtc);
-
-                if (!CanConvergeMissingFileToDeleteSucceeded(current, expectedPhysicalPath))
-                    return false;
-
-                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
-                    return true;
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.DeleteSucceeded;
-                updated.DeleteSucceededAt = deleteSucceededAtUtc;
-                updated.ProcessingStartTime = null;
-                updated.AvailableForProcessingAt = null;
-
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return false;
-
-                IndexStatusCandidate(current, updated);
-
                 lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    UpsertFile(GetDatabase(tenantId), updated);
-                }
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return TryConvergeMissingFileToDeleteSucceededInDatabase(
+                            tenantId,
+                            fileKey,
+                            expectedPhysicalPath,
+                            deleteSucceededAtUtc);
 
-                return true;
+                    if (!CanConvergeMissingFileToDeleteSucceeded(current, expectedPhysicalPath))
+                        return false;
+
+                    if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                        return true;
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.DeleteSucceeded;
+                    updated.DeleteSucceededAt = deleteSucceededAtUtc;
+                    updated.ProcessingStartTime = null;
+                    updated.AvailableForProcessingAt = null;
+
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return false;
+
+                    IndexStatusCandidate(current, updated);
+
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        UpsertFile(GetDatabase(tenantId), updated);
+                    }
+
+                    return true;
+                }
             }
             finally
             {
@@ -1847,52 +2006,56 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return TryMarkPermanentlyFailedDeadLetteredInDatabase(
-                        tenantId,
-                        fileKey,
-                        expectedLastFailedAtUtc,
-                        deadLetteredAtUtc,
-                        deadLetterPhysicalPath,
-                        volumeId,
-                        projectionApplied);
-
-                if (current.Status != FileProcessingStatus.PermanentlyFailed
-                    || !current.LastFailedAt.HasValue
-                    || current.LastFailedAt.Value != expectedLastFailedAtUtc)
-                {
-                    return false;
-                }
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.DeadLettered;
-                updated.ProcessingStartTime = null;
-                updated.CompletedAt = null;
-                updated.DeleteSucceededAt = null;
-                updated.DeadLetteredAt = deadLetteredAtUtc;
-                updated.AvailableForProcessingAt = null;
-                updated.PhysicalPath = deadLetterPhysicalPath;
-                if (!string.IsNullOrWhiteSpace(volumeId))
-                    updated.VolumeId = volumeId!;
-
-                if (projectionApplied)
-                    QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(updated);
-                else
-                    QueueProjectionMetadataState.MarkDeadLetterProjectionPending(updated);
-
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return false;
-
-                IndexStatusCandidate(current, updated);
-
                 lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    var conn = GetDatabase(tenantId);
-                    UpsertFile(conn, updated);
-                }
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return TryMarkPermanentlyFailedDeadLetteredInDatabase(
+                            tenantId,
+                            fileKey,
+                            expectedLastFailedAtUtc,
+                            deadLetteredAtUtc,
+                            deadLetterPhysicalPath,
+                            volumeId,
+                            projectionApplied);
 
-                return true;
+                    if (current.Status != FileProcessingStatus.PermanentlyFailed
+                        || !current.LastFailedAt.HasValue
+                        || current.LastFailedAt.Value != expectedLastFailedAtUtc)
+                    {
+                        return false;
+                    }
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.DeadLettered;
+                    updated.ProcessingStartTime = null;
+                    updated.CompletedAt = null;
+                    updated.DeleteSucceededAt = null;
+                    updated.DeadLetteredAt = deadLetteredAtUtc;
+                    updated.AvailableForProcessingAt = null;
+                    updated.PhysicalPath = deadLetterPhysicalPath;
+                    if (!string.IsNullOrWhiteSpace(volumeId))
+                        updated.VolumeId = volumeId!;
+
+                    if (projectionApplied)
+                        QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(updated);
+                    else
+                        QueueProjectionMetadataState.MarkDeadLetterProjectionPending(updated);
+
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return false;
+
+                    IndexStatusCandidate(current, updated);
+
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        var conn = GetDatabase(tenantId);
+                        UpsertFile(conn, updated);
+                    }
+
+                    return true;
+                }
             }
             finally
             {
@@ -1920,41 +2083,45 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    var removedFromDatabase = TryDeleteCompletedFromDatabase(
-                        tenantId,
-                        fileKey,
-                        expectedCompletedAtUtc);
-                    if (removedFromDatabase)
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
                     {
-                        _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                        InvalidatePendingGeneration(tenantId, fileKey);
+                        var removedFromDatabase = TryDeleteCompletedFromDatabase(
+                            tenantId,
+                            fileKey,
+                            expectedCompletedAtUtc);
+                        if (removedFromDatabase)
+                        {
+                            _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                            InvalidatePendingGeneration(tenantId, fileKey);
+                        }
+
+                        return removedFromDatabase;
                     }
 
-                    return removedFromDatabase;
+                    if ((current.Status != FileProcessingStatus.Completed
+                        && current.Status != FileProcessingStatus.DeleteRequested)
+                        || !current.CompletedAt.HasValue
+                        || current.CompletedAt.Value != expectedCompletedAtUtc)
+                    {
+                        return false;
+                    }
+
+                    var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
+                        .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
+                    if (!removed)
+                        return false;
+
+                    _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                    RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
+                    InvalidatePendingGeneration(tenantId, fileKey);
+                    EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
+                    _logger.LogDebug("Conditionally removed completed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
+                    return true;
                 }
-
-                if ((current.Status != FileProcessingStatus.Completed
-                    && current.Status != FileProcessingStatus.DeleteRequested)
-                    || !current.CompletedAt.HasValue
-                    || current.CompletedAt.Value != expectedCompletedAtUtc)
-                {
-                    return false;
-                }
-
-                var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
-                    .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
-                if (!removed)
-                    return false;
-
-                _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
-                InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
-                _logger.LogDebug("Conditionally removed completed metadata for file: {FileKey}, Tenant: {TenantId}", fileKey, tenantId);
-                return true;
             }
             finally
             {
@@ -1982,7 +2149,7 @@ WHERE tenant_id = @tenant_id
                 cmd.Parameters.AddWithValue("@completed_status", (int)FileProcessingStatus.Completed);
                 cmd.Parameters.AddWithValue("@delete_requested_status", (int)FileProcessingStatus.DeleteRequested);
                 cmd.Parameters.AddWithValue("@completed_at", expectedCompletedAtUtc.ToString("O"));
-                return cmd.ExecuteNonQuery() > 0;
+                return ExecuteOrderedDelete(cmd, tenantId, fileKey);
             }
         }
 
@@ -2033,7 +2200,7 @@ WHERE tenant_id = @tenant_id
                 cmd.Parameters.AddWithValue("@file_key", fileKey);
                 cmd.Parameters.AddWithValue("@status", (int)FileProcessingStatus.PermanentlyFailed);
                 cmd.Parameters.AddWithValue("@last_failed_at", expectedLastFailedAtUtc.ToString("O"));
-                return cmd.ExecuteNonQuery() > 0;
+                return ExecuteOrderedDelete(cmd, tenantId, fileKey);
             }
         }
 
@@ -2171,41 +2338,45 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return TryMarkCompletedDeleteSucceededInDatabase(
-                        tenantId,
-                        fileKey,
-                        expectedCompletedAtUtc,
-                        deleteSucceededAtUtc);
-
-                if ((current.Status != FileProcessingStatus.Completed
-                    && current.Status != FileProcessingStatus.DeleteRequested)
-                    || !current.CompletedAt.HasValue
-                    || current.CompletedAt.Value != expectedCompletedAtUtc)
-                {
-                    return false;
-                }
-
-                if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
-                    return true;
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.DeleteSucceeded;
-                updated.DeleteSucceededAt = deleteSucceededAtUtc;
-
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return false;
-
-                IndexStatusCandidate(current, updated);
-
                 lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    var conn = GetDatabase(tenantId);
-                    UpsertFile(conn, updated);
-                }
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return TryMarkCompletedDeleteSucceededInDatabase(
+                            tenantId,
+                            fileKey,
+                            expectedCompletedAtUtc,
+                            deleteSucceededAtUtc);
 
-                return true;
+                    if ((current.Status != FileProcessingStatus.Completed
+                        && current.Status != FileProcessingStatus.DeleteRequested)
+                        || !current.CompletedAt.HasValue
+                        || current.CompletedAt.Value != expectedCompletedAtUtc)
+                    {
+                        return false;
+                    }
+
+                    if (current.DeleteSucceededAt.HasValue && current.DeleteSucceededAt.Value >= deleteSucceededAtUtc)
+                        return true;
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.DeleteSucceeded;
+                    updated.DeleteSucceededAt = deleteSucceededAtUtc;
+
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return false;
+
+                    IndexStatusCandidate(current, updated);
+
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        var conn = GetDatabase(tenantId);
+                        UpsertFile(conn, updated);
+                    }
+
+                    return true;
+                }
             }
             finally
             {
@@ -2233,30 +2404,34 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return null;
-
-                if (current.Status != FileProcessingStatus.Processing
-                    || !current.ProcessingStartTime.HasValue
-                    || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    return null;
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return null;
+
+                    if (current.Status != FileProcessingStatus.Processing
+                        || !current.ProcessingStartTime.HasValue
+                        || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                    {
+                        return null;
+                    }
+
+                    var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
+                        .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
+                    if (!removed)
+                        return null;
+
+                    _fileKeyTenantIndex.TryRemove(fileKey, out _);
+                    RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
+                    InvalidatePendingGeneration(tenantId, fileKey);
+                    EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
+                    _logger.LogDebug(
+                        "Conditionally removed processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
+                        fileKey, tenantId, expectedProcessingStartTimeUtc);
+                    return current.Clone();
                 }
-
-                var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
-                    .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
-                if (!removed)
-                    return null;
-
-                _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
-                InvalidatePendingGeneration(tenantId, fileKey);
-                EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
-                _logger.LogDebug(
-                    "Conditionally removed processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
-                    fileKey, tenantId, expectedProcessingStartTimeUtc);
-                return current.Clone();
             }
             finally
             {
@@ -2288,36 +2463,40 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return null;
-
-                if (current.Status != FileProcessingStatus.Processing
-                    || !current.ProcessingStartTime.HasValue
-                    || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    return null;
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return null;
+
+                    if (current.Status != FileProcessingStatus.Processing
+                        || !current.ProcessingStartTime.HasValue
+                        || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
+                    {
+                        return null;
+                    }
+
+                    var updated = updateFactory(current.Clone());
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return null;
+
+                    _fileKeyTenantIndex[fileKey] = tenantId;
+                    IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+
+                    if (updated.Status == FileProcessingStatus.Pending)
+                    {
+                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                        EnqueuePendingCandidate(updated, refreshGeneration: false);
+                    }
+
+                    IndexStatusCandidate(current, updated);
+                    EnqueuePersistence(CreatePersistenceUpsert(updated));
+                    _logger.LogDebug(
+                        "Conditionally updated processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}, NewStatus: {Status}",
+                        fileKey, tenantId, expectedProcessingStartTimeUtc, updated.Status);
+                    return updated.Clone();
                 }
-
-                var updated = updateFactory(current.Clone());
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return null;
-
-                _fileKeyTenantIndex[fileKey] = tenantId;
-                IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
-
-                if (updated.Status == FileProcessingStatus.Pending)
-                {
-                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-                    EnqueuePendingCandidate(updated, refreshGeneration: false);
-                }
-
-                IndexStatusCandidate(current, updated);
-                EnqueuePersistence(CreatePersistenceUpsert(updated));
-                _logger.LogDebug(
-                    "Conditionally updated processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}, NewStatus: {Status}",
-                    fileKey, tenantId, expectedProcessingStartTimeUtc, updated.Status);
-                return updated.Clone();
             }
             finally
             {
@@ -2345,38 +2524,42 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                if (!cache.TryGetValue(fileKey, out var current))
-                    return null;
-
-                if (current.Status != FileProcessingStatus.Pending)
-                    return null;
-
-                if (current.AvailableForProcessingAt.HasValue
-                    && current.AvailableForProcessingAt.Value > processingStartTimeUtc)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    return null;
+                    var cache = GetCache(tenantId);
+                    if (!cache.TryGetValue(fileKey, out var current))
+                        return null;
+
+                    if (current.Status != FileProcessingStatus.Pending)
+                        return null;
+
+                    if (current.AvailableForProcessingAt.HasValue
+                        && current.AvailableForProcessingAt.Value > processingStartTimeUtc)
+                    {
+                        return null;
+                    }
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.Processing;
+                    updated.ProcessingStartTime = processingStartTimeUtc;
+                    updated.AvailableForProcessingAt = null;
+                    QueueProjectionMetadataState.ClearReleasedLease(updated);
+
+                    if (!cache.TryUpdate(fileKey, updated, current))
+                        return null;
+
+                    _fileKeyTenantIndex[fileKey] = tenantId;
+                    IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+                    InvalidatePendingGeneration(tenantId, fileKey);
+                    IndexStatusCandidate(current, updated);
+                    EnqueuePersistence(CreatePersistenceUpsert(updated));
+                    _logger.LogDebug(
+                        "Conditionally marked pending metadata as processing for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
+                        fileKey, tenantId, processingStartTimeUtc);
+                    return updated.Clone();
                 }
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.Processing;
-                updated.ProcessingStartTime = processingStartTimeUtc;
-                updated.AvailableForProcessingAt = null;
-                QueueProjectionMetadataState.ClearReleasedLease(updated);
-
-                if (!cache.TryUpdate(fileKey, updated, current))
-                    return null;
-
-                _fileKeyTenantIndex[fileKey] = tenantId;
-                IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
-                _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
-                InvalidatePendingGeneration(tenantId, fileKey);
-                IndexStatusCandidate(current, updated);
-                EnqueuePersistence(CreatePersistenceUpsert(updated));
-                _logger.LogDebug(
-                    "Conditionally marked pending metadata as processing for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
-                    fileKey, tenantId, processingStartTimeUtc);
-                return updated.Clone();
             }
             finally
             {
@@ -2404,49 +2587,53 @@ WHERE tenant_id = @tenant_id
             await tenantLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var cache = GetCache(tenantId);
-                var currentFromCache = cache.TryGetValue(fileKey, out var current);
-                if (!currentFromCache)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    current = TryGetFromDatabase(tenantId, fileKey);
-                    if (current == null)
+                    var cache = GetCache(tenantId);
+                    var currentFromCache = cache.TryGetValue(fileKey, out var current);
+                    if (!currentFromCache)
+                    {
+                        current = TryGetFromDatabase(tenantId, fileKey);
+                        if (current == null)
+                            return null;
+                    }
+
+                    if (current.Status == FileProcessingStatus.Processing)
+                        return current.Clone();
+
+                    var updated = current.Clone();
+                    updated.Status = FileProcessingStatus.Pending;
+                    updated.ProcessingStartTime = null;
+                    updated.AvailableForProcessingAt = null;
+                    updated.RetryCount = 0;
+                    updated.LastError = null;
+                    updated.LastFailedAt = null;
+
+                    if (currentFromCache && !cache.TryUpdate(fileKey, updated, current))
                         return null;
+
+                    if (!currentFromCache)
+                        UpdateCacheAndIndices(updated);
+                    else
+                    {
+                        _fileKeyTenantIndex[fileKey] = tenantId;
+                        IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
+
+                        if (current.Status != FileProcessingStatus.Pending)
+                            _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+
+                        InvalidatePendingGeneration(tenantId, fileKey);
+                        EnqueuePendingCandidate(updated, refreshGeneration: false);
+                        IndexStatusCandidate(current, updated);
+                    }
+
+                    EnqueuePersistence(CreatePersistenceUpsert(updated));
+                    _logger.LogDebug(
+                        "Conditionally reset file metadata to pending for file: {FileKey}, Tenant: {TenantId}, PreviousStatus: {PreviousStatus}",
+                        fileKey, tenantId, current.Status);
+                    return updated.Clone();
                 }
-
-                if (current.Status == FileProcessingStatus.Processing)
-                    return current.Clone();
-
-                var updated = current.Clone();
-                updated.Status = FileProcessingStatus.Pending;
-                updated.ProcessingStartTime = null;
-                updated.AvailableForProcessingAt = null;
-                updated.RetryCount = 0;
-                updated.LastError = null;
-                updated.LastFailedAt = null;
-
-                if (currentFromCache && !cache.TryUpdate(fileKey, updated, current))
-                    return null;
-
-                if (!currentFromCache)
-                    UpdateCacheAndIndices(updated);
-                else
-                {
-                    _fileKeyTenantIndex[fileKey] = tenantId;
-                    IndexPhysicalPathCandidate(tenantId, fileKey, current, updated);
-
-                    if (current.Status != FileProcessingStatus.Pending)
-                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-
-                    InvalidatePendingGeneration(tenantId, fileKey);
-                    EnqueuePendingCandidate(updated, refreshGeneration: false);
-                    IndexStatusCandidate(current, updated);
-                }
-
-                EnqueuePersistence(CreatePersistenceUpsert(updated));
-                _logger.LogDebug(
-                    "Conditionally reset file metadata to pending for file: {FileKey}, Tenant: {TenantId}, PreviousStatus: {PreviousStatus}",
-                    fileKey, tenantId, current.Status);
-                return updated.Clone();
             }
             finally
             {
@@ -3305,7 +3492,7 @@ LIMIT @limit;";
                 await tenantLock.WaitAsync(ct);
 
             var maxAllocations = lockContended ? PendingSingleAllocatorPrefetchCount : 1;
-            var transitions = new List<(FileMetadata Previous, FileMetadata Updated)>(maxAllocations);
+            var transitions = new List<(FileMetadata Previous, FileMetadata Updated, PersistenceOperation Operation)>(maxAllocations);
             var dequeuedAttempts = 0;
             var staleSkips = 0;
             FileMetadata? prefetchedInsideLock = null;
@@ -3317,60 +3504,64 @@ LIMIT @limit;";
                 }
 
                 var cache = GetCache(tenantId);
-                cacheRef = cache;
-                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
-                var now = DateTime.UtcNow;
-                PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotions);
-                pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
-                var maxDequeues = Math.Min(Math.Max(pendingCount + 64, 64), MaxSinglePendingDequeues);
-                var targetAllocations = Math.Min(Math.Max(1, pendingCount), maxAllocations);
-
-                while (prefetchedInsideLock == null
-                       && dequeuedAttempts++ < maxDequeues
-                       && transitions.Count < targetAllocations
-                       && pendingQueue.TryDequeue(out var entry))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    if (!IsGenerationCurrent(tenantId, entry))
+                    cacheRef = cache;
+                    var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
+                    var now = DateTime.UtcNow;
+                    PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotions);
+                    pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
+                    var maxDequeues = Math.Min(Math.Max(pendingCount + 64, 64), MaxSinglePendingDequeues);
+                    var targetAllocations = Math.Min(Math.Max(1, pendingCount), maxAllocations);
+
+                    while (prefetchedInsideLock == null
+                           && dequeuedAttempts++ < maxDequeues
+                           && transitions.Count < targetAllocations
+                           && pendingQueue.TryDequeue(out var entry))
                     {
-                        staleSkips++;
-                        continue;
+                        if (!IsGenerationCurrent(tenantId, entry))
+                        {
+                            staleSkips++;
+                            continue;
+                        }
+
+                        if (!cache.TryGetValue(entry.FileKey, out var candidate))
+                        {
+                            staleSkips++;
+                            continue;
+                        }
+
+                        if (candidate.Status != FileProcessingStatus.Pending)
+                        {
+                            staleSkips++;
+                            continue;
+                        }
+
+                        if (candidate.AvailableForProcessingAt.HasValue
+                            && candidate.AvailableForProcessingAt.Value > now)
+                        {
+                            // Not ready yet - move back to delayed queue.
+                            EnqueueDelayed(tenantId, entry, candidate.AvailableForProcessingAt.Value);
+                            continue;
+                        }
+
+                        // Clone before mutating so concurrent lock-free readers always observe
+                        // a fully-consistent object (Pending snapshot or Processing snapshot).
+                        var updated = candidate.Clone();
+                        updated.Status = FileProcessingStatus.Processing;
+                        updated.ProcessingStartTime = now;
+                        QueueProjectionMetadataState.ClearReleasedLease(updated);
+
+                        cache[updated.FileKey] = updated;
+                        _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+                        InvalidatePendingGeneration(tenantId, updated.FileKey);
+                        IndexStatusCandidate(candidate, updated);
+                        transitions.Add((candidate, updated, CreatePersistenceUpsert(updated)));
                     }
 
-                    if (!cache.TryGetValue(entry.FileKey, out var candidate))
-                    {
-                        staleSkips++;
-                        continue;
-                    }
-
-                    if (candidate.Status != FileProcessingStatus.Pending)
-                    {
-                        staleSkips++;
-                        continue;
-                    }
-
-                    if (candidate.AvailableForProcessingAt.HasValue
-                        && candidate.AvailableForProcessingAt.Value > now)
-                    {
-                        // Not ready yet - move back to delayed queue.
-                        EnqueueDelayed(tenantId, entry, candidate.AvailableForProcessingAt.Value);
-                        continue;
-                    }
-
-                    // Clone before mutating so concurrent lock-free readers always observe
-                    // a fully-consistent object (Pending snapshot or Processing snapshot).
-                    var updated = candidate.Clone();
-                    updated.Status = FileProcessingStatus.Processing;
-                    updated.ProcessingStartTime = now;
-                    QueueProjectionMetadataState.ClearReleasedLease(updated);
-
-                    cache[updated.FileKey] = updated;
-                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
-                    InvalidatePendingGeneration(tenantId, updated.FileKey);
-                    transitions.Add((candidate, updated));
+                    for (var i = 1; i < transitions.Count; i++)
+                        EnqueuePrefetchedPending(tenantId, transitions[i].Updated);
                 }
-
-                for (var i = 1; i < transitions.Count; i++)
-                    EnqueuePrefetchedPending(tenantId, transitions[i].Updated);
             }
             finally
             {
@@ -3392,8 +3583,7 @@ LIMIT @limit;";
             for (var i = 0; i < transitions.Count; i++)
             {
                 var transition = transitions[i];
-                IndexStatusCandidate(transition.Previous, transition.Updated);
-                EnqueuePersistence(CreatePersistenceUpsert(transition.Updated));
+                EnqueuePersistence(transition.Operation);
             }
 
             var selected = transitions[0].Updated;
@@ -3452,7 +3642,7 @@ LIMIT @limit;";
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
 
             ConcurrentDictionary<string, FileMetadata>? cacheRef = null;
-            var transitions = new List<(FileMetadata Previous, FileMetadata Updated)>(batchSize);
+            var transitions = new List<(FileMetadata Previous, FileMetadata Updated, PersistenceOperation Operation)>(batchSize);
             var dequeued = 0;
             var staleSkips = 0;
 
@@ -3467,57 +3657,61 @@ LIMIT @limit;";
                     return results;
 
                 var cache = GetCache(tenantId);
-                cacheRef = cache;
-                var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
-                var now = DateTime.UtcNow;
-                PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotionsBatch);
-
-                // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
-                // are present. Tie the cap to pendingCount and batchSize to bound lock hold time.
-                pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
-                var targetBatchSize = batchSize - results.Count;
-                var maxDequeues = Math.Min(pendingCount + 64, targetBatchSize * 2 + 64);
-
-                while (transitions.Count < targetBatchSize
-                       && dequeued++ < maxDequeues
-                       && pendingQueue.TryDequeue(out var entry))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    if (!IsGenerationCurrent(tenantId, entry))
+                    cacheRef = cache;
+                    var pendingQueue = _pendingKeys.GetOrAdd(tenantId, _ => new ConcurrentQueue<PendingQueueEntry>());
+                    var now = DateTime.UtcNow;
+                    PromoteDelayedReady(tenantId, now, pendingQueue, MaxDelayedPromotionsBatch);
+
+                    // Cap total dequeues to avoid an unbounded loop when many stale/delayed entries
+                    // are present. Tie the cap to pendingCount and batchSize to bound lock hold time.
+                    pendingCount = _pendingFileCounts.TryGetValue(tenantId, out var currentPending) ? currentPending : 0;
+                    var targetBatchSize = batchSize - results.Count;
+                    var maxDequeues = Math.Min(pendingCount + 64, targetBatchSize * 2 + 64);
+
+                    while (transitions.Count < targetBatchSize
+                           && dequeued++ < maxDequeues
+                           && pendingQueue.TryDequeue(out var entry))
                     {
-                        staleSkips++;
-                        continue;
+                        if (!IsGenerationCurrent(tenantId, entry))
+                        {
+                            staleSkips++;
+                            continue;
+                        }
+
+                        if (!cache.TryGetValue(entry.FileKey, out var candidate))
+                        {
+                            staleSkips++;
+                            continue;
+                        }
+
+                        if (candidate.Status != FileProcessingStatus.Pending)
+                        {
+                            staleSkips++;
+                            continue;
+                        }
+
+                        if (candidate.AvailableForProcessingAt.HasValue
+                            && candidate.AvailableForProcessingAt.Value > now)
+                        {
+                            // Not ready yet - move back to delayed queue.
+                            EnqueueDelayed(tenantId, entry, candidate.AvailableForProcessingAt.Value);
+                            continue;
+                        }
+
+                        // Clone before mutating - same rationale as GetNextPendingFileAsync.
+                        var updated = candidate.Clone();
+                        updated.Status = FileProcessingStatus.Processing;
+                        updated.ProcessingStartTime = now;
+                        QueueProjectionMetadataState.ClearReleasedLease(updated);
+
+                        cache[updated.FileKey] = updated;
+                        _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
+                        InvalidatePendingGeneration(tenantId, updated.FileKey);
+                        IndexStatusCandidate(candidate, updated);
+                        transitions.Add((candidate, updated, CreatePersistenceUpsert(updated)));
                     }
-
-                    if (!cache.TryGetValue(entry.FileKey, out var candidate))
-                    {
-                        staleSkips++;
-                        continue;
-                    }
-
-                    if (candidate.Status != FileProcessingStatus.Pending)
-                    {
-                        staleSkips++;
-                        continue;
-                    }
-
-                    if (candidate.AvailableForProcessingAt.HasValue
-                        && candidate.AvailableForProcessingAt.Value > now)
-                    {
-                        // Not ready yet - move back to delayed queue.
-                        EnqueueDelayed(tenantId, entry, candidate.AvailableForProcessingAt.Value);
-                        continue;
-                    }
-
-                    // Clone before mutating - same rationale as GetNextPendingFileAsync.
-                    var updated = candidate.Clone();
-                    updated.Status = FileProcessingStatus.Processing;
-                    updated.ProcessingStartTime = now;
-                    QueueProjectionMetadataState.ClearReleasedLease(updated);
-
-                    cache[updated.FileKey] = updated;
-                    _pendingFileCounts.AddOrUpdate(tenantId, 0, (_, c) => Math.Max(0, c - 1));
-                    InvalidatePendingGeneration(tenantId, updated.FileKey);
-                    transitions.Add((candidate, updated));
                 }
             }
             finally
@@ -3530,8 +3724,7 @@ LIMIT @limit;";
             for (var i = 0; i < transitions.Count; i++)
             {
                 var transition = transitions[i];
-                IndexStatusCandidate(transition.Previous, transition.Updated);
-                EnqueuePersistence(CreatePersistenceUpsert(transition.Updated));
+                EnqueuePersistence(transition.Operation);
                 results.Add(transition.Updated);
             }
 
@@ -3597,40 +3790,44 @@ LIMIT @limit;";
                 var tenantId = kvp.Key;
                 var cache = kvp.Value;
 
-                // ConcurrentDictionary.Values enumeration is thread-safe without snapshotting.
-                foreach (var file in cache.Values)
+                lock (GetDatabaseLock(tenantId))
+                lock (GetCacheMutationLock(tenantId))
                 {
-                    if (file.Status != FileProcessingStatus.Processing
-                        || !file.ProcessingStartTime.HasValue
-                        || file.ProcessingStartTime.Value >= cutoffTime)
-                        continue;
+                    // ConcurrentDictionary.Values enumeration is thread-safe without snapshotting.
+                    foreach (var file in cache.Values)
+                    {
+                        if (file.Status != FileProcessingStatus.Processing
+                            || !file.ProcessingStartTime.HasValue
+                            || file.ProcessingStartTime.Value >= cutoffTime)
+                            continue;
 
-                    var processingDuration = DateTime.UtcNow - file.ProcessingStartTime.Value;
+                        var processingDuration = DateTime.UtcNow - file.ProcessingStartTime.Value;
 
-                    // Clone before mutating - keeps the cache entry consistent for lock-free readers.
-                    var updated = file.Clone();
-                    updated.Status = FileProcessingStatus.Pending;
-                    QueueProjectionMetadataState.MarkReleasedLease(updated, file.ProcessingStartTime.Value);
-                    updated.ProcessingStartTime = null;
-                    updated.AvailableForProcessingAt = null;
+                        // Clone before mutating - keeps the cache entry consistent for lock-free readers.
+                        var updated = file.Clone();
+                        updated.Status = FileProcessingStatus.Pending;
+                        QueueProjectionMetadataState.MarkReleasedLease(updated, file.ProcessingStartTime.Value);
+                        updated.ProcessingStartTime = null;
+                        updated.AvailableForProcessingAt = null;
 
-                    // Use TryUpdate (CAS) so that if a concurrent GetNextPendingFileAsync or
-                    // MarkAsFailedAsync already changed this entry since we read it above, we
-                    // skip rather than overwriting with stale data. The `file` reference acts
-                    // as the expected-current-value sentinel.
-                    if (!cache.TryUpdate(updated.FileKey, updated, file))
-                        continue;
+                        // Use TryUpdate (CAS) so that if a concurrent GetNextPendingFileAsync or
+                        // MarkAsFailedAsync already changed this entry since we read it above, we
+                        // skip rather than overwriting with stale data. The `file` reference acts
+                        // as the expected-current-value sentinel.
+                        if (!cache.TryUpdate(updated.FileKey, updated, file))
+                            continue;
 
-                    _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-                    IndexStatusCandidate(file, updated);
-                    EnqueuePersistence(CreatePersistenceUpsert(updated));
+                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
+                        IndexStatusCandidate(file, updated);
+                        EnqueuePersistence(CreatePersistenceUpsert(updated));
 
-                    // Re-enqueue in the pending queue so the allocator can find it immediately.
-                    EnqueuePendingCandidate(updated, refreshGeneration: false);
+                        // Re-enqueue in the pending queue so the allocator can find it immediately.
+                        EnqueuePendingCandidate(updated, refreshGeneration: false);
 
-                    count++;
-                    _logger.LogWarning("Reset timed-out file: {FileKey}, Tenant: {TenantId}, was processing for {Duration}",
-                        updated.FileKey, tenantId, processingDuration);
+                        count++;
+                        _logger.LogWarning("Reset timed-out file: {FileKey}, Tenant: {TenantId}, was processing for {Duration}",
+                            updated.FileKey, tenantId, processingDuration);
+                    }
                 }
             }
 
@@ -4046,6 +4243,8 @@ LIMIT @limit;";
                     }
 
                     // Step 3: Clear in-memory cache and pending index
+                    _hydratedTenants.TryRemove(tenantId, out _);
+                    _startupMutatedKeys.TryRemove(tenantId, out _);
                     if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                         RemoveTenantFromGlobalIndex(staleTenantCache);
                     _physicalPathIndex.TryRemove(tenantId, out _);
@@ -4126,17 +4325,68 @@ LIMIT @limit;";
         // within this process lifetime. On restart, the cleanup service reconciles disk vs metadata.
         private PersistenceOperation CreatePersistenceUpsert(FileMetadata metadata)
         {
-            return new PersistenceOperation(
-                metadata,
-                Interlocked.Increment(ref _persistenceOperationSequence));
+            lock (_persistenceOrderLock)
+            {
+                var operation = new PersistenceOperation(metadata.Clone(), ++_persistenceOperationSequence);
+                RegisterPersistenceOperation(operation);
+                return operation;
+            }
         }
 
         private PersistenceOperation CreatePersistenceDelete(string tenantId, string fileKey)
         {
-            return new PersistenceOperation(
-                tenantId,
-                fileKey,
-                Interlocked.Increment(ref _persistenceOperationSequence));
+            lock (_persistenceOrderLock)
+            {
+                var operation = new PersistenceOperation(tenantId, fileKey, ++_persistenceOperationSequence);
+                RegisterPersistenceOperation(operation);
+                return operation;
+            }
+        }
+
+        private void RegisterPersistenceOperation(PersistenceOperation operation)
+        {
+            var key = (operation.TenantId, operation.FileKey);
+            if (!_persistenceOrder.TryGetValue(key, out var state))
+                _persistenceOrder[key] = state = new PersistenceOrderState();
+            state.Outstanding.Add(operation.Sequence);
+        }
+
+        private bool HasNewerCommittedOperation(PersistenceOperation operation)
+        {
+            lock (_persistenceOrderLock)
+                return _persistenceOrder.TryGetValue((operation.TenantId, operation.FileKey), out var state)
+                    && state.CommittedSequence > operation.Sequence;
+        }
+
+        private bool HasNewerPersistenceOperation(PersistenceOperation operation)
+        {
+            lock (_persistenceOrderLock)
+                return _persistenceOrder.TryGetValue((operation.TenantId, operation.FileKey), out var state)
+                    && (state.CommittedSequence > operation.Sequence
+                        || state.Outstanding.Any(sequence => sequence > operation.Sequence));
+        }
+
+        private bool IsOutstandingPersistenceOperation(PersistenceOperation operation)
+        {
+            lock (_persistenceOrderLock)
+                return _persistenceOrder.TryGetValue((operation.TenantId, operation.FileKey), out var state)
+                    && state.Outstanding.Contains(operation.Sequence);
+        }
+
+        private void SettlePersistenceOperation(PersistenceOperation operation, bool committed)
+        {
+            lock (_persistenceOrderLock)
+            {
+                var key = (operation.TenantId, operation.FileKey);
+                if (!_persistenceOrder.TryGetValue(key, out var state))
+                    return;
+                if (committed)
+                    state.CommittedSequence = Math.Max(state.CommittedSequence, operation.Sequence);
+                state.Outstanding.Remove(operation.Sequence);
+                // Keep the watermark until every older operation has drained or been discarded.
+                if (state.Outstanding.Count == 0)
+                    _persistenceOrder.Remove(key);
+            }
         }
 
         private void EnqueuePersistence(PersistenceOperation op)
@@ -4211,10 +4461,16 @@ LIMIT @limit;";
                 if (_coalescedPersistenceOps.TryGetValue(compositeKey, out var existing))
                 {
                     if (existing.Sequence >= op.Sequence)
+                    {
+                        SettlePersistenceOperation(op, committed: false);
                         return false;
+                    }
 
                     if (_coalescedPersistenceOps.TryUpdate(compositeKey, op, existing))
+                    {
+                        SettlePersistenceOperation(existing, committed: false);
                         return false;
+                    }
 
                     continue;
                 }
@@ -4387,7 +4643,7 @@ LIMIT @limit;";
             return !encounteredFailure;
         }
 
-        private static void AddLatestOperationToTenantBucket(
+        private void AddLatestOperationToTenantBucket(
             Dictionary<string, Dictionary<string, PersistenceOperation>> byTenant,
             PersistenceOperation op)
         {
@@ -4397,11 +4653,18 @@ LIMIT @limit;";
                 byTenant[op.TenantId] = bucket;
             }
 
-            if (!bucket.TryGetValue(op.FileKey, out var existing) || op.Sequence > existing.Sequence)
+            if (!bucket.TryGetValue(op.FileKey, out var existing))
                 bucket[op.FileKey] = op;
+            else if (op.Sequence > existing.Sequence)
+            {
+                bucket[op.FileKey] = op;
+                SettlePersistenceOperation(existing, committed: false);
+            }
+            else
+                SettlePersistenceOperation(op, committed: false);
         }
 
-        private void ExecuteDirectBatch(string tenantId, IReadOnlyList<PersistenceOperation> ops)
+        private void ExecuteDirectBatch(string tenantId, IReadOnlyList<PersistenceOperation> ops, bool settleOnFailure = true)
         {
             if (ops == null)
                 throw new ArgumentNullException(nameof(ops));
@@ -4409,16 +4672,35 @@ LIMIT @limit;";
             if (ops.Count == 0)
                 return;
 
-            ExecuteBatchCore(tenantId, ops);
+            try
+            {
+                ExecuteBatchCore(tenantId, ops);
+            }
+            catch
+            {
+                if (settleOnFailure)
+                    foreach (var op in ops)
+                        SettlePersistenceOperation(op, committed: false);
+                throw;
+            }
         }
 
         private void ExecuteBatchCore(string tenantId, IReadOnlyList<PersistenceOperation> ops)
         {
             lock (GetDatabaseLock(tenantId))
             {
+                // Connection/transaction writes are serialized per tenant. A committed
+                // watermark prevents retries in later batches from reverting that commit.
+                var currentOps = ops.Where(op => !HasNewerCommittedOperation(op)).ToList();
+                if (currentOps.Count == 0)
+                {
+                    foreach (var op in ops)
+                        SettlePersistenceOperation(op, committed: false);
+                    return;
+                }
                 try
                 {
-                    ExecuteBatchCoreWithConnectionRecoveryNoLock(tenantId, ops);
+                    ExecuteBatchCoreWithConnectionRecoveryNoLock(tenantId, currentOps);
                 }
                 catch (Exception ex) when (IsRecoverableDatabaseException(ex))
                 {
@@ -4427,8 +4709,11 @@ LIMIT @limit;";
                         "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during batch persistence. Attempting automatic runtime recovery...",
                         tenantId);
 
-                    RecoverCorruptedDatabaseAndReplayBatchNoLock(tenantId, ops);
+                    RecoverCorruptedDatabaseAndReplayBatchNoLock(tenantId, currentOps);
                 }
+
+                foreach (var op in ops)
+                    SettlePersistenceOperation(op, committed: true);
 
                 var conn = GetDatabase(tenantId);
                 TryCheckpointAfterCommittedBatch(conn, tenantId);
@@ -4634,13 +4919,20 @@ LIMIT @limit;";
         private void RequeueFailedPersistenceBatch(List<PersistenceOperation> ops)
         {
             if (!_enableBackgroundPersistence || _disposed || ops.Count == 0)
+            {
+                foreach (var op in ops)
+                    SettlePersistenceOperation(op, committed: false);
                 return;
+            }
 
             var coalescedAdded = 0;
             var coalescedSkipped = 0;
 
             foreach (var op in ops)
             {
+                // A diagnostic can fail after SQL committed; settled operations must never retry.
+                if (!IsOutstandingPersistenceOperation(op))
+                    continue;
                 var compositeKey = $"{op.TenantId}\u001F{op.FileKey}";
                 if (CoalesceLatestPersistenceOperation(compositeKey, op))
                 {
@@ -4671,14 +4963,36 @@ LIMIT @limit;";
             }
         }
 
-        private static void UpsertFile(SqliteConnection conn, FileMetadata m)
+        private bool ExecuteOrderedDelete(SqliteCommand command, string tenantId, string fileKey)
         {
-            using var txn = conn.BeginTransaction();
-            UpsertFile(conn, txn, m);
-            txn.Commit();
+            var operation = CreatePersistenceDelete(tenantId, fileKey);
+            var removed = false;
+            try
+            {
+                removed = command.ExecuteNonQuery() > 0;
+                return removed;
+            }
+            finally { SettlePersistenceOperation(operation, committed: removed); }
         }
 
-        private static void UpsertFile(SqliteConnection conn, SqliteTransaction txn, FileMetadata m)
+        private void UpsertFile(SqliteConnection conn, FileMetadata m)
+        {
+            var operation = CreatePersistenceUpsert(m);
+            var committed = false;
+            try
+            {
+                using var txn = conn.BeginTransaction();
+                UpsertFile(conn, txn, m);
+                txn.Commit();
+                committed = true;
+            }
+            finally
+            {
+                SettlePersistenceOperation(operation, committed);
+            }
+        }
+
+        private static bool UpsertFile(SqliteConnection conn, SqliteTransaction txn, FileMetadata m, bool insertOnly = false)
         {
             using var cmd = conn.CreateCommand();
             cmd.Transaction = txn;
@@ -4713,6 +5027,10 @@ ON CONFLICT(file_key) DO UPDATE SET
     file_extension             = excluded.file_extension,
     metadata_json              = excluded.metadata_json;";
 
+            if (insertOnly)
+                cmd.CommandText = cmd.CommandText.Substring(0, cmd.CommandText.IndexOf("ON CONFLICT", StringComparison.Ordinal))
+                    + "ON CONFLICT(file_key) DO NOTHING;";
+
             cmd.Parameters.AddWithValue("@file_key", m.FileKey);
             cmd.Parameters.AddWithValue("@tenant_id", m.TenantId);
             cmd.Parameters.AddWithValue("@volume_id", m.VolumeId);
@@ -4732,7 +5050,7 @@ ON CONFLICT(file_key) DO UPDATE SET
             cmd.Parameters.AddWithValue("@original_file_name", (object?)m.OriginalFileName ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@file_extension", (object?)m.FileExtension ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@metadata_json", m.Metadata != null ? (object)System.Text.Json.JsonSerializer.Serialize(m.Metadata) : DBNull.Value);
-            cmd.ExecuteNonQuery();
+            return cmd.ExecuteNonQuery() > 0;
         }
 
         private static void DeleteFile(SqliteConnection conn, SqliteTransaction txn, string fileKey)
@@ -4951,6 +5269,11 @@ ON CONFLICT(file_key) DO UPDATE SET
             _delayedQueueLocks.Clear();
             _coalescedPersistenceOps.Clear();
             _databaseLocks.Clear();
+            _cacheMutationLocks.Clear();
+            _hydratedTenants.Clear();
+            _startupMutatedKeys.Clear();
+            lock (_persistenceOrderLock)
+                _persistenceOrder.Clear();
 
             // 4. Dispose all tenant locks
             foreach (var semaphore in _tenantLocks.Values)
