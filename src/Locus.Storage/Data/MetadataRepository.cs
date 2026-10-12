@@ -595,84 +595,103 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
         {
             TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
 
-            // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
-            // This prevents multiple threads from simultaneously creating the connection instance.
-            var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
+            lock (GetDatabaseLock(tenantId))
             {
-                SqliteConnection? conn = null;
-                try
+                // Lock order: tenant semaphore (when held) -> database monitor -> Lazy.
+                // Acquire the monitor BEFORE selecting/evaluating Lazy.Value, never inside
+                // its factory. Initialization and maintenance now share a lifecycle boundary.
+                var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
                 {
-                    // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
-                    var tenantDir = GetTenantDirectoryPath(tid);
-                    if (!_fileSystem.Directory.Exists(tenantDir))
-                        _fileSystem.Directory.CreateDirectory(tenantDir);
-
-                    var dbPath = _fileSystem.Path.Combine(tenantDir, "metadata.db");
-                    conn = OpenAndInitializeConnection(dbPath);
-
-                    _logger.LogDebug("Created/opened SQLite database for tenant {TenantId} at {Path}", tid, dbPath);
-
-                    // Load active files into memory on first access
-                    LoadActiveFilesForTenant(tid, conn);
-
-                    return conn;
-                }
-                catch (Exception ex) when (IsRecoverableDatabaseException(ex))
-                {
-                    DisposeOpenConnection(conn, tid, "initialization");
-
-                    // Database is corrupted during initialization - attempt automatic recovery.
-                    // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here - it acquires _tenantLocks[tid],
-                    // which another thread may already hold while waiting for this Lazy to complete,
-                    // causing a deadlock (Lazy lock -> tenant lock cycle).
-                    // Instead call the lock-free internal helper directly.
-                    _logger.LogError(ex, "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...", tid);
-
+                    SqliteConnection? conn = null;
                     try
                     {
-                        // IMPORTANT: do NOT remove _databases[tid] from inside this Lazy factory.
-                        // Doing so would allow a concurrent caller to race in and install a second
-                        // Lazy for the same tenant while this factory is still rebuilding the file.
-                        // Clear only the tenant-specific in-memory indexes; the current Lazy instance
-                        // will remain the single publisher and will return the recovered connection.
-                        if (_activeFiles.TryRemove(tid, out var staleTenantCache))
-                            RemoveTenantFromGlobalIndex(staleTenantCache);
-                        _physicalPathIndex.TryRemove(tid, out _);
+                        // Ensure tenant subdirectory exists (thread-safe in case of concurrent access)
+                        var tenantDir = GetTenantDirectoryPath(tid);
+                        if (!_fileSystem.Directory.Exists(tenantDir))
+                            _fileSystem.Directory.CreateDirectory(tenantDir);
 
-                        // Rebuild database without acquiring the tenant lock (we may be called
-                        // from within the Lazy factory which is already locked via ExecutionAndPublication).
-                        var backupPath = RebuildDatabaseFileNoLock(tid);
+                        var dbPath = _fileSystem.Path.Combine(tenantDir, "metadata.db");
+                        conn = OpenAndInitializeConnection(dbPath);
 
-                        _logger.LogWarning("Metadata database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}", tid, backupPath ?? "N/A");
+                        _logger.LogDebug("Created/opened SQLite database for tenant {TenantId} at {Path}", tid, dbPath);
 
-                        // Retry initialization
-                        var dbPath = GetDatabasePath(tid);
-                        SqliteConnection? recoveredConn = null;
+                        // Load active files into memory on first access
+                        LoadActiveFilesForTenant(tid, conn);
+
+                        return conn;
+                    }
+                    catch (Exception ex) when (IsRecoverableDatabaseException(ex))
+                    {
+                        DisposeOpenConnection(conn, tid, "initialization");
+
+                        // Database is corrupted during initialization - attempt automatic recovery.
+                        // IMPORTANT: Do NOT call BeginDatabaseRebuildAsync here - it acquires _tenantLocks[tid],
+                        // which another thread may already hold while waiting for this Lazy to complete,
+                        // causing a deadlock (Lazy lock -> tenant lock cycle).
+                        // Instead call the lock-free internal helper directly.
+                        _logger.LogError(ex, "CORRUPTED METADATA DATABASE DETECTED for tenant {TenantId} during initialization. Attempting automatic recovery...", tid);
+
                         try
                         {
-                            recoveredConn = OpenAndInitializeConnection(dbPath);
+                            // IMPORTANT: do NOT remove _databases[tid] from inside this Lazy factory.
+                            // Doing so would allow a concurrent caller to race in and install a second
+                            // Lazy for the same tenant while this factory is still rebuilding the file.
+                            // Clear only the tenant-specific in-memory indexes; the current Lazy instance
+                            // will remain the single publisher and will return the recovered connection.
+                            if (_activeFiles.TryRemove(tid, out var staleTenantCache))
+                                RemoveTenantFromGlobalIndex(staleTenantCache);
+                            _physicalPathIndex.TryRemove(tid, out _);
 
-                            _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
+                            // Rebuild database without acquiring the tenant lock (we may be called
+                            // from within the Lazy factory which is already locked via ExecutionAndPublication).
+                            var backupPath = RebuildDatabaseFileNoLock(tid);
 
-                            return recoveredConn;
+                            _logger.LogWarning("Metadata database rebuilt for tenant {TenantId} during initialization. Backup: {BackupPath}", tid, backupPath ?? "N/A");
+
+                            // Retry initialization
+                            var dbPath = GetDatabasePath(tid);
+                            SqliteConnection? recoveredConn = null;
+                            try
+                            {
+                                recoveredConn = OpenAndInitializeConnection(dbPath);
+
+                                _logger.LogInformation("Successfully recovered and initialized metadata database for tenant {TenantId}", tid);
+
+                                return recoveredConn;
+                            }
+                            catch
+                            {
+                                DisposeOpenConnection(recoveredConn, tid, "recovery");
+                                throw;
+                            }
                         }
-                        catch
+                        catch (Exception recoveryEx)
                         {
-                            DisposeOpenConnection(recoveredConn, tid, "recovery");
-                            _databases.TryRemove(tid, out _);
+                            _logger.LogError(recoveryEx, "Failed to recover corrupted metadata database for tenant {TenantId} during initialization", tid);
                             throw;
                         }
                     }
-                    catch (Exception recoveryEx)
+                    catch
                     {
-                        _databases.TryRemove(tid, out _);
-                        _logger.LogError(recoveryEx, "Failed to recover corrupted metadata database for tenant {TenantId} during initialization", tid);
+                        // Open succeeded, but startup loading (or another factory step) failed.
+                        DisposeOpenConnection(conn, tid, "initialization");
                         throw;
                     }
-                }
-            }, LazyThreadSafetyMode.ExecutionAndPublication));
+                }, LazyThreadSafetyMode.ExecutionAndPublication));
 
-            return lazyConn.Value;
+                try
+                {
+                    return lazyConn.Value;
+                }
+                catch
+                {
+                    // Lazy caches factory exceptions. Remove only this failed instance,
+                    // after the factory has unwound, so the next access can retry.
+                    ((ICollection<KeyValuePair<string, Lazy<SqliteConnection>>>)_databases)
+                        .Remove(new KeyValuePair<string, Lazy<SqliteConnection>>(tenantId, lazyConn));
+                    throw;
+                }
+            }
         }
 
         private string GetTenantDirectoryPath(string tenantId)
@@ -3693,7 +3712,8 @@ LIMIT @limit;";
 
         /// <summary>
         /// Optimizes (rebuilds) a specific tenant's metadata database to reclaim space.
-        /// This method is thread-safe and will block all operations for this tenant during optimization.
+        /// Serializes database access and connection initialization for this tenant during optimization.
+        /// In-memory operations that do not access the connection can continue.
         /// WARNING: This is a heavy operation. Should be called during maintenance windows.
         /// </summary>
         /// <param name="tenantId">The tenant ID whose database should be optimized.</param>
@@ -3896,14 +3916,10 @@ LIMIT @limit;";
                 return null;
             }
 
-            // IMPORTANT: Do NOT acquire GetDatabaseLock here.
-            // This method is only called from within the Lazy<SqliteConnection> factory in GetDatabase,
-            // which holds the Lazy.ExecutionAndPublication lock for this tenant.
-            // If we try to acquire GetDatabaseLock we risk a deadlock:
-            //   Thread A: inside Lazy factory (holds Lazy lock) �� wants GetDatabaseLock
-            //   Thread B: inside AddOrUpdateDirectAsync (holds GetDatabaseLock) �� waits on Lazy.Value
-            // The Lazy lock already serializes all concurrent callers for this tenantId, so all
-            // ConcurrentDictionary updates and file operations below are safe without an extra lock.
+            // GetDatabase already holds the tenant's database monitor before entering
+            // the Lazy factory. Maintenance cannot evict or close this connection while
+            // initialization is running. Do not acquire the tenant semaphore here:
+            // callers can hold it while waiting for GetDatabase.
             {
                 if (_activeFiles.TryRemove(tenantId, out var staleTenantCache))
                     RemoveTenantFromGlobalIndex(staleTenantCache);
