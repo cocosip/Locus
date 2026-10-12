@@ -1431,7 +1431,7 @@ WHERE tenant_id = @tenant_id
             private readonly Dictionary<string, FileMetadata?> _originalMetadataByFileKey;
             private readonly Dictionary<string, FileMetadata?> _stagedMetadataByFileKey;
             private readonly Dictionary<string, FileMetadata?> _rollbackMetadataByFileKey;
-            private readonly Dictionary<string, FileMetadata?> _appliedMetadataByFileKey;
+            private readonly Dictionary<string, PersistenceOperation> _appliedOperationsByFileKey;
             private bool _flushed;
 
             public DirectProjectionBatch(MetadataRepository repository, string tenantId)
@@ -1442,7 +1442,7 @@ WHERE tenant_id = @tenant_id
                 _originalMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
                 _stagedMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
                 _rollbackMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
-                _appliedMetadataByFileKey = new Dictionary<string, FileMetadata?>(StringComparer.Ordinal);
+                _appliedOperationsByFileKey = new Dictionary<string, PersistenceOperation>(StringComparer.Ordinal);
             }
 
             public string TenantId => _tenantId;
@@ -1468,7 +1468,7 @@ WHERE tenant_id = @tenant_id
                     var original = CaptureOriginalMetadata(metadata.FileKey);
                     var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(metadata.FileKey, out var stagedProjection);
                     var expected = hasStagedProjection ? stagedProjection : original;
-                    var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(metadata.FileKey);
+                    var current = ReadCurrentMetadata(metadata.FileKey);
                     var projected = ResolveConcurrentUpsert(metadata, expected, current);
                     if (projected == null)
                     {
@@ -1476,13 +1476,12 @@ WHERE tenant_id = @tenant_id
                         return Task.CompletedTask;
                     }
 
-                    CaptureRollbackMetadata(
-                        metadata.FileKey,
-                        hasStagedProjection ? ReadCurrentMetadata(metadata.FileKey) : current);
+                    CaptureRollbackMetadata(metadata.FileKey, current);
                     _repository.UpdateCacheAndIndices(projected);
                     _stagedMetadataByFileKey[metadata.FileKey] = projected.Clone();
-                    _appliedMetadataByFileKey[metadata.FileKey] = projected.Clone();
-                    _operations.Add(_repository.CreatePersistenceUpsert(projected));
+                    var operation = _repository.CreatePersistenceUpsert(projected);
+                    _operations.Add(operation);
+                    _appliedOperationsByFileKey[metadata.FileKey] = operation;
                     return Task.CompletedTask;
                 }
             }
@@ -1506,23 +1505,24 @@ WHERE tenant_id = @tenant_id
                     var original = CaptureOriginalMetadata(fileKey);
                     var hasStagedProjection = _stagedMetadataByFileKey.TryGetValue(fileKey, out var stagedProjection);
                     var expected = hasStagedProjection ? stagedProjection : original;
-                    var current = hasStagedProjection ? stagedProjection?.Clone() : ReadCurrentMetadata(fileKey);
+                    var current = ReadCurrentMetadata(fileKey);
                     if (!MetadataEquals(current, expected))
                     {
                         _stagedMetadataByFileKey[fileKey] = current?.Clone();
                         return Task.FromResult(false);
                     }
 
-                    CaptureRollbackMetadata(
-                        fileKey,
-                        hasStagedProjection ? ReadCurrentMetadata(fileKey) : current);
+                    CaptureRollbackMetadata(fileKey, current);
                     var removed = _repository.TryRemoveFromCacheAndIndices(_tenantId, fileKey, out _);
                     _stagedMetadataByFileKey[fileKey] = null;
-                    _appliedMetadataByFileKey[fileKey] = null;
-                    if (removed || original != null)
-                        _operations.Add(_repository.CreatePersistenceDelete(_tenantId, fileKey));
+                    if (removed || current != null)
+                    {
+                        var operation = _repository.CreatePersistenceDelete(_tenantId, fileKey);
+                        _operations.Add(operation);
+                        _appliedOperationsByFileKey[fileKey] = operation;
+                    }
 
-                    return Task.FromResult(removed || original != null);
+                    return Task.FromResult(removed || current != null);
                 }
             }
 
@@ -1539,11 +1539,14 @@ WHERE tenant_id = @tenant_id
                 if (string.IsNullOrWhiteSpace(fileKey))
                     throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-                if (_stagedMetadataByFileKey.TryGetValue(fileKey, out var staged))
-                    return Task.FromResult(staged?.Clone());
-
-                var original = CaptureOriginalMetadata(fileKey);
-                return Task.FromResult(original?.Clone());
+                lock (_repository.GetDatabaseLock(_tenantId))
+                lock (_repository.GetCacheMutationLock(_tenantId))
+                {
+                    CaptureOriginalMetadata(fileKey);
+                    var current = ReadCurrentMetadata(fileKey);
+                    _stagedMetadataByFileKey[fileKey] = current?.Clone();
+                    return Task.FromResult(current);
+                }
             }
 
             public Task FlushAsync(CancellationToken ct = default)
@@ -1559,7 +1562,7 @@ WHERE tenant_id = @tenant_id
                     _originalMetadataByFileKey.Clear();
                     _stagedMetadataByFileKey.Clear();
                     _rollbackMetadataByFileKey.Clear();
-                    _appliedMetadataByFileKey.Clear();
+                    _appliedOperationsByFileKey.Clear();
                 }
                 catch
                 {
@@ -1605,12 +1608,19 @@ WHERE tenant_id = @tenant_id
 
             private void CaptureRollbackMetadata(string fileKey, FileMetadata? current)
             {
-                if (!_rollbackMetadataByFileKey.ContainsKey(fileKey))
+                if (!_rollbackMetadataByFileKey.ContainsKey(fileKey)
+                    || (_appliedOperationsByFileKey.TryGetValue(fileKey, out var operation)
+                        && _repository.HasNewerPersistenceOperation(operation)))
                     _rollbackMetadataByFileKey[fileKey] = current?.Clone();
             }
 
             private FileMetadata? ReadCurrentMetadata(string fileKey)
             {
+                // A staged cold state or deletion is absent from the hot cache until SQL flush.
+                if (_appliedOperationsByFileKey.TryGetValue(fileKey, out var operation)
+                    && !_repository.HasNewerPersistenceOperation(operation))
+                    return operation.Metadata?.Clone();
+
                 var cache = _repository.GetCache(_tenantId);
                 return cache.TryGetValue(fileKey, out var current)
                     ? current.Clone()
@@ -1649,21 +1659,11 @@ WHERE tenant_id = @tenant_id
                 {
                     foreach (var entry in _rollbackMetadataByFileKey)
                     {
-                        if (!_appliedMetadataByFileKey.TryGetValue(entry.Key, out var applied))
+                        if (!_appliedOperationsByFileKey.TryGetValue(entry.Key, out var operation))
                             continue;
 
-                        var current = ReadCurrentMetadata(entry.Key);
-                        var operation = _operations.LastOrDefault(op => op.FileKey == entry.Key);
-                        if (operation.Sequence == 0)
-                            continue;
                         if (_repository.HasNewerPersistenceOperation(operation))
                             continue;
-                        if (!MetadataEquals(current, applied))
-                        {
-                            // Cold staged states evict the hot entry before their SQL commit.
-                            if (current != null || applied == null || IsHotCachedStatus(applied.Status))
-                                continue;
-                        }
 
                         if (entry.Value == null)
                         {
@@ -4715,10 +4715,24 @@ LIMIT @limit;";
                 foreach (var op in ops)
                     SettlePersistenceOperation(op, committed: true);
 
-                var conn = GetDatabase(tenantId);
-                TryCheckpointAfterCommittedBatch(conn, tenantId);
-                RecordSqlitePersistenceStatistics(tenantId, ops.Count);
-                _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
+                try
+                {
+                    var conn = GetDatabase(tenantId);
+                    TryCheckpointAfterCommittedBatch(conn, tenantId);
+                    RecordSqlitePersistenceStatistics(tenantId, ops.Count);
+                    _logger.LogDebug("Flushed {Count} persistence operations for tenant {TenantId}", ops.Count, tenantId);
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        _logger.LogWarning(ex, "SQLite metadata committed for tenant {TenantId}, but post-commit diagnostics failed", tenantId);
+                    }
+                    catch
+                    {
+                        // A failing logging provider cannot turn a committed write into a rollback.
+                    }
+                }
             }
         }
 
