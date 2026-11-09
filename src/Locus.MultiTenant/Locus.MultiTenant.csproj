@@ -1,9 +1,8 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <Import Project="..\..\common.props" />
 
   <PropertyGroup>
-    <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>Locus.MultiTenant</PackageId>
     <Description>Multi-tenant management for Locus. Includes TenantManager with JSON-based metadata, in-memory caching, and auto-creation support.</Description>
   </PropertyGroup>

@@ -13,9 +13,11 @@
     <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and SQLite metadata management.</Description>
 
     <!-- Version information -->
-    <Version>2.0.3</Version>
+    <Version>2.1.0</Version>
 
     <!-- Build configuration -->
+    <!-- Consumers pick the matching TFM asset and dependency line: netstandard2.0/net10.0 use 10.x, net9.0 uses 9.x, net8.0 uses 8.x. -->
+    <TargetFrameworks>netstandard2.0;net8.0;net9.0;net10.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

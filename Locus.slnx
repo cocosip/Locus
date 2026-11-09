@@ -19,6 +19,7 @@
     <Project Path="tests/Locus.FileSystem.Tests/Locus.FileSystem.Tests.csproj" />
     <Project Path="tests/Locus.IntegrationTests/Locus.IntegrationTests.csproj" />
     <Project Path="tests/Locus.MultiTenant.Tests/Locus.MultiTenant.Tests.csproj" />
+    <Project Path="tests/Locus.NetStandardSmoke/Locus.NetStandardSmoke.csproj" />
     <Project Path="tests/Locus.Storage.Tests/Locus.Storage.Tests.csproj" />
   </Folder>
 </Solution>

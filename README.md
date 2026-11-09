@@ -4,7 +4,7 @@
 [![NuGet](https://img.shields.io/nuget/v/Locus.svg)](https://www.nuget.org/packages/Locus/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A high-performance, multi-tenant file storage pool system targeting netstandard2.0 and validated on .NET 10, with SQLite-based metadata management.
+A high-performance, multi-tenant file storage pool system for .NET, targeting `netstandard2.0`, .NET 8, .NET 9, and .NET 10, with SQLite-based metadata management.
 
 ## Overview
 
@@ -16,6 +16,23 @@ Locus is designed as a **file queue system** that provides:
 - **Automatic management** - System handles directory structure, file placement, and cleanup
 - **Directory-level quota control** - Configurable file count limits per directory
 - **Operational statistics** - Optional low-overhead in-process statistics for write throughput, file queue flow, SQLite persistence, and watcher imports
+
+## Supported Frameworks
+
+Locus multi-targets `netstandard2.0`, `net8.0`, `net9.0`, and `net10.0`. NuGet selects the asset
+matching the consuming project's target framework, and each asset declares a matching dependency range:
+
+| Target | Microsoft.Extensions / System packages | Microsoft.Data.Sqlite | SQLitePCLRaw |
+|---|---|---|---|
+| `netstandard2.0` | `[10.0.0,11.0.0)` | `[10.0.0,11.0.0)` | `[2.1.14,3.0.0)` |
+| `net8.0` | `[8.0.0,9.0.0)`（`System.Text.Json` 为 `[8.0.6,9.0.0)`） | `[8.0.0,9.0.0)` | `[2.1.14,3.0.0)` |
+| `net9.0` | `[9.0.0,10.0.0)` | `[9.0.0,10.0.0)` | `[2.1.14,3.0.0)` |
+| `net10.0` | `[10.0.0,11.0.0)` | `[10.0.0,11.0.0)` | `[3.0.5,4.0.0)` |
+
+依赖声明使用范围而不是固定补丁版本：下界降到该 TFM 的首个版本（net8 的 `System.Text.Json` 因安全修复从 `8.0.6` 起步），消费者已有的同大版本更高补丁不会被强制降级。上界限定到下一个大版本，避免 net8/net9 消费者跨到 10.x 后与 SQLitePCLRaw 2.x/3.x 资产不匹配。NuGet pack 会把无上界的 `[9.0.0, )` 归一化成固定 `9.0.0`，所以这里使用带下界和上界的范围。
+
+A `netstandard2.0` library compiles against the `netstandard2.0` asset; when a .NET 8/9/10 application
+consumes it, NuGet resolves the application's own target framework asset instead.
 
 ## Key Concepts
 
@@ -606,7 +623,12 @@ The solution is covered by focused xUnit projects and BenchmarkDotNet harnesses:
 - `tests/Locus.Storage.Tests`
 - `tests/Locus.MultiTenant.Tests`
 - `tests/Locus.IntegrationTests`
+- `tests/Locus.NetStandardSmoke`
 - `tests/Locus.Benchmarks`
+
+The test projects multi-target `net8.0;net9.0;net10.0`, so the full suite runs once per supported
+runtime and dependency line. `Locus.NetStandardSmoke` is a compile-only guard for the `netstandard2.0`
+asset and its 10.x dependency group.
 
 Use `dotnet test Locus.slnx --no-build` after a successful build, or run a focused project such as
 `dotnet test tests/Locus.Storage.Tests/Locus.Storage.Tests.csproj --no-restore` while working on storage

@@ -59,7 +59,6 @@ namespace Locus.Storage
         private int _emptyDirectoriesRemoved;
         private int _completedRecordsRemoved;
         private int _permanentlyFailedFilesRemoved;
-        private int _orphanedFilesRemoved;
         private int _orphanedFilesRecovered;
         private int _timedOutFilesReset;
         private long _spaceFreed;
@@ -2426,7 +2425,8 @@ namespace Locus.Storage
                 EmptyDirectoriesRemoved = Volatile.Read(ref _emptyDirectoriesRemoved),
                 CompletedRecordsRemoved = Volatile.Read(ref _completedRecordsRemoved),
                 PermanentlyFailedFilesRemoved = Volatile.Read(ref _permanentlyFailedFilesRemoved),
-                OrphanedFilesRemoved = Volatile.Read(ref _orphanedFilesRemoved),
+                // Orphaned files are recovered and re-queued, never deleted by cleanup.
+                OrphanedFilesRemoved = 0,
                 OrphanedFilesRecovered = Volatile.Read(ref _orphanedFilesRecovered),
                 TimedOutFilesReset = Volatile.Read(ref _timedOutFilesReset),
                 SpaceFreed = Interlocked.Read(ref _spaceFreed)

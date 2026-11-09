@@ -5,7 +5,7 @@ on:
     branches:
       - main
       - master
-      - net9
+      - dev
       - 'feature/**'
       - 'release/**'
     tags:
@@ -14,11 +14,14 @@ on:
     branches:
       - main
       - master
-      - net9
+      - dev
   workflow_dispatch:
 
 env:
-  DOTNET_VERSION: '10.0.x'
+  DOTNET_VERSIONS: |
+    8.0.x
+    9.0.x
+    10.0.x
   CONFIGURATION: Release
   NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
 
@@ -39,7 +42,7 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
+        dotnet-version: ${{ env.DOTNET_VERSIONS }}
 
     - name: Cache NuGet packages
       uses: actions/cache@v6
@@ -56,7 +59,7 @@ jobs:
       run: dotnet build Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
 
     - name: Run tests with coverage
-      run: dotnet test Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-build --verbosity minimal
+      run: dotnet test Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-build --verbosity minimal -m:1
         --collect:"XPlat Code Coverage"
         --results-directory ./coverage
         --logger "trx;LogFileName=test-results.trx"
@@ -100,6 +103,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write # NuGet trusted publishing (GitHub OIDC -> short-lived nuget.org API key)
 
     steps:
     - name: Checkout code
@@ -110,7 +114,7 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
+        dotnet-version: ${{ env.DOTNET_VERSIONS }}
 
     - name: Cache NuGet packages
       uses: actions/cache@v6
@@ -138,6 +142,14 @@ jobs:
           --verbosity minimal
       shell: bash
 
+    - name: Verify multi-target package
+      run: |
+        NUSPEC=$(unzip -p ./packages/Locus.*.nupkg '*.nuspec')
+        for tfm in ".NETStandard2.0" "net8.0" "net9.0" "net10.0"; do
+          grep -q "targetFramework=\"$tfm\"" <<< "$NUSPEC" || { echo "Missing dependency group: $tfm"; exit 1; }
+        done
+        unzip -l ./packages/Locus.*.nupkg | grep -E 'lib/(netstandard2\.0|net8\.0|net9\.0|net10\.0)/Locus\.dll'
+
     - name: List packages
       run: ls -la ./packages/
 
@@ -155,14 +167,21 @@ jobs:
         path: ./packages/*.nupkg
         retention-days: 30
 
+    # Exchange the GitHub OIDC token for a short-lived (1h) nuget.org API key.
+    # Requires a trusted publishing policy on nuget.org: cocosip / Locus / ci-cd.yml
+    - name: NuGet login (OIDC -> temp API key)
+      id: login
+      uses: NuGet/login@v1
+      with:
+        user: virtual # nuget.org profile name (not email); public, so no secret is needed
+
     - name: Publish to NuGet.org
       run: |
         dotnet nuget push ./packages/*.nupkg \
-          --api-key ${{ secrets.NUGET_API_KEY }} \
+          --api-key ${{ steps.login.outputs.NUGET_API_KEY }} \
           --source https://api.nuget.org/v3/index.json \
           --skip-duplicate \
           --no-symbols
-      continue-on-error: true
 
     - name: Generate changelog
       id: changelog
@@ -220,7 +239,7 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
+        dotnet-version: ${{ env.DOTNET_VERSIONS }}
 
     - name: Cache NuGet packages
       uses: actions/cache@v6

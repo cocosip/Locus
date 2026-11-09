@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -592,7 +593,7 @@ namespace Locus.Storage
             return drainedAny;
         }
 
-        private bool TryDequeuePendingRequest(TenantWriterState writer, out PendingAppendRequest request)
+        private bool TryDequeuePendingRequest(TenantWriterState writer, [NotNullWhen(true)] out PendingAppendRequest? request)
         {
             if (writer.PendingRequests.TryDequeue(out request))
             {
@@ -600,7 +601,7 @@ namespace Locus.Storage
                 return true;
             }
 
-            request = null!;
+            request = null;
             return false;
         }
 
@@ -1416,7 +1417,7 @@ namespace Locus.Storage
             }
         }
 
-        private void OnStateFlushTimer(object state)
+        private void OnStateFlushTimer(object? state)
         {
             _ = FlushDirtyJournalStatesAsync();
         }

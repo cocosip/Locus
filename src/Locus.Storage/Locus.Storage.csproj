@@ -1,9 +1,8 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <Import Project="..\..\common.props" />
 
   <PropertyGroup>
-    <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>Locus.Storage</PackageId>
     <Description>Storage pool and metadata management for Locus. Includes StoragePool, FileScheduler, DirectoryQuotaManager with SQLite-based persistence and active-data caching.</Description>
   </PropertyGroup>

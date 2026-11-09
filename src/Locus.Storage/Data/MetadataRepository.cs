@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -2593,11 +2594,10 @@ WHERE tenant_id = @tenant_id
                     var cache = GetCache(tenantId);
                     var currentFromCache = cache.TryGetValue(fileKey, out var current);
                     if (!currentFromCache)
-                    {
                         current = TryGetFromDatabase(tenantId, fileKey);
-                        if (current == null)
-                            return null;
-                    }
+
+                    if (current == null)
+                        return null;
 
                     if (current.Status == FileProcessingStatus.Processing)
                         return current.Clone();
@@ -3864,15 +3864,17 @@ LIMIT @limit;";
             return Task.FromResult<FileMetadata?>(null);
         }
 
-        internal bool TryResolveTenantIdByFileKey(string fileKey, out string tenantId)
+        internal bool TryResolveTenantIdByFileKey(string fileKey, [NotNullWhen(true)] out string? tenantId)
         {
             if (string.IsNullOrWhiteSpace(fileKey))
                 throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
 
-            if (_fileKeyTenantIndex.TryGetValue(fileKey, out tenantId)
-                && _activeFiles.TryGetValue(tenantId, out var indexedTenantFiles)
+            if (_fileKeyTenantIndex.TryGetValue(fileKey, out var indexedTenantId)
+                && indexedTenantId != null
+                && _activeFiles.TryGetValue(indexedTenantId, out var indexedTenantFiles)
                 && indexedTenantFiles.ContainsKey(fileKey))
             {
+                tenantId = indexedTenantId;
                 return true;
             }
 
@@ -3888,7 +3890,7 @@ LIMIT @limit;";
             }
 
             _fileKeyTenantIndex.TryRemove(fileKey, out _);
-            tenantId = null!;
+            tenantId = null;
             return false;
         }
 

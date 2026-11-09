@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -576,7 +577,7 @@ namespace Locus.Storage
             _importedFiles[path] = value;
         }
 
-        private bool TryRemoveImportedFileValue(string path, out string removedValue)
+        private bool TryRemoveImportedFileValue(string path, [NotNullWhen(true)] out string? removedValue)
         {
             if (!_importedFiles.TryRemove(path, out removedValue))
                 return false;

@@ -13,16 +13,16 @@
 #### 1. build-and-test (构建和测试)
 
 **触发条件**:
-- Push 到 `main` 或 `master` 分支
-- Pull Request 到 `main` 或 `master` 分支
+- Push 到 `main`、`master` 或 `dev` 分支
+- Pull Request 到 `main`、`master` 或 `dev` 分支
 - Tag 推送 (格式: `v*.*.*`)
 
 **执行步骤**:
 1. 检出代码
-2. 设置 .NET 10.0 环境
+2. 设置 .NET 8.0 / 9.0 / 10.0 环境
 3. 恢复 NuGet 依赖
 4. 构建解决方案
-5. 运行所有测试
+5. 运行 `net8.0` / `net9.0` / `net10.0` 全部测试
 6. 上传测试结果
 
 #### 2. pack-nuget (打包和发布)
@@ -34,15 +34,16 @@
 **执行步骤**:
 1. 从 tag 提取版本号
 2. 构建解决方案
-3. 打包 Locus NuGet 包 (包含所有依赖组件):
+3. 打包 Locus NuGet 包 (包含 `netstandard2.0`、`net8.0`、`net9.0`、`net10.0` 四套资产与依赖组):
    - Locus.Core
    - Locus.FileSystem
    - Locus.Storage
    - Locus.MultiTenant
-4. 上传 NuGet 包到 Artifacts
-5. 发布到 NuGet.org (如果配置了 API Key)
-6. 生成 Changelog (从上一个 tag 到当前 tag 的提交记录)
-7. 创建 GitHub Release，包含:
+4. 校验包内四个 TFM 的依赖组和 `Locus.dll`
+5. 上传 NuGet 包到 Artifacts
+6. 通过 NuGet Trusted Publishing (OIDC) 发布到 NuGet.org
+7. 生成 Changelog (从上一个 tag 到当前 tag 的提交记录)
+8. 创建 GitHub Release，包含:
    - 版本信息
    - NuGet 包信息
    - 完整的 Changelog
@@ -54,23 +55,26 @@
 - 仅在 tag 推送且 `pack-nuget` 成功后触发
 
 **执行步骤**:
-1. 使用 .NET 10 构建 `Locus.slnx`
+1. 使用 .NET 8/9/10 构建 `Locus.slnx`
 2. 生成并上传 `.snupkg` 符号包
 
 ## 配置步骤
 
-### 1. 设置 NuGet API Key
+### 1. 配置 NuGet Trusted Publishing
 
-要发布到 NuGet.org，需要配置 API Key：
+发布使用 NuGet 的 Trusted Publishing，不再需要长期 API Key。先到 nuget.org 配置信任策略：
 
 1. 登录 [NuGet.org](https://www.nuget.org/)
-2. 进入 Account Settings → API Keys
-3. 创建新的 API Key (推荐 scope: Push new packages and package versions)
-4. 在 GitHub 仓库设置中添加 Secret:
-   - 进入: Settings → Secrets and variables → Actions
-   - 点击 "New repository secret"
-   - Name: `NUGET_API_KEY`
-   - Value: 粘贴你的 NuGet API Key
+2. 点击用户名 → **Trusted Publishing** → **Add new policy**
+3. 填写：
+   - **Repository owner**: `cocosip`
+   - **Repository**: `Locus`
+   - **Workflow file**: `ci-cd.yml`（只填文件名，不带 `.github/workflows/`）
+   - **Environment**: 留空（当前 workflow 未使用 GitHub Environment）
+4. 工作流中的 `NuGet/login@v1` 使用 `user: virtual`（nuget.org 的 profile 名，不是邮箱）。如果账号的 profile 名不同，修改 [ci-cd.yml](ci-cd.yml) 中的 `user`。
+5. 无需在 GitHub 配置 `NUGET_API_KEY` secret；发布 job 已声明 `id-token: write`。
+
+参考：[NuGet Trusted Publishing - GitHub Actions](https://learn.microsoft.com/zh-cn/nuget/nuget-org/trusted-publishing#github-actions)
 
 ### 2. 更新项目元数据
 
@@ -168,9 +172,11 @@ test: Add integration tests for FileScheduler
 - 查看 Actions 日志获取详细错误信息
 
 ### 发布到 NuGet 失败
-- 确认 NUGET_API_KEY secret 已正确配置
-- 检查 API Key 是否有正确的权限
-- 确认包名称没有与现有包冲突
+- 确认 nuget.org 的 Trusted Publishing 策略为 `cocosip` / `Locus` / `ci-cd.yml`
+- 确认发布 job 有 `id-token: write` 权限
+- 确认 `NuGet/login@v1` 的 `user` 是 nuget.org profile 名（不是邮箱）
+- 如果包版本已存在，`--skip-duplicate` 会跳过；需要新版本时更新 tag
+- 查看 Actions 日志中 `NuGet login` 步骤的输出
 
 ### GitHub Release 创建失败
 - 确认 GITHUB_TOKEN 有足够权限 (默认已配置)
