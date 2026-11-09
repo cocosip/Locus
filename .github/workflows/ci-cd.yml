@@ -1,20 +1,17 @@
 name: CI/CD Pipeline
 
+# 触发范围（dev 分支不触发任何任务）：
+#   push master / PR -> master   : 编译 + 单元测试
+#   push v*.*.* tag              : 编译 + 单元测试 + 打包 + 发布 NuGet
 on:
   push:
     branches:
-      - main
       - master
-      - dev
-      - 'feature/**'
-      - 'release/**'
     tags:
       - 'v*.*.*'
   pull_request:
     branches:
-      - main
       - master
-      - dev
   workflow_dispatch:
 
 env:
@@ -26,12 +23,15 @@ env:
   NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
 
 jobs:
+  # 全流程只编译一次：restore -> build -> test (--no-build) -> pack (复用同一份 Release 输出)
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
-      should_publish: ${{ steps.version.outputs.should_publish }}
+      release: ${{ steps.version.outputs.release }}
 
     steps:
     - name: Checkout code
@@ -52,6 +52,20 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-nuget-
 
+    - name: Extract version
+      id: version
+      run: |
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          RELEASE=true
+        else
+          VERSION="0.0.0-dev.$(date +%Y%m%d%H%M%S)"
+          RELEASE=false
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "release=${RELEASE}" >> "$GITHUB_OUTPUT"
+        echo "Version: ${VERSION} (release: ${RELEASE})"
+
     - name: Restore dependencies
       run: dotnet restore Locus.slnx --verbosity minimal
 
@@ -59,11 +73,16 @@ jobs:
       run: dotnet build Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
 
     - name: Run tests with coverage
-      run: dotnet test Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-build --verbosity minimal -m:1
-        --collect:"XPlat Code Coverage"
-        --results-directory ./coverage
-        --logger "trx;LogFileName=test-results.trx"
-        -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+      run: |
+        dotnet test Locus.slnx \
+          --configuration ${{ env.CONFIGURATION }} \
+          --no-build \
+          --verbosity minimal \
+          -m:1 \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ./coverage \
+          --logger "trx;LogFileName=test-results.trx" \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
 
     - name: Upload test results
       if: always()
@@ -81,28 +100,60 @@ jobs:
         path: ./coverage/**/coverage.cobertura.xml
         retention-days: 7
 
-    - name: Extract version
-      id: version
+    # 不传 --no-build：项目引用场景下 NetSDK 会拒绝 NoBuild=true；
+    # 这里只是增量检查（实测约 3 秒，不发生重新编译），一次 pack 同时产出 .nupkg 与 .snupkg。
+    - name: Pack NuGet packages
+      if: steps.version.outputs.release == 'true'
       run: |
-        if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "should_publish=true" >> $GITHUB_OUTPUT
-        else
-          VERSION="0.0.0-dev.$(date +%Y%m%d%H%M%S)"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "should_publish=false" >> $GITHUB_OUTPUT
-        fi
-        echo "Version: ${VERSION}"
+        mkdir -p ./packages
+        dotnet pack src/Locus/Locus.csproj \
+          --configuration ${{ env.CONFIGURATION }} \
+          --no-restore \
+          --output ./packages \
+          /p:PackageVersion=${{ steps.version.outputs.version }} \
+          --verbosity minimal
+      shell: bash
 
-  pack-nuget:
-    name: Pack NuGet (Linux)
+    - name: Verify multi-target package
+      if: steps.version.outputs.release == 'true'
+      run: |
+        NUSPEC=$(unzip -p ./packages/Locus.*.nupkg '*.nuspec')
+        for tfm in ".NETStandard2.0" "net8.0" "net9.0" "net10.0"; do
+          grep -q "targetFramework=\"$tfm\"" <<< "$NUSPEC" || { echo "Missing dependency group: $tfm"; exit 1; }
+        done
+        unzip -l ./packages/Locus.*.nupkg | grep -E 'lib/(netstandard2\.0|net8\.0|net9\.0|net10\.0)/Locus\.dll'
+        ls ./packages/*.snupkg
+
+    - name: Verify NuGet packages exclude test artifacts
+      if: steps.version.outputs.release == 'true'
+      run: |
+        if unzip -l ./packages/*.nupkg | grep -Eiq '(^|/)(coverage|test-results)(/|$)|\.trx$|coverage\.cobertura\.xml$'; then
+          echo "NuGet package contains test or coverage artifacts"
+          exit 1
+        fi
+
+    - name: List packages
+      if: steps.version.outputs.release == 'true'
+      run: ls -la ./packages/
+
+    - name: Upload NuGet packages
+      if: steps.version.outputs.release == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: nuget-packages
+        path: |
+          ./packages/*.nupkg
+          ./packages/*.snupkg
+        retention-days: 30
+
+  # 发布只消费上面的产物：不 checkout 源码、不 restore、不编译。
+  publish:
+    name: Publish NuGet
     runs-on: ubuntu-latest
     needs: build-and-test
-    if: needs.build-and-test.outputs.should_publish == 'true'
+    if: needs.build-and-test.outputs.release == 'true'
     permissions:
       contents: write
-      packages: write
       id-token: write # NuGet trusted publishing (GitHub OIDC -> short-lived nuget.org API key)
 
     steps:
@@ -111,61 +162,16 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Download NuGet packages
+      uses: actions/download-artifact@v8
+      with:
+        name: nuget-packages
+        path: ./packages
+
     - name: Setup .NET
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: ${{ env.DOTNET_VERSIONS }}
-
-    - name: Cache NuGet packages
-      uses: actions/cache@v6
-      with:
-        path: ${{ env.NUGET_PACKAGES }}
-        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
-        restore-keys: |
-          ${{ runner.os }}-nuget-
-
-    - name: Restore dependencies
-      run: dotnet restore Locus.slnx --verbosity minimal
-
-    - name: Build solution
-      run: dotnet build Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
-
-    - name: Pack NuGet packages
-      run: |
-        mkdir -p ./packages
-        dotnet pack src/Locus/Locus.csproj \
-          --configuration ${{ env.CONFIGURATION }} \
-          --no-restore \
-          --output ./packages \
-          /p:PackageVersion=${{ needs.build-and-test.outputs.version }} \
-          /p:ContinuousIntegrationBuild=true \
-          --verbosity minimal
-      shell: bash
-
-    - name: Verify multi-target package
-      run: |
-        NUSPEC=$(unzip -p ./packages/Locus.*.nupkg '*.nuspec')
-        for tfm in ".NETStandard2.0" "net8.0" "net9.0" "net10.0"; do
-          grep -q "targetFramework=\"$tfm\"" <<< "$NUSPEC" || { echo "Missing dependency group: $tfm"; exit 1; }
-        done
-        unzip -l ./packages/Locus.*.nupkg | grep -E 'lib/(netstandard2\.0|net8\.0|net9\.0|net10\.0)/Locus\.dll'
-
-    - name: List packages
-      run: ls -la ./packages/
-
-    - name: Verify NuGet packages exclude test artifacts
-      run: |
-        if unzip -l ./packages/*.nupkg | grep -Eiq '(^|/)(coverage|test-results)(/|$)|\.trx$|coverage\.cobertura\.xml$'; then
-          echo "NuGet package contains test or coverage artifacts"
-          exit 1
-        fi
-
-    - name: Upload NuGet packages
-      uses: actions/upload-artifact@v7
-      with:
-        name: nuget-packages
-        path: ./packages/*.nupkg
-        retention-days: 30
+        dotnet-version: 10.0.x
 
     # Exchange the GitHub OIDC token for a short-lived (1h) nuget.org API key.
     # Requires a trusted publishing policy on nuget.org: cocosip / Locus / ci-cd.yml
@@ -175,13 +181,13 @@ jobs:
       with:
         user: virtual # nuget.org profile name (not email); public, so no secret is needed
 
+    # 不传 --no-symbols：同一目录下的 .snupkg 会随 .nupkg 一起推送。
     - name: Publish to NuGet.org
       run: |
         dotnet nuget push ./packages/*.nupkg \
           --api-key ${{ steps.login.outputs.NUGET_API_KEY }} \
           --source https://api.nuget.org/v3/index.json \
-          --skip-duplicate \
-          --no-symbols
+          --skip-duplicate
 
     - name: Generate changelog
       id: changelog
@@ -221,53 +227,9 @@ jobs:
           ### 🔗 Links
           - [NuGet Gallery](https://www.nuget.org/packages/Locus)
           - [Documentation](https://github.com/${{ github.repository }})
-        files: ./packages/*.nupkg
+        files: |
+          ./packages/*.nupkg
+          ./packages/*.snupkg
         draft: false
         prerelease: ${{ contains(needs.build-and-test.outputs.version, '-') }}
         token: ${{ secrets.GITHUB_TOKEN }}
-
-  pack-debug-symbols:
-    name: Pack Debug Symbols
-    runs-on: ubuntu-latest
-    needs: [build-and-test, pack-nuget]
-    if: needs.build-and-test.outputs.should_publish == 'true'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v7
-
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v6
-      with:
-        dotnet-version: ${{ env.DOTNET_VERSIONS }}
-
-    - name: Cache NuGet packages
-      uses: actions/cache@v6
-      with:
-        path: ${{ env.NUGET_PACKAGES }}
-        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
-        restore-keys: |
-          ${{ runner.os }}-nuget-
-
-    - name: Restore and Build
-      run: |
-        dotnet restore Locus.slnx --verbosity minimal
-        dotnet build Locus.slnx --configuration ${{ env.CONFIGURATION }} --no-restore --verbosity minimal
-
-    - name: Pack Symbol Packages
-      run: |
-        mkdir -p ./symbols
-        dotnet pack src/Locus/Locus.csproj \
-          --configuration ${{ env.CONFIGURATION }} \
-          --no-restore \
-          --output ./symbols \
-          /p:PackageVersion=${{ needs.build-and-test.outputs.version }} \
-          /p:ContinuousIntegrationBuild=true \
-          --verbosity minimal
-
-    - name: Upload Symbol Packages
-      uses: actions/upload-artifact@v7
-      with:
-        name: symbol-packages
-        path: ./symbols/*.snupkg
-        retention-days: 30
