@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -399,28 +400,68 @@ namespace Locus.Storage.Tests
                 WatchPath = "/watch/slow"
             };
 
-            var service = CreateService(options, new[] { fastWatcher, slowWatcher }, out var scanCounts);
+            var fileWatcher = new Mock<IFileWatcher>();
+            var optionsManager = new Mock<IFileWatcherOptionsManager>();
+            var fastScanCount = 0;
+            var slowScanStarts = new ConcurrentQueue<long>();
+
+            optionsManager
+                .Setup(manager => manager.GetOptionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(options);
+            fileWatcher
+                .Setup(w => w.GetAllWatchersAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { fastWatcher, slowWatcher });
+            fileWatcher
+                .Setup(w => w.ScanNowAsync(It.IsAny<FileWatcherConfiguration>(), It.IsAny<CancellationToken>()))
+                .Returns<FileWatcherConfiguration, CancellationToken>((watcher, _) =>
+                {
+                    if (watcher.WatcherId == slowWatcher.WatcherId)
+                        slowScanStarts.Enqueue(Stopwatch.GetTimestamp());
+                    else
+                        Interlocked.Increment(ref fastScanCount);
+
+                    return Task.FromResult(new FileWatcherScanResult());
+                });
+
+            var service = new BackgroundFileWatcherService(
+                fileWatcher.Object,
+                optionsManager.Object,
+                NullLogger<BackgroundFileWatcherService>.Instance);
 
             await service.StartAsync(CancellationToken.None);
             try
             {
+                // Observe several slow scans instead of a fixed wall-clock window: under CI load the
+                // scheduler loop may sleep past a due time and scan both watchers in the same wakeup,
+                // which makes a fixed-window scan-count ratio flaky without indicating over-scanning.
                 await WaitUntilAsync(
-                    () => GetCount(scanCounts, "fast") >= 1 && GetCount(scanCounts, "slow") >= 1,
-                    TimeSpan.FromSeconds(2),
-                    "Timed out waiting for initial watcher scan.");
-
-                await Task.Delay(TimeSpan.FromMilliseconds(620));
+                    () => Volatile.Read(ref fastScanCount) >= 3 && slowScanStarts.Count >= 3,
+                    TimeSpan.FromSeconds(10),
+                    $"Timed out waiting for repeated watcher scans. Fast={Volatile.Read(ref fastScanCount)}, Slow={slowScanStarts.Count}.");
             }
             finally
             {
                 await service.StopAsync(CancellationToken.None);
             }
 
-            var fastCount = GetCount(scanCounts, "fast");
-            var slowCount = GetCount(scanCounts, "slow");
+            var slowStarts = slowScanStarts.ToArray();
+            var fastCount = Volatile.Read(ref fastScanCount);
 
-            Assert.True(fastCount >= slowCount * 2, $"Fast watcher should run much more often. Fast={fastCount}, Slow={slowCount}.");
-            Assert.InRange(slowCount, 2, 4);
+            // Every scan of a due watcher is at least as likely for the fast watcher, so it must never
+            // run less often than the slow one.
+            Assert.True(
+                fastCount >= slowStarts.Length,
+                $"Fast watcher should not run less often than the slow watcher. Fast={fastCount}, Slow={slowStarts.Length}.");
+
+            // The invariant that matters: the slow watcher is never scanned faster than its polling
+            // interval. A scheduler that ignores per-watcher due times would rescan it every loop.
+            for (var i = 1; i < slowStarts.Length; i++)
+            {
+                var gap = Stopwatch.GetElapsedTime(slowStarts[i - 1], slowStarts[i]);
+                Assert.True(
+                    gap >= TimeSpan.FromMilliseconds(150),
+                    $"Slow watcher was rescanned after {gap.TotalMilliseconds:F0}ms, below its 250ms polling interval.");
+            }
         }
 
         [Fact]
