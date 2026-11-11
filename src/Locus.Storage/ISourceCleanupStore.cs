@@ -55,7 +55,10 @@ namespace Locus.Storage
         /// <param name="ct">Cancellation token.</param>
         Task RemoveAsync(long id, CancellationToken ct = default);
 
-        /// <summary>Removes expired terminal suppression records.</summary>
+        /// <summary>
+        /// Removes expired terminal suppression records and abandoned import reservations
+        /// (interrupted imports whose source no longer exists).
+        /// </summary>
         Task<int> PruneTerminalAsync(DateTime cutoffUtc, int limit, CancellationToken ct = default);
 
         /// <summary>Compacts the source cleanup database and returns size statistics.</summary>

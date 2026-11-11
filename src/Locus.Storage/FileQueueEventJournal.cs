@@ -1309,11 +1309,13 @@ namespace Locus.Storage
             return fallback;
         }
 
-        private void SaveJournalState(string tenantId, JournalState state)
+        private void SaveJournalState(string tenantId, JournalState state, bool rescanJournal = false)
         {
-            // The caller owns the authoritative tail offset for this save; rescanning the journal
-            // here would discard in-memory progress that has not been flushed yet.
-            NormalizeJournalState(tenantId, state, scanJournal: false);
+            // The caller normally owns the authoritative tail offset for this save; rescanning the
+            // journal here would discard in-memory progress that has not been flushed yet. Shutdown
+            // is the exception: writers may have timed out mid-append, so the persisted tail must be
+            // reconciled with the bytes that actually reached the file.
+            NormalizeJournalState(tenantId, state, scanJournal: rescanJournal);
             var tenantDirectory = GetTenantDirectory(tenantId);
             if (!_fileSystem.Directory.Exists(tenantDirectory))
                 _fileSystem.Directory.CreateDirectory(tenantDirectory);
@@ -1929,7 +1931,7 @@ namespace Locus.Storage
                         {
                             using (AcquireTenantJournalLockAsync(tenantId, CancellationToken.None).GetAwaiter().GetResult())
                             {
-                                SaveJournalState(tenantId, LoadJournalState(tenantId));
+                                SaveJournalState(tenantId, LoadJournalState(tenantId), rescanJournal: true);
                             }
                         }
                         finally

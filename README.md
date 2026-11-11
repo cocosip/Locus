@@ -257,8 +257,10 @@ those heavier volume scans, independent from the normal status cleanup cadence.
 
 `FileWatcher` imports each stable source file into the storage pool and then enqueues its configured
 `PostImportAction` (`Delete`, `Move`, or `Keep`) in the bounded source-cleanup queue. Capacity is reserved
-before the Locus write; when `MaxActiveJobs` is reached, that file is deferred without being imported and
-will be reconsidered by a later scan. The scan continues with other files while cleanup runs independently.
+before the Locus write; `MaxActiveJobs` only counts in-flight rows (`Importing`/`Pending`/`Retrying`/
+`MovePending`), so retained Keep/Failed suppression rows never block new imports. When the limit is reached,
+that file is deferred without being imported and will be reconsidered by a later scan. The scan continues
+with other files while cleanup runs independently.
 A source path is suppressed only while its tracked cleanup row has the same fingerprint; if the producer
 reuses the path with different content, the old row is discarded before the new import is considered.
 
@@ -267,8 +269,9 @@ The source-cleanup worker runs only when `SourceCleanup.Enabled` is true, the pe
 also prevents terminal pruning and database optimization while Watcher is inactive. Failed source Delete/Move
 operations are retried using the watcher post-import retry settings. After the configured attempts, the worker
 moves the still-matching source into `<FailureDirectory>/<WatcherId>/`; when no failure directory is configured,
-the job becomes a terminal suppression marker instead. Stale import reservations are released after
-`ImportReservationTimeout` so the watcher can retry the import; they never authorize deletion of a source whose
+the job becomes a terminal suppression marker instead. Stale import reservations are reset by the watcher once
+`ImportReservationTimeout` elapses so the import can be retried, and reservations whose source disappeared are
+pruned by the worker after `TerminalJobRetentionPeriod`; they never authorize deletion of a source whose
 Locus write was not durably confirmed. `TerminalJobRetentionPeriod` bounds Keep/Failed suppression history, so
 an unchanged retained source can be imported again after its marker is pruned. This queue is separate from
 `RetryPolicy`: `RetryPolicy` applies to downstream Locus file processing

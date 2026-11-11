@@ -62,8 +62,9 @@
       // 如果源文件仍留在 watcher 目录，后续扫描可能重新导入它。
       "TerminalJobRetentionPeriod": "1.00:00:00",
 
-      // Importing 预留多久未更新即视为进程中断。过期预留只会被释放，让 Watcher
-      // 重新导入；不会把未确认导入成功的源文件直接删除或移动。
+      // Importing 预留多久未更新即视为进程中断。Watcher 下次扫描到同一路径时会重置预留并
+      // 重新导入；源文件已消失、Watcher 再也扫描不到的预留行由 worker 在超过
+      // TerminalJobRetentionPeriod 后裁剪。两者都不会删除或移动未确认导入成功的源文件。
       "ImportReservationTimeout": "00:10:00",
 
       // 是否按周期对 source-cleanup.db 执行 VACUUM，以归还裁剪后空闲页。
@@ -72,7 +73,7 @@
       // 两次 SQLite VACUUM 之间的最小间隔。
       "DatabaseOptimizationInterval": "1.00:00:00",
 
-      // 每轮最多裁剪多少条过期 Keep/Failed 记录，限制单轮数据库工作量。
+      // 每轮最多裁剪多少条过期 Keep/Failed 记录或废弃 Importing 预留，限制单轮数据库工作量。
       "TerminalPruneBatchSize": 5000
     },
 
