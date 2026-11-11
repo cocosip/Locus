@@ -72,10 +72,14 @@
 
 隔离记录不会自动重放；修复数据后可依据 dead-letter 文件手工补偿，或删除文件后按需重建投影。
 
-已知限制：投影失败时整批回滚并从批次起点重试，批次内已成功的记录会被重新执行，而 tenant/directory
-quota 计数在投影批次之外应用，因此重试与隔离可能使配额计数偏高（与失败重试次数同量级）。偏差可用
-`IStorageCleanupService.ReconcileQuotaCountsAsync` 按 metadata 重算校正；要彻底消除则需要把配额应用
-纳入投影批次，属于后续设计调整。
+投影失败时整批从批次起点重试，批次内已成功的记录会被重新执行。tenant/directory quota 计数在投影批次之外
+应用，因此 projector 在回滚批次时会把本批次已经落库的配额增量记入账本并逐条补偿（Accepted 回退增量，
+DeleteSucceeded/DeadLettered 回退减量），再重试或隔离，重试不会重复累加。
+
+已知限制：quota 库与 metadata 库是两个 SQLite 文件，无法原子提交。如果在“配额已写入、metadata 批次尚未
+flush”之间进程崩溃，配额计数仍可能与 metadata 不一致；此时可用
+`IStorageCleanupService.ReconcileQuotaCountsAsync` 按 metadata 重算校正。要彻底消除该窗口需要把配额应用
+纳入投影批次（跨库事务），属于后续设计调整。
 
 ## 维护态状态字段
 

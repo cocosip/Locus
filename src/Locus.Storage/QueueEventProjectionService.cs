@@ -47,6 +47,7 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, CachedProjectionCursor> _cursorCache;
         private readonly ConcurrentDictionary<string, ProjectionRecordFailureState> _recordFailureStates;
         private readonly AsyncLocal<IQueueProjectionBatch?> _currentProjectionBatch;
+        private readonly AsyncLocal<ProjectionQuotaLedger?> _currentQuotaLedger;
         private string? _nextTenantProjectionCursor;
 
         /// <summary>
@@ -83,6 +84,7 @@ namespace Locus.Storage
             _cursorCache = new ConcurrentDictionary<string, CachedProjectionCursor>(StringComparer.Ordinal);
             _recordFailureStates = new ConcurrentDictionary<string, ProjectionRecordFailureState>(StringComparer.Ordinal);
             _currentProjectionBatch = new AsyncLocal<IQueueProjectionBatch?>();
+            _currentQuotaLedger = new AsyncLocal<ProjectionQuotaLedger?>();
         }
 
         /// <inheritdoc/>
@@ -452,9 +454,54 @@ namespace Locus.Storage
                 return new ProjectionCycleResult(null, maintenanceWork: null, hasBacklog: false, gapRecovery: null);
             }
 
+            // Quota counters are updated outside the metadata projection batch, so every delta the
+            // batch applied must be undone when the batch is rolled back; otherwise retrying the
+            // batch re-applies the deltas and the counters drift upward (or downward for deletes).
+            // The ledger only exists when the store actually stages a rollable batch.
+            return await ProjectBatchCoreAsync(tenantId, batch, cursor, ct).ConfigureAwait(false);
+        }
+
+        private async Task<ProjectionCycleResult> ProjectBatchCoreAsync(
+            string tenantId,
+            QueueEventReadBatch batch,
+            ProjectionCursor cursor,
+            CancellationToken ct)
+        {
+            var projectionBatch = BeginProjectionBatch(tenantId);
+
+            // The ledger only exists when the store stages a rollable batch. Without one, earlier
+            // records were already handed to the write-behind store and must keep their quota delta.
+            var quotaLedger = projectionBatch != null ? new ProjectionQuotaLedger() : null;
+            var previousQuotaLedger = _currentQuotaLedger.Value;
+            _currentQuotaLedger.Value = quotaLedger;
+            try
+            {
+                return await ProjectBatchWithRollbackAsync(tenantId, batch, cursor, projectionBatch, quotaLedger, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                if (quotaLedger != null)
+                    await CompensateProjectionQuotaLedgerAsync(quotaLedger).ConfigureAwait(false);
+                throw;
+            }
+            finally
+            {
+                _currentQuotaLedger.Value = previousQuotaLedger;
+            }
+        }
+
+        private async Task<ProjectionCycleResult> ProjectBatchWithRollbackAsync(
+            string tenantId,
+            QueueEventReadBatch batch,
+            ProjectionCursor cursor,
+            IQueueProjectionBatch? projectionBatch,
+            ProjectionQuotaLedger? quotaLedger,
+            CancellationToken ct)
+        {
+            var offset = cursor.Offset;
             GapRecoveryRequest? gapRecovery = null;
             Exception? projectionFailure = null;
-            var projectionBatch = BeginProjectionBatch(tenantId);
             try
             {
                 try
@@ -483,10 +530,12 @@ namespace Locus.Storage
 
             if (projectionFailure != null)
             {
-                // Known limitation: the failed batch was rolled back as a whole and is retried from
-                // its start, while quota increments are applied outside the projection batch, so a
-                // batch that keeps failing can over-count quota by roughly the retry count.
-                // IStorageCleanupService.ReconcileQuotaCountsAsync recomputes the counters.
+                // The batch below is rolled back as a whole (metadata was never committed), so the
+                // quota deltas it applied must be compensated before the failure is retried or
+                // quarantined. Compensating is idempotent because the ledger is cleared.
+                if (quotaLedger != null)
+                    await CompensateProjectionQuotaLedgerAsync(quotaLedger).ConfigureAwait(false);
+
                 var attempts = IncrementProjectionFailureAttempts(tenantId, offset);
                 if (attempts < _options.MaxProjectionAttemptsPerRecord)
                 {
@@ -564,6 +613,12 @@ namespace Locus.Storage
             CancellationToken ct)
         {
             var offset = startOffset;
+
+            // The replay below is not part of the failed batch: it writes metadata through the normal
+            // write-behind path, so its quota deltas stay applied and must not be compensated when a
+            // later deferred record aborts the replay. Detach the failed batch's ledger for it.
+            _currentQuotaLedger.Value = null;
+
             while (offset < batchEndOffset)
             {
                 ct.ThrowIfCancellationRequested();
@@ -831,6 +886,11 @@ namespace Locus.Storage
                     var updated = existing.Clone();
                     QueueProjectionMetadataState.MarkAcceptedProjectionApplied(updated);
                     await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+                    RecordAcceptedProjectionApplied(
+                        record.TenantId,
+                        existing.DirectoryPath,
+                        tenantReservationConsumed,
+                        directoryReservationConsumed);
                     return;
                 }
                 catch
@@ -1022,6 +1082,8 @@ namespace Locus.Storage
 
                     throw new InvalidOperationException($"Failed to remove projected metadata for deleted file {existing.FileKey}.");
                 }
+
+                RecordDeleteSucceededProjectionApplied(existing.TenantId, directoryPath);
             }
             catch
             {
@@ -1104,6 +1166,11 @@ namespace Locus.Storage
 
                 QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
                 await UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);
+                RecordAcceptedProjectionApplied(
+                    record.TenantId,
+                    metadata.DirectoryPath,
+                    tenantReservationConsumed,
+                    directoryReservationConsumed);
                 return metadata;
             }
             catch
@@ -1159,6 +1226,7 @@ namespace Locus.Storage
                 QueueProjectionMetadataState.MarkDeadLetterProjectionApplied(updated);
 
                 await UpsertProjectedFileAsync(updated, ct).ConfigureAwait(false);
+                RecordDeleteSucceededProjectionApplied(existing.TenantId, directoryPath);
             }
             catch
             {
@@ -2149,6 +2217,58 @@ namespace Locus.Storage
             }
         }
 
+        private void RecordAcceptedProjectionApplied(
+            string tenantId,
+            string directoryPath,
+            bool tenantReservationConsumed,
+            bool directoryReservationConsumed)
+        {
+            _currentQuotaLedger.Value?.RecordAccepted(
+                tenantId,
+                directoryPath,
+                tenantReservationConsumed,
+                directoryReservationConsumed);
+        }
+
+        private void RecordDeleteSucceededProjectionApplied(string tenantId, string directoryPath)
+        {
+            _currentQuotaLedger.Value?.RecordDeleteSucceeded(tenantId, directoryPath);
+        }
+
+        /// <summary>
+        /// Compensates the quota deltas that a rolled-back projection batch had already applied.
+        /// Quota counters live outside the projection batch, so rolling back the staged metadata
+        /// alone would leave the counters ahead of the durable metadata and let every retry of the
+        /// batch apply the same deltas again.
+        /// </summary>
+        private async Task CompensateProjectionQuotaLedgerAsync(ProjectionQuotaLedger ledger)
+        {
+            var entries = ledger.Entries;
+            for (var index = entries.Count - 1; index >= 0; index--)
+            {
+                var entry = entries[index];
+                if (entry.Kind == ProjectionQuotaEntryKind.Accepted)
+                {
+                    await RollbackAcceptedProjectionAsync(
+                        entry.TenantId,
+                        entry.DirectoryPath,
+                        entry.TenantReservationConsumed,
+                        entry.DirectoryReservationConsumed).ConfigureAwait(false);
+                    continue;
+                }
+
+                // DeadLettered also frees the quota slot, so its delta is undone the same way as
+                // DeleteSucceeded.
+                await RollbackDeleteSucceededProjectionAsync(
+                    entry.TenantId,
+                    entry.DirectoryPath,
+                    tenantQuotaDecremented: true,
+                    directoryQuotaDecremented: true).ConfigureAwait(false);
+            }
+
+            ledger.Clear();
+        }
+
         private sealed class ProjectionCursor
         {
             public long Offset { get; set; }
@@ -2270,6 +2390,72 @@ namespace Locus.Storage
             public int Attempts { get; }
 
             public ProjectionRecordFailureState WithAttempt(int attempts) => new ProjectionRecordFailureState(Offset, attempts);
+        }
+
+        private sealed class ProjectionQuotaLedger
+        {
+            private readonly List<ProjectionQuotaEntry> _entries = new();
+
+            public IReadOnlyList<ProjectionQuotaEntry> Entries => _entries;
+
+            public void RecordAccepted(
+                string tenantId,
+                string directoryPath,
+                bool tenantReservationConsumed,
+                bool directoryReservationConsumed)
+            {
+                _entries.Add(new ProjectionQuotaEntry(
+                    tenantId,
+                    directoryPath,
+                    ProjectionQuotaEntryKind.Accepted,
+                    tenantReservationConsumed,
+                    directoryReservationConsumed));
+            }
+
+            public void RecordDeleteSucceeded(string tenantId, string directoryPath)
+            {
+                _entries.Add(new ProjectionQuotaEntry(
+                    tenantId,
+                    directoryPath,
+                    ProjectionQuotaEntryKind.DeleteSucceeded,
+                    tenantReservationConsumed: false,
+                    directoryReservationConsumed: false));
+            }
+
+            public void Clear() => _entries.Clear();
+        }
+
+        private readonly struct ProjectionQuotaEntry
+        {
+            public ProjectionQuotaEntry(
+                string tenantId,
+                string directoryPath,
+                ProjectionQuotaEntryKind kind,
+                bool tenantReservationConsumed,
+                bool directoryReservationConsumed)
+            {
+                TenantId = tenantId;
+                DirectoryPath = directoryPath;
+                Kind = kind;
+                TenantReservationConsumed = tenantReservationConsumed;
+                DirectoryReservationConsumed = directoryReservationConsumed;
+            }
+
+            public string TenantId { get; }
+
+            public string DirectoryPath { get; }
+
+            public ProjectionQuotaEntryKind Kind { get; }
+
+            public bool TenantReservationConsumed { get; }
+
+            public bool DirectoryReservationConsumed { get; }
+        }
+
+        private enum ProjectionQuotaEntryKind
+        {
+            Accepted,
+            DeleteSucceeded,
         }
 
         private sealed class ProjectionDeadLetterEntry

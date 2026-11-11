@@ -2325,6 +2325,32 @@ namespace Locus.Storage.Tests
                 quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
         }
 
+        private QueueEventProjectionService CreateProjectionService(
+            IQueueEventJournal journal,
+            TenantQuotaManager tenantQuotaManager,
+            DirectoryQuotaManager directoryQuotaManager)
+        {
+            return TrackDisposable(new QueueEventProjectionService(
+                journal,
+                _metadataRepository,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1)
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                quotaMaintenanceStore: CreateQuotaMaintenanceStore()));
+        }
+
         private T TrackDisposable<T>(T disposable)
             where T : IDisposable
         {
@@ -2391,6 +2417,217 @@ namespace Locus.Storage.Tests
                 => _inner.GetProjectedFilesAsync(tenantId, skip, take, ct);
         }
 
+        [Fact]
+        public async Task ReplayTenantAsync_BatchFailure_RollsBackQuotaAppliedByEarlierRecords()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+
+            const string tenantId = "tenant-quota-rollback";
+            const string fileKey = "file-quota-rollback";
+            const string directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "quota-rollback.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3 });
+
+            var validRecord = new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending,
+                OriginalFileName = "quota-rollback.dcm",
+                FileExtension = ".dcm"
+            };
+            var poisonRecord = new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = string.Empty,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending,
+                OriginalFileName = "poison.dcm",
+                FileExtension = ".dcm"
+            };
+
+            var journal = new ScriptedQueueEventJournal(new[] { validRecord, poisonRecord });
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            // MaxProjectionAttemptsPerRecord defaults to 5, so attempts 1..4 retry the batch.
+            for (var attempt = 0; attempt < 4; attempt++)
+            {
+                await Assert.ThrowsAnyAsync<Exception>(() => service.ReplayTenantAsync(tenantId, CancellationToken.None));
+            }
+
+            Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.Null(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+            Assert.Equal(0L, journal.LastReadOffset);
+
+            // The next attempt quarantines the poison record and keeps the valid projection.
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+            Assert.True(_fileSystem.File.Exists(
+                Path.Combine(_queueDirectory, tenantId, "projection.deadletter.jsonl")));
+        }
+
+        [Fact]
+        public async Task ReplayTenantAsync_DeferredRecord_RollsBackQuotaAppliedByEarlierRecords()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var journal = CreateJournal();
+
+            const string tenantId = "tenant-quota-deferred";
+            const string directoryPath = "/incoming";
+            var firstPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "first.dcm");
+            var deferredPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "deferred.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(firstPath)!);
+            _fileSystem.File.WriteAllBytes(firstPath, new byte[] { 1, 2, 3 });
+            _fileSystem.File.WriteAllBytes(deferredPath, new byte[] { 4, 5, 6 });
+
+            await journal.AppendBatchAsync(new[]
+            {
+                new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-first",
+                    EventType = QueueEventType.Accepted,
+                    OccurredAtUtc = DateTime.UtcNow,
+                    VolumeId = "vol-001",
+                    PhysicalPath = firstPath,
+                    DirectoryPath = directoryPath,
+                    FileSize = 3,
+                    Status = FileProcessingStatus.Pending
+                },
+                new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = "file-deferred",
+                    EventType = QueueEventType.Accepted,
+                    OccurredAtUtc = DateTime.UtcNow,
+                    VolumeId = "vol-001",
+                    PhysicalPath = deferredPath,
+                    DirectoryPath = directoryPath,
+                    FileSize = 3,
+                    Status = FileProcessingStatus.Pending
+                }
+            }, CancellationToken.None);
+
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            using (var lease = _fileSystem.File.Open(deferredPath, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+                // The first record was projected before the deferral; its quota delta must be undone.
+                Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+                Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+                Assert.Null(await _metadataRepository.GetAsync(tenantId, "file-first", CancellationToken.None));
+            }
+
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(2, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(2, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, "file-first", CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, "file-deferred", CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task ReplayTenantAsync_BatchFailure_RollsBackQuotaDecrementAppliedByEarlierRecords()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+
+            const string tenantId = "tenant-quota-delete-rollback";
+            const string fileKey = "file-quota-delete-rollback";
+            const string directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "delete-rollback.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3 });
+
+            var acceptedRecord = new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending
+            };
+
+            var firstService = CreateProjectionService(
+                new ScriptedQueueEventJournal(new[] { acceptedRecord }),
+                tenantQuotaManager,
+                directoryQuotaManager);
+            await firstService.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+
+            var deleteRecord = new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.DeleteSucceeded,
+                OccurredAtUtc = DateTime.UtcNow.AddSeconds(1)
+            };
+            var poisonRecord = new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = string.Empty,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow.AddSeconds(2),
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 3,
+                Status = FileProcessingStatus.Pending
+            };
+
+            // The first replay advanced the persisted cursor to offset 50.
+            var service = CreateProjectionService(
+                new ScriptedQueueEventJournal(new[] { deleteRecord, poisonRecord }, startOffset: 50),
+                tenantQuotaManager,
+                directoryQuotaManager);
+
+            for (var attempt = 0; attempt < 4; attempt++)
+            {
+                await Assert.ThrowsAnyAsync<Exception>(() => service.ReplayTenantAsync(tenantId, CancellationToken.None));
+            }
+
+            // The decrement was applied before the batch failed and must be rolled back with it.
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+
+            // Quarantining the poison record lets the delete projection apply exactly once.
+            await service.ReplayTenantAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(0, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(0, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.Null(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+        }
+
         private sealed class TrackingQueueEventJournal : IQueueEventJournal
         {
             private readonly IReadOnlyList<string> _tenantIds;
@@ -2442,6 +2679,69 @@ namespace Locus.Storage.Tests
             {
                 return Task.FromResult(_tenantIds);
             }
+        }
+
+        private sealed class ScriptedQueueEventJournal : IQueueEventJournal
+        {
+            private readonly IReadOnlyList<QueueEventRecord> _records;
+            private readonly long[] _offsets;
+
+            public ScriptedQueueEventJournal(IReadOnlyList<QueueEventRecord> records, long startOffset = 0)
+            {
+                _records = records ?? throw new ArgumentNullException(nameof(records));
+                _offsets = new long[records.Count + 1];
+                _offsets[0] = startOffset;
+                for (var index = 0; index < records.Count; index++)
+                    _offsets[index + 1] = _offsets[index] + 50;
+            }
+
+            public long LastReadOffset { get; private set; }
+
+            public Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
+                => throw new NotSupportedException();
+
+            public Task AppendBatchAsync(IReadOnlyList<QueueEventRecord> records, CancellationToken ct = default)
+                => throw new NotSupportedException();
+
+            public Task<QueueEventReadBatch> ReadBatchAsync(
+                string tenantId,
+                long offset,
+                int maxRecords,
+                CancellationToken ct = default)
+            {
+                LastReadOffset = offset;
+
+                var index = Array.IndexOf(_offsets, offset);
+                if (index < 0 || index >= _records.Count)
+                {
+                    return Task.FromResult(new QueueEventReadBatch(
+                        Array.Empty<QueueEventRecord>(),
+                        offset,
+                        reachedEndOfFile: true));
+                }
+
+                var take = Math.Min(Math.Max(1, maxRecords), _records.Count - index);
+                var slice = new QueueEventRecord[take];
+                for (var i = 0; i < take; i++)
+                    slice[i] = _records[index + i];
+
+                return Task.FromResult(new QueueEventReadBatch(
+                    slice,
+                    _offsets[index + take],
+                    reachedEndOfFile: index + take == _records.Count));
+            }
+
+            public Task<long> CompactAsync(string tenantId, long processedOffset, CancellationToken ct = default)
+                => throw new NotSupportedException();
+
+            public Task<long> GetTailOffsetAsync(string tenantId, CancellationToken ct = default)
+                => Task.FromResult(_offsets[_offsets.Length - 1]);
+
+            public Task<long> GetBaseOffsetAsync(string tenantId, CancellationToken ct = default)
+                => Task.FromResult(0L);
+
+            public Task<IReadOnlyList<string>> GetTenantIdsAsync(CancellationToken ct = default)
+                => Task.FromResult((IReadOnlyList<string>)new[] { _records[0].TenantId });
         }
     }
 }
