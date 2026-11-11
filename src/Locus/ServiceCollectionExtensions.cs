@@ -289,6 +289,7 @@ namespace Locus
                 var queueEventJournal = sp.GetService<IQueueEventJournal>();
                 var projectionStore = sp.GetRequiredService<IQueueProjectionStore>();
                 var processingTimeoutRecoveryService = sp.GetRequiredService<IProcessingTimeoutRecoveryService>();
+                var projectionMaintenanceService = sp.GetService<IQueueProjectionMaintenanceService>();
                 return new FileScheduler(
                     projectionStore,
                     fileSystem,
@@ -304,7 +305,8 @@ namespace Locus
                     options.StoragePool.EmptyQueueTimedOutReclaimBatchSize,
                     options.StoragePool.BackgroundTimedOutReclaimBatchSize,
                     options.StoragePool.TimedOutReclaimCooldown,
-                    options.StoragePool.EnableBackgroundTimedOutReclaim);
+                    options.StoragePool.EnableBackgroundTimedOutReclaim,
+                    projectionMaintenanceService);
             });
 
             // Register StoragePool as its concrete type so StorageVolumeInitializationService

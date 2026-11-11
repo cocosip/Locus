@@ -663,6 +663,66 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task CleanupOrphanedMetadataAsync_AppliesPendingAcceptedProjectionBeforeDeleteDecrement()
+        {
+            var tenantQuotaManager = new Mock<ITenantQuotaManager>();
+            var tenantProjection = tenantQuotaManager.As<ITenantQuotaProjectionManager>();
+            var directoryQuotaManager = new Mock<IDirectoryQuotaManager>();
+            var directoryProjection = directoryQuotaManager.As<IDirectoryQuotaProjectionManager>();
+            var fileKey = "orphan-pending-accepted";
+            var physicalPath = Path.Combine(_metadataDir, "missing-pending-accepted.txt");
+
+            var metadata = new FileMetadata
+            {
+                FileKey = fileKey,
+                TenantId = "tenant-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = "/accepted",
+                Status = FileProcessingStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            };
+            QueueProjectionMetadataState.MarkAcceptedProjectionPending(metadata);
+            await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+
+            var sequence = new MockSequence();
+            tenantProjection
+                .InSequence(sequence)
+                .Setup(m => m.ApplyAcceptedProjectionAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+            directoryProjection
+                .InSequence(sequence)
+                .Setup(m => m.ApplyAcceptedProjectionAsync("tenant-001", "/accepted", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+            tenantProjection
+                .InSequence(sequence)
+                .Setup(m => m.ApplyDeleteSucceededProjectionAsync("tenant-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            directoryProjection
+                .InSequence(sequence)
+                .Setup(m => m.ApplyDeleteSucceededProjectionAsync("tenant-001", "/accepted", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            var scheduler = new FileScheduler(
+                _repository,
+                _fileSystem,
+                _logger.Object,
+                tenantQuotaManager: tenantQuotaManager.Object,
+                directoryQuotaManager: directoryQuotaManager.Object,
+                allowLegacyNonJournalMode: true);
+
+            var removed = await scheduler.CleanupOrphanedMetadataAsync(CancellationToken.None);
+
+            Assert.Equal(1, removed);
+            Assert.Null(await _repository.GetAsync("tenant-001", fileKey, CancellationToken.None));
+            tenantQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+            directoryQuotaManager.Verify(
+                m => m.DecrementFileCountAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+
+        [Fact]
         public async Task CleanupOrphanedMetadataAsync_ThrowsAndKeepsMetadataWhenTenantQuotaDecrementFails()
         {
             var tenantQuotaManager = new Mock<ITenantQuotaManager>(MockBehavior.Strict);

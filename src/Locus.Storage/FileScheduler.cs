@@ -34,6 +34,7 @@ namespace Locus.Storage
         private readonly ITenantQuotaManager? _tenantQuotaManager;
         private readonly IDirectoryQuotaManager? _directoryQuotaManager;
         private readonly IQueueEventJournal? _queueEventJournal;
+        private readonly IQueueProjectionMaintenanceService? _projectionMaintenanceService;
         private readonly SemaphoreSlim[] _transitionGuardStripes;
         private const int TransitionGuardStripeCount = 256;
         private readonly IProcessingTimeoutRecoveryService? _processingTimeoutRecoveryService;
@@ -79,7 +80,8 @@ namespace Locus.Storage
             int emptyQueueTimedOutReclaimBatchSize = DefaultEmptyQueueTimedOutReclaimBatchSize,
             int backgroundTimedOutReclaimBatchSize = DefaultBackgroundTimedOutReclaimBatchSize,
             TimeSpan? timedOutReclaimCooldown = null,
-            bool enableBackgroundTimedOutReclaim = true)
+            bool enableBackgroundTimedOutReclaim = true,
+            IQueueProjectionMaintenanceService? projectionMaintenanceService = null)
         {
             _projectionStore = projectionStore ?? throw new ArgumentNullException(nameof(projectionStore));
             _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
@@ -89,6 +91,7 @@ namespace Locus.Storage
             _tenantQuotaManager = tenantQuotaManager;
             _directoryQuotaManager = directoryQuotaManager;
             _queueEventJournal = queueEventJournal;
+            _projectionMaintenanceService = projectionMaintenanceService;
             _allowLegacyNonJournalMode = allowLegacyNonJournalMode;
             _transitionGuardStripes = Enumerable.Range(0, TransitionGuardStripeCount)
                 .Select(_ => new SemaphoreSlim(1, 1))
@@ -124,7 +127,8 @@ namespace Locus.Storage
             int emptyQueueTimedOutReclaimBatchSize = DefaultEmptyQueueTimedOutReclaimBatchSize,
             int backgroundTimedOutReclaimBatchSize = DefaultBackgroundTimedOutReclaimBatchSize,
             TimeSpan? timedOutReclaimCooldown = null,
-            bool enableBackgroundTimedOutReclaim = true)
+            bool enableBackgroundTimedOutReclaim = true,
+            IQueueProjectionMaintenanceService? projectionMaintenanceService = null)
             : this(
                 projectionStore ?? new MetadataRepositoryQueueProjectionStore(repository ?? throw new ArgumentNullException(nameof(repository))),
                 fileSystem,
@@ -140,7 +144,8 @@ namespace Locus.Storage
                 emptyQueueTimedOutReclaimBatchSize,
                 backgroundTimedOutReclaimBatchSize,
                 timedOutReclaimCooldown,
-                enableBackgroundTimedOutReclaim)
+                enableBackgroundTimedOutReclaim,
+                projectionMaintenanceService)
         {
         }
 
@@ -771,6 +776,7 @@ namespace Locus.Storage
 
                 var skip = 0;
                 var physicalPathExistsCache = new Dictionary<string, bool>(PhysicalPathComparer);
+                var pendingAcceptedProjectionsReplayed = false;
 
                 while (true)
                 {
@@ -780,8 +786,10 @@ namespace Locus.Storage
 
                     var removedFromPage = 0;
 
-                    foreach (var metadata in page)
+                    foreach (var candidateMetadata in page)
                     {
+                        var metadata = candidateMetadata;
+
                         if (string.IsNullOrWhiteSpace(metadata.PhysicalPath))
                             continue;
 
@@ -794,6 +802,30 @@ namespace Locus.Storage
 
                         if (physicalFileMissing)
                         {
+                            var acceptedProjectionPending = QueueProjectionMetadataState.IsAcceptedProjectionPending(metadata);
+                            if (acceptedProjectionPending && _projectionMaintenanceService != null)
+                            {
+                                // Settle queued events before removing the row. Cleanup must observe
+                                // the applied Accepted projection instead of racing the projection
+                                // worker, otherwise the reservation can be counted twice.
+                                if (!pendingAcceptedProjectionsReplayed)
+                                {
+                                    await _projectionMaintenanceService
+                                        .ReplayTenantAsync(metadata.TenantId, CancellationToken.None)
+                                        .ConfigureAwait(false);
+                                    pendingAcceptedProjectionsReplayed = true;
+                                }
+
+                                var refreshedMetadata = await _projectionStore
+                                    .GetProjectedFileAsync(metadata.TenantId, metadata.FileKey, default)
+                                    .ConfigureAwait(false);
+                                if (refreshedMetadata == null)
+                                    continue;
+
+                                metadata = refreshedMetadata;
+                                acceptedProjectionPending = QueueProjectionMetadataState.IsAcceptedProjectionPending(metadata);
+                            }
+
                             if (metadata.Status == FileProcessingStatus.DeleteSucceeded)
                             {
                                 _logger.LogDebug(
@@ -809,16 +841,18 @@ namespace Locus.Storage
 
                             var normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(metadata.DirectoryPath);
                             var quotaApplied = false;
+                            (bool TenantReservationConsumed, bool DirectoryReservationConsumed) quotaSettlement = default;
 
                             // Use default for the full cleanup sequence once a candidate orphan has
                             // been selected; otherwise a mid-flight cancellation could leave cleanup
                             // work half-applied.
                             if (ShouldApplyOrphanedMetadataDeleteProjection(metadata))
                             {
-                                await ApplyOrphanedMetadataDeleteQuotaAsync(
+                                quotaSettlement = await ApplyOrphanedMetadataDeleteQuotaAsync(
                                     metadata.TenantId,
                                     metadata.FileKey,
-                                    normalizedDirectoryPath).ConfigureAwait(false);
+                                    normalizedDirectoryPath,
+                                    acceptedProjectionPending).ConfigureAwait(false);
                                 quotaApplied = true;
                             }
 
@@ -837,7 +871,13 @@ namespace Locus.Storage
                                     await RollbackOrphanedMetadataDeleteQuotaAsync(
                                         metadata.TenantId,
                                         metadata.FileKey,
-                                        normalizedDirectoryPath).ConfigureAwait(false);
+                                        normalizedDirectoryPath,
+                                        true,
+                                        true,
+                                        acceptedProjectionPending,
+                                        acceptedProjectionPending,
+                                        quotaSettlement.TenantReservationConsumed,
+                                        quotaSettlement.DirectoryReservationConsumed).ConfigureAwait(false);
                                 }
 
                                 throw;
@@ -850,7 +890,13 @@ namespace Locus.Storage
                                     await RollbackOrphanedMetadataDeleteQuotaAsync(
                                         metadata.TenantId,
                                         metadata.FileKey,
-                                        normalizedDirectoryPath).ConfigureAwait(false);
+                                        normalizedDirectoryPath,
+                                        true,
+                                        true,
+                                        acceptedProjectionPending,
+                                        acceptedProjectionPending,
+                                        quotaSettlement.TenantReservationConsumed,
+                                        quotaSettlement.DirectoryReservationConsumed).ConfigureAwait(false);
                                 }
 
                                 _logger.LogDebug(
@@ -890,40 +936,67 @@ namespace Locus.Storage
             return metadata.Status == FileProcessingStatus.DeleteSucceeded;
         }
 
-        private async Task ApplyOrphanedMetadataDeleteQuotaAsync(
+        private async Task<(bool TenantReservationConsumed, bool DirectoryReservationConsumed)> ApplyOrphanedMetadataDeleteQuotaAsync(
             string tenantId,
             string fileKey,
-            string normalizedDirectoryPath)
+            string normalizedDirectoryPath,
+            bool acceptedProjectionPending)
         {
-            var tenantQuotaApplied = false;
+            var tenantReservationConsumed = false;
+            var directoryReservationConsumed = false;
+            var tenantAcceptedApplied = false;
+            var directoryAcceptedApplied = false;
+            var tenantDeleteApplied = false;
 
             try
             {
+                if (acceptedProjectionPending)
+                {
+                    // The Accepted queue event has not been projected yet, so this orphan still
+                    // holds a quota reservation instead of a projected count. Apply the accepted
+                    // projection first; otherwise the delete projection below observes a zero
+                    // projected count, drops the decrement, and leaks the reservation forever.
+                    if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+                    {
+                        tenantReservationConsumed = await tenantQuotaProjectionManager
+                            .ApplyAcceptedProjectionAsync(tenantId, default).ConfigureAwait(false);
+                        tenantAcceptedApplied = true;
+                    }
+
+                    if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+                    {
+                        directoryReservationConsumed = await directoryQuotaProjectionManager
+                            .ApplyAcceptedProjectionAsync(tenantId, normalizedDirectoryPath, default).ConfigureAwait(false);
+                        directoryAcceptedApplied = true;
+                    }
+                }
+
                 if (_tenantQuotaManager != null)
                 {
                     await ApplyDeleteSucceededTenantProjectionAsync(tenantId).ConfigureAwait(false);
-                    tenantQuotaApplied = true;
+                    tenantDeleteApplied = true;
                 }
 
                 if (_directoryQuotaManager != null)
                 {
-                    try
-                    {
-                        await ApplyDeleteSucceededDirectoryProjectionAsync(tenantId, normalizedDirectoryPath).ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        if (tenantQuotaApplied)
-                        {
-                            await RollbackDeleteSucceededTenantProjectionAsync(tenantId).ConfigureAwait(false);
-                        }
-
-                        throw;
-                    }
+                    await ApplyDeleteSucceededDirectoryProjectionAsync(tenantId, normalizedDirectoryPath).ConfigureAwait(false);
                 }
+
+                return (tenantReservationConsumed, directoryReservationConsumed);
             }
             catch (Exception ex)
             {
+                await RollbackOrphanedMetadataDeleteQuotaAsync(
+                    tenantId,
+                    fileKey,
+                    normalizedDirectoryPath,
+                    tenantDeleteApplied,
+                    false,
+                    tenantAcceptedApplied,
+                    directoryAcceptedApplied,
+                    tenantReservationConsumed,
+                    directoryReservationConsumed).ConfigureAwait(false);
+
                 _logger.LogWarning(
                     ex,
                     "Failed to apply orphaned metadata quota cleanup for tenant {TenantId}, file {FileKey}",
@@ -936,11 +1009,17 @@ namespace Locus.Storage
         private async Task RollbackOrphanedMetadataDeleteQuotaAsync(
             string tenantId,
             string fileKey,
-            string normalizedDirectoryPath)
+            string normalizedDirectoryPath,
+            bool tenantDeleteApplied,
+            bool directoryDeleteApplied,
+            bool tenantAcceptedApplied,
+            bool directoryAcceptedApplied,
+            bool tenantReservationConsumed,
+            bool directoryReservationConsumed)
         {
             Exception? firstException = null;
 
-            if (_directoryQuotaManager != null)
+            if (directoryDeleteApplied && _directoryQuotaManager != null)
             {
                 try
                 {
@@ -958,7 +1037,7 @@ namespace Locus.Storage
                 }
             }
 
-            if (_tenantQuotaManager != null)
+            if (tenantDeleteApplied && _tenantQuotaManager != null)
             {
                 try
                 {
@@ -972,6 +1051,54 @@ namespace Locus.Storage
                     _logger.LogError(
                         ex,
                         "Failed to rollback orphaned tenant quota cleanup for tenant {TenantId}, file {FileKey}",
+                        tenantId,
+                        fileKey);
+                }
+            }
+
+            if (directoryAcceptedApplied
+                && _directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                try
+                {
+                    await directoryQuotaProjectionManager.RollbackAcceptedProjectionAsync(
+                        tenantId,
+                        normalizedDirectoryPath,
+                        directoryReservationConsumed,
+                        default).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    if (firstException == null)
+                        firstException = ex;
+
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback orphaned accepted directory projection for tenant {TenantId}, file {FileKey}, directory {DirectoryPath}",
+                        tenantId,
+                        fileKey,
+                        normalizedDirectoryPath);
+                }
+            }
+
+            if (tenantAcceptedApplied
+                && _tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                try
+                {
+                    await tenantQuotaProjectionManager.RollbackAcceptedProjectionAsync(
+                        tenantId,
+                        tenantReservationConsumed,
+                        default).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    if (firstException == null)
+                        firstException = ex;
+
+                    _logger.LogError(
+                        ex,
+                        "Failed to rollback orphaned accepted tenant projection for tenant {TenantId}, file {FileKey}",
                         tenantId,
                         fileKey);
                 }

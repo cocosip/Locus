@@ -25,6 +25,18 @@ namespace Locus.Storage
                 && string.Equals(value, bool.TrueString, StringComparison.OrdinalIgnoreCase);
         }
 
+        public static bool IsAcceptedProjectionPending(FileMetadata metadata)
+        {
+            if (metadata == null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (metadata.Metadata == null)
+                return false;
+
+            return metadata.Metadata.TryGetValue(AcceptedProjectionAppliedKey, out var value)
+                && string.Equals(value, bool.FalseString, StringComparison.OrdinalIgnoreCase);
+        }
+
         public static void MarkAcceptedProjectionPending(FileMetadata metadata)
         {
             if (metadata == null)
