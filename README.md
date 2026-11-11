@@ -458,9 +458,11 @@ while (true)
 
 ### Benchmark Results
 
-Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 cores, .NET 10.0.0, Windows 11:
+Performance benchmarks run with BenchmarkDotNet; each table notes the machine and date it was measured on.
 
 #### Write Throughput (Single-Threaded, 100 KB file)
+
+Measured on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 cores, .NET 10.0.0, Windows 11.
 
 | File Size | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
@@ -477,15 +479,24 @@ Performance benchmarks run on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 co
 | 50 concurrent writers | 113.463 ms | 10.608 ms | 701.02 KB | All 50 writes in parallel |
 | 100 concurrent writers | 228.952 ms | 11.859 ms | 1163.76 KB | All 100 writes in parallel |
 
+Performance benchmarks run with BenchmarkDotNet; each table notes the machine and date it was measured on.
+
 #### Metadata Operations (Write-Behind + `_pendingKeys` Index)
+
+Latest local run: Intel Core Ultra 9 185H, .NET 10.0.14, 2026-11-11 (BenchmarkDotNet v0.15.8, IterationCount=5, WarmupCount=3).
 
 | Operation | Mean Time | Allocated | Notes |
 |-----------|-----------|-----------|-------|
-| AddOrUpdate single file | 1.878 μs | 2.4 KB | ⚡ Memory-first, async SQLite persistence |
-| Get file metadata (cache hit) | 40.91 ns | 72 B | ⚡ ConcurrentDictionary lookup |
-| Get non-existent file (returns null) | 34.87 ns | 0 B | Cache miss → null, no SQLite fallback |
-| Batch insert 100 files | 237.9 μs | 63.4 KB | ~2.4 μs per file |
-| Get next pending file (100-file pool) | 2.975 μs | 1.4 KB | ⚡ O(n_pending) scan via `_pendingKeys` |
+| AddOrUpdate single file | 6.96 μs | 1.57 KB | ⚡ Memory-first, async SQLite persistence |
+| Get file metadata (cache hit) | 70.09 ns | 280 B | ⚡ ConcurrentDictionary lookup |
+| Get non-existent file (returns null) | 20.13 μs | 4.97 KB | Cache miss → null, no SQLite fallback |
+| Batch insert 100 files | 704.1 μs | 196.5 KB | ~7.0 μs per file |
+| Get next pending file (100-file pool) | 61.69 ns | 0 B | ⚡ FIFO dequeue via `_pendingKeys` |
+| Get tenant page (skip 0, take 50) | 204.37 μs | 55.74 KB | SQL `LIMIT/OFFSET` + tenant drain (includes in-flight write-behind rows) |
+
+Write-path rows show notable iteration-to-iteration variance on this run (the tenant drain interleaves
+with the batch benchmarks), so treat `AddOrUpdate`/`Batch insert` as order-of-magnitude figures; the
+cache-hit, pending-dequeue and paging rows were stable.
 
 #### Directory Quota Operations (Lock-Free CAS)
 
@@ -538,8 +549,11 @@ Last updated: 2026-02-28 (BenchmarkDotNet v0.15.8, .NET 10.0.0, IterationCount=1
 **Key Findings**:
 - ⚡ **Directory quota CAS**: 94.80 ns per increment — lock-free atomic operations (vs. ~200 μs with SemaphoreSlim)
 - ⚡ **Volume health/space**: 17–22 ns — 30-second TTL cache eliminates one disk I/O per write
-- ⚡ **Metadata write-behind**: 1.878 μs per file — memory-first, SQLite persistence is async
-- ⚡ **Metadata cache hit**: 40.91 ns — pure ConcurrentDictionary lookup
+- ⚡ **Metadata write-behind**: 6.96 μs per file — memory-first, SQLite persistence is async
+- ⚡ **Metadata cache hit**: 70.09 ns — pure ConcurrentDictionary lookup
+- ⚡ **Tenant paging**: 204 μs for a 50-row page — SQL `LIMIT/OFFSET`, no whole-tenant materialization
+- ✅ **Queue journal single append**: `Durable` ≈1.6–2.0 ms and `Balanced` ≈1.6–1.8 ms on the same run
+  (single record, high variance; both modes share the per-tenant writer batch path)
 - ⚡ **Tenant cache**: 82–90 ns — 5-minute cache keeps tenant lookups near-zero cost
 - ✅ **100 KB write**: ~1.1 ms end-to-end (quota check + disk write + metadata)
 - ✅ **100-concurrent writes (1 MB)**: 229 ms total for 100 simultaneous writes, StdDev 5.2%

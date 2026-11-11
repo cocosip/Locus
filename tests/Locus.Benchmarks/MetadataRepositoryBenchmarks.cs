@@ -114,6 +114,16 @@ namespace Locus.Benchmarks
             }
         }
 
+        [Benchmark(Description = "Get tenant page (skip 0, take 50)")]
+        public async Task GetByTenantAsync_Page()
+        {
+            // Paged listing is served by SQL LIMIT/OFFSET, so its cost should stay independent of
+            // the tenant's total file count instead of materializing the whole tenant in memory.
+            var page = await _repository.GetByTenantAsync(_tenantId, skip: 0, take: 50, CancellationToken.None);
+            if (page.Count == 0)
+                throw new InvalidOperationException("Expected a non-empty tenant page.");
+        }
+
         private FileMetadata CreateTestMetadata(string fileKey)
         {
             return new FileMetadata

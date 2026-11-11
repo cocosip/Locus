@@ -61,6 +61,11 @@
 - 在 `1MiB` 左右的 durable 写入场景中，`Queue journal` 经常仍占请求总时延的明显比例
 - 相比继续抠 `LocalFileSystemVolume` 的 copy 细节，这一段更可能提供稳定且可复用的收益
 
+当前实现（2026-11-11 起）：所有 ack 模式（`Durable`/`Balanced`/`Async`）都经过每租户 writer
+统一批处理，`Durable` 不再逐条 append + fsync；每个租户的 append 队列有 `MaxPendingRequests` 上限，
+队列满时对调用方施加背压。因此下面这些历史样本里的“单条 append”数字只代表当时实现，
+`Durable` 与 `Balanced` 的差距需要基于当前代码重新测量。
+
 重点关注：
 
 - `QueueEventJournalAckMode.Durable` 与 `Balanced` 的实际代价差异
@@ -122,13 +127,16 @@ dotnet run -c Release --project tests/Locus.Benchmarks -- direct-volume-breakdow
 - 在这组更新后的样本里，`volume_write` 又重新回到主导位置，`Queue journal` 已经不再是最突出的单段瓶颈
 - 在当前这组更新后的本地样本里，`Balanced` 已经不再呈现稳定优势，因此仍然不建议仅凭本地 benchmark 就切换默认生产 `AckMode`
 
-建议先看这些指标：
+建议先看这些信号：
 
-- `locus.queue_journal.append.batch.count`
-- `locus.queue_journal.append.bytes`
-- `locus.queue_journal.append.duration`
-- `locus.queue_journal.flush.count`
-- `locus.queue_journal.flush.duration`
+- 写路径统计（`IQueueEventJournalWritePathDiagnostics.GetWritePathStatisticsSnapshot()`）：
+  `AppendBatchCount`、`SingleRecordAppendBatchCount`、`MultiRecordAppendBatchCount`、
+  `AppendedRecordCount`、`AppendedBytes`、`AppendTicks`、`FlushCount`、`FlushTicks`
+- Metrics（`Locus.Storage.QueueJournal`）：
+  `locus.queue_journal.append.failed`、`locus.queue_journal.corrupt_tail.detected`、
+  `locus.queue_journal.corrupt_tail.auto_repaired`、`locus.queue_journal.sequence_gap.detected`
+- 投影侧（同一 meter）：`locus.queue_projection.record.failed`、
+  `locus.queue_projection.record.quarantined`
 
 如果这些指标显示：
 
@@ -141,7 +149,18 @@ dotnet run -c Release --project tests/Locus.Benchmarks -- direct-volume-breakdow
 - 调整 `BalancedFlushWindow`
 - 调整 `MaxBatchRecords`
 - 调整 `MaxBatchBytes`
+- 调整 `MaxPendingRequests`（队列上限与背压强度）
 - 评估特定场景下是否允许 `Balanced` 作为可选模式
+
+2026-11-11 本地核对样本（`QueueLogSingleRecordBenchmarks`，`BinaryV1`，单条 append，
+Intel Core Ultra 9 185H，.NET 10.0.14）：
+
+- `Durable`，`Linger=1ms`：约 `1.96 ms`（StdDev `0.26 ms`，Error `1.0 ms`）
+- `Durable`，`Linger=2ms`：约 `1.59 ms`（StdDev `0.09 ms`）
+- `Balanced`，`Linger=1ms`：约 `1.78 ms`（StdDev `0.14 ms`）
+- `Balanced`，`Linger=2ms`：约 `1.63 ms`（StdDev `0.18 ms`）
+- 该轮样本方差较大（尤其 `Durable`/`Linger=1ms`），只能说明“`Durable` 不再明显贵于 `Balanced`”，
+  不足以据此调整默认 `AckMode`；需要按上文的 `write-path-breakdown` 命令在目标环境复测
 
 现有本地窗口扫描样本（2026-04-15，`Balanced`，`file source`，`forceFlushAfterWrite=true`）：
 
