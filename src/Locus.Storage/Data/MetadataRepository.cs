@@ -4594,11 +4594,9 @@ LIMIT @limit;";
         // per tenant, minimising fsync overhead and memory spikes.
         private void DrainPersistenceQueueForTenant(string tenantId)
         {
-            // Fast path: with nothing queued either way there is nothing to steal, and taking the
-            // global drain lock would needlessly serialize this read behind other tenants' writes.
-            if (Volatile.Read(ref _persistenceChannelDepth) == 0 && Volatile.Read(ref _coalescedDepth) == 0)
-                return;
-
+            // Always take the drain lock, even when both queues look empty: the background loop
+            // decrements the queue depth when it dequeues an operation, and only the lock makes the
+            // subsequent page read wait until that in-flight operation is committed.
             lock (_persistenceDrainLock)
             {
                 var byTenant = new Dictionary<string, Dictionary<string, PersistenceOperation>>(StringComparer.Ordinal);

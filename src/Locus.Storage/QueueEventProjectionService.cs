@@ -483,6 +483,10 @@ namespace Locus.Storage
 
             if (projectionFailure != null)
             {
+                // Known limitation: the failed batch was rolled back as a whole and is retried from
+                // its start, while quota increments are applied outside the projection batch, so a
+                // batch that keeps failing can over-count quota by roughly the retry count.
+                // IStorageCleanupService.ReconcileQuotaCountsAsync recomputes the counters.
                 var attempts = IncrementProjectionFailureAttempts(tenantId, offset);
                 if (attempts < _options.MaxProjectionAttemptsPerRecord)
                 {

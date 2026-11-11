@@ -72,6 +72,11 @@
 
 隔离记录不会自动重放；修复数据后可依据 dead-letter 文件手工补偿，或删除文件后按需重建投影。
 
+已知限制：投影失败时整批回滚并从批次起点重试，批次内已成功的记录会被重新执行，而 tenant/directory
+quota 计数在投影批次之外应用，因此重试与隔离可能使配额计数偏高（与失败重试次数同量级）。偏差可用
+`IStorageCleanupService.ReconcileQuotaCountsAsync` 按 metadata 重算校正；要彻底消除则需要把配额应用
+纳入投影批次，属于后续设计调整。
+
 ## 维护态状态字段
 
 除了 metrics，维护态查询 `QueueProjectionTenantState` 也会暴露最近一次 gap / 坏尾诊断结果。
