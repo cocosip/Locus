@@ -151,7 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         _fileSystem.Directory.CreateDirectory(tenantDir);
 
                     var dbPath = _fileSystem.Path.Combine(tenantDir, "quotas.db");
-                    conn = OpenAndInitializeConnection(dbPath);
+                    conn = OpenWithTransientRetry(dbPath, tid);
 
                     _logger.LogDebug("Created/opened SQLite quota database for tenant {TenantId} at {Path}", tid, dbPath);
 
@@ -239,7 +239,102 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                 }
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
-            return lazyConn.Value;
+            try
+            {
+                return lazyConn.Value;
+            }
+            catch
+            {
+                // Lazy caches factory exceptions. Remove only this failed instance after the
+                // factory has unwound so the next access can retry instead of replaying the error
+                // for the lifetime of the process.
+                ((ICollection<KeyValuePair<string, Lazy<SqliteConnection>>>)_databases)
+                    .Remove(new KeyValuePair<string, Lazy<SqliteConnection>>(tenantId, lazyConn));
+                throw;
+            }
+        }
+
+        private const int TransientRetryAttempts = 3;
+
+        private SqliteConnection OpenWithTransientRetry(string dbPath, string tenantId)
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    return OpenAndInitializeConnection(dbPath);
+                }
+                catch (Exception ex) when (SqliteFailureClassifier.IsTransient(ex) && attempt < TransientRetryAttempts)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Transient SQLite failure opening quota database for tenant {TenantId} (attempt {Attempt}/{MaxAttempts}); retrying.",
+                        tenantId,
+                        attempt,
+                        TransientRetryAttempts);
+                    Thread.Sleep(50 * attempt);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Drops the cached connection for a tenant so the next call reopens it.
+        /// Must be called while holding the tenant lock.
+        /// </summary>
+        private void EvictDatabaseConnectionNoLock(string tenantId)
+        {
+            if (_databases.TryRemove(tenantId, out var lazyConn) && lazyConn.IsValueCreated)
+            {
+                try
+                {
+                    lazyConn.Value?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error disposing SQLite quota connection for tenant {TenantId} before retry", tenantId);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Retries a quota persistence after a transient SQLite failure on a freshly opened connection.
+        /// Corruption never reaches this path.
+        /// </summary>
+        private void PersistQuotaWithTransientRetryNoLock(
+            string tenantId,
+            DirectoryQuota quota,
+            Exception firstFailure)
+        {
+            var failure = firstFailure;
+            for (var attempt = 1; attempt < TransientRetryAttempts; attempt++)
+            {
+                _logger.LogWarning(
+                    failure,
+                    "Transient SQLite failure persisting quota for tenant {TenantId} (retry {Attempt}/{MaxAttempts}).",
+                    tenantId,
+                    attempt,
+                    TransientRetryAttempts);
+
+                Thread.Sleep(100 * attempt);
+
+                try
+                {
+                    lock (GetDatabaseLock(tenantId))
+                    {
+                        EvictDatabaseConnectionNoLock(tenantId);
+                        UpsertQuota(GetDatabase(tenantId), quota);
+                    }
+
+                    GetCache(tenantId)[quota.DirectoryPath] = quota;
+                    return;
+                }
+                catch (Exception retryFailure) when (SqliteFailureClassifier.IsTransient(retryFailure))
+                {
+                    failure = retryFailure;
+                }
+            }
+
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
         }
 
         private object GetDatabaseLock(string tenantId)
@@ -458,22 +553,12 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         }
 
         /// <summary>
-        /// Checks whether the exception indicates a recoverable database corruption scenario.
+        /// Checks whether the exception indicates database corruption that requires a rebuild.
+        /// Only SQLITE_CORRUPT (11) and SQLITE_NOTADB (26) qualify.
         /// </summary>
         private static bool IsRecoverableDatabaseException(Exception ex)
         {
-            if (ex is IOException)
-                return true;
-
-            if (ex is SqliteException sqliteEx)
-            {
-                // SQLITE_CORRUPT (11), SQLITE_NOTADB (26), SQLITE_IOERR (10)
-                return sqliteEx.SqliteErrorCode == 11
-                    || sqliteEx.SqliteErrorCode == 26
-                    || sqliteEx.SqliteErrorCode == 10;
-            }
-
-            return false;
+            return SqliteFailureClassifier.IsCorruption(ex);
         }
 
         private static bool IsReadonlyDatabaseException(SqliteException ex)
@@ -598,6 +683,10 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
                         tenantId);
                     throw;
                 }
+            }
+            catch (Exception ex) when (SqliteFailureClassifier.IsTransient(ex))
+            {
+                PersistQuotaWithTransientRetryNoLock(tenantId, quota, ex);
             }
         }
 

@@ -11,7 +11,7 @@ A high-performance, multi-tenant file storage pool system for .NET, targeting `n
 Locus is designed as a **file queue system** that provides:
 - **Multi-tenant isolation** - Each tenant has isolated storage space with enable/disable controls
 - **Queue-based processing** - Files are processed as a queue with automatic retry on failure
-- **Unlimited storage expansion** - Dynamically mount multiple storage volumes
+- **Unlimited storage expansion** - Add storage volumes without changing file keys
 - **High concurrency** - Thread-safe operations with per-tenant SQLite databases and active-data caching
 - **Automatic management** - System handles directory structure, file placement, and cleanup
 - **Directory-level quota control** - Configurable file count limits per directory
@@ -217,7 +217,8 @@ already been projected, the tenant journal is truncated to an empty file and its
 The sample appsettings file currently favors high-throughput image ingestion: `AckMode = Async`,
 `JournalFormat = BinaryV1`, larger projection batches, and `ForceFlushAfterWrite = false` on the first
 sample volume. Deployments that need stronger "success returned means flushed" semantics should evaluate
-`AckMode = Durable` or `Balanced`, and set critical volumes to `ForceFlushAfterWrite = true`.
+`AckMode = Durable` or `Balanced`, and set critical volumes to `ForceFlushAfterWrite = true`, which
+fsyncs each written file to the storage device before the write completes.
 
 ## Configuration Reference
 
@@ -306,11 +307,11 @@ public interface IStoragePool
     Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(
         ITenantContext tenant, int batchSize, CancellationToken ct);
 
-    // Mark file as completed → deletes file and metadata (requires lease token)
-    Task MarkAsCompletedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, CancellationToken ct);
+    // Mark file as completed → deletes file and metadata (requires the processing lease)
+    Task MarkAsCompletedAsync(FileProcessingLease lease, CancellationToken ct = default);
 
-    // Mark file as failed → returns to queue for retry (requires lease token)
-    Task MarkAsFailedAsync(string fileKey, DateTime expectedProcessingStartTimeUtc, string errorMessage, CancellationToken ct);
+    // Mark file as failed → returns to queue for retry (requires the processing lease)
+    Task MarkAsFailedAsync(FileProcessingLease lease, string errorMessage, CancellationToken ct = default);
 
     // Get current file status
     Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct);
@@ -378,16 +379,26 @@ var tasks = Enumerable.Range(0, 10).Select(async threadId =>
             await ProcessFileAsync(stream);
 
             // Success: mark as completed (deletes file and metadata)
-            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
-                ?? throw new InvalidOperationException("Missing processing start time.");
-            await storagePool.MarkAsCompletedAsync(file.FileKey, expectedProcessingStartTimeUtc, ct);
+            var lease = new FileProcessingLease
+            {
+                TenantId = tenant.TenantId,
+                FileKey = file.FileKey,
+                ProcessingStartTimeUtc = file.ProcessingStartTime
+                    ?? throw new InvalidOperationException("Missing processing start time.")
+            };
+            await storagePool.MarkAsCompletedAsync(lease, ct);
         }
         catch (Exception ex)
         {
             // Failure: return to queue for retry
-            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
-                ?? throw new InvalidOperationException("Missing processing start time.");
-            await storagePool.MarkAsFailedAsync(file.FileKey, expectedProcessingStartTimeUtc, ex.Message, ct);
+            var lease = new FileProcessingLease
+            {
+                TenantId = tenant.TenantId,
+                FileKey = file.FileKey,
+                ProcessingStartTimeUtc = file.ProcessingStartTime
+                    ?? throw new InvalidOperationException("Missing processing start time.")
+            };
+            await storagePool.MarkAsFailedAsync(lease, ex.Message, ct);
             // File will be retried based on retry policy
         }
     }
@@ -416,15 +427,25 @@ while (true)
         {
             using var stream = await storagePool.ReadFileAsync(tenant, file.FileKey, token);
             await ProcessFileAsync(stream);
-            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
-                ?? throw new InvalidOperationException("Missing processing start time.");
-            await storagePool.MarkAsCompletedAsync(file.FileKey, expectedProcessingStartTimeUtc, token);
+            var lease = new FileProcessingLease
+            {
+                TenantId = tenant.TenantId,
+                FileKey = file.FileKey,
+                ProcessingStartTimeUtc = file.ProcessingStartTime
+                    ?? throw new InvalidOperationException("Missing processing start time.")
+            };
+            await storagePool.MarkAsCompletedAsync(lease, token);
         }
         catch (Exception ex)
         {
-            var expectedProcessingStartTimeUtc = file.ProcessingStartTime
-                ?? throw new InvalidOperationException("Missing processing start time.");
-            await storagePool.MarkAsFailedAsync(file.FileKey, expectedProcessingStartTimeUtc, ex.Message, token);
+            var lease = new FileProcessingLease
+            {
+                TenantId = tenant.TenantId,
+                FileKey = file.FileKey,
+                ProcessingStartTimeUtc = file.ProcessingStartTime
+                    ?? throw new InvalidOperationException("Missing processing start time.")
+            };
+            await storagePool.MarkAsFailedAsync(lease, ex.Message, token);
         }
     });
 }
@@ -602,10 +623,10 @@ Locus/
 │       ├── LocusBuilder.cs
 │       └── ServiceCollectionExtensions.cs
 ├── tests/
-│   ├── Locus.FileSystem.Tests/  # 51 tests ✅
-│   ├── Locus.Storage.Tests/     # 179 tests ✅
-│   ├── Locus.MultiTenant.Tests/ # 12 tests ✅
-│   ├── Locus.IntegrationTests/  # 10 tests ✅
+│   ├── Locus.FileSystem.Tests/  # 62 tests ✅
+│   ├── Locus.Storage.Tests/     # 614 tests ✅
+│   ├── Locus.MultiTenant.Tests/ # 17 tests ✅
+│   ├── Locus.IntegrationTests/  # 13 tests ✅
 │   └── Locus.Benchmarks/        # Performance benchmarks
 │       ├── MetadataRepositoryBenchmarks.cs
 │       ├── DirectoryQuotaBenchmarks.cs
@@ -721,8 +742,7 @@ dotnet pack src/Locus/Locus.csproj -c Release
 - Failed file retention, dead-letter handling, and retired-volume metadata policies
 
 🔧 **Storage Management**
-- Dynamic volume mounting/unmounting
-- Automatic volume expansion
+- Startup volume configuration with automatic volume expansion
 - Load balancing across volumes
 - Directory-level quota control
 

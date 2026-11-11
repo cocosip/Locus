@@ -52,7 +52,6 @@ namespace Locus.Storage
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orphanScanQueues;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _orphanScanLocks;
         private readonly ConcurrentDictionary<string, OrphanDirectoryScanState> _orphanDirectoryScanStates;
-        private readonly ConcurrentDictionary<string, DateTime> _orphanScanLastRunUtc;
         private readonly SemaphoreSlim _volumeScanGate;
         private long _statusCleanupIterationCount;
         private long _statusCleanupIterationStopwatchTicks;
@@ -118,7 +117,6 @@ namespace Locus.Storage
             _orphanScanQueues = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
             _orphanScanLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _orphanDirectoryScanStates = new ConcurrentDictionary<string, OrphanDirectoryScanState>();
-            _orphanScanLastRunUtc = new ConcurrentDictionary<string, DateTime>();
             _volumeScanGate = new SemaphoreSlim(1, 1);
 
             if (string.IsNullOrWhiteSpace(metadataDirectory))
@@ -625,7 +623,6 @@ namespace Locus.Storage
                         scanLock.Release();
                     }
 
-                    _orphanScanLastRunUtc[scanKey] = DateTime.UtcNow;
                 }
             Interlocked.Add(ref _orphanedFilesRecovered, rebuiltCount);
 
@@ -698,13 +695,9 @@ namespace Locus.Storage
         {
             ct.ThrowIfCancellationRequested();
 
-            if (_volumeScanGate.Wait(0))
-                return true;
-
-            await Task.Yield();
-            ct.ThrowIfCancellationRequested();
-
-            if (_volumeScanGate.Wait(0))
+            // Wait briefly for a running volume scan instead of skipping the pass outright: a long
+            // junk-file sweep would otherwise starve orphaned-file recovery for a whole interval.
+            if (await _volumeScanGate.WaitAsync(VolumeScanWaitTimeout, ct).ConfigureAwait(false))
                 return true;
 
             _logger.LogInformation(
@@ -2599,6 +2592,8 @@ namespace Locus.Storage
         // extremely deep sharding hierarchies).  Normal storage depth is 3-5 levels.
         private const int MaxCleanupRecursionDepth = 20;
 
+        private static readonly TimeSpan VolumeScanWaitTimeout = TimeSpan.FromSeconds(30);
+
         /// <summary>
         /// Recursively removes junk files and empty directories, bottom-up.
         /// A directory is considered empty when it contains no files (other than junk files that are
@@ -2627,14 +2622,22 @@ namespace Locus.Storage
 
             var removedCount = 0;
 
-            // 1. Process subdirectories first (bottom-up so parents can be emptied).
-            foreach (var subdirectory in _fileSystem.Directory.EnumerateDirectories(directoryPath))
+            // 1. Process subdirectories first (bottom-up so parents can be emptied). A single
+            // unreadable subtree must not abort the sweep for the rest of the volume.
+            foreach (var subdirectory in EnumerateDirectoriesSafe(directoryPath))
             {
-                removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false, shardingDepth: shardingDepth, depth: depth + 1);
+                try
+                {
+                    removedCount += await CleanupJunkFilesRecursiveAsync(subdirectory, ct, isProtectedRoot: false, shardingDepth: shardingDepth, depth: depth + 1);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Skipping junk-file cleanup for unreadable directory {DirectoryPath}", subdirectory);
+                }
             }
 
             // 2. Delete junk files in the current directory.
-            foreach (var file in _fileSystem.Directory.EnumerateFiles(directoryPath))
+            foreach (var file in EnumerateFilesSafe(directoryPath))
             {
                 ct.ThrowIfCancellationRequested();
                 var fileName = _fileSystem.Path.GetFileName(file);
@@ -2672,6 +2675,32 @@ namespace Locus.Storage
             }
 
             return removedCount;
+        }
+
+        private IEnumerable<string> EnumerateDirectoriesSafe(string directoryPath)
+        {
+            try
+            {
+                return _fileSystem.Directory.EnumerateDirectories(directoryPath).ToArray();
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Failed to enumerate directories under {DirectoryPath}; skipping the subtree", directoryPath);
+                return Array.Empty<string>();
+            }
+        }
+
+        private IEnumerable<string> EnumerateFilesSafe(string directoryPath)
+        {
+            try
+            {
+                return _fileSystem.Directory.EnumerateFiles(directoryPath).ToArray();
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Failed to enumerate files under {DirectoryPath}; skipping the directory", directoryPath);
+                return Array.Empty<string>();
+            }
         }
 
         /// <summary>

@@ -45,6 +45,7 @@ namespace Locus.Storage
         private readonly LocusStartupCoordinator _startupCoordinator;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tenantProjectionLocks;
         private readonly ConcurrentDictionary<string, CachedProjectionCursor> _cursorCache;
+        private readonly ConcurrentDictionary<string, ProjectionRecordFailureState> _recordFailureStates;
         private readonly AsyncLocal<IQueueProjectionBatch?> _currentProjectionBatch;
         private string? _nextTenantProjectionCursor;
 
@@ -80,6 +81,7 @@ namespace Locus.Storage
             _startupCoordinator = startupCoordinator ?? LocusStartupCoordinator.Ready;
             _tenantProjectionLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
             _cursorCache = new ConcurrentDictionary<string, CachedProjectionCursor>(StringComparer.Ordinal);
+            _recordFailureStates = new ConcurrentDictionary<string, ProjectionRecordFailureState>(StringComparer.Ordinal);
             _currentProjectionBatch = new AsyncLocal<IQueueProjectionBatch?>();
         }
 
@@ -105,6 +107,8 @@ namespace Locus.Storage
             {
                 var cycleStopwatch = Stopwatch.StartNew();
                 var processedAny = false;
+                var backlogRemaining = false;
+                var tenantFailed = false;
 
                 try
                 {
@@ -122,8 +126,12 @@ namespace Locus.Storage
                         if (cycleStopwatch.Elapsed >= _options.MaxProjectionTimePerCycle)
                             break;
 
-                        var processedForTenant = await ProjectTenantAsync(tenantId, stoppingToken).ConfigureAwait(false);
-                        processedAny |= processedForTenant;
+                        // A failure in one tenant must never abort the cycle for the remaining
+                        // tenants, and the rotation cursor below must still move forward.
+                        var outcome = await ProjectTenantAsync(tenantId, stoppingToken).ConfigureAwait(false);
+                        processedAny |= outcome.Advanced;
+                        backlogRemaining |= outcome.HasBacklog;
+                        tenantFailed |= outcome.Failed;
                         tenantsProcessed++;
                         lastTenantProcessed = tenantId;
                     }
@@ -140,7 +148,16 @@ namespace Locus.Storage
                     _logger.LogError(ex, "Queue event projection cycle failed");
                 }
 
-                var delay = processedAny ? _options.BusyCycleDelay : _options.IdleCycleDelay;
+                if (backlogRemaining && !tenantFailed)
+                {
+                    // Do not sleep while the journal still has unread records; yielding keeps the
+                    // loop responsive without burning a full cycle delay per small batch. When a
+                    // tenant failed, fall through to the busy delay so the retry loop is not a spin.
+                    await Task.Yield();
+                    continue;
+                }
+
+                var delay = processedAny || tenantFailed ? _options.BusyCycleDelay : _options.IdleCycleDelay;
                 if (delay > TimeSpan.Zero)
                     await Task.Delay(delay, stoppingToken).ConfigureAwait(false);
             }
@@ -220,6 +237,7 @@ namespace Locus.Storage
             ValidateTenantId(tenantId);
 
             ProjectionMaintenanceWork? maintenanceWork = null;
+            GapRecoveryRequest? gapRecovery = null;
             long cursorOffset;
             var projectionLock = GetTenantProjectionLock(tenantId);
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
@@ -233,6 +251,7 @@ namespace Locus.Storage
                     {
                         cursorOffset = cycleResult.AdvancedCursorOffset.Value;
                         maintenanceWork = cycleResult.MaintenanceWork;
+                        gapRecovery ??= cycleResult.GapRecovery;
                     }
                 }
                 catch (DeferredProjectionException ex)
@@ -248,6 +267,15 @@ namespace Locus.Storage
             finally
             {
                 projectionLock.Release();
+            }
+
+            if (gapRecovery != null)
+            {
+                await TriggerGapRecoveryAsync(
+                    tenantId,
+                    gapRecovery.Value.ExpectedSequenceNumber,
+                    gapRecovery.Value.ObservedSequenceNumber,
+                    ct).ConfigureAwait(false);
             }
 
             if (maintenanceWork != null)
@@ -284,6 +312,7 @@ namespace Locus.Storage
             ValidateTenantId(tenantId);
 
             ProjectionMaintenanceWork? maintenanceWork = null;
+            GapRecoveryRequest? gapRecovery = null;
             long cursorOffset;
             var projectionLock = GetTenantProjectionLock(tenantId);
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
@@ -306,6 +335,7 @@ namespace Locus.Storage
                         {
                             cursorOffset = cycleResult.AdvancedCursorOffset.Value;
                             maintenanceWork = cycleResult.MaintenanceWork;
+                            gapRecovery ??= cycleResult.GapRecovery;
                         }
                     }
                     catch (DeferredProjectionException ex)
@@ -331,13 +361,22 @@ namespace Locus.Storage
                 projectionLock.Release();
             }
 
+            if (gapRecovery != null)
+            {
+                await TriggerGapRecoveryAsync(
+                    tenantId,
+                    gapRecovery.Value.ExpectedSequenceNumber,
+                    gapRecovery.Value.ObservedSequenceNumber,
+                    ct).ConfigureAwait(false);
+            }
+
             if (maintenanceWork != null)
                 await ExecuteProjectionMaintenanceAsync(maintenanceWork, ct).ConfigureAwait(false);
 
             return await BuildTenantStateAsync(tenantId, cursorOffset, ct).ConfigureAwait(false);
         }
 
-        private async Task<bool> ProjectTenantAsync(string tenantId, CancellationToken ct)
+        private async Task<TenantProjectionOutcome> ProjectTenantAsync(string tenantId, CancellationToken ct)
         {
             ValidateTenantId(tenantId);
 
@@ -346,28 +385,53 @@ namespace Locus.Storage
             await projectionLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                try
-                {
-                    cycleResult = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false);
-                }
-                catch (DeferredProjectionException ex)
-                {
-                    _logger.LogWarning(
-                        ex,
-                        "Deferred queue projection for tenant {TenantId} because the physical file could not be verified",
-                        tenantId);
-                    return false;
-                }
+                cycleResult = await ProjectTenantCoreAsync(tenantId, ct).ConfigureAwait(false);
+            }
+            catch (DeferredProjectionException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Deferred queue projection for tenant {TenantId} because the physical file could not be verified",
+                    tenantId);
+                return new TenantProjectionOutcome(advanced: false, hasBacklog: true, failed: true);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // One tenant's failing record must never stall the cycle for the other tenants.
+                // The batch has already been rolled back by the projection batch dispose, so the
+                // record is retried safely on the next cycle.
+                _logger.LogError(
+                    ex,
+                    "Queue projection failed for tenant {TenantId}; retrying the tenant on a later cycle",
+                    tenantId);
+                return new TenantProjectionOutcome(advanced: false, hasBacklog: true, failed: true);
             }
             finally
             {
                 projectionLock.Release();
             }
 
+            var pendingGapRecovery = cycleResult?.GapRecovery;
+            if (pendingGapRecovery.HasValue)
+            {
+                await TriggerGapRecoveryAsync(
+                    tenantId,
+                    pendingGapRecovery.Value.ExpectedSequenceNumber,
+                    pendingGapRecovery.Value.ObservedSequenceNumber,
+                    ct).ConfigureAwait(false);
+            }
+
             if (cycleResult?.MaintenanceWork != null)
                 await ExecuteProjectionMaintenanceAsync(cycleResult.MaintenanceWork, ct).ConfigureAwait(false);
 
-            return cycleResult?.AdvancedCursorOffset.HasValue == true;
+            return new TenantProjectionOutcome(
+                advanced: cycleResult?.AdvancedCursorOffset.HasValue == true,
+                hasBacklog: cycleResult?.HasBacklog == true,
+                failed: false);
         }
 
         private async Task<ProjectionCycleResult> ProjectTenantCoreAsync(string tenantId, CancellationToken ct)
@@ -382,29 +446,69 @@ namespace Locus.Storage
                 {
                     cursor.Offset = batch.NextOffset;
                     await QueueCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
-                    return new ProjectionCycleResult(batch.NextOffset, maintenanceWork: null);
+                    return new ProjectionCycleResult(batch.NextOffset, maintenanceWork: null, hasBacklog: false, gapRecovery: null);
                 }
 
-                return new ProjectionCycleResult(null, maintenanceWork: null);
+                return new ProjectionCycleResult(null, maintenanceWork: null, hasBacklog: false, gapRecovery: null);
             }
 
+            GapRecoveryRequest? gapRecovery = null;
+            Exception? projectionFailure = null;
             var projectionBatch = BeginProjectionBatch(tenantId);
             try
             {
-                foreach (var record in batch.Records)
+                try
                 {
-                    ct.ThrowIfCancellationRequested();
-                    await ApplySequenceTrackingAsync(tenantId, cursor, record, ct).ConfigureAwait(false);
-                    await ProjectRecordAsync(record, ct).ConfigureAwait(false);
-                }
+                    foreach (var record in batch.Records)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        gapRecovery ??= ApplySequenceTracking(cursor, record);
+                        await ProjectRecordAsync(record, ct).ConfigureAwait(false);
+                    }
 
-                if (projectionBatch != null)
-                    await projectionBatch.FlushAsync(ct).ConfigureAwait(false);
+                    if (projectionBatch != null)
+                        await projectionBatch.FlushAsync(ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException && ex is not DeferredProjectionException)
+                {
+                    // Capture the failure and let the finally block roll the batch back before any
+                    // quarantine replay runs on a clean projection state.
+                    projectionFailure = ex;
+                }
             }
             finally
             {
                 EndProjectionBatch(projectionBatch);
             }
+
+            if (projectionFailure != null)
+            {
+                var attempts = IncrementProjectionFailureAttempts(tenantId, offset);
+                if (attempts < _options.MaxProjectionAttemptsPerRecord)
+                {
+                    QueueJournalMetrics.RecordProjectionRecordFailed();
+                    throw projectionFailure;
+                }
+
+                var advancedOffset = await QuarantineFailedBatchAsync(
+                    tenantId,
+                    offset,
+                    batch.NextOffset,
+                    projectionFailure,
+                    ct).ConfigureAwait(false);
+
+                cursor.Offset = advancedOffset;
+                await SaveCursorAsync(tenantId, advancedOffset, ct).ConfigureAwait(false);
+                _recordFailureStates.TryRemove(tenantId, out _);
+
+                return new ProjectionCycleResult(
+                    advancedOffset,
+                    maintenanceWork: null,
+                    hasBacklog: true,
+                    gapRecovery: gapRecovery);
+            }
+
+            _recordFailureStates.TryRemove(tenantId, out _);
 
             var cursorOffset = batch.NextOffset;
             ProjectionMaintenanceWork? maintenanceWork = null;
@@ -426,7 +530,123 @@ namespace Locus.Storage
 
             cursor.Offset = cursorOffset;
             await QueueCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
-            return new ProjectionCycleResult(cursorOffset, maintenanceWork);
+            return new ProjectionCycleResult(cursorOffset, maintenanceWork, hasBacklog: !batch.ReachedEndOfFile, gapRecovery: gapRecovery);
+        }
+
+        private int IncrementProjectionFailureAttempts(string tenantId, long offset)
+        {
+            var state = _recordFailureStates.AddOrUpdate(
+                tenantId,
+                _ => new ProjectionRecordFailureState(offset, 1),
+                (_, existing) => existing.Offset == offset
+                    ? existing.WithAttempt(existing.Attempts + 1)
+                    : new ProjectionRecordFailureState(offset, 1));
+
+            return state.Attempts;
+        }
+
+        /// <summary>
+        /// Replays a batch that keeps failing one record at a time after the per-record retry budget
+        /// is exhausted. Each failing record is written to a dead-letter file and skipped so that the
+        /// tenant (and every other tenant) keeps making progress.
+        /// </summary>
+        private async Task<long> QuarantineFailedBatchAsync(
+            string tenantId,
+            long startOffset,
+            long batchEndOffset,
+            Exception failure,
+            CancellationToken ct)
+        {
+            var offset = startOffset;
+            while (offset < batchEndOffset)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var single = await _journal.ReadBatchAsync(tenantId, offset, 1, ct).ConfigureAwait(false);
+                if (single.Records.Count == 0)
+                {
+                    // No record at this position; stop instead of spinning.
+                    offset = single.NextOffset > offset ? single.NextOffset : batchEndOffset;
+                    break;
+                }
+
+                try
+                {
+                    await ProjectRecordAsync(single.Records[0], ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception quarantineFailure)
+                {
+                    await WriteProjectionDeadLetterAsync(
+                        tenantId,
+                        offset,
+                        single.NextOffset,
+                        single.Records[0],
+                        quarantineFailure,
+                        ct).ConfigureAwait(false);
+
+                    QueueJournalMetrics.RecordProjectionRecordQuarantined();
+                    _logger.LogError(
+                        quarantineFailure,
+                        "Quarantined queue journal record for tenant {TenantId} at offset {RecordOffset} after {MaxAttempts} failed projection attempts. Record written to projection.deadletter.jsonl. Original batch failure: {BatchFailure}",
+                        tenantId,
+                        offset,
+                        _options.MaxProjectionAttemptsPerRecord,
+                        failure.Message);
+                }
+
+                offset = single.NextOffset;
+            }
+
+            return offset;
+        }
+
+        private async Task WriteProjectionDeadLetterAsync(
+            string tenantId,
+            long recordOffset,
+            long nextOffset,
+            QueueEventRecord record,
+            Exception failure,
+            CancellationToken ct)
+        {
+            try
+            {
+                var tenantDirectory = _fileSystem.Path.Combine(_options.QueueDirectory, tenantId);
+                if (!_fileSystem.Directory.Exists(tenantDirectory))
+                    _fileSystem.Directory.CreateDirectory(tenantDirectory);
+
+                var path = _fileSystem.Path.Combine(tenantDirectory, "projection.deadletter.jsonl");
+                var payload = JsonSerializer.Serialize(
+                    new ProjectionDeadLetterEntry
+                    {
+                        WrittenAtUtc = DateTime.UtcNow,
+                        TenantId = tenantId,
+                        RecordOffset = recordOffset,
+                        NextOffset = nextOffset,
+                        EventType = record.EventType.ToString(),
+                        FileKey = record.FileKey,
+                        Error = failure.Message,
+                        ExceptionType = failure.GetType().FullName,
+                    },
+                    JsonOptions);
+
+                _fileSystem.File.AppendAllText(path, payload + Environment.NewLine);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to write projection dead-letter entry for tenant {TenantId} at offset {RecordOffset}",
+                    tenantId,
+                    recordOffset);
+            }
         }
 
         private IQueueProjectionBatch? BeginProjectionBatch(string tenantId)
@@ -474,15 +694,14 @@ namespace Locus.Storage
             return _projectionStore.RemoveProjectedFileAsync(tenantId, fileKey, ct);
         }
 
-        private async Task ApplySequenceTrackingAsync(
-            string tenantId,
+        private GapRecoveryRequest? ApplySequenceTracking(
             ProjectionCursor cursor,
-            QueueEventRecord record,
-            CancellationToken ct)
+            QueueEventRecord record)
         {
             if (!record.SequenceNumber.HasValue || record.SequenceNumber.Value <= 0)
-                return;
+                return null;
 
+            GapRecoveryRequest? request = null;
             var sequenceNumber = record.SequenceNumber.Value;
             if (cursor.LastSequenceNumber > 0 && sequenceNumber > cursor.LastSequenceNumber + 1)
             {
@@ -495,16 +714,21 @@ namespace Locus.Storage
 
                 _logger.LogWarning(
                     SequenceGapDetectedEventId,
-                    "Queue journal sequence gap detected for tenant {TenantId}: expected {ExpectedSequenceNumber} but observed {ObservedSequenceNumber}. Triggering orphan recovery.",
-                    tenantId,
+                    "Queue journal sequence gap detected for tenant {TenantId}: expected {ExpectedSequenceNumber} but observed {ObservedSequenceNumber}. Orphan recovery will run after the current projection batch completes.",
+                    record.TenantId,
                     expectedSequence,
                     sequenceNumber);
 
-                await TriggerGapRecoveryAsync(tenantId, expectedSequence, sequenceNumber, ct).ConfigureAwait(false);
+                // Recovery is deliberately deferred until the projection batch is closed and the
+                // tenant projection lock is released; running a full orphan scan inside an open
+                // batch blocks every writer for the tenant and can re-enter batch creation.
+                request = new GapRecoveryRequest(expectedSequence, sequenceNumber);
             }
 
             if (sequenceNumber > cursor.LastSequenceNumber)
                 cursor.LastSequenceNumber = sequenceNumber;
+
+            return request;
         }
 
         private async Task TriggerGapRecoveryAsync(
@@ -1967,15 +2191,88 @@ namespace Locus.Storage
 
         private sealed class ProjectionCycleResult
         {
-            public ProjectionCycleResult(long? advancedCursorOffset, ProjectionMaintenanceWork? maintenanceWork)
+            public ProjectionCycleResult(
+                long? advancedCursorOffset,
+                ProjectionMaintenanceWork? maintenanceWork,
+                bool hasBacklog,
+                GapRecoveryRequest? gapRecovery)
             {
                 AdvancedCursorOffset = advancedCursorOffset;
                 MaintenanceWork = maintenanceWork;
+                HasBacklog = hasBacklog;
+                GapRecovery = gapRecovery;
             }
 
             public long? AdvancedCursorOffset { get; }
 
             public ProjectionMaintenanceWork? MaintenanceWork { get; }
+
+            public bool HasBacklog { get; }
+
+            public GapRecoveryRequest? GapRecovery { get; }
+        }
+
+        private sealed class TenantProjectionOutcome
+        {
+            public TenantProjectionOutcome(bool advanced, bool hasBacklog, bool failed)
+            {
+                Advanced = advanced;
+                HasBacklog = hasBacklog;
+                Failed = failed;
+            }
+
+            public bool Advanced { get; }
+
+            public bool HasBacklog { get; }
+
+            public bool Failed { get; }
+        }
+
+        private readonly struct GapRecoveryRequest
+        {
+            public GapRecoveryRequest(long expectedSequenceNumber, long observedSequenceNumber)
+            {
+                ExpectedSequenceNumber = expectedSequenceNumber;
+                ObservedSequenceNumber = observedSequenceNumber;
+            }
+
+            public long ExpectedSequenceNumber { get; }
+
+            public long ObservedSequenceNumber { get; }
+        }
+
+        private readonly struct ProjectionRecordFailureState
+        {
+            public ProjectionRecordFailureState(long offset, int attempts)
+            {
+                Offset = offset;
+                Attempts = attempts;
+            }
+
+            public long Offset { get; }
+
+            public int Attempts { get; }
+
+            public ProjectionRecordFailureState WithAttempt(int attempts) => new ProjectionRecordFailureState(Offset, attempts);
+        }
+
+        private sealed class ProjectionDeadLetterEntry
+        {
+            public DateTime WrittenAtUtc { get; set; }
+
+            public string TenantId { get; set; } = string.Empty;
+
+            public long RecordOffset { get; set; }
+
+            public long NextOffset { get; set; }
+
+            public string EventType { get; set; } = string.Empty;
+
+            public string? FileKey { get; set; }
+
+            public string? Error { get; set; }
+
+            public string? ExceptionType { get; set; }
         }
 
         private sealed class ProjectionMaintenanceWork

@@ -578,12 +578,19 @@ public sealed class MetadataPersistenceOrderingTests : IDisposable
 
         protected override SqliteConnection OpenAndInitializeConnection(string dbPath)
         {
-            if (Interlocked.Increment(ref _attempts) == 1)
+            // Exhaust both retry layers (per-open retries and the batch-level reopen retry) so the
+            // batch really fails and must be requeued, which is the behavior under test here.
+            if (Interlocked.Increment(ref _attempts) <= 9)
             {
-                Entered.Set();
-                if (!Release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+                if (Volatile.Read(ref _attempts) == 1)
+                {
+                    Entered.Set();
+                    if (!Release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+                }
+
                 throw new SqliteException("Injected SQLITE_BUSY", 5);
             }
+
             return base.OpenAndInitializeConnection(dbPath);
         }
     }

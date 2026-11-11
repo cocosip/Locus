@@ -37,9 +37,6 @@ namespace Locus.Storage
         /// <returns>Due cleanup jobs.</returns>
         Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(DateTime nowUtc, int limit, CancellationToken ct = default);
 
-        /// <summary>Gets due cleanup jobs and stale interrupted import reservations.</summary>
-        Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(DateTime nowUtc, int limit, DateTime staleImportCutoffUtc, CancellationToken ct = default);
-
         /// <summary>Attempts to acquire a lease for a cleanup job.</summary>
         /// <param name="id">The cleanup job identifier.</param>
         /// <param name="nowUtc">The current UTC time.</param>

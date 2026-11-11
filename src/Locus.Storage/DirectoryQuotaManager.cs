@@ -137,8 +137,6 @@ namespace Locus.Storage
             {
                 state.Gate.Release();
             }
-
-            TryRemoveStateIfEmpty(tenantId, normalizedDirectoryPath, state);
         }
 
         /// <inheritdoc/>
@@ -290,8 +288,6 @@ namespace Locus.Storage
             {
                 state.Gate.Release();
             }
-
-            TryRemoveStateIfEmpty(tenantId, normalizedDirectoryPath, state);
         }
 
         /// <inheritdoc/>
@@ -350,6 +346,9 @@ namespace Locus.Storage
 
         private async Task<DirectoryQuotaState> EnterStateAsync(string tenantId, string directoryPath, CancellationToken ct)
         {
+            // Per-directory state objects are kept for the lifetime of the manager on purpose:
+            // evicting one while another caller already holds (or waits on) its gate would create a
+            // second live counter for the same directory and silently bypass the quota limit.
             var tenantStates = _states.GetOrAdd(
                 tenantId,
                 _ => new ConcurrentDictionary<string, DirectoryQuotaState>(StringComparer.Ordinal));
@@ -380,15 +379,6 @@ namespace Locus.Storage
                 throw new ArgumentException("Tenant ID cannot be empty", nameof(tenantId));
 
             normalizedDirectoryPath = DirectoryPathNormalizer.Normalize(directoryPath);
-        }
-
-        private void TryRemoveStateIfEmpty(string tenantId, string directoryPath, DirectoryQuotaState state)
-        {
-            if (state.ProjectedCount != 0 || state.ReservationCount != 0)
-                return;
-
-            if (_states.TryGetValue(tenantId, out var tenantStates))
-                tenantStates.TryRemove(directoryPath, out _);
         }
 
         private sealed class DirectoryQuotaState

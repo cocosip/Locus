@@ -201,13 +201,6 @@ namespace Locus.Storage
 
                 try
                 {
-                    if (job.State == SourceCleanupJobState.Importing)
-                    {
-                        // Import reservations are resumed by the watcher, which owns the source
-                        // validation and the durable idempotent operation identifier.
-                        return;
-                    }
-
                     if (job.State == SourceCleanupJobState.MovePending)
                     {
                         if (await TryMoveToFailureDirectoryAsync(job, ct).ConfigureAwait(false))
@@ -216,9 +209,6 @@ namespace Locus.Storage
                             await RecordFailureAsync(job, "Failed to move source file to the failure directory.", movePending: true, ct).ConfigureAwait(false);
                         return;
                     }
-
-                    if (job.Action == SourceCleanupJobAction.Keep)
-                        return;
 
                     if (!_fileSystem.File.Exists(job.SourcePath))
                     {

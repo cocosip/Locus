@@ -25,6 +25,18 @@ namespace Locus.Storage
             "locus.queue_journal.corrupt_tail.auto_repaired",
             unit: "{event}",
             description: "Number of corrupt queue journal tails automatically truncated and repaired.");
+        private static readonly Counter<long> ProjectionRecordFailedCounter = Meter.CreateCounter<long>(
+            "locus.queue_projection.record.failed",
+            unit: "{event}",
+            description: "Number of queue projection record failures that were retried on a later cycle.");
+        private static readonly Counter<long> ProjectionRecordQuarantinedCounter = Meter.CreateCounter<long>(
+            "locus.queue_projection.record.quarantined",
+            unit: "{event}",
+            description: "Number of queue journal records quarantined to projection.deadletter.jsonl after exhausting the retry budget.");
+        private static readonly Counter<long> AppendFailedCounter = Meter.CreateCounter<long>(
+            "locus.queue_journal.append.failed",
+            unit: "{event}",
+            description: "Number of queue journal records whose append batch failed, including appends that no caller awaits.");
 
         public static void RecordSequenceGapDetected()
         {
@@ -49,6 +61,22 @@ namespace Locus.Storage
         public static void RecordCorruptTailAutoRepaired()
         {
             CorruptTailAutoRepairedCounter.Add(1);
+        }
+
+        public static void RecordProjectionRecordFailed()
+        {
+            ProjectionRecordFailedCounter.Add(1);
+        }
+
+        public static void RecordProjectionRecordQuarantined()
+        {
+            ProjectionRecordQuarantinedCounter.Add(1);
+        }
+
+        public static void RecordAppendFailed(int recordCount)
+        {
+            if (recordCount > 0)
+                AppendFailedCounter.Add(recordCount);
         }
     }
 }

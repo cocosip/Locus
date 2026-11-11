@@ -69,6 +69,14 @@ namespace Locus.Storage
         public int MaxBatchBytes { get; set; } = 256 * 1024;
 
         /// <summary>
+        /// Gets or sets the maximum number of append requests queued per tenant before appends
+        /// apply backpressure to their callers. The bound keeps memory usage predictable when the
+        /// journal writer cannot keep up.
+        /// Default: 100000.
+        /// </summary>
+        public int MaxPendingRequests { get; set; } = 100_000;
+
+        /// <summary>
         /// Gets or sets the idle timeout after which the per-tenant append stream is closed.
         /// Default: 30 seconds.
         /// </summary>
@@ -115,6 +123,14 @@ namespace Locus.Storage
         /// Default: 2 seconds.
         /// </summary>
         public TimeSpan MaxProjectionTimePerCycle { get; set; } = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// Gets or sets how many consecutive cycles may fail on the same journal position before the
+        /// offending record is quarantined (written to projection.deadletter.jsonl and skipped) so the
+        /// rest of the tenant journal and all other tenants keep progressing.
+        /// Default: 5.
+        /// </summary>
+        public int MaxProjectionAttemptsPerRecord { get; set; } = 5;
 
         /// <summary>
         /// Gets or sets a value indicating whether projection snapshots should be refreshed automatically
@@ -201,6 +217,9 @@ namespace Locus.Storage
             if (MaxBatchBytes <= 0)
                 throw new InvalidOperationException("QueueEventJournal.MaxBatchBytes must be greater than zero");
 
+            if (MaxPendingRequests <= 0)
+                throw new InvalidOperationException("QueueEventJournal.MaxPendingRequests must be greater than zero");
+
             if (WriterIdleTimeout < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.WriterIdleTimeout cannot be negative");
 
@@ -209,6 +228,9 @@ namespace Locus.Storage
 
             if (MaxProjectionTimePerCycle <= TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.MaxProjectionTimePerCycle must be greater than zero");
+
+            if (MaxProjectionAttemptsPerRecord <= 0)
+                throw new InvalidOperationException("QueueEventJournal.MaxProjectionAttemptsPerRecord must be greater than zero");
 
             if (AutomaticSnapshotInterval < TimeSpan.Zero)
                 throw new InvalidOperationException("QueueEventJournal.AutomaticSnapshotInterval cannot be negative");

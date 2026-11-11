@@ -529,6 +529,76 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetBaseOffsetAsync_RecoversBaseOffsetWhenCompactionCrashedBeforeStateSave()
+        {
+            const string tenantId = "tenant-compaction-recovery";
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-002",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+
+            var firstBatch = await _journal.ReadBatchAsync(tenantId, 0, 1, CancellationToken.None);
+            var compactedOffset = await _journal.CompactAsync(tenantId, firstBatch.NextOffset, CancellationToken.None);
+
+            var statePath = Path.Combine(_queueDirectory, tenantId, "queue.state.json");
+            var markerPath = Path.Combine(_queueDirectory, tenantId, "queue.log.compact-marker");
+
+            // Replay the crash window: the journal file was swapped and the marker written, but the
+            // state file still carries the pre-compaction base offset.
+            var stateJson = _fileSystem.File.ReadAllText(statePath)
+                .Replace($"\"baseOffset\":{compactedOffset}", "\"baseOffset\":0");
+            Assert.DoesNotContain($"\"baseOffset\":{compactedOffset}", stateJson);
+            _fileSystem.File.WriteAllText(statePath, stateJson);
+            _fileSystem.File.WriteAllText(markerPath, $"{{\"baseOffset\":{compactedOffset}}}");
+
+            using var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                _queueDirectory);
+            var recoveredBaseOffset = await restartedJournal.GetBaseOffsetAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(compactedOffset, recoveredBaseOffset);
+            Assert.False(_fileSystem.File.Exists(markerPath));
+            Assert.Contains($"\"baseOffset\":{compactedOffset}", _fileSystem.File.ReadAllText(statePath));
+        }
+
+        [Fact]
+        public async Task GetBaseOffsetAsync_IgnoresCompactionMarkerThatDoesNotMatchJournalLength()
+        {
+            const string tenantId = "tenant-compaction-stale-marker";
+            await _journal.AppendAsync(new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = "file-001",
+                EventType = QueueEventType.Accepted
+            }, CancellationToken.None);
+            var firstBatch = await _journal.ReadBatchAsync(tenantId, 0, 1, CancellationToken.None);
+            var compactedOffset = await _journal.CompactAsync(tenantId, firstBatch.NextOffset, CancellationToken.None);
+
+            var statePath = Path.Combine(_queueDirectory, tenantId, "queue.state.json");
+            var markerPath = Path.Combine(_queueDirectory, tenantId, "queue.log.compact-marker");
+            _fileSystem.File.WriteAllText(markerPath, "{\"baseOffset\":999999}");
+
+            using var restartedJournal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                _queueDirectory);
+            var baseOffset = await restartedJournal.GetBaseOffsetAsync(tenantId, CancellationToken.None);
+
+            Assert.Equal(compactedOffset, baseOffset);
+            Assert.False(_fileSystem.File.Exists(markerPath));
+            Assert.Contains($"\"baseOffset\":{compactedOffset}", _fileSystem.File.ReadAllText(statePath));
+        }
+
+        [Fact]
         public async Task AppendAsync_AfterCompactionByAnotherInstance_PreservesCompactedBaseOffset()
         {
             var tenantId = "tenant-cross-instance-compact";

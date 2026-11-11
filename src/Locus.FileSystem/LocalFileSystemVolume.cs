@@ -9,6 +9,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.IO;
 using Locus.Core.Models;
 using Microsoft.Extensions.Logging;
 
@@ -94,7 +95,7 @@ namespace Locus.FileSystem
         /// <param name="logger">The logger.</param>
         /// <param name="volumeId">Unique volume identifier.</param>
         /// <param name="mountPath">Root directory of this volume.</param>
-        /// <param name="shardingDepth">Number of directory sharding levels (0鈥?). Default 2.</param>
+        /// <param name="shardingDepth">Number of directory sharding levels (0 disables sharding). Default 2.</param>
         /// <param name="healthCheckCacheDuration">
         /// How long to cache IsHealthy and AvailableSpace results.
         /// Eliminates the file-write+delete health probe and DriveInfo syscall on every write.
@@ -160,7 +161,7 @@ namespace Locus.FileSystem
                 ? TimeSpan.FromSeconds(30)
                 : healthCheckCacheDuration;
 
-            // TimeSpan.Zero means no caching 鈥?set ticks to 0 so every call checks
+            // TimeSpan.Zero means no caching — set ticks to 0 so every call checks
             _healthCacheDurationTicks = cacheDuration == TimeSpan.Zero
                 ? 0
                 : (long)(cacheDuration.TotalSeconds * Stopwatch.Frequency);
@@ -254,7 +255,7 @@ namespace Locus.FileSystem
                     return _cachedIsHealthy;
 
                 // Singleflight: only the CAS winner triggers the background refresh.
-                // Losers return the (slightly stale) cached value 鈥?acceptable.
+                // Losers return the (slightly stale) cached value — acceptable.
                 if (Interlocked.CompareExchange(ref _lastHealthCheckTicks, now, last) != last)
                     return _cachedIsHealthy;
 
@@ -269,7 +270,7 @@ namespace Locus.FileSystem
                 Task.Run(() =>
                 {
                     var result = PerformHealthCheckInternal();
-                    _cachedIsHealthy = result; // volatile write 鈥?visible to all threads
+                    _cachedIsHealthy = result; // volatile write — visible to all threads
                 }).ContinueWith(
                     t => _logger.LogError(t.Exception, "Unexpected error in background health check for volume {VolumeId}", _volumeId),
                     TaskContinuationOptions.OnlyOnFaulted);
@@ -290,6 +291,7 @@ namespace Locus.FileSystem
         public Task WarmWritePathCacheAsync(CancellationToken ct = default)
         {
             var directoriesScanned = 0;
+            var cacheLimitReached = false;
             var pending = new Stack<string>();
             pending.Push(_mountPath);
 
@@ -298,8 +300,16 @@ namespace Locus.FileSystem
                 ct.ThrowIfCancellationRequested();
 
                 var current = pending.Pop();
-                TrackKnownDirectoryWithoutTrim(current);
+                TrackKnownDirectory(current);
                 directoriesScanned++;
+
+                // The cache is bounded: stop walking instead of caching an entire tree that the
+                // normal trim path would immediately evict again.
+                if (Volatile.Read(ref _knownDirectoryCount) >= _knownDirectoryCacheMaxEntries)
+                {
+                    cacheLimitReached = true;
+                    break;
+                }
 
                 IEnumerable<string> childDirectories;
                 try
@@ -320,11 +330,21 @@ namespace Locus.FileSystem
                     pending.Push(childDirectory);
             }
 
-            _logger.LogInformation(
-                "Warmed write-path directory cache for volume {VolumeId}: scanned {ScannedCount} directories, cached {CachedCount}",
-                _volumeId,
-                directoriesScanned,
-                Volatile.Read(ref _knownDirectoryCount));
+            if (cacheLimitReached)
+            {
+                _logger.LogInformation(
+                    "Write-path directory cache warmup for volume {VolumeId} stopped at the cache limit after scanning {ScannedCount} directories",
+                    _volumeId,
+                    directoriesScanned);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Warmed write-path directory cache for volume {VolumeId}: scanned {ScannedCount} directories, cached {CachedCount}",
+                    _volumeId,
+                    directoriesScanned,
+                    Volatile.Read(ref _knownDirectoryCount));
+            }
 
             return Task.CompletedTask;
         }
@@ -369,8 +389,8 @@ namespace Locus.FileSystem
         /// Uses singleflight (CAS): only one thread calls DriveInfo.GetDrives() per window.
         ///
         /// The CAS winner dispatches the actual drive enumeration onto the thread pool
-        /// (same pattern as IsHealthy) so the calling thread 鈥?which may be inside
-        /// WriteAsync 鈥?is never blocked by a potentially slow GetDrives() syscall on
+        /// (same pattern as IsHealthy) so the calling thread — which may be inside
+        /// WriteAsync — is never blocked by a potentially slow GetDrives() syscall on
         /// network volumes.  All other callers return the (slightly stale) cached values.
         ///
         /// Exception: when _spaceCacheDurationTicks == 0 (caching disabled) the call
@@ -397,7 +417,7 @@ namespace Locus.FileSystem
             }
 
             if (last != 0 && (now - last) < _spaceCacheDurationTicks)
-                return; // Still within TTL 鈥?cached values are fresh enough
+                return; // Still within TTL — cached values are fresh enough
 
             // Singleflight: only the CAS winner triggers the refresh.
             // Losers return immediately with the stale (but acceptable) cached values.
@@ -405,7 +425,7 @@ namespace Locus.FileSystem
                 return;
 
             // Dispatch onto the thread pool so the caller is never blocked by
-            // DriveInfo.GetDrives() 鈥?a syscall that can take seconds on NFS/SMB mounts.
+            // DriveInfo.GetDrives() — a syscall that can take seconds on NFS/SMB mounts.
             Task.Run(RefreshSpaceFromDrive)
                 .ContinueWith(
                     t => _logger.LogWarning(t.Exception, "Background space refresh failed for volume {VolumeId}", _volumeId),
@@ -423,7 +443,7 @@ namespace Locus.FileSystem
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to get drive info for volume {VolumeId}", _volumeId);
-                // Leave cached values unchanged 鈥?use last known values
+                // Leave cached values unchanged — use last known values
             }
         }
 
@@ -453,7 +473,7 @@ namespace Locus.FileSystem
                     }
                 }
 
-                // Single probe write 鈥?no retries to avoid blocking the thread pool with Thread.Sleep.
+                // Single probe write — no retries to avoid blocking the thread pool with Thread.Sleep.
                 // A transient failure here simply marks the volume unhealthy for the 30-second TTL
                 // window, after which the next IsHealthy access will re-probe.
                 var testFilePath = _fileSystem.Path.Combine(_mountPath, $".health-check-{Guid.NewGuid()}.tmp");
@@ -573,7 +593,7 @@ namespace Locus.FileSystem
                             MeasureCopy(() => fileStream.Write(directBuffer.Array!, directBuffer.Offset, directBuffer.Count));
                             directSource.Position += directBuffer.Count;
                             if (_forceFlushAfterWrite)
-                                MeasureFlush(fileStream.Flush);
+                                MeasureFlush(() => DurableFileWrite.FlushToDisk(fileStream));
                         }
                     }
                     else
@@ -586,7 +606,7 @@ namespace Locus.FileSystem
                             directSource.Position += directBuffer.Count;
                             if (_forceFlushAfterWrite)
                                 await MeasureFlushAsync(
-                                    () => fileStream.FlushAsync(ct))
+                                    () => DurableFileWrite.FlushToDiskAsync(fileStream, ct))
                                     .ConfigureAwait(false);
                         }
                     }
@@ -598,7 +618,7 @@ namespace Locus.FileSystem
                         ct.ThrowIfCancellationRequested();
                         MeasureCopy(() => WriteHiddenMemoryStreamSynchronously(memoryStream!, fileStream, ct));
                         if (_forceFlushAfterWrite)
-                            MeasureFlush(fileStream.Flush);
+                            MeasureFlush(() => DurableFileWrite.FlushToDisk(fileStream));
                     }
                 }
                 else if (useSynchronousSmallWritePath)
@@ -607,7 +627,7 @@ namespace Locus.FileSystem
                     {
                         MeasureCopy(() => CopySmallSeekableStreamSynchronously(content, fileStream, checked((int)remainingBytes!.Value), ct));
                         if (_forceFlushAfterWrite)
-                            MeasureFlush(fileStream.Flush);
+                            MeasureFlush(() => DurableFileWrite.FlushToDisk(fileStream));
                     }
                 }
                 else if (useSynchronousSeekableFileWritePath)
@@ -616,7 +636,7 @@ namespace Locus.FileSystem
                     {
                         MeasureCopy(() => CopySeekableStreamSynchronously(content, fileStream, remainingBytes, ct));
                         if (_forceFlushAfterWrite)
-                            MeasureFlush(fileStream.Flush);
+                            MeasureFlush(() => DurableFileWrite.FlushToDisk(fileStream));
                     }
                 }
                 else
@@ -625,7 +645,7 @@ namespace Locus.FileSystem
                     {
                         await MeasureCopyAsync(() => CopyStreamAsync(content, fileStream, ct)).ConfigureAwait(false);
                         if (_forceFlushAfterWrite)
-                            await MeasureFlushAsync(() => fileStream.FlushAsync(ct)).ConfigureAwait(false);
+                            await MeasureFlushAsync(() => DurableFileWrite.FlushToDiskAsync(fileStream, ct)).ConfigureAwait(false);
                     }
                 }
 
@@ -673,36 +693,62 @@ namespace Locus.FileSystem
 
         /// <summary>
         /// Gets the DriveInfo for the mount path.
-        /// Cross-platform compatible: uses RootDirectory.FullName for matching on Linux.
+        /// Cross-platform compatible: matches the longest drive root that contains the mount path,
+        /// because on Linux a volume directory is usually below the actual mount point.
         /// </summary>
         private IDriveInfo? GetDriveInfo()
         {
             try
             {
-                var root = _fileSystem.Path.GetPathRoot(_mountPath);
-                if (string.IsNullOrEmpty(root))
-                    return null;
-
-                var drives = _fileSystem.DriveInfo.GetDrives();
-
-                // Try RootDirectory.FullName first (works on both Windows and Linux).
-                // Use _pathComparison so Linux (Ordinal) and Windows (OrdinalIgnoreCase) behave correctly.
-                var drive = drives.FirstOrDefault(d =>
-                    d.IsReady && d.RootDirectory.FullName.Equals(root, _pathComparison));
-
-                if (drive == null)
-                {
-                    drive = drives.FirstOrDefault(d =>
-                        d.IsReady && d.Name.Equals(root, _pathComparison));
-                }
-
-                return drive;
+                var volumePath = _fileSystem.Path.GetFullPath(_mountPath);
+                return SelectDriveForVolume(
+                    _fileSystem.DriveInfo.GetDrives(),
+                    volumePath,
+                    _pathComparison,
+                    _fileSystem.Path.DirectorySeparatorChar);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to get drive info for volume {VolumeId}", _volumeId);
                 return null;
             }
+        }
+
+        internal static IDriveInfo? SelectDriveForVolume(
+            IEnumerable<IDriveInfo> drives,
+            string volumePath,
+            StringComparison pathComparison,
+            char directorySeparator)
+        {
+            foreach (var drive in drives.OrderByDescending(drive => drive.RootDirectory.FullName.Length))
+            {
+                if (!drive.IsReady)
+                    continue;
+
+                if (IsPathUnderMountPoint(volumePath, drive.RootDirectory.FullName, pathComparison, directorySeparator))
+                    return drive;
+            }
+
+            return null;
+        }
+
+        internal static bool IsPathUnderMountPoint(
+            string path,
+            string mountPoint,
+            StringComparison pathComparison,
+            char directorySeparator)
+        {
+            if (string.IsNullOrEmpty(mountPoint))
+                return false;
+
+            if (path.Equals(mountPoint, pathComparison))
+                return true;
+
+            var prefix = mountPoint.EndsWith(directorySeparator.ToString(), StringComparison.Ordinal)
+                ? mountPoint
+                : mountPoint + directorySeparator;
+
+            return path.StartsWith(prefix, pathComparison);
         }
 
         // ---------------------------------------------------------------------------
@@ -1054,12 +1100,6 @@ namespace Locus.FileSystem
             {
                 _pendingDirectoryCreations.TryRemove(directory, out _);
             }
-        }
-
-        private void TrackKnownDirectoryWithoutTrim(string directory)
-        {
-            if (_knownDirectories.TryAdd(directory, 0))
-                Interlocked.Increment(ref _knownDirectoryCount);
         }
 
         private Stream CreateWriteStream(string path, long? expectedBytes)

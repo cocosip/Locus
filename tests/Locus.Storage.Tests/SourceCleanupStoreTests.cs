@@ -295,7 +295,52 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
         }
 
         [Fact]
-        public async Task GetDueAsync_IncludesOnlyExpiredImportReservations()
+        public async Task TryReserveAsync_IgnoresTerminalSuppressionRowsForCapacity()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));
+            var databasePath = Path.Combine(directory, "source-cleanup.db");
+
+            try
+            {
+                using (var store = new SourceCleanupStore(databasePath))
+                {
+                    // A retained Keep/Failed suppression row must not consume import capacity.
+                    await store.UpsertAsync(new SourceCleanupJob
+                    {
+                        WatcherId = "watcher",
+                        TenantId = "tenant",
+                        SourcePath = Path.Combine(directory, "kept.dcm"),
+                        Fingerprint = "fp:v3:1:2:3:kept",
+                        Action = SourceCleanupJobAction.Keep,
+                        State = SourceCleanupJobState.Failed,
+                        UpdatedAtUtc = DateTime.UtcNow
+                    });
+
+                    var reserved = await store.TryReserveAsync(
+                        new SourceCleanupJob
+                        {
+                            WatcherId = "watcher",
+                            TenantId = "tenant",
+                            SourcePath = Path.Combine(directory, "new.dcm"),
+                            Fingerprint = "fp:v3:1:2:3:new",
+                            Action = SourceCleanupJobAction.Delete
+                        },
+                        maxActiveJobs: 1,
+                        DateTime.UtcNow.AddMinutes(5));
+
+                    Assert.True(reserved);
+                    Assert.Equal(1, await store.GetActiveCountAsync());
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+            }
+        }
+
+        [Fact]
+        public async Task GetDueAsync_ExcludesImportReservationsAndKeepRows()
         {
             var directory = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));
             var databasePath = Path.Combine(directory, "source-cleanup.db");
@@ -308,20 +353,63 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
                     {
                         WatcherId = "watcher",
                         TenantId = "tenant",
-                        SourcePath = Path.Combine(directory, "stale.dcm"),
-                        Fingerprint = "fp:v3:1:2:3:stale",
+                        SourcePath = Path.Combine(directory, "importing.dcm"),
+                        Fingerprint = "fp:v3:1:2:3:importing",
                         Action = SourceCleanupJobAction.Delete,
                         State = SourceCleanupJobState.Importing,
-                        UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-10)
+                        UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-30)
+                    });
+                    await store.UpsertAsync(new SourceCleanupJob
+                    {
+                        WatcherId = "watcher",
+                        TenantId = "tenant",
+                        SourcePath = Path.Combine(directory, "kept.dcm"),
+                        Fingerprint = "fp:v3:1:2:3:kept",
+                        Action = SourceCleanupJobAction.Keep,
+                        State = SourceCleanupJobState.Pending,
+                        NextAttemptUtc = DateTime.UtcNow.AddMinutes(-30),
+                        UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-30)
                     });
 
-                    var due = await store.GetDueAsync(
-                        DateTime.UtcNow,
-                        10,
-                        DateTime.UtcNow.AddMinutes(-5));
+                    var due = await store.GetDueAsync(DateTime.UtcNow, 10);
 
-                    Assert.Single(due);
-                    Assert.Equal(SourceCleanupJobState.Importing, due[0].State);
+                    // Import reservations belong to the watcher (it owns the idempotent operation id)
+                    // and Keep rows represent already-processed sources.
+                    Assert.Empty(due);
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+            }
+        }
+
+        [Fact]
+        public async Task PruneTerminalAsync_RemovesAbandonedImportReservations()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));
+            var databasePath = Path.Combine(directory, "source-cleanup.db");
+
+            try
+            {
+                using (var store = new SourceCleanupStore(databasePath))
+                {
+                    await store.UpsertAsync(new SourceCleanupJob
+                    {
+                        WatcherId = "watcher",
+                        TenantId = "tenant",
+                        SourcePath = Path.Combine(directory, "abandoned.dcm"),
+                        Fingerprint = "fp:v3:1:2:3:abandoned",
+                        Action = SourceCleanupJobAction.Delete,
+                        State = SourceCleanupJobState.Importing,
+                        UpdatedAtUtc = DateTime.UtcNow.AddDays(-2)
+                    });
+
+                    var removed = await store.PruneTerminalAsync(DateTime.UtcNow.AddDays(-1), 10);
+
+                    Assert.Equal(1, removed);
+                    Assert.Null(await store.GetActiveAsync(Path.Combine(directory, "abandoned.dcm"), "fp:v3:1:2:3:abandoned"));
                 }
             }
             finally

@@ -105,8 +105,11 @@ namespace Locus.Storage.Data
             }
             catch (SqliteException ex)
             {
-                // SQLITE_CORRUPT (11), SQLITE_NOTADB (26), SQLITE_IOERR (10)
-                if (ex.SqliteErrorCode == 11 || ex.SqliteErrorCode == 26 || ex.SqliteErrorCode == 10)
+                // Only SQLITE_CORRUPT (11) and SQLITE_NOTADB (26) prove corruption. Everything
+                // else (busy/locked/I/O) is transient: rebuilding would destroy cold history and
+                // would not fix the underlying device problem, so report "not corrupted" and let
+                // the runtime retry with backoff.
+                if (ex.SqliteErrorCode == 11 || ex.SqliteErrorCode == 26)
                 {
                     _logger.LogError(ex,
                         "SQLite database corruption detected: {DatabasePath}. ErrorCode: {ErrorCode}",
@@ -114,7 +117,6 @@ namespace Locus.Storage.Data
                     return true;
                 }
 
-                // SQLITE_BUSY (5) / SQLITE_LOCKED (6) -- temporarily unavailable, not corrupted
                 if (ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6)
                 {
                     _logger.LogDebug(
@@ -124,16 +126,16 @@ namespace Locus.Storage.Data
                 }
 
                 _logger.LogWarning(ex,
-                    "SqliteException when checking database: {DatabasePath}. ErrorCode: {ErrorCode}. Assuming corrupted.",
-                    dbPath, ex.SqliteErrorCode);
-                return true;
+                    "SQLite error {ErrorCode} while checking {DatabasePath}; treating the database as not corrupted because the failure is not a corruption signal.",
+                    ex.SqliteErrorCode, dbPath);
+                return false;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex,
-                    "Exception when checking database: {DatabasePath}. ExceptionType: {ExceptionType}. Assuming corrupted.",
+                    "Exception when checking database: {DatabasePath}. ExceptionType: {ExceptionType}. Treating the database as not corrupted.",
                     dbPath, ex.GetType().Name);
-                return true;
+                return false;
             }
         }
 
@@ -236,7 +238,7 @@ namespace Locus.Storage.Data
                                 FileExtension = _fileSystem.Path.GetExtension(filePath)
                             };
 
-                            // Use direct write 鈥?rebuild must be persisted synchronously so the
+                            // Use direct write — rebuild must be persisted synchronously so the
                             // new DB file exists and is fully populated when this method returns.
                             QueueProjectionMetadataState.MarkAcceptedProjectionApplied(metadata);
                             await _projectionStore.UpsertProjectedFileAsync(metadata, ct).ConfigureAwait(false);

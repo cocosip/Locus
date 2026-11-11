@@ -2100,6 +2100,146 @@ namespace Locus.Storage.Tests
             throw new TimeoutException("Condition was not satisfied within the expected timeout.");
         }
 
+        [Fact]
+        public async Task ExecuteAsync_SingleTenantProjectionFailure_DoesNotStarveOtherTenants()
+        {
+            var journal = CreateJournal();
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var projectionStore = new FaultInjectingProjectionStore(
+                new MetadataRepositoryQueueProjectionStore(_metadataRepository),
+                failureFileKey: "poison-file");
+
+            await journal.AppendAsync(CreateAcceptedEvent("tenant-a", "poison-file"), CancellationToken.None);
+            await journal.AppendAsync(CreateAcceptedEvent("tenant-b", "healthy-file"), CancellationToken.None);
+
+            var service = CreateProjectionServiceWithStore(
+                journal,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                projectionStore,
+                maxProjectionAttemptsPerRecord: 1000);
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(
+                    async () => await _metadataRepository.GetByFileKeyAsync("healthy-file", CancellationToken.None) != null,
+                    TimeSpan.FromSeconds(10));
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var healthy = await _metadataRepository.GetByFileKeyAsync("healthy-file", CancellationToken.None);
+            var poison = await _metadataRepository.GetByFileKeyAsync("poison-file", CancellationToken.None);
+
+            Assert.NotNull(healthy);
+            Assert.Null(poison);
+        }
+
+        [Fact]
+        public async Task ExecuteAsync_PoisonRecord_IsQuarantinedAndProjectionContinues()
+        {
+            var journal = CreateJournal();
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+            var projectionStore = new FaultInjectingProjectionStore(
+                new MetadataRepositoryQueueProjectionStore(_metadataRepository),
+                failureFileKey: "poison-file");
+
+            const string tenantId = "tenant-quarantine";
+            await journal.AppendAsync(CreateAcceptedEvent(tenantId, "poison-file"), CancellationToken.None);
+            await journal.AppendAsync(CreateAcceptedEvent(tenantId, "healthy-file"), CancellationToken.None);
+
+            var service = CreateProjectionServiceWithStore(
+                journal,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                projectionStore,
+                maxProjectionAttemptsPerRecord: 2);
+
+            var deadLetterPath = Path.Combine(_queueDirectory, tenantId, "projection.deadletter.jsonl");
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitUntilAsync(
+                    () => Task.FromResult(
+                        _fileSystem.File.Exists(deadLetterPath)
+                        && _fileSystem.File.ReadAllText(deadLetterPath).Contains("poison-file", StringComparison.Ordinal)),
+                    TimeSpan.FromSeconds(10));
+
+                await WaitUntilAsync(
+                    async () => await _metadataRepository.GetByFileKeyAsync("healthy-file", CancellationToken.None) != null,
+                    TimeSpan.FromSeconds(10));
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+
+            var poison = await _metadataRepository.GetByFileKeyAsync("poison-file", CancellationToken.None);
+            var healthy = await _metadataRepository.GetByFileKeyAsync("healthy-file", CancellationToken.None);
+
+            Assert.Null(poison);
+            Assert.NotNull(healthy);
+            Assert.StartsWith("{\"writtenAtUtc\":", _fileSystem.File.ReadAllText(deadLetterPath));
+        }
+
+        private QueueEventRecord CreateAcceptedEvent(string tenantId, string fileKey)
+        {
+            var directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", fileKey + ".dcm");
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3, 4 });
+
+            return new QueueEventRecord
+            {
+                TenantId = tenantId,
+                FileKey = fileKey,
+                EventType = QueueEventType.Accepted,
+                OccurredAtUtc = DateTime.UtcNow,
+                VolumeId = "vol-001",
+                PhysicalPath = physicalPath,
+                DirectoryPath = directoryPath,
+                FileSize = 4,
+                Status = FileProcessingStatus.Pending,
+                RetryCount = 0,
+                OriginalFileName = fileKey + ".dcm",
+                FileExtension = ".dcm"
+            };
+        }
+
+        private QueueEventProjectionService CreateProjectionServiceWithStore(
+            FileQueueEventJournal journal,
+            TenantQuotaManager tenantQuotaManager,
+            DirectoryQuotaManager directoryQuotaManager,
+            IQueueProjectionStore projectionStore,
+            int maxProjectionAttemptsPerRecord)
+        {
+            return TrackDisposable(new QueueEventProjectionService(
+                journal,
+                metadataRepository: null,
+                tenantQuotaManager,
+                directoryQuotaManager,
+                _fileSystem,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = _queueDirectory,
+                    Enabled = true,
+                    EnableProjection = true,
+                    MaxRecordsPerTenantPerCycle = 16,
+                    MaxTenantsPerCycle = 4,
+                    BusyCycleDelay = TimeSpan.FromMilliseconds(10),
+                    IdleCycleDelay = TimeSpan.FromMilliseconds(10),
+                    MaxProjectionTimePerCycle = TimeSpan.FromSeconds(1),
+                    MaxProjectionAttemptsPerRecord = maxProjectionAttemptsPerRecord
+                },
+                new Mock<ILogger<QueueEventProjectionService>>().Object,
+                projectionStore: projectionStore));
+        }
+
         private TenantQuotaManager CreateTenantQuotaManager()
         {
             return new TenantQuotaManager(
@@ -2190,6 +2330,65 @@ namespace Locus.Storage.Tests
         {
             _trackedDisposables.Add(disposable);
             return disposable;
+        }
+
+        private sealed class FaultInjectingProjectionStore : IQueueProjectionStore
+        {
+            private readonly IQueueProjectionStore _inner;
+            private readonly string _failureFileKey;
+
+            public FaultInjectingProjectionStore(IQueueProjectionStore inner, string failureFileKey)
+            {
+                _inner = inner;
+                _failureFileKey = failureFileKey;
+            }
+
+            public Task<IReadOnlyList<string>> GetProjectedTenantIdsAsync(CancellationToken ct = default)
+                => _inner.GetProjectedTenantIdsAsync(ct);
+
+            public Task<FileMetadata?> LeaseNextPendingFileAsync(string tenantId, CancellationToken ct = default)
+                => _inner.LeaseNextPendingFileAsync(tenantId, ct);
+
+            public Task<IReadOnlyList<FileMetadata>> LeaseNextPendingBatchAsync(string tenantId, int batchSize, CancellationToken ct = default)
+                => _inner.LeaseNextPendingBatchAsync(tenantId, batchSize, ct);
+
+            public Task<FileMetadata?> GetProjectedFileAsync(string tenantId, string fileKey, CancellationToken ct = default)
+                => _inner.GetProjectedFileAsync(tenantId, fileKey, ct);
+
+            public Task<FileMetadata?> TryUpdateProjectedProcessingFileAsync(
+                string tenantId,
+                string fileKey,
+                DateTime expectedProcessingStartTimeUtc,
+                Func<FileMetadata, FileMetadata> updateFactory,
+                CancellationToken ct = default)
+                => _inner.TryUpdateProjectedProcessingFileAsync(tenantId, fileKey, expectedProcessingStartTimeUtc, updateFactory, ct);
+
+            public Task<FileMetadata?> TryMarkProjectedPendingFileAsProcessingAsync(
+                string tenantId,
+                string fileKey,
+                DateTime processingStartTimeUtc,
+                CancellationToken ct = default)
+                => _inner.TryMarkProjectedPendingFileAsProcessingAsync(tenantId, fileKey, processingStartTimeUtc, ct);
+
+            public Task<FileMetadata?> TryResetProjectedFileToPendingAsync(string tenantId, string fileKey, CancellationToken ct = default)
+                => _inner.TryResetProjectedFileToPendingAsync(tenantId, fileKey, ct);
+
+            public Task UpsertProjectedFileAsync(FileMetadata metadata, CancellationToken ct = default)
+            {
+                if (string.Equals(metadata.FileKey, _failureFileKey, StringComparison.Ordinal))
+                    throw new InvalidOperationException($"Injected projection failure for file '{metadata.FileKey}'.");
+
+                return _inner.UpsertProjectedFileAsync(metadata, ct);
+            }
+
+            public Task<bool> RemoveProjectedFileAsync(string tenantId, string fileKey, CancellationToken ct = default)
+                => _inner.RemoveProjectedFileAsync(tenantId, fileKey, ct);
+
+            public Task<IReadOnlyList<FileMetadata>> GetProjectedFilesAsync(string tenantId, CancellationToken ct = default)
+                => _inner.GetProjectedFilesAsync(tenantId, ct);
+
+            public Task<IReadOnlyList<FileMetadata>> GetProjectedFilesAsync(string tenantId, int skip, int take, CancellationToken ct = default)
+                => _inner.GetProjectedFilesAsync(tenantId, skip, take, ct);
         }
 
         private sealed class TrackingQueueEventJournal : IQueueEventJournal

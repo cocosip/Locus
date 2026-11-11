@@ -75,18 +75,7 @@ namespace Locus.Storage
         /// <inheritdoc />
         public Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(DateTime nowUtc, int limit, CancellationToken ct = default)
         {
-            return Task.FromResult<IReadOnlyList<SourceCleanupJob>>(GetDue(nowUtc, limit, null, ct));
-        }
-
-        /// <summary>Gets due jobs together with stale import reservations.</summary>
-        public Task<IReadOnlyList<SourceCleanupJob>> GetDueAsync(
-            DateTime nowUtc,
-            int limit,
-            DateTime staleImportCutoffUtc,
-            CancellationToken ct = default)
-        {
-            return Task.FromResult<IReadOnlyList<SourceCleanupJob>>(
-                GetDue(nowUtc, limit, staleImportCutoffUtc, ct));
+            return Task.FromResult<IReadOnlyList<SourceCleanupJob>>(GetDue(nowUtc, limit, ct));
         }
 
         /// <inheritdoc />
@@ -152,7 +141,9 @@ CREATE TABLE IF NOT EXISTS source_cleanup_jobs (
     UNIQUE(watcher_id, source_path)
 );
 CREATE INDEX IF NOT EXISTS idx_source_cleanup_due
-    ON source_cleanup_jobs(state, next_attempt_utc, lease_until_utc);";
+    ON source_cleanup_jobs(state, next_attempt_utc, lease_until_utc);
+CREATE INDEX IF NOT EXISTS idx_source_cleanup_source_path
+    ON source_cleanup_jobs(source_path);";
                     command.ExecuteNonQuery();
                 }
 
@@ -287,7 +278,15 @@ SELECT id FROM source_cleanup_jobs WHERE watcher_id = $watcher_id AND source_pat
                 using (var countCommand = _connection.CreateCommand())
                 {
                     countCommand.Transaction = transaction;
-                    countCommand.CommandText = "SELECT COUNT(*) FROM source_cleanup_jobs;";
+                    // Capacity must only count rows that represent real in-flight work. Terminal
+                    // suppression rows (Keep/Failed) stay around for retention and must not block
+                    // new imports, otherwise a Keep-mode watcher eventually stalls itself.
+                    countCommand.CommandText = @"SELECT COUNT(*) FROM source_cleanup_jobs
+WHERE state IN ($importing, $pending, $retrying, $move_pending);";
+                    countCommand.Parameters.AddWithValue("$importing", (int)SourceCleanupJobState.Importing);
+                    countCommand.Parameters.AddWithValue("$pending", (int)SourceCleanupJobState.Pending);
+                    countCommand.Parameters.AddWithValue("$retrying", (int)SourceCleanupJobState.Retrying);
+                    countCommand.Parameters.AddWithValue("$move_pending", (int)SourceCleanupJobState.MovePending);
                     var activeCount = Convert.ToInt32(countCommand.ExecuteScalar(), CultureInfo.InvariantCulture);
                     if (maxActiveJobs > 0 && activeCount >= maxActiveJobs)
                     {
@@ -342,7 +341,12 @@ INSERT OR IGNORE INTO source_cleanup_jobs
                 ct.ThrowIfCancellationRequested();
                 using (var command = _connection.CreateCommand())
                 {
-                    command.CommandText = "SELECT COUNT(*) FROM source_cleanup_jobs;";
+                    command.CommandText = @"SELECT COUNT(*) FROM source_cleanup_jobs
+WHERE state IN ($importing, $pending, $retrying, $move_pending);";
+                    command.Parameters.AddWithValue("$importing", (int)SourceCleanupJobState.Importing);
+                    command.Parameters.AddWithValue("$pending", (int)SourceCleanupJobState.Pending);
+                    command.Parameters.AddWithValue("$retrying", (int)SourceCleanupJobState.Retrying);
+                    command.Parameters.AddWithValue("$move_pending", (int)SourceCleanupJobState.MovePending);
                     return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
                 }
             }
@@ -351,7 +355,6 @@ INSERT OR IGNORE INTO source_cleanup_jobs
         private IReadOnlyList<SourceCleanupJob> GetDue(
             DateTime nowUtc,
             int limit,
-            DateTime? staleImportCutoffUtc,
             CancellationToken ct)
         {
             var jobs = new List<SourceCleanupJob>();
@@ -362,22 +365,15 @@ INSERT OR IGNORE INTO source_cleanup_jobs
                 {
                     command.CommandText = @"SELECT * FROM source_cleanup_jobs
 WHERE (lease_until_utc IS NULL OR lease_until_utc <= $now)
-  AND (
-      (action <> $keep
-       AND (next_attempt_utc IS NULL OR next_attempt_utc <= $now)
-       AND state IN ($pending, $retrying, $move_pending))
-      OR (state = $importing AND updated_at_utc <= $stale_import_cutoff)
-  )
-ORDER BY updated_at_utc, id LIMIT $limit";
+  AND action <> $keep
+  AND (next_attempt_utc IS NULL OR next_attempt_utc <= $now)
+  AND state IN ($pending, $retrying, $move_pending)
+ORDER BY updated_at_utc, id LIMIT $limit;";
                     command.Parameters.AddWithValue("$now", Format(nowUtc));
                     command.Parameters.AddWithValue("$pending", (int)SourceCleanupJobState.Pending);
                     command.Parameters.AddWithValue("$retrying", (int)SourceCleanupJobState.Retrying);
                     command.Parameters.AddWithValue("$move_pending", (int)SourceCleanupJobState.MovePending);
-                    command.Parameters.AddWithValue("$importing", (int)SourceCleanupJobState.Importing);
                     command.Parameters.AddWithValue("$keep", (int)SourceCleanupJobAction.Keep);
-                    command.Parameters.AddWithValue(
-                        "$stale_import_cutoff",
-                        (object?)(staleImportCutoffUtc.HasValue ? Format(staleImportCutoffUtc.Value) : null) ?? DBNull.Value);
                     command.Parameters.AddWithValue("$limit", Math.Max(1, limit));
                     using (var reader = command.ExecuteReader())
                         while (reader.Read())
@@ -456,13 +452,14 @@ move_target_path = $move_target_path WHERE id = $id";
 WHERE id IN (
     SELECT id FROM source_cleanup_jobs
     WHERE updated_at_utc <= $cutoff
-      AND (action = $keep OR state = $failed)
+      AND (action = $keep OR state = $failed OR state = $importing)
     ORDER BY updated_at_utc, id
     LIMIT $limit
 );";
                     command.Parameters.AddWithValue("$cutoff", Format(cutoffUtc));
                     command.Parameters.AddWithValue("$keep", (int)SourceCleanupJobAction.Keep);
                     command.Parameters.AddWithValue("$failed", (int)SourceCleanupJobState.Failed);
+                    command.Parameters.AddWithValue("$importing", (int)SourceCleanupJobState.Importing);
                     command.Parameters.AddWithValue("$limit", Math.Max(1, limit));
                     return command.ExecuteNonQuery();
                 }

@@ -120,12 +120,6 @@ namespace Locus.Storage.Data
         // Per-tenant status indexes for cleanup hot paths.
         private readonly ConcurrentDictionary<string, StatusTimestampIndex> _processingByStartTime;
         private readonly ConcurrentDictionary<string, object> _processingByStartTimeLocks;
-        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _completedByCompletedAt;
-        private readonly ConcurrentDictionary<string, object> _completedByCompletedAtLocks;
-        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _deleteRequestedByCompletedAt;
-        private readonly ConcurrentDictionary<string, object> _deleteRequestedByCompletedAtLocks;
-        private readonly ConcurrentDictionary<string, StatusTimestampIndex> _permanentlyFailedByLastFailedAt;
-        private readonly ConcurrentDictionary<string, object> _permanentlyFailedByLastFailedAtLocks;
         private long _statusIndexSequence;
         private long _statusIndexStaleSkips;
 
@@ -516,12 +510,6 @@ namespace Locus.Storage.Data
             _persistenceDrainLock = new object();
             _processingByStartTime = new ConcurrentDictionary<string, StatusTimestampIndex>();
             _processingByStartTimeLocks = new ConcurrentDictionary<string, object>();
-            _completedByCompletedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
-            _completedByCompletedAtLocks = new ConcurrentDictionary<string, object>();
-            _deleteRequestedByCompletedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
-            _deleteRequestedByCompletedAtLocks = new ConcurrentDictionary<string, object>();
-            _permanentlyFailedByLastFailedAt = new ConcurrentDictionary<string, StatusTimestampIndex>();
-            _permanentlyFailedByLastFailedAtLocks = new ConcurrentDictionary<string, object>();
             _delayedQueues = new ConcurrentDictionary<string, DelayedQueue>();
             _delayedQueueLocks = new ConcurrentDictionary<string, object>();
 
@@ -624,7 +612,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
                             _fileSystem.Directory.CreateDirectory(tenantDir);
 
                         var dbPath = _fileSystem.Path.Combine(tenantDir, "metadata.db");
-                        conn = OpenAndInitializeConnection(dbPath);
+                        conn = OpenWithTransientRetry(dbPath, tid);
 
                         _logger.LogDebug("Created/opened SQLite database for tenant {TenantId} at {Path}", tid, dbPath);
 
@@ -1025,7 +1013,12 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             var persistenceEnqueueStarted = Stopwatch.GetTimestamp();
             EnqueuePersistence(persistenceOperation);
             if (!IsHotCachedStatus(metadata.Status) && _enableBackgroundPersistence)
-                DrainPersistenceQueue();
+            {
+                // Cold statuses must be visible to SQLite-backed cleanup and management queries
+                // right away, but only this tenant's operations may be flushed here: a global drain
+                // also pushes every other tenant's pending hot update to disk and stalls the caller.
+                DrainPersistenceQueueForTenant(metadata.TenantId);
+            }
             RecordProjectionPhase(
                 ref _observedProjectionPersistenceEnqueueCount,
                 ref _observedProjectionPersistenceEnqueueTicks,
@@ -2687,6 +2680,11 @@ WHERE tenant_id = @tenant_id
         /// <summary>
         /// Gets a page of file metadata for a specific tenant.
         /// </summary>
+        /// <remarks>
+        /// Paging is pushed down to SQLite so a single page never materializes the whole tenant
+        /// table. In-memory hot states overlay the persisted rows in the page; a row whose initial
+        /// insert is still queued in write-behind persistence becomes visible on a later page.
+        /// </remarks>
         public Task<IReadOnlyList<FileMetadata>> GetByTenantAsync(string tenantId, int skip, int take, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
@@ -2697,31 +2695,40 @@ WHERE tenant_id = @tenant_id
                 throw new ArgumentOutOfRangeException(nameof(take));
 
             ct.ThrowIfCancellationRequested();
+
+            // The page is built from SQLite, so write-behind rows for this tenant must be flushed
+            // first; otherwise a freshly added file is missing from the listing. This runs before
+            // the database lock is taken to avoid inverting the drain/database lock order.
+            if (_enableBackgroundPersistence)
+                DrainPersistenceQueueForTenant(tenantId);
+
             lock (GetDatabaseLock(tenantId))
             {
                 var conn = GetDatabase(tenantId);
                 var rows = conn.Query<FileMetadataRow>(
                     @"SELECT * FROM files
                       WHERE tenant_id = @tenantId
-                      ORDER BY created_at ASC, file_key ASC;",
-                    new { tenantId },
-                    buffered: true);
-                var byFileKey = rows
-                    .Select(row => row.ToFileMetadata())
-                    .ToDictionary(metadata => metadata.FileKey, StringComparer.Ordinal);
-                if (_activeFiles.TryGetValue(tenantId, out var cache))
+                      ORDER BY created_at ASC, file_key ASC
+                      LIMIT @limit OFFSET @offset;",
+                    new { tenantId, limit = take, offset = skip },
+                    buffered: true).ToList();
+
+                if (rows.Count == 0)
+                    return Task.FromResult<IReadOnlyList<FileMetadata>>(Array.Empty<FileMetadata>());
+
+                var cache = _activeFiles.TryGetValue(tenantId, out var hotCache) ? hotCache : null;
+                var results = new List<FileMetadata>(rows.Count);
+                foreach (var row in rows)
                 {
-                    foreach (var hotMetadata in cache.Values)
-                        byFileKey[hotMetadata.FileKey] = hotMetadata.Clone();
+                    var metadata = row.ToFileMetadata();
+                    if (cache != null && cache.TryGetValue(metadata.FileKey, out var hotMetadata))
+                        metadata = hotMetadata.Clone();
+                    else
+                        metadata = metadata.Clone();
+
+                    results.Add(metadata);
                 }
 
-                var results = byFileKey.Values
-                    .OrderBy(metadata => metadata.CreatedAt)
-                    .ThenBy(metadata => metadata.FileKey, StringComparer.Ordinal)
-                    .Skip(skip)
-                    .Take(take)
-                    .Select(metadata => metadata.Clone())
-                    .ToList();
                 return Task.FromResult<IReadOnlyList<FileMetadata>>(results);
             }
         }
@@ -3209,47 +3216,9 @@ LIMIT @limit;";
                 }
             }
 
-            if (current.Status == FileProcessingStatus.Completed && current.CompletedAt.HasValue)
-            {
-                if (statusChanged || previous?.CompletedAt != current.CompletedAt)
-                {
-                    EnqueueStatusIndex(
-                        _completedByCompletedAt,
-                        _completedByCompletedAtLocks,
-                        current.TenantId,
-                        current.FileKey,
-                        current.CompletedAt.Value,
-                        current.CreatedAt);
-                }
-            }
-
-            if (current.Status == FileProcessingStatus.DeleteRequested && current.CompletedAt.HasValue)
-            {
-                if (statusChanged || previous?.CompletedAt != current.CompletedAt)
-                {
-                    EnqueueStatusIndex(
-                        _deleteRequestedByCompletedAt,
-                        _deleteRequestedByCompletedAtLocks,
-                        current.TenantId,
-                        current.FileKey,
-                        current.CompletedAt.Value,
-                        current.CreatedAt);
-                }
-            }
-
-            if (current.Status == FileProcessingStatus.PermanentlyFailed && current.LastFailedAt.HasValue)
-            {
-                if (statusChanged || previous?.LastFailedAt != current.LastFailedAt)
-                {
-                    EnqueueStatusIndex(
-                        _permanentlyFailedByLastFailedAt,
-                        _permanentlyFailedByLastFailedAtLocks,
-                        current.TenantId,
-                        current.FileKey,
-                        current.LastFailedAt.Value,
-                        current.CreatedAt);
-                }
-            }
+            // Only the processing timeout scan reads a status index. Completed, DeleteRequested and
+            // PermanentlyFailed scans are served by SQLite; maintaining heaps for them only cost CPU
+            // and memory on every status transition.
         }
 
         private void EnqueueStatusIndex(
@@ -4074,23 +4043,82 @@ LIMIT @limit;";
         }
 
         /// <summary>
-        /// Checks whether an exception indicates a recoverable database corruption scenario.
-        /// Consistent with DirectoryQuotaRepository.IsRecoverableDatabaseException.
+        /// Checks whether an exception indicates database corruption that requires a rebuild.
+        /// Only SQLITE_CORRUPT (11) and SQLITE_NOTADB (26) qualify; transient I/O failures are
+        /// retried by <see cref="ExecuteBatchWithTransientRetryNoLock"/> instead of deleting data.
         /// </summary>
         private static bool IsRecoverableDatabaseException(Exception ex)
         {
-            if (ex is IOException)
-                return true;
+            return SqliteFailureClassifier.IsCorruption(ex);
+        }
 
-            if (ex is SqliteException sqliteEx)
+        /// <summary>
+        /// Checks whether an exception indicates a transient SQLite failure (busy, locked, or I/O).
+        /// </summary>
+        private static bool IsTransientDatabaseException(Exception ex)
+        {
+            return SqliteFailureClassifier.IsTransient(ex);
+        }
+
+        private const int TransientRetryAttempts = 3;
+
+        /// <summary>
+        /// Opens and initializes a tenant database, retrying transient I/O failures before giving up.
+        /// The retry is bounded and delayed so that a backup agent or network blip does not fail a write
+        /// permanently, while a genuinely unavailable device still surfaces its error.
+        /// </summary>
+        private SqliteConnection OpenWithTransientRetry(string dbPath, string tenantId)
+        {
+            for (var attempt = 1; ; attempt++)
             {
-                // SQLITE_CORRUPT (11), SQLITE_NOTADB (26), SQLITE_IOERR (10)
-                return sqliteEx.SqliteErrorCode == 11
-                    || sqliteEx.SqliteErrorCode == 26
-                    || sqliteEx.SqliteErrorCode == 10;
+                try
+                {
+                    return OpenAndInitializeConnection(dbPath);
+                }
+                catch (Exception ex) when (IsTransientDatabaseException(ex) && attempt < TransientRetryAttempts)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Transient SQLite failure opening metadata database for tenant {TenantId} (attempt {Attempt}/{MaxAttempts}); retrying.",
+                        tenantId,
+                        attempt,
+                        TransientRetryAttempts);
+                    Thread.Sleep(50 * attempt);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Retries a failed metadata batch after a transient SQLite failure. The connection is reopened
+        /// because an I/O failure can leave it unusable; corruption never reaches this path.
+        /// </summary>
+        private void ExecuteBatchWithTransientRetryNoLock(string tenantId, IReadOnlyList<PersistenceOperation> ops, Exception firstFailure)
+        {
+            var failure = firstFailure;
+            for (var attempt = 1; attempt < TransientRetryAttempts; attempt++)
+            {
+                _logger.LogWarning(
+                    failure,
+                    "Transient SQLite failure persisting metadata batch for tenant {TenantId} (retry {Attempt}/{MaxAttempts}).",
+                    tenantId,
+                    attempt,
+                    TransientRetryAttempts);
+
+                Thread.Sleep(100 * attempt);
+                ReopenDatabaseConnectionNoLock(tenantId);
+
+                try
+                {
+                    ExecuteBatchCoreWithConnectionRecoveryNoLock(tenantId, ops);
+                    return;
+                }
+                catch (Exception retryFailure) when (IsTransientDatabaseException(retryFailure))
+                {
+                    failure = retryFailure;
+                }
             }
 
-            return false;
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
         }
 
         private static bool IsReadonlyDatabaseException(SqliteException ex)
@@ -4131,12 +4159,6 @@ LIMIT @limit;";
                 _delayedQueueLocks.TryRemove(tenantId, out _);
                 _processingByStartTime.TryRemove(tenantId, out _);
                 _processingByStartTimeLocks.TryRemove(tenantId, out _);
-                _completedByCompletedAt.TryRemove(tenantId, out _);
-                _completedByCompletedAtLocks.TryRemove(tenantId, out _);
-                _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
-                _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
-                _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-                _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                 EnsureWritableDatabaseArtifacts(dbPath);
 
@@ -4258,12 +4280,6 @@ LIMIT @limit;";
                     _delayedQueueLocks.TryRemove(tenantId, out _);
                     _processingByStartTime.TryRemove(tenantId, out _);
                     _processingByStartTimeLocks.TryRemove(tenantId, out _);
-                    _completedByCompletedAt.TryRemove(tenantId, out _);
-                    _completedByCompletedAtLocks.TryRemove(tenantId, out _);
-                    _deleteRequestedByCompletedAt.TryRemove(tenantId, out _);
-                    _deleteRequestedByCompletedAtLocks.TryRemove(tenantId, out _);
-                    _permanentlyFailedByLastFailedAt.TryRemove(tenantId, out _);
-                    _permanentlyFailedByLastFailedAtLocks.TryRemove(tenantId, out _);
 
                     EnsureWritableDatabaseArtifacts(dbPath);
 
@@ -4576,6 +4592,48 @@ LIMIT @limit;";
         // Drains queued and coalesced operations in bounded batches.
         // Operations are grouped by tenantId and flushed in a single SQLite transaction
         // per tenant, minimising fsync overhead and memory spikes.
+        private void DrainPersistenceQueueForTenant(string tenantId)
+        {
+            lock (_persistenceDrainLock)
+            {
+                var byTenant = new Dictionary<string, Dictionary<string, PersistenceOperation>>(StringComparer.Ordinal);
+                var deferred = new List<PersistenceOperation>();
+
+                foreach (var entry in _coalescedPersistenceOps)
+                {
+                    var separatorIndex = entry.Key.IndexOf('\u001F');
+                    var entryTenantId = separatorIndex > 0 ? entry.Key.Substring(0, separatorIndex) : entry.Key;
+                    if (!string.Equals(entryTenantId, tenantId, StringComparison.Ordinal))
+                        continue;
+
+                    if (_coalescedPersistenceOps.TryRemove(entry.Key, out var coalescedOperation))
+                    {
+                        Interlocked.Decrement(ref _coalescedDepth);
+                        AddLatestOperationToTenantBucket(byTenant, coalescedOperation);
+                    }
+                }
+
+                while (_persistenceReader.TryRead(out var queuedOperation))
+                {
+                    Interlocked.Decrement(ref _persistenceChannelDepth);
+                    if (string.Equals(queuedOperation.TenantId, tenantId, StringComparison.Ordinal))
+                        AddLatestOperationToTenantBucket(byTenant, queuedOperation);
+                    else
+                        deferred.Add(queuedOperation);
+                }
+
+                // Operations for other tenants are put back in their original order.
+                foreach (var operation in deferred)
+                {
+                    if (!TryWritePersistenceOperation(operation))
+                        CoalescePersistenceOperation(operation, Volatile.Read(ref _persistenceChannelDepth), "tenant_drain_requeue");
+                }
+
+                foreach (var tenantBucket in byTenant)
+                    ExecuteBatch(tenantBucket.Key, tenantBucket.Value.Values.ToList());
+            }
+        }
+
         private void DrainPersistenceQueue()
         {
             lock (_persistenceDrainLock)
@@ -4712,6 +4770,13 @@ LIMIT @limit;";
                         tenantId);
 
                     RecoverCorruptedDatabaseAndReplayBatchNoLock(tenantId, currentOps);
+                }
+                catch (Exception ex) when (IsTransientDatabaseException(ex))
+                {
+                    // Transient I/O failures must never delete the database. Retry the batch on a
+                    // reopened connection and surface the original failure only after the retries
+                    // are exhausted.
+                    ExecuteBatchWithTransientRetryNoLock(tenantId, currentOps, ex);
                 }
 
                 foreach (var op in ops)
@@ -5275,12 +5340,6 @@ ON CONFLICT(file_key) DO UPDATE SET
             _pendingFileCounts.Clear();
             _processingByStartTime.Clear();
             _processingByStartTimeLocks.Clear();
-            _completedByCompletedAt.Clear();
-            _completedByCompletedAtLocks.Clear();
-            _deleteRequestedByCompletedAt.Clear();
-            _deleteRequestedByCompletedAtLocks.Clear();
-            _permanentlyFailedByLastFailedAt.Clear();
-            _permanentlyFailedByLastFailedAtLocks.Clear();
             _delayedQueues.Clear();
             _delayedQueueLocks.Clear();
             _coalescedPersistenceOps.Clear();
@@ -5312,5 +5371,4 @@ ON CONFLICT(file_key) DO UPDATE SET
         }
     }
 }
-
 

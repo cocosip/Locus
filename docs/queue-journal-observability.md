@@ -46,6 +46,32 @@
   - 当前 tags：
     - `format`: `JsonLines` 或 `BinaryV1`
 
+### Append
+
+- `locus.queue_journal.append.failed`
+  - 含义：append 批次写入失败的记录数（包括 Async 模式下调用方不等待结果的写入）
+  - 触发时机：writer 写入或 flush 失败后，批次内请求被置为失败时
+
+### Projection
+
+- `locus.queue_projection.record.failed`
+  - 含义：单条 journal 记录投影失败、留待后续周期重试的次数
+  - 触发时机：`QueueEventProjectionService` 捕获投影异常但未达到 `MaxProjectionAttemptsPerRecord` 时
+- `locus.queue_projection.record.quarantined`
+  - 含义：达到重试上限后被隔离（写入 dead-letter 文件）的记录数
+  - 触发时机：逐条重放仍失败的记录被隔离时
+
+## Projection Dead Letter
+
+当同一批记录连续失败达到 `MaxProjectionAttemptsPerRecord` 后，projector 会逐条重放该批次：
+
+- 成功的记录继续投影并推进 cursor；
+- 仍失败的记录写入 `<QueueDirectory>/<tenant>/projection.deadletter.jsonl`（每行一个 JSON 对象，
+  包含 `writtenAtUtc`、`tenantId`、`recordOffset`、`nextOffset`、`eventType`、`fileKey`、`error`、`exceptionType`），
+  然后跳过该记录继续推进 cursor，避免单条毒记录阻塞整个租户的投影。
+
+隔离记录不会自动重放；修复数据后可依据 dead-letter 文件手工补偿，或删除文件后按需重建投影。
+
 ## 维护态状态字段
 
 除了 metrics，维护态查询 `QueueProjectionTenantState` 也会暴露最近一次 gap / 坏尾诊断结果。

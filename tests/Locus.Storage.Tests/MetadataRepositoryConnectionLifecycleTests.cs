@@ -23,13 +23,14 @@ public sealed class MetadataRepositoryConnectionLifecycleTests : IDisposable
         SeedDatabase();
         using var repository = new FailingInitializationRepository(_fileSystem, _directory, errorCode);
 
-        var error = await Assert.ThrowsAsync<SqliteException>(() => repository.GetAsync(TenantId, "existing"));
-        Assert.Equal(errorCode, error.SqliteErrorCode);
-
+        // A transient lock is retried in place; the caller never sees the failure and the database
+        // is never rebuilt or backed up.
         var file = await repository.GetAsync(TenantId, "existing");
 
         Assert.NotNull(file);
         Assert.Equal("existing", file.FileKey);
+        Assert.Equal(2, repository.OpenAttempts);
+        Assert.NotNull(await repository.GetAsync(TenantId, "existing"));
         Assert.Equal(2, repository.OpenAttempts);
         Assert.Empty(Directory.GetFiles(_directory, "*.corrupted.*", SearchOption.AllDirectories));
         Assert.Equal(1L, CountPersistedFiles("existing"));
@@ -256,7 +257,7 @@ public sealed class MetadataRepositoryConnectionLifecycleTests : IDisposable
         newer.Status = FileProcessingStatus.Processing;
         newer.ProcessingStartTime = DateTime.UtcNow;
         await repository.AddOrUpdateAsync(newer);
-        Assert.Equal(1, repository.OpenAttempts);
+        Assert.Equal(2, repository.OpenAttempts);
         var actual = await repository.GetAsync(TenantId, "existing");
         Assert.Equal(FileProcessingStatus.Processing, actual!.Status);
         Assert.Equal(newer.ProcessingStartTime, actual.ProcessingStartTime);

@@ -39,6 +39,33 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task GetByTenantAsync_PagedRead_ReturnsRequestedSliceWithHotStateOverlay()
+        {
+            var createdAt = DateTime.UtcNow.AddMinutes(-10);
+            for (var index = 0; index < 5; index++)
+            {
+                var metadata = CreateMetadata($"paged-{index}", FileProcessingStatus.Pending);
+                metadata.CreatedAt = createdAt.AddSeconds(index);
+                await _repository.AddOrUpdateAsync(metadata, CancellationToken.None);
+            }
+
+            var page = await _repository.GetByTenantAsync(_tenantId, skip: 1, take: 2, CancellationToken.None);
+
+            Assert.Equal(new[] { "paged-1", "paged-2" }, page.Select(metadata => metadata.FileKey));
+
+            var hot = CreateMetadata("paged-0", FileProcessingStatus.Processing);
+            hot.CreatedAt = createdAt;
+            hot.ProcessingStartTime = DateTime.UtcNow;
+            await _repository.AddOrUpdateAsync(hot, CancellationToken.None);
+
+            var firstPage = await _repository.GetByTenantAsync(_tenantId, 0, 1, CancellationToken.None);
+
+            var projected = Assert.Single(firstPage);
+            Assert.Equal("paged-0", projected.FileKey);
+            Assert.Equal(FileProcessingStatus.Processing, projected.Status);
+        }
+
+        [Fact]
         public async Task GetNextPendingFileAsync_DecrementsPendingCounter()
         {
             var file = CreateMetadata("file-001", FileProcessingStatus.Pending);
@@ -287,7 +314,7 @@ namespace Locus.Storage.Tests
                 new Mock<ILogger<MetadataRepository>>().Object,
                 _metadataDir);
 
-            repository.FailInitializationTwice();
+            repository.FailInitialization(3);
 
             await Assert.ThrowsAnyAsync<Exception>(() =>
                 repository.GetAsync(tenantId, "file-001", CancellationToken.None));
@@ -1943,9 +1970,9 @@ WHERE file_key = $file_key;";
             {
             }
 
-            public void FailInitializationTwice()
+            public void FailInitialization(int times)
             {
-                _failuresRemaining = 2;
+                _failuresRemaining = times;
             }
 
             protected override SqliteConnection OpenAndInitializeConnection(string dbPath)

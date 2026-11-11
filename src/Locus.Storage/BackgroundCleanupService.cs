@@ -63,7 +63,14 @@ namespace Locus.Storage
             }
 
             // Wait for initial delay before first cleanup
-            await Task.Delay(_options.InitialDelay, stoppingToken);
+            try
+            {
+                await Task.Delay(_options.InitialDelay, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
 
             while (!stoppingToken.IsCancellationRequested)
             {

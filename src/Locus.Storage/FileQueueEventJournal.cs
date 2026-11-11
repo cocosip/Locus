@@ -47,6 +47,8 @@ namespace Locus.Storage
         private readonly TimeSpan _balancedFlushWindow;
         private readonly int _maxBatchRecords;
         private readonly int _maxBatchBytes;
+
+        private readonly int _maxPendingRequests;
         private readonly QueueEventJournalAckMode _ackMode;
         private readonly JournalFormat _defaultFormat;
         private readonly IQueueEventJournalCodec _jsonCodec;
@@ -108,6 +110,7 @@ namespace Locus.Storage
             _balancedFlushWindow = options.BalancedFlushWindow;
             _maxBatchRecords = options.MaxBatchRecords;
             _maxBatchBytes = options.MaxBatchBytes;
+            _maxPendingRequests = options.MaxPendingRequests;
             _ackMode = options.AckMode;
             _defaultFormat = options.JournalFormat;
             _jsonCodec = new JsonQueueEventJournalCodec();
@@ -121,7 +124,7 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc/>
-        public Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
+        public async Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
         {
             ThrowIfDisposed();
 
@@ -131,22 +134,21 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
 
             var tenantId = ValidateAppendRecord(record, nameof(record));
-            if (_ackMode == QueueEventJournalAckMode.Durable)
-            {
-                var directWriter = GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: false);
-                return AppendDirectAsync(directWriter, CloneRecord(record), ct);
-            }
-
             var request = new PendingAppendRequest(
                 CloneRecord(record),
                 EstimateRecordSize(record),
                 createCompletion: _ackMode != QueueEventJournalAckMode.Async);
-            GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: true).Enqueue(request);
+
+            // Every ack mode goes through the tenant writer. Durable used to bypass it and fsync
+            // once per individual event, which made batch appends arbitrarily slower and left the
+            // writer's batching/backpressure settings unused for the strictest mode.
+            var writer = GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: true);
+            await EnqueueWithBackpressureAsync(writer, request, ct).ConfigureAwait(false);
 
             if (_ackMode == QueueEventJournalAckMode.Async)
-                return Task.CompletedTask;
+                return;
 
-            return request.Completion!.Task;
+            await request.Completion!.Task.ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -169,18 +171,12 @@ namespace Locus.Storage
             ct.ThrowIfCancellationRequested();
 
             var tenantId = ValidateAppendBatch(records);
-            if (_ackMode == QueueEventJournalAckMode.Durable)
-            {
-                var directWriter = GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: false);
-                await AppendBatchDirectAsync(directWriter, CloneRecords(records), ct).ConfigureAwait(false);
-                return;
-            }
-
             var request = new PendingAppendRequest(
                 CloneRecords(records),
                 EstimateBatchSize(records),
                 createCompletion: _ackMode != QueueEventJournalAckMode.Async);
-            GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: true).Enqueue(request);
+            var writer = GetOrCreateTenantWriter(tenantId, ensureWorkerStarted: true);
+            await EnqueueWithBackpressureAsync(writer, request, ct).ConfigureAwait(false);
 
             if (_ackMode == QueueEventJournalAckMode.Async)
                 return;
@@ -332,30 +328,35 @@ namespace Locus.Storage
 
                     if (relativeProcessedOffset == length)
                     {
+                        WriteCompactionMarker(tenantId, processedOffset);
                         using (var truncateStream = _fileSystem.File.Open(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
                         {
                             await truncateStream.FlushAsync(ct).ConfigureAwait(false);
+                            DurableFileWrite.FlushToDisk(truncateStream);
                         }
 
                         state.BaseOffset = processedOffset;
                         state.TailOffset = processedOffset;
                         SaveJournalState(tenantId, state);
+                        DeleteCompactionMarker(tenantId);
                         return processedOffset;
                     }
 
                     var tempPath = path + ".compact";
+                    WriteCompactionMarker(tenantId, processedOffset);
                     using (var source = _fileSystem.File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                     using (var destination = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                     {
                         source.Seek(relativeProcessedOffset, SeekOrigin.Begin);
                         await source.CopyToAsync(destination, 16 * 1024, ct).ConfigureAwait(false);
-                        await destination.FlushAsync(ct).ConfigureAwait(false);
+                        await DurableFileWrite.FlushToDiskAsync(destination, ct).ConfigureAwait(false);
                     }
 
                     ReplaceFileAtomically(tempPath, path);
                     state.BaseOffset = processedOffset;
                     state.TailOffset = processedOffset + (length - relativeProcessedOffset);
                     SaveJournalState(tenantId, state);
+                    DeleteCompactionMarker(tenantId);
                     return processedOffset;
                 }
             }
@@ -629,11 +630,14 @@ namespace Locus.Storage
                         state.TailOffset += singleRecord.Length;
                         var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                        MarkJournalStateDirty(writer.TenantId);
                         if (shouldFlushBeforeAck)
                             await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
                         else
                             writer.HasUnflushedData = true;
+
+                        // Persist the state only after the bytes are visible in the journal file: the
+                        // state save rescans the file, so saving first would drop the new tail offset.
+                        MarkJournalStateDirty(writer.TenantId);
 
                         var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                         QueueJournalOperationMetrics.RecordAppendBatch(
@@ -654,11 +658,12 @@ namespace Locus.Storage
                         state.TailOffset += serializedBatch.Length;
                         var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
 
-                        MarkJournalStateDirty(writer.TenantId);
                         if (shouldFlushBeforeAck)
                             await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
                         else
                             writer.HasUnflushedData = true;
+
+                        MarkJournalStateDirty(writer.TenantId);
 
                         var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
                         QueueJournalOperationMetrics.RecordAppendBatch(
@@ -678,91 +683,27 @@ namespace Locus.Storage
             }
         }
 
-        private async Task AppendDirectAsync(TenantWriterState writer, QueueEventRecord record, CancellationToken ct)
+        private async Task EnqueueWithBackpressureAsync(TenantWriterState writer, PendingAppendRequest request, CancellationToken ct)
         {
-            var appendStartedAt = Stopwatch.GetTimestamp();
-            var appendLock = _appendLocks.GetOrAdd(writer.TenantId, _ => new SemaphoreSlim(1, 1));
-            await appendLock.WaitAsync(ct).ConfigureAwait(false);
-            try
+            while (true)
             {
-                using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
+                ct.ThrowIfCancellationRequested();
+
+                if (writer.WorkerStarted == 1 && writer.WorkerTask.IsCompleted)
                 {
-                    CloseTenantAppendStream(writer);
-                    var state = LoadJournalStateForLockedOperation(writer.TenantId, allowJournalScanCatchUp: true);
-                    await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
-                    var stream = EnsureAppendStream(writer);
-                    var serializedRecord = SerializeSingleRecord(state, record);
-                    ct.ThrowIfCancellationRequested();
-                    stream.Write(serializedRecord, 0, serializedRecord.Length);
-
-                    state.TailOffset += serializedRecord.Length;
-                    var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                    FlushAppendStreamCore(writer);
-                    MarkJournalStateDirty(writer.TenantId);
-
-                    var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                    QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
-                    RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
+                    throw new InvalidOperationException(
+                        $"The queue journal writer for tenant '{writer.TenantId}' has stopped; the append was rejected.");
                 }
-            }
-            finally
-            {
-                appendLock.Release();
-            }
-        }
 
-        private async Task AppendBatchDirectAsync(TenantWriterState writer, IReadOnlyList<QueueEventRecord> records, CancellationToken ct)
-        {
-            var appendStartedAt = Stopwatch.GetTimestamp();
-            var appendLock = _appendLocks.GetOrAdd(writer.TenantId, _ => new SemaphoreSlim(1, 1));
-            await appendLock.WaitAsync(ct).ConfigureAwait(false);
-            try
-            {
-                using (await AcquireTenantJournalLockAsync(writer.TenantId, ct).ConfigureAwait(false))
+                if (writer.PendingRequests.Count < _maxPendingRequests)
                 {
-                    CloseTenantAppendStream(writer);
-                    var state = LoadJournalStateForLockedOperation(writer.TenantId, allowJournalScanCatchUp: true);
-                    await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, ct, lockAlreadyHeld: true).ConfigureAwait(false);
-                    var stream = EnsureAppendStream(writer);
-                    if (records.Count == 1)
-                    {
-                        var serializedRecord = SerializeSingleRecord(state, records[0]);
-                        ct.ThrowIfCancellationRequested();
-                        stream.Write(serializedRecord, 0, serializedRecord.Length);
-
-                        state.TailOffset += serializedRecord.Length;
-                        var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                        FlushAppendStreamCore(writer);
-                        MarkJournalStateDirty(writer.TenantId);
-
-                        var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                        QueueJournalOperationMetrics.RecordAppendBatch(serializedRecord.Length, durationTicks);
-                        RecordObservedAppendBatch(recordCount: 1, totalBytes: serializedRecord.Length, durationTicks: appendDurationTicks);
-                        return;
-                    }
-
-                    using (var serializedBatch = SerializeBatch(state, records))
-                    {
-                        if (serializedBatch.Length == 0)
-                            return;
-
-                        ct.ThrowIfCancellationRequested();
-                        stream.Write(serializedBatch.Buffer, 0, serializedBatch.Length);
-
-                        state.TailOffset += serializedBatch.Length;
-                        var appendDurationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                        FlushAppendStreamCore(writer);
-                        MarkJournalStateDirty(writer.TenantId);
-
-                        var durationTicks = Stopwatch.GetTimestamp() - appendStartedAt;
-                        QueueJournalOperationMetrics.RecordAppendBatch(serializedBatch.Length, durationTicks);
-                        RecordObservedAppendBatch(recordCount: records.Count, totalBytes: serializedBatch.Length, durationTicks: appendDurationTicks);
-                    }
+                    writer.Enqueue(request);
+                    return;
                 }
-            }
-            finally
-            {
-                appendLock.Release();
+
+                // Bounded queue: apply backpressure instead of letting an ack mode that returns
+                // before the write completes grow the queue without limit.
+                await Task.Delay(1, ct).ConfigureAwait(false);
             }
         }
 
@@ -938,14 +879,26 @@ namespace Locus.Storage
 
         private void FailRequests(IReadOnlyList<PendingAppendRequest> batch, Exception exception)
         {
+            var failedRecords = 0;
             foreach (var request in batch)
+            {
+                failedRecords += request.RecordCount;
                 request.TrySetException(exception);
+            }
+
+            QueueJournalMetrics.RecordAppendFailed(failedRecords);
         }
 
         private void FailPendingRequests(TenantWriterState writer, Exception exception)
         {
+            var failedRecords = 0;
             while (writer.PendingRequests.TryDequeue(out var request))
+            {
+                failedRecords += request.RecordCount;
                 request.TrySetException(exception);
+            }
+
+            QueueJournalMetrics.RecordAppendFailed(failedRecords);
         }
 
         private string ValidateAppendBatch(IReadOnlyList<QueueEventRecord> records)
@@ -1319,6 +1272,9 @@ namespace Locus.Storage
                         var state = JsonSerializer.Deserialize<JournalState>(stream, JsonOptions);
                         if (state != null)
                         {
+                            // Must run before NormalizeJournalState: the marker relies on the
+                            // state file's TailOffset and the compacted journal's byte length.
+                            ApplyCompactionMarker(tenantId, state);
                             NormalizeJournalState(tenantId, state, scanJournal);
                             CacheJournalStateFileStamp(tenantId);
                             return state;
@@ -1355,7 +1311,9 @@ namespace Locus.Storage
 
         private void SaveJournalState(string tenantId, JournalState state)
         {
-            NormalizeJournalState(tenantId, state);
+            // The caller owns the authoritative tail offset for this save; rescanning the journal
+            // here would discard in-memory progress that has not been flushed yet.
+            NormalizeJournalState(tenantId, state, scanJournal: false);
             var tenantDirectory = GetTenantDirectory(tenantId);
             if (!_fileSystem.Directory.Exists(tenantDirectory))
                 _fileSystem.Directory.CreateDirectory(tenantDirectory);
@@ -1391,6 +1349,116 @@ namespace Locus.Storage
                     }
                 }
             }
+        }
+
+        private string GetCompactionMarkerPath(string tenantId)
+        {
+            return GetJournalPath(tenantId) + ".compact-marker";
+        }
+
+        private void WriteCompactionMarker(string tenantId, long baseOffset)
+        {
+            var path = GetCompactionMarkerPath(tenantId);
+            var tempPath = path + ".tmp." + Guid.NewGuid().ToString("N");
+            try
+            {
+                using (var stream = _fileSystem.File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    JsonSerializer.Serialize(stream, new CompactionMarker { BaseOffset = baseOffset }, JsonOptions);
+                    DurableFileWrite.FlushToDisk(stream);
+                }
+
+                ReplaceFileAtomically(tempPath, path);
+            }
+            finally
+            {
+                DeleteFileQuietly(tempPath);
+            }
+        }
+
+        private void DeleteCompactionMarker(string tenantId)
+        {
+            DeleteFileQuietly(GetCompactionMarkerPath(tenantId));
+        }
+
+        private void DeleteFileQuietly(string path)
+        {
+            try
+            {
+                if (_fileSystem.File.Exists(path))
+                    _fileSystem.File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        /// <summary>
+        /// Recovers the journal base offset when a compaction swapped the journal file but crashed
+        /// before the journal state file was persisted. The marker records the new base offset and
+        /// is only trusted when the journal length still matches it.
+        /// </summary>
+        private void ApplyCompactionMarker(string tenantId, JournalState state)
+        {
+            var markerPath = GetCompactionMarkerPath(tenantId);
+            if (!_fileSystem.File.Exists(markerPath))
+                return;
+
+            CompactionMarker? marker;
+            try
+            {
+                using (var stream = _fileSystem.File.Open(
+                    markerPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                    marker = JsonSerializer.Deserialize<CompactionMarker>(stream, JsonOptions);
+                }
+            }
+            catch (Exception ex) when (ex is IOException || ex is JsonException || ex is UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Failed to read the queue journal compaction marker for tenant {TenantId}", tenantId);
+                return;
+            }
+
+            if (marker == null)
+            {
+                DeleteCompactionMarker(tenantId);
+                return;
+            }
+
+            var journalPath = GetJournalPath(tenantId);
+            if (!_fileSystem.File.Exists(journalPath))
+            {
+                DeleteCompactionMarker(tenantId);
+                return;
+            }
+
+            var recoveredBaseOffset = state.TailOffset - _fileSystem.FileInfo.New(journalPath).Length;
+            if (recoveredBaseOffset != marker.BaseOffset)
+            {
+                // The journal was never swapped (or the state file was already persisted), so the
+                // marker describes a compaction that did not take effect.
+                DeleteCompactionMarker(tenantId);
+                return;
+            }
+
+            if (state.BaseOffset != recoveredBaseOffset)
+            {
+                _logger.LogWarning(
+                    "Recovered the queue journal base offset for tenant {TenantId} after an interrupted compaction: {PreviousBaseOffset} -> {RecoveredBaseOffset}",
+                    tenantId,
+                    state.BaseOffset,
+                    recoveredBaseOffset);
+                state.BaseOffset = recoveredBaseOffset;
+                SaveJournalState(tenantId, state);
+            }
+
+            DeleteCompactionMarker(tenantId);
         }
 
         private void MarkJournalStateDirty(string tenantId)
@@ -1655,6 +1723,11 @@ namespace Locus.Storage
             {
                 Completion?.TrySetException(exception);
             }
+        }
+
+        private sealed class CompactionMarker
+        {
+            public long BaseOffset { get; set; }
         }
 
         private sealed class TenantWriterState

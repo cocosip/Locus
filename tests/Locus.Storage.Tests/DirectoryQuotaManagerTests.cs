@@ -234,7 +234,7 @@ namespace Locus.Storage.Tests
                 new Mock<ILogger<DirectoryQuotaRepository>>().Object,
                 _quotaDir);
 
-            repository.FailInitializationTwice();
+            repository.FailInitialization(3);
 
             await Assert.ThrowsAnyAsync<Exception>(() =>
                 repository.GetOrCreateAsync(tenantId, "/test/dir", CancellationToken.None));
@@ -571,9 +571,9 @@ namespace Locus.Storage.Tests
             {
             }
 
-            public void FailInitializationTwice()
+            public void FailInitialization(int times)
             {
-                _failuresRemaining = 2;
+                _failuresRemaining = times;
             }
 
             protected override SqliteConnection OpenAndInitializeConnection(string dbPath)

@@ -9,6 +9,7 @@ using Locus.Storage.Data;
 using Locus.Storage.Statistics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 
 namespace Locus
@@ -107,7 +108,9 @@ namespace Locus
             options.SourceCleanup.Validate();
 
             // Register file system abstraction
-            services.AddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
+            // TryAdd keeps a host-provided IFileSystem (for example a test double) instead of
+        // overwriting it with the default implementation.
+        services.TryAddSingleton<IFileSystem, System.IO.Abstractions.FileSystem>();
             services.AddSingleton<StorageVolumeRegistry>();
             services.AddSingleton(_ =>
             {
@@ -546,14 +549,5 @@ namespace Locus
 
             return services;
         }
-
-        /// <summary>
-        /// Creates a storage volume based on configuration.
-        /// </summary>
-        private static IStorageVolume CreateVolume(
-            VolumeConfiguration config,
-            IFileSystem fileSystem,
-            IServiceProvider serviceProvider)
-            => StorageVolumeFactory.CreateVolume(config, fileSystem, serviceProvider);
     }
 }

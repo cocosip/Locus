@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -987,16 +987,37 @@ namespace Locus.Storage
 
         private async Task ApplyDeleteSucceededTenantProjectionAsync(string tenantId)
         {
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                // DecrementFileCountAsync releases a reservation when one exists, which would
+                // silently consume an in-flight upload's reservation; the projection API always
+                // decrements the projected count instead.
+                await tenantQuotaProjectionManager.ApplyDeleteSucceededProjectionAsync(tenantId, default).ConfigureAwait(false);
+                return;
+            }
+
             await _tenantQuotaManager!.DecrementFileCountAsync(tenantId, default).ConfigureAwait(false);
         }
 
         private async Task ApplyDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath)
         {
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                await directoryQuotaProjectionManager.ApplyDeleteSucceededProjectionAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+                return;
+            }
+
             await _directoryQuotaManager!.DecrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);
         }
 
         private async Task RollbackDeleteSucceededTenantProjectionAsync(string tenantId)
         {
+            if (_tenantQuotaManager is ITenantQuotaProjectionManager tenantQuotaProjectionManager)
+            {
+                await tenantQuotaProjectionManager.RollbackDeleteSucceededProjectionAsync(tenantId, default).ConfigureAwait(false);
+                return;
+            }
+
             if (_tenantQuotaManager is ITenantQuotaCompensationManager tenantQuotaCompensationManager)
             {
                 await tenantQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, default).ConfigureAwait(false);
@@ -1008,6 +1029,12 @@ namespace Locus.Storage
 
         private async Task RollbackDeleteSucceededDirectoryProjectionAsync(string tenantId, string directoryPath)
         {
+            if (_directoryQuotaManager is IDirectoryQuotaProjectionManager directoryQuotaProjectionManager)
+            {
+                await directoryQuotaProjectionManager.RollbackDeleteSucceededProjectionAsync(tenantId, directoryPath, default).ConfigureAwait(false);
+                return;
+            }
+
             if (_directoryQuotaManager is IDirectoryQuotaCompensationManager directoryQuotaCompensationManager)
             {
                 await directoryQuotaCompensationManager.CompensateIncrementFileCountAsync(tenantId, directoryPath, default).ConfigureAwait(false);

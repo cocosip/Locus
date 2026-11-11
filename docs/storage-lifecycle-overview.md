@@ -204,10 +204,11 @@ flowchart TD
 
 `FileWatcher` 在写入 Locus 之前先在 `source-cleanup.db` 原子预留一个 `Importing` 记录。预留成功后才执行
 Locus 写入；写入完成后把同一记录转换为带源路径、指纹和 `fileKey` 的 Delete/Move cleanup job，或 Keep
-终态抑制记录。`MaxActiveJobs` 是数据库总记录数的硬上限；达到上限时该文件本轮不会写入 Locus，而是等待
-后续扫描重试。Delete/Move 不在扫描线程中执行，因此某个源文件删除失败不会阻塞同一 watcher 目录中尚未
-导入的其他文件，只会占用一个 cleanup 容量槽位。cleanup worker 从数据库独立领取任务并按 watcher 的
-后处理重试配置退避重试。
+终态抑制记录。`MaxActiveJobs` 只统计仍在处理中的记录（`Importing`/`Pending`/`Retrying`/`MovePending`）；
+Keep/Failed 这类终态抑制记录按 `TerminalJobRetentionPeriod` 单独裁剪，不占用导入容量。达到上限时该文件
+本轮不会写入 Locus，而是等待后续扫描重试。Delete/Move 不在扫描线程中执行，因此某个源文件删除失败不会
+阻塞同一 watcher 目录中尚未导入的其他文件，只会占用一个 cleanup 容量槽位。cleanup worker 从数据库独立
+领取任务并按 watcher 的后处理重试配置退避重试。
 
 worker 只有在 `SourceCleanup.Enabled`、持久化的 `FileWatcherOptions.Enabled` 都为 true，且至少存在一个
 启用的 watcher 配置时才处理任务、裁剪终态记录或优化数据库。重试耗尽后，若源文件仍与记录的指纹一致，则移动到配置的
@@ -218,10 +219,11 @@ worker 只有在 `SourceCleanup.Enabled`、持久化的 `FileWatcherOptions.Enab
 `DatabaseOptimizationInterval` 执行一次 SQLite `VACUUM`，回收裁剪后空闲页。
 
 `ImportReservationTimeout` 用于恢复进程中断留下的 `Importing` 预留。由于预留发生在 Locus 写入之前，超时
-不能证明导入已经完成，因此 worker 只删除预留并允许 watcher 重试，绝不会据此删除或移动源文件。底层存储池
-支持幂等写入时，相同 import operation id 会避免“写入已完成但状态切换前崩溃”造成重复文件。如果
-`SourceCleanup.Enabled=false`，Watcher 不创建 durable cleanup job 或 SQLite 数据库，而是继续在扫描线程执行
-原有的后处理动作。
+不能证明导入已经完成，因此 watcher 在下次扫描到同一路径时只会重置该预留并重试，绝不会据此删除或移动
+源文件；对于源文件已经消失、watcher 再也扫描不到的预留行，worker 会在超过 `TerminalJobRetentionPeriod`
+后把对应 `Importing` 记录裁剪掉，避免僵尸记录长期占用容量。底层存储池支持幂等写入时，相同 import
+operation id 会避免“写入已完成但状态切换前崩溃”造成重复文件。如果 `SourceCleanup.Enabled=false`，
+Watcher 不创建 durable cleanup job 或 SQLite 数据库，而是继续在扫描线程执行原有的后处理动作。
 
 这条链路与下面的 Locus 业务处理重试不同：`RetryPolicy` 只处理已写入 Locus 后由消费者领取的文件，
 不会控制 watcher 源文件的删除或移动。

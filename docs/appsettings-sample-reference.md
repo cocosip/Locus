@@ -53,9 +53,9 @@
       // 同时执行的 Delete/Move/恢复任务数量。
       "MaxConcurrentActions": 2,
 
-      // 数据库允许保留的最大任务/抑制记录数。达到上限后，Watcher 不再向 Locus
-      // 写入新文件，而是跳过本轮并等待后续扫描；这是保护 SQLite 的硬背压上限。
-      // 该计数包含 Importing、待处理任务及尚在保留期内的 Keep/Failed 终态记录。
+      // 同时允许存在的在途任务数上限（Importing/Pending/Retrying/MovePending）。达到上限后，
+      // Watcher 不再向 Locus 写入新文件，而是跳过本轮并等待后续扫描；这是保护 SQLite 的背压上限。
+      // Keep/Failed 终态抑制记录不占用该容量，由 TerminalJobRetentionPeriod 单独裁剪。
       "MaxActiveJobs": 10000,
 
       // Keep/Failed 终态记录保留多久。到期裁剪后，同路径同内容不再被该记录抑制；
@@ -257,6 +257,11 @@
       // 单个 journal append 微批最多合并多少序列化字节。
       "MaxBatchBytes": 1048576,
 
+      // 每个租户最多允许排队的 append 请求数。
+      // 队列满后 append 会对调用方施加背压（等待、而不是无限增长内存）；
+      // Async 模式下成功返回也可能因背压而短暂等待。
+      "MaxPendingRequests": 100000,
+
       // 单租户 writer 空闲多久后关闭长期打开的 FileStream。
       // 调大可减少频繁打开文件，调小可减少空闲租户占用句柄。
       "WriterIdleTimeout": "00:02:00",
@@ -281,6 +286,11 @@
       // 单轮投影允许持续工作的最长时间。
       // 用于避免一个忙租户长期占住投影循环。
       "MaxProjectionTimePerCycle": "00:00:05",
+
+      // 同一批记录连续失败多少次后，projector 会逐条重放并把仍失败的记录写入
+      // <QueueDirectory>/<tenant>/projection.deadletter.jsonl，然后继续推进 cursor。
+      // 调大更保守（更长时间保留重试机会），调小更快隔离毒记录。
+      "MaxProjectionAttemptsPerRecord": 5,
 
       // 是否在租户投影追上 journal tail 后自动刷新快照。
       // 快照可缩短启动或恢复时的 journal 重放成本。

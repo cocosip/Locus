@@ -78,7 +78,7 @@ namespace Locus
         /// <summary>
         /// Gets or sets the interval in seconds between persistence loop drain cycles
         /// when no new channel items arrive. Controls how quickly coalesced-only writes are flushed.
-        /// Default: 5.
+        /// Default: 2.
         /// </summary>
         public int PersistenceIntervalSeconds { get; set; } = DefaultPersistenceIntervalSeconds;
 
