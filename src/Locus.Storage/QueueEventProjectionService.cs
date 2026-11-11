@@ -514,7 +514,13 @@ namespace Locus.Storage
                     }
 
                     if (projectionBatch != null)
+                    {
                         await projectionBatch.FlushAsync(ct).ConfigureAwait(false);
+
+                        // The batch is committed at this point, so the quota deltas are durable too.
+                        // A later failure (cursor save, maintenance) must not compensate them.
+                        quotaLedger?.Clear();
+                    }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException && ex is not DeferredProjectionException)
                 {

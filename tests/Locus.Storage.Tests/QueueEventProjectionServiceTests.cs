@@ -2549,6 +2549,48 @@ namespace Locus.Storage.Tests
         }
 
         [Fact]
+        public async Task ReplayTenantAsync_PostCommitFailure_KeepsQuotaDeltasApplied()
+        {
+            var tenantQuotaManager = CreateTenantQuotaManager();
+            var directoryQuotaManager = CreateDirectoryQuotaManager();
+
+            const string tenantId = "tenant-quota-post-commit";
+            const string fileKey = "file-quota-post-commit";
+            const string directoryPath = "/incoming";
+            var physicalPath = Path.Combine(_volumeDirectory, tenantId, "incoming", "post-commit.dcm");
+
+            _fileSystem.Directory.CreateDirectory(Path.GetDirectoryName(physicalPath)!);
+            _fileSystem.File.WriteAllBytes(physicalPath, new byte[] { 1, 2, 3 });
+
+            var journal = new ScriptedQueueEventJournal(new[]
+            {
+                new QueueEventRecord
+                {
+                    TenantId = tenantId,
+                    FileKey = fileKey,
+                    EventType = QueueEventType.Accepted,
+                    OccurredAtUtc = DateTime.UtcNow,
+                    VolumeId = "vol-001",
+                    PhysicalPath = physicalPath,
+                    DirectoryPath = directoryPath,
+                    FileSize = 3,
+                    Status = FileProcessingStatus.Pending
+                }
+            });
+            var service = CreateProjectionService(journal, tenantQuotaManager, directoryQuotaManager);
+
+            // Compaction/tail checks run after the batch commits; failing there must not undo the
+            // committed metadata or the quota deltas that belong to it.
+            journal.FailTailOffsetReads = true;
+
+            await Assert.ThrowsAnyAsync<Exception>(() => service.ReplayTenantAsync(tenantId, CancellationToken.None));
+
+            Assert.Equal(1, await tenantQuotaManager.GetFileCountAsync(tenantId, CancellationToken.None));
+            Assert.Equal(1, await directoryQuotaManager.GetFileCountAsync(tenantId, directoryPath, CancellationToken.None));
+            Assert.NotNull(await _metadataRepository.GetAsync(tenantId, fileKey, CancellationToken.None));
+        }
+
+        [Fact]
         public async Task ReplayTenantAsync_BatchFailure_RollsBackQuotaDecrementAppliedByEarlierRecords()
         {
             var tenantQuotaManager = CreateTenantQuotaManager();
@@ -2697,6 +2739,8 @@ namespace Locus.Storage.Tests
 
             public long LastReadOffset { get; private set; }
 
+            public bool FailTailOffsetReads { get; set; }
+
             public Task AppendAsync(QueueEventRecord record, CancellationToken ct = default)
                 => throw new NotSupportedException();
 
@@ -2735,7 +2779,12 @@ namespace Locus.Storage.Tests
                 => throw new NotSupportedException();
 
             public Task<long> GetTailOffsetAsync(string tenantId, CancellationToken ct = default)
-                => Task.FromResult(_offsets[_offsets.Length - 1]);
+            {
+                if (FailTailOffsetReads)
+                    throw new IOException("Injected journal tail read failure.");
+
+                return Task.FromResult(_offsets[_offsets.Length - 1]);
+            }
 
             public Task<long> GetBaseOffsetAsync(string tenantId, CancellationToken ct = default)
                 => Task.FromResult(0L);
