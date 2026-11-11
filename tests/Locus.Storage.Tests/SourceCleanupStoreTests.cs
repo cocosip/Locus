@@ -420,6 +420,43 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
         }
 
         [Fact]
+        public async Task PruneTerminalAsync_KeepsImportReservationWhoseLeaseIsStillActive()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));
+            var databasePath = Path.Combine(directory, "source-cleanup.db");
+
+            try
+            {
+                using (var store = new SourceCleanupStore(databasePath))
+                {
+                    var sourcePath = Path.Combine(directory, "long-import.dcm");
+                    var fingerprint = "fp:v3:1:2:3:long";
+                    await store.UpsertAsync(new SourceCleanupJob
+                    {
+                        WatcherId = "watcher",
+                        TenantId = "tenant",
+                        SourcePath = sourcePath,
+                        Fingerprint = fingerprint,
+                        Action = SourceCleanupJobAction.Delete,
+                        State = SourceCleanupJobState.Importing,
+                        UpdatedAtUtc = DateTime.UtcNow.AddDays(-2),
+                        NextAttemptUtc = DateTime.UtcNow.AddMinutes(10)
+                    });
+
+                    var removed = await store.PruneTerminalAsync(DateTime.UtcNow.AddDays(-1), 10);
+
+                    Assert.Equal(0, removed);
+                    Assert.NotNull(await store.GetActiveAsync(sourcePath, fingerprint));
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+            }
+        }
+
+        [Fact]
         public async Task PruneTerminalAsync_RemovesExpiredKeepAndFailedRows()
         {
             var directory = Path.Combine(Path.GetTempPath(), "locus-source-cleanup-tests", Guid.NewGuid().ToString("N"));

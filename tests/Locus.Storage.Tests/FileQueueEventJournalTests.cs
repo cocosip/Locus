@@ -1665,5 +1665,44 @@ namespace Locus.Storage.Tests
                 await Task.Delay(10, ct);
             }
         }
+
+        [Fact]
+        public async Task Dispose_WithQueuedDurableAppends_CompletesOrFaultsEveryAwaitedAppend()
+        {
+            var queueDirectory = Path.Combine(_queueDirectory, "durable-dispose");
+            var journal = new FileQueueEventJournal(
+                _fileSystem,
+                new Mock<ILogger<FileQueueEventJournal>>().Object,
+                new QueueEventJournalOptions
+                {
+                    QueueDirectory = queueDirectory,
+                    JournalFormat = JournalFormat.BinaryV1,
+                    AckMode = QueueEventJournalAckMode.Durable,
+                    EnableProjection = false,
+                    StateFlushDebounce = TimeSpan.Zero,
+                    Linger = TimeSpan.FromMilliseconds(1),
+                });
+
+            var appends = new List<Task>();
+            for (var i = 0; i < 25; i++)
+            {
+                appends.Add(journal.AppendAsync(new QueueEventRecord
+                {
+                    TenantId = "tenant-dispose",
+                    FileKey = $"file-{i:D3}",
+                    EventType = QueueEventType.Accepted,
+                }, CancellationToken.None));
+            }
+
+            journal.Dispose();
+
+            // Shutdown may complete or reject the queued appends, but no awaited append may hang.
+            var drained = Task.WhenAll(appends.Select(task => task.ContinueWith(
+                _ => 0,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default)));
+            await drained.WaitAsync(TimeSpan.FromSeconds(10));
+        }
     }
 }

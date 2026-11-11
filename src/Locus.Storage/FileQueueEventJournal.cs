@@ -425,14 +425,25 @@ namespace Locus.Storage
 
         private void EnsureTenantWriterStarted(TenantWriterState writer)
         {
-            if (Interlocked.CompareExchange(ref writer.WorkerStarted, 1, 0) != 0)
+            if (Volatile.Read(ref writer.WorkerStarted) == 1)
                 return;
 
-            writer.WorkerTask = Task.Run(() => RunTenantWriterAsync(writer));
+            lock (writer.StartSync)
+            {
+                if (writer.WorkerStarted == 1)
+                    return;
+
+                // Publish the worker task before the started flag, so a concurrent append can never
+                // observe "started" together with the pristine Task.CompletedTask placeholder and
+                // wrongly conclude that the writer has stopped.
+                writer.WorkerTask = Task.Run(() => RunTenantWriterAsync(writer));
+                Volatile.Write(ref writer.WorkerStarted, 1);
+            }
         }
 
         private async Task RunTenantWriterAsync(TenantWriterState writer)
         {
+            PendingAppendRequest? dequeuedRequest = null;
             try
             {
                 while (true)
@@ -440,10 +451,12 @@ namespace Locus.Storage
                     if (writer.ShutdownRequested && writer.PendingRequests.IsEmpty)
                         break;
 
-                    var firstRequest = await WaitForNextRequestAsync(writer).ConfigureAwait(false);
-                    if (firstRequest == null)
+                    dequeuedRequest = await WaitForNextRequestAsync(writer).ConfigureAwait(false);
+                    if (dequeuedRequest == null)
                         continue;
 
+                    var firstRequest = dequeuedRequest;
+                    dequeuedRequest = null;
                     var batch = await CollectBatchAsync(writer, firstRequest).ConfigureAwait(false);
                     try
                     {
@@ -461,14 +474,22 @@ namespace Locus.Storage
             }
             catch (OperationCanceledException) when (writer.ShutdownRequested)
             {
+                // Shutdown cancels the writer's waits. Requests that were dequeued before the
+                // cancellation are failed in the finally block instead of leaving their awaiters
+                // blocked forever.
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Queue journal writer crashed for tenant {TenantId}", writer.TenantId);
-                FailPendingRequests(writer, ex);
             }
             finally
             {
+                var stoppedException = new OperationCanceledException(
+                    $"The queue journal writer for tenant '{writer.TenantId}' stopped before the append completed.");
+                if (dequeuedRequest != null)
+                    FailRequests(new[] { dequeuedRequest }, stoppedException);
+
+                FailPendingRequests(writer, stoppedException);
                 CloseTenantAppendStream(writer);
             }
         }
@@ -535,43 +556,53 @@ namespace Locus.Storage
         private async Task<List<PendingAppendRequest>> CollectBatchAsync(TenantWriterState writer, PendingAppendRequest firstRequest)
         {
             var batch = new List<PendingAppendRequest> { firstRequest };
-            var totalRecords = firstRequest.RecordCount;
-            var totalBytes = firstRequest.EstimatedBytes;
-            var sawBacklog = !writer.PendingRequests.IsEmpty;
-
-            if (_linger <= TimeSpan.Zero)
+            try
             {
-                DrainQueuedRequests(writer, batch, ref totalRecords, ref totalBytes);
+                var totalRecords = firstRequest.RecordCount;
+                var totalBytes = firstRequest.EstimatedBytes;
+                var sawBacklog = !writer.PendingRequests.IsEmpty;
+
+                if (_linger <= TimeSpan.Zero)
+                {
+                    DrainQueuedRequests(writer, batch, ref totalRecords, ref totalBytes);
+                    return batch;
+                }
+
+                var deadlineUtc = DateTime.UtcNow + _linger;
+                while (true)
+                {
+                    if (DrainQueuedRequests(writer, batch, ref totalRecords, ref totalBytes))
+                        sawBacklog = true;
+
+                    if (totalRecords >= _maxBatchRecords || totalBytes >= _maxBatchBytes || !sawBacklog)
+                        break;
+
+                    var remaining = deadlineUtc - DateTime.UtcNow;
+                    if (remaining <= TimeSpan.Zero)
+                        break;
+
+                    var signaled = await writer.Signal.WaitAsync(remaining, writer.Cancellation.Token).ConfigureAwait(false);
+                    if (!signaled)
+                        break;
+
+                    if (writer.PendingRequests.TryDequeue(out var nextRequest))
+                    {
+                        batch.Add(nextRequest);
+                        totalRecords += nextRequest.RecordCount;
+                        totalBytes += nextRequest.EstimatedBytes;
+                        sawBacklog = true;
+                    }
+                }
+
                 return batch;
             }
-
-            var deadlineUtc = DateTime.UtcNow + _linger;
-            while (true)
+            catch (Exception ex)
             {
-                if (DrainQueuedRequests(writer, batch, ref totalRecords, ref totalBytes))
-                    sawBacklog = true;
-
-                if (totalRecords >= _maxBatchRecords || totalBytes >= _maxBatchBytes || !sawBacklog)
-                    break;
-
-                var remaining = deadlineUtc - DateTime.UtcNow;
-                if (remaining <= TimeSpan.Zero)
-                    break;
-
-                var signaled = await writer.Signal.WaitAsync(remaining, writer.Cancellation.Token).ConfigureAwait(false);
-                if (!signaled)
-                    break;
-
-                if (writer.PendingRequests.TryDequeue(out var nextRequest))
-                {
-                    batch.Add(nextRequest);
-                    totalRecords += nextRequest.RecordCount;
-                    totalBytes += nextRequest.EstimatedBytes;
-                    sawBacklog = true;
-                }
+                // Requests drained into the local batch are no longer reachable from the queue, so
+                // they must be failed here or their awaiters would block forever.
+                FailRequests(batch, ex);
+                throw;
             }
-
-            return batch;
         }
 
         private bool DrainQueuedRequests(
@@ -689,7 +720,7 @@ namespace Locus.Storage
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (writer.WorkerStarted == 1 && writer.WorkerTask.IsCompleted)
+                if (Volatile.Read(ref writer.WorkerStarted) == 1 && writer.WorkerTask.IsCompleted)
                 {
                     throw new InvalidOperationException(
                         $"The queue journal writer for tenant '{writer.TenantId}' has stopped; the append was rejected.");
@@ -698,6 +729,17 @@ namespace Locus.Storage
                 if (writer.PendingRequests.Count < _maxPendingRequests)
                 {
                     writer.Enqueue(request);
+
+                    if (Volatile.Read(ref writer.WorkerStarted) == 1 && writer.WorkerTask.IsCompleted)
+                    {
+                        // The writer exited between the liveness check and the enqueue. Nobody will
+                        // drain the request now, so fail it explicitly instead of hanging the caller.
+                        FailRequests(new[] { request }, new OperationCanceledException(
+                            $"The queue journal writer for tenant '{writer.TenantId}' stopped before the append completed."));
+                        throw new InvalidOperationException(
+                            $"The queue journal writer for tenant '{writer.TenantId}' has stopped; the append was rejected.");
+                    }
+
                     return;
                 }
 
@@ -1753,6 +1795,8 @@ namespace Locus.Storage
 
             public Task WorkerTask { get; set; } = Task.CompletedTask;
 
+            public object StartSync { get; } = new object();
+
             public int WorkerStarted;
 
             public Stream? AppendStream { get; set; }
@@ -1761,7 +1805,9 @@ namespace Locus.Storage
 
             public DateTime LastFlushUtc { get; set; }
 
-            public bool ShutdownRequested { get; private set; }
+            private volatile bool _shutdownRequested;
+
+            public bool ShutdownRequested => _shutdownRequested;
 
             public void Enqueue(PendingAppendRequest request)
             {
@@ -1771,7 +1817,7 @@ namespace Locus.Storage
 
             public void RequestShutdown()
             {
-                ShutdownRequested = true;
+                _shutdownRequested = true;
                 Signal.Release();
             }
         }

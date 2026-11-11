@@ -452,7 +452,11 @@ move_target_path = $move_target_path WHERE id = $id";
 WHERE id IN (
     SELECT id FROM source_cleanup_jobs
     WHERE updated_at_utc <= $cutoff
-      AND (action = $keep OR state = $failed OR state = $importing)
+      AND (
+          action = $keep
+          OR state = $failed
+          OR (state = $importing AND (next_attempt_utc IS NULL OR next_attempt_utc <= $cutoff))
+      )
     ORDER BY updated_at_utc, id
     LIMIT $limit
 );";

@@ -492,13 +492,14 @@ namespace Locus.Storage
 
                 var advancedOffset = await QuarantineFailedBatchAsync(
                     tenantId,
+                    cursor,
                     offset,
                     batch.NextOffset,
                     projectionFailure,
                     ct).ConfigureAwait(false);
 
                 cursor.Offset = advancedOffset;
-                await SaveCursorAsync(tenantId, advancedOffset, ct).ConfigureAwait(false);
+                await QueueCursorStateAsync(tenantId, cursor, CancellationToken.None).ConfigureAwait(false);
                 _recordFailureStates.TryRemove(tenantId, out _);
 
                 return new ProjectionCycleResult(
@@ -552,6 +553,7 @@ namespace Locus.Storage
         /// </summary>
         private async Task<long> QuarantineFailedBatchAsync(
             string tenantId,
+            ProjectionCursor cursor,
             long startOffset,
             long batchEndOffset,
             Exception failure,
@@ -572,10 +574,20 @@ namespace Locus.Storage
 
                 try
                 {
+                    // Keep the in-memory sequence cursor in step with the records that are being
+                    // skipped as well as the ones that project successfully; otherwise a later real
+                    // gap would be missed after a quarantine.
+                    ApplySequenceTracking(cursor, single.Records[0]);
                     await ProjectRecordAsync(single.Records[0], ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
+                    throw;
+                }
+                catch (DeferredProjectionException)
+                {
+                    // A missing physical file is not a poison record: let the tenant defer instead
+                    // of dead-lettering data that will become projectable again.
                     throw;
                 }
                 catch (Exception quarantineFailure)

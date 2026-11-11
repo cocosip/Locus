@@ -303,9 +303,10 @@ namespace Locus.FileSystem
                 TrackKnownDirectory(current);
                 directoriesScanned++;
 
-                // The cache is bounded: stop walking instead of caching an entire tree that the
-                // normal trim path would immediately evict again.
-                if (Volatile.Read(ref _knownDirectoryCount) >= _knownDirectoryCacheMaxEntries)
+                // TrackKnownDirectory trims the cache back to half the limit as soon as it is
+                // exceeded, so the cache-size counter cannot bound this walk. Bound the walk by the
+                // number of directories actually visited instead.
+                if (directoriesScanned >= _knownDirectoryCacheMaxEntries)
                 {
                     cacheLimitReached = true;
                     break;
