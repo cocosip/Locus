@@ -170,13 +170,13 @@ namespace Locus.Storage
                 using (var stream = _fileSystem.File.OpenRead(configPath))
                 {
                     var options = await JsonSerializer.DeserializeAsync<FileWatcherOptions>(stream, JsonOptions, ct);
-                    return options ?? new FileWatcherOptions();
+                    return options ?? CloneOptions(_configuredDefaults);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to load file watcher options, using defaults");
-                return new FileWatcherOptions();
+                _logger.LogError(ex, "Failed to load file watcher options, using configured defaults");
+                return CloneOptions(_configuredDefaults);
             }
         }
 
@@ -184,9 +184,37 @@ namespace Locus.Storage
         {
             var configPath = GetConfigurationPath();
 
-            using (var stream = _fileSystem.File.Create(configPath))
+            // Serialize to a temporary file first: a cancellation (typically a host shutdown during
+            // the write) must not leave an empty or truncated options file behind, which the next
+            // start would have to treat as corrupt.
+            var tempPath = configPath + ".tmp." + Guid.NewGuid().ToString("N");
+
+            try
             {
-                await JsonSerializer.SerializeAsync(stream, options, JsonOptions, ct);
+                using (var stream = _fileSystem.File.Create(tempPath))
+                {
+                    await JsonSerializer.SerializeAsync(stream, options, JsonOptions, ct);
+                    await stream.FlushAsync(ct);
+                }
+
+                if (_fileSystem.File.Exists(configPath))
+                    _fileSystem.File.Replace(tempPath, configPath, null);
+                else
+                    _fileSystem.File.Move(tempPath, configPath);
+            }
+            catch
+            {
+                try
+                {
+                    if (_fileSystem.File.Exists(tempPath))
+                        _fileSystem.File.Delete(tempPath);
+                }
+                catch
+                {
+                    // Best-effort cleanup only.
+                }
+
+                throw;
             }
         }
 

@@ -6,10 +6,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Moq;
 using Xunit;
 
 namespace Locus.IntegrationTests
@@ -255,7 +255,7 @@ namespace Locus.IntegrationTests
             var tenantManager = _serviceProvider.GetRequiredService<ITenantManager>();
             var storagePool = _serviceProvider.GetRequiredService<IStoragePool>();
             var fileScheduler = _serviceProvider.GetRequiredService<IFileScheduler>();
-            var cleanupService = _serviceProvider.GetRequiredService<IStorageCleanupService>();
+            var timeoutRecovery = _serviceProvider.GetRequiredService<IProcessingTimeoutRecoveryService>();
 
             await tenantManager.CreateTenantAsync("tenant-004", default);
             var tenant = await tenantManager.GetTenantAsync("tenant-004", default);
@@ -267,16 +267,23 @@ namespace Locus.IntegrationTests
             var file = await fileScheduler.GetNextFileForProcessingAsync(tenant!, default);
             Assert.NotNull(file);
 
-            // Simulate timeout by running cleanup with very short timeout
-            await cleanupService.CleanupTimedOutProcessingFilesAsync(TimeSpan.FromMilliseconds(1), default);
+            // Simulate the clock moving past the processing timeout instead of racing a
+            // sub-millisecond timeout: evaluate the lease against a "now" one hour ahead.
+            var recovery = await timeoutRecovery.RecoverTimedOutFilesAsync(
+                tenant!.TenantId,
+                batchSize: 100,
+                nowUtc: DateTime.UtcNow.AddHours(1),
+                timeout: TimeSpan.FromMinutes(1),
+                CancellationToken.None);
+            Assert.True(recovery.RecoveredCount >= 1);
 
             // Assert - File should be reset to Pending
-            var status = await fileScheduler.GetFileStatusAsync(tenant!.TenantId, file.FileKey, default);
+            var status = await fileScheduler.GetFileStatusAsync(tenant.TenantId, file.FileKey, default);
             Assert.Equal(FileProcessingStatus.Pending, status);
         }
 
         [Fact]
-        public async Task MultipleVolumes_DistributesFiles()
+        public async Task MultipleVolumes_PlacesFilesOnConfiguredVolumes()
         {
             // Arrange
             var tenantManager = _serviceProvider.GetRequiredService<ITenantManager>();
@@ -285,16 +292,31 @@ namespace Locus.IntegrationTests
             await tenantManager.CreateTenantAsync("tenant-005", default);
             var tenant = await tenantManager.GetTenantAsync("tenant-005", default);
 
+            var volumeRoots = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["vol-001"] = Path.Combine(_testDirectory, "volume1"),
+                ["vol-002"] = Path.Combine(_testDirectory, "volume2"),
+            };
+
             // Act - Write multiple files
+            var fileKeys = new List<string>();
             for (int i = 1; i <= 10; i++)
             {
                 var content = new MemoryStream(Encoding.UTF8.GetBytes($"File {i}"));
-                await storagePool.WriteFileAsync(tenant!, content, null, default);
+                fileKeys.Add(await storagePool.WriteFileAsync(tenant!, content, null, default));
             }
 
-            // Assert - Verify total capacity includes both volumes
-            var totalCapacity = await storagePool.GetTotalCapacityAsync(default);
-            Assert.True(totalCapacity > 0);
+            // Assert - Every file reports a configured volume and its physical file lives on it
+            foreach (var fileKey in fileKeys)
+            {
+                var location = await storagePool.GetFileLocationAsync(tenant!, fileKey, default);
+                Assert.NotNull(location);
+                Assert.True(
+                    volumeRoots.TryGetValue(location!.VolumeId, out var volumeRoot),
+                    $"File {fileKey} reported unknown volume '{location.VolumeId}'.");
+                Assert.StartsWith(volumeRoot!, location.PhysicalPath, StringComparison.Ordinal);
+                Assert.True(File.Exists(location.PhysicalPath), $"Physical file missing: {location.PhysicalPath}");
+            }
         }
     }
 }

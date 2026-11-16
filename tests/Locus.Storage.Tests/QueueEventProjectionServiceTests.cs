@@ -16,7 +16,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
-    [Collection("QueueJournalMetrics")]
+    [Collection("sqlite-pool")]
     public class QueueEventProjectionServiceTests : IDisposable
     {
         private readonly IFileSystem _fileSystem;

@@ -32,7 +32,7 @@ namespace Locus.Storage.Tests
                         NextAttemptUtc = DateTime.UtcNow
                     });
 
-                    var active = await store.GetActiveAsync(sourcePath, "fp:v3:10:20:30:hash");
+                    var active = await store.GetActiveAsync("watcher", sourcePath);
                     Assert.NotNull(active);
                     Assert.Equal(jobId, active!.Id);
                 }
@@ -45,7 +45,7 @@ namespace Locus.Storage.Tests
                     Assert.Equal("operation-1", due[0].ImportOperationId);
 
                     await reloaded.RemoveAsync(jobId);
-                    Assert.Null(await reloaded.GetActiveAsync(sourcePath, "fp:v3:10:20:30:hash"));
+                    Assert.Null(await reloaded.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -107,7 +107,7 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
 
                 using (var store = new SourceCleanupStore(databasePath))
                 {
-                    var job = await store.GetActiveAsync("legacy.dcm", "ignored");
+                    var job = await store.GetActiveAsync("watcher", "legacy.dcm");
                     Assert.NotNull(job);
                     Assert.Null(job!.ImportOperationId);
 
@@ -117,7 +117,7 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
 
                 using (var reloaded = new SourceCleanupStore(databasePath))
                 {
-                    var job = await reloaded.GetActiveAsync("legacy.dcm", "ignored");
+                    var job = await reloaded.GetActiveAsync("watcher", "legacy.dcm");
                     Assert.Equal("upgraded-operation", job!.ImportOperationId);
                 }
             }
@@ -229,7 +229,7 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
 
                     Assert.True(reserved);
                     Assert.True(job.Id > 0);
-                    var persisted = await store.GetActiveAsync(job.SourcePath, job.Fingerprint);
+                    var persisted = await store.GetActiveAsync("watcher", job.SourcePath);
                     Assert.NotNull(persisted);
                     Assert.Equal(job.Id, persisted!.Id);
                 }
@@ -281,7 +281,7 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
 
                     Assert.False(reserved);
                     Assert.Equal(0, competing.Id);
-                    var persisted = await store.GetActiveAsync(sourcePath, first.Fingerprint);
+                    var persisted = await store.GetActiveAsync("watcher", sourcePath);
                     Assert.NotNull(persisted);
                     Assert.Equal(first.Id, persisted!.Id);
                     Assert.Equal(first.Fingerprint, persisted.Fingerprint);
@@ -409,7 +409,7 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
                     var removed = await store.PruneTerminalAsync(DateTime.UtcNow.AddDays(-1), 10);
 
                     Assert.Equal(1, removed);
-                    Assert.Null(await store.GetActiveAsync(Path.Combine(directory, "abandoned.dcm"), "fp:v3:1:2:3:abandoned"));
+                    Assert.Null(await store.GetActiveAsync("watcher", Path.Combine(directory, "abandoned.dcm")));
                 }
             }
             finally
@@ -446,7 +446,7 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
                     var removed = await store.PruneTerminalAsync(DateTime.UtcNow.AddDays(-1), 10);
 
                     Assert.Equal(0, removed);
-                    Assert.NotNull(await store.GetActiveAsync(sourcePath, fingerprint));
+                    Assert.NotNull(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -489,8 +489,8 @@ VALUES ('watcher', 'tenant', 'legacy.dcm', 'fp:v3:1:2:3:legacy', '', 1, 5, 0, 0,
                     var removed = await store.PruneTerminalAsync(DateTime.UtcNow.AddDays(-1), 10);
 
                     Assert.Equal(2, removed);
-                    Assert.Null(await store.GetActiveAsync(Path.Combine(directory, "keep.dcm"), "keep"));
-                    Assert.Null(await store.GetActiveAsync(Path.Combine(directory, "failed.dcm"), "failed"));
+                    Assert.Null(await store.GetActiveAsync("watcher", Path.Combine(directory, "keep.dcm")));
+                    Assert.Null(await store.GetActiveAsync("watcher", Path.Combine(directory, "failed.dcm")));
                 }
             }
             finally

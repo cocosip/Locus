@@ -18,6 +18,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
+    [Collection("sqlite-pool")]
     public class StorageCleanupServiceTests : IDisposable
     {
         private readonly IFileSystem _fileSystem;
@@ -205,37 +206,6 @@ namespace Locus.Storage.Tests
                     directoryQuotaManager: _directoryQuotaManager));
 
             Assert.Contains("legacy non-journal mode", ex.Message);
-        }
-
-        [Fact]
-        public async Task CleanupEmptyDirectoriesAsync_RemovesEmptyDirectories()
-        {
-            // Act
-            await _cleanupService.CleanupEmptyDirectoriesAsync("tenant-001", default);
-
-            // Assert
-            // Cleanup is disabled for sharded volumes, so no directories should be removed
-            // The assertion logic has changed because the functionality was intentionally disabled
-        }
-
-        [Fact]
-        public async Task CleanupEmptyDirectoriesAsync_WithTenantContext_RemovesEmptyDirectories()
-        {
-             // Act
-            await _cleanupService.CleanupEmptyDirectoriesAsync(_tenant.Object, default);
-
-            // Assert
-            // Cleanup is disabled for sharded volumes
-        }
-
-        [Fact]
-        public async Task CleanupAllEmptyDirectoriesAsync_RemovesAllEmptyDirectories()
-        {
-            // Act
-            await _cleanupService.CleanupAllEmptyDirectoriesAsync(default);
-
-            // Assert
-            // Cleanup is disabled for sharded volumes
         }
 
         [Fact]

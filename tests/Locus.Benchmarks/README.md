@@ -6,50 +6,51 @@
 
 ### 运行所有基准测试
 
+从仓库根目录运行：
+
 ```bash
-cd tests/Locus.Benchmarks
-dotnet run -c Release
+dotnet run -c Release --project tests/Locus.Benchmarks
 ```
 
 ### 运行特定的基准测试类
 
 ```bash
 # 元数据仓库基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.MetadataRepositoryBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.MetadataRepositoryBenchmarks*"
 
 # 并发操作基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.ConcurrentOperationsBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.ConcurrentOperationsBenchmarks*"
 
 # 目录配额基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.DirectoryQuotaBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.DirectoryQuotaBenchmarks*"
 
 # 租户管理基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.TenantManagerBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.TenantManagerBenchmarks*"
 
 # StoragePool 写入吞吐量基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolWriteThroughputBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.StoragePoolWriteThroughputBenchmarks*"
 
 # StoragePool 并发写入基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.StoragePoolConcurrencyBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.StoragePoolConcurrencyBenchmarks*"
 
 # Volume 健康检查基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.VolumeHealthCheckBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.VolumeHealthCheckBenchmarks*"
 
 # 待处理文件分配锁竞争（第7点）基准测试
-dotnet run -c Release --filter "Locus.Benchmarks.PendingAllocationContentionBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.PendingAllocationContentionBenchmarks*"
 
 # 第5/6点基准测试（脏键刷盘 + known-dir 裁剪）
-dotnet run -c Release --filter "Locus.Benchmarks.DirectoryQuotaDirtyFlushBenchmarks*"
-dotnet run -c Release --filter "Locus.Benchmarks.KnownDirectoryTrimBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.DirectoryQuotaDirtyFlushBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.KnownDirectoryTrimBenchmarks*"
 
 # 第1~4点基准测试（FileWatcher 主路径）
-dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherLargeDirectoryBenchmarks*"
-dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherConfigurationDispatchBenchmarks*"
-dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherMultiTenantStatusBenchmarks*"
-dotnet run -c Release --filter "Locus.Benchmarks.FileWatcherPrunePressureBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.FileWatcherLargeDirectoryBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.FileWatcherConfigurationDispatchBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.FileWatcherMultiTenantStatusBenchmarks*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "Locus.Benchmarks.FileWatcherPrunePressureBenchmarks*"
 
 # Metadata 冷启动内存验证（SQLite 冷状态不进内存）
-dotnet run -c Release -- metadata-cold-start-memory --cold 900000 --hot 100 --cold-query-limit 100
+dotnet run -c Release --project tests/Locus.Benchmarks -- metadata-cold-start-memory --cold 900000 --hot 100 --cold-query-limit 100
 
 # 生成第5/6点参数矩阵对比面板（会自动跑基准并输出 Markdown）
 pwsh ./tests/Locus.Benchmarks/build-phase56-matrix-panel.ps1
@@ -64,10 +65,10 @@ pwsh ./tests/Locus.Benchmarks/build-phase14-benchmark-panel.ps1
 
 ```bash
 # 只运行并发写入测试
-dotnet run -c Release --filter "*ConcurrentWrites*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "*ConcurrentWrites*"
 
 # 只运行元数据添加测试
-dotnet run -c Release --filter "*AddOrUpdateAsync_Single*"
+dotnet run -c Release --project tests/Locus.Benchmarks --filter "*AddOrUpdateAsync_Single*"
 ```
 
 ## 基准测试类说明
@@ -303,13 +304,13 @@ BenchmarkDotNet 会输出以下关键指标:
 
 ```bash
 # 生成 Markdown 格式的性能报告
-dotnet run -c Release --exporters markdown
+dotnet run -c Release --project tests/Locus.Benchmarks --exporters markdown
 
 # 生成 JSON + Markdown 格式报告
-dotnet run -c Release --exporters json markdown
+dotnet run -c Release --project tests/Locus.Benchmarks --exporters json markdown
 
 # 导出结果到指定目录
-dotnet run -c Release --exporters markdown --artifacts ./benchmark-results
+dotnet run -c Release --project tests/Locus.Benchmarks --exporters markdown --artifacts ./benchmark-results
 ```
 
 结果文件保存在 `BenchmarkDotNet.Artifacts/results/` 目录，文件名格式:
@@ -325,17 +326,6 @@ dotnet run -c Release --exporters markdown --artifacts ./benchmark-results
 ## P0-2 Peak Memory Validation (100k+ files)
 
 To validate the **peak managed memory** target for orphan-rebuild (not only BDN `Allocated`), run:
-
-```powershell
-pwsh ./tests/Locus.Benchmarks/measure-orphan-peak-memory.ps1 `
-  -Mode both `
-  -FileCount 120000 `
-  -MetadataRatio 0.90 `
-  -AttachDelaySec 15 `
-  -PostRunDelaySec 5
-```
-
-Or run directly:
 
 ```powershell
 dotnet run -c Release --project tests/Locus.Benchmarks -- `

@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.IO;
 using Locus.Core.Models;
+using Locus.Core.Validation;
 using Microsoft.Extensions.Logging;
 
 namespace Locus.Storage
@@ -525,7 +526,7 @@ namespace Locus.Storage
                         continue;
                     }
 
-                    if (writer.PendingRequests.TryDequeue(out request))
+                    if (TryDequeuePendingRequest(writer, out request, signalAlreadyConsumed: true))
                         return request;
 
                     continue;
@@ -535,7 +536,7 @@ namespace Locus.Storage
                 {
                     CloseTenantAppendStream(writer);
                     await writer.Signal.WaitAsync(writer.Cancellation.Token).ConfigureAwait(false);
-                    if (writer.PendingRequests.TryDequeue(out request))
+                    if (TryDequeuePendingRequest(writer, out request, signalAlreadyConsumed: true))
                         return request;
 
                     continue;
@@ -548,7 +549,7 @@ namespace Locus.Storage
                     continue;
                 }
 
-                if (writer.PendingRequests.TryDequeue(out request))
+                if (TryDequeuePendingRequest(writer, out request, signalAlreadyConsumed: true))
                     return request;
             }
         }
@@ -591,6 +592,7 @@ namespace Locus.Storage
                         totalRecords += nextRequest.RecordCount;
                         totalBytes += nextRequest.EstimatedBytes;
                         sawBacklog = true;
+                        writer.NotifyCapacityReleased();
                     }
                 }
 
@@ -625,11 +627,17 @@ namespace Locus.Storage
             return drainedAny;
         }
 
-        private bool TryDequeuePendingRequest(TenantWriterState writer, [NotNullWhen(true)] out PendingAppendRequest? request)
+        private bool TryDequeuePendingRequest(
+            TenantWriterState writer,
+            [NotNullWhen(true)] out PendingAppendRequest? request,
+            bool signalAlreadyConsumed = false)
         {
             if (writer.PendingRequests.TryDequeue(out request))
             {
-                writer.Signal.Wait(0);
+                if (!signalAlreadyConsumed)
+                    writer.Signal.Wait(0);
+
+                writer.NotifyCapacityReleased();
                 return true;
             }
 
@@ -653,13 +661,39 @@ namespace Locus.Storage
                     await RepairCorruptTailCoreAsync(writer.TenantId, state, appendLock, writer.Cancellation.Token, lockAlreadyHeld: true).ConfigureAwait(false);
                     var stream = EnsureAppendStream(writer);
                     var shouldFlushBeforeAck = ShouldFlushBeforeAck(writer);
-                    if (batch.Count == 1 && batch[0].TryGetSingleRecord(out var singleAppendRecord))
-                    {
-                        var singleRecord = SerializeSingleRecord(state, singleAppendRecord);
-                        await stream.WriteAsync(singleRecord, 0, singleRecord.Length, writer.Cancellation.Token).ConfigureAwait(false);
 
-                        state.TailOffset += singleRecord.Length;
-                        var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
+                    // Both shapes serialize here and then share one write/flush/metrics/completion
+                    // path, so no exit can skip CompleteRequests and strand an awaiter.
+                    QueueEventJournalBatchBuffer? serializedBatch = null;
+                    byte[] buffer;
+                    int length;
+                    int recordCount;
+                    try
+                    {
+                        if (batch.Count == 1 && batch[0].TryGetSingleRecord(out var singleAppendRecord))
+                        {
+                            buffer = SerializeSingleRecord(state, singleAppendRecord);
+                            length = buffer.Length;
+                            recordCount = 1;
+                        }
+                        else
+                        {
+                            serializedBatch = SerializeBatch(state, batch, out var batchRecords);
+                            buffer = serializedBatch.Buffer;
+                            length = serializedBatch.Length;
+                            recordCount = batchRecords.Length;
+                        }
+
+                        if (length == 0)
+                        {
+                            // Nothing was serialized (defensive: an empty request). The requests are
+                            // already dequeued, so they still have to be completed.
+                            CompleteRequests(batch);
+                            return;
+                        }
+
+                        await stream.WriteAsync(buffer, 0, length, writer.Cancellation.Token).ConfigureAwait(false);
+                        state.TailOffset += length;
 
                         if (shouldFlushBeforeAck)
                             await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
@@ -670,41 +704,16 @@ namespace Locus.Storage
                         // state save rescans the file, so saving first would drop the new tail offset.
                         MarkJournalStateDirty(writer.TenantId);
 
+                        // One timestamp pair per operation: the append metrics and the write-path
+                        // statistics report the same span.
                         var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
-                        QueueJournalOperationMetrics.RecordAppendBatch(
-                            singleRecord.Length,
-                            durationTicks);
-                        RecordObservedAppendBatch(recordCount: 1, totalBytes: singleRecord.Length, durationTicks: appendDurationTicks);
+                        QueueJournalOperationMetrics.RecordAppendBatch(length, durationTicks);
+                        RecordObservedAppendBatch(recordCount, length, durationTicks);
                         CompleteRequests(batch);
-                        return;
                     }
-
-                    using (var serializedBatch = SerializeBatch(state, batch, out var batchRecords))
+                    finally
                     {
-                        if (serializedBatch.Length == 0)
-                            return;
-
-                        await stream.WriteAsync(serializedBatch.Buffer, 0, serializedBatch.Length, writer.Cancellation.Token).ConfigureAwait(false);
-
-                        state.TailOffset += serializedBatch.Length;
-                        var appendDurationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
-
-                        if (shouldFlushBeforeAck)
-                            await FlushAppendStreamCoreAsync(writer).ConfigureAwait(false);
-                        else
-                            writer.HasUnflushedData = true;
-
-                        MarkJournalStateDirty(writer.TenantId);
-
-                        var durationTicks = Stopwatch.GetTimestamp() - batchStartedAt;
-                        QueueJournalOperationMetrics.RecordAppendBatch(
-                            serializedBatch.Length,
-                            durationTicks);
-                        RecordObservedAppendBatch(
-                            recordCount: batchRecords.Length,
-                            totalBytes: serializedBatch.Length,
-                            durationTicks: appendDurationTicks);
-                        CompleteRequests(batch);
+                        serializedBatch?.Dispose();
                     }
                 }
             }
@@ -744,8 +753,38 @@ namespace Locus.Storage
                 }
 
                 // Bounded queue: apply backpressure instead of letting an ack mode that returns
-                // before the write completes grow the queue without limit.
-                await Task.Delay(1, ct).ConfigureAwait(false);
+                // before the write completes grow the queue without limit. The waiter is registered
+                // before the depth is rechecked so a slot freed in between cannot be missed, and the
+                // recheck also absorbs wakeups that were meant for the writer's own Signal.
+                var capacityReleased = writer.RegisterCapacityWaiter();
+                try
+                {
+                    if (writer.PendingRequests.Count < _maxPendingRequests)
+                        continue;
+
+                    await WaitForCapacityAsync(capacityReleased, ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    writer.UnregisterCapacityWaiter();
+                }
+            }
+        }
+
+        private static async Task WaitForCapacityAsync(Task capacityReleased, CancellationToken ct)
+        {
+            if (!ct.CanBeCanceled)
+            {
+                await capacityReleased.ConfigureAwait(false);
+                return;
+            }
+
+            var cancellation = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (ct.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetResult(null), cancellation))
+            {
+                // Task.WaitAsync is unavailable on netstandard2.0, so race the signal against
+                // cancellation and let the caller's loop observe the cancellation.
+                await Task.WhenAny(capacityReleased, cancellation.Task).ConfigureAwait(false);
             }
         }
 
@@ -881,15 +920,6 @@ namespace Locus.Storage
             CompleteAppendFlush(writer, flushStartedAt);
         }
 
-        private void FlushAppendStreamCore(TenantWriterState writer)
-        {
-            var flushStartedAt = Stopwatch.GetTimestamp();
-            if (writer.AppendStream != null)
-                DurableFileWrite.FlushToDisk(writer.AppendStream);
-
-            CompleteAppendFlush(writer, flushStartedAt);
-        }
-
         private void CompleteAppendFlush(TenantWriterState writer, long flushStartedAt)
         {
             writer.HasUnflushedData = false;
@@ -941,6 +971,10 @@ namespace Locus.Storage
             }
 
             QueueJournalMetrics.RecordAppendFailed(failedRecords);
+
+            // The queue was drained, so blocked appenders must wake up and observe the stopped writer
+            // instead of waiting for a slot that will never be reused.
+            writer.NotifyCapacityReleased();
         }
 
         private string ValidateAppendBatch(IReadOnlyList<QueueEventRecord> records)
@@ -977,7 +1011,7 @@ namespace Locus.Storage
 
         private static void ValidateTenantIdForPath(string? tenantId, string paramName)
         {
-            TenantIdPathValidator.Validate(tenantId, paramName);
+            TenantIdValidator.Validate(tenantId, paramName);
         }
 
         private IReadOnlyList<QueueEventRecord> CloneRecords(IReadOnlyList<QueueEventRecord> records)
@@ -1159,12 +1193,6 @@ namespace Locus.Storage
             }
 
             return _defaultFormat;
-        }
-
-        private async Task RepairCorruptTailIfNeededAsync(string tenantId, JournalState state, CancellationToken ct)
-        {
-            var appendLock = _appendLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
-            await RepairCorruptTailCoreAsync(tenantId, state, appendLock, ct, lockAlreadyHeld: false).ConfigureAwait(false);
         }
 
         private async Task RepairCorruptTailCoreAsync(
@@ -1650,11 +1678,6 @@ namespace Locus.Storage
             return new JournalStateFileStamp(exists: true, info.Length, info.LastWriteTimeUtc);
         }
 
-        private void NormalizeJournalState(string tenantId, JournalState state)
-        {
-            NormalizeJournalState(tenantId, state, scanJournal: true);
-        }
-
         private void NormalizeJournalState(string tenantId, JournalState state, bool scanJournal)
         {
             if (state.BaseOffset < 0)
@@ -1776,6 +1799,10 @@ namespace Locus.Storage
 
         private sealed class TenantWriterState
         {
+            private readonly object _capacitySync = new object();
+            private TaskCompletionSource<object?> _capacityReleased = CreateCapacitySignal();
+            private int _capacityWaiters;
+
             public TenantWriterState(string tenantId)
             {
                 TenantId = tenantId ?? throw new ArgumentNullException(nameof(tenantId));
@@ -1815,10 +1842,58 @@ namespace Locus.Storage
                 Signal.Release();
             }
 
+            /// <summary>
+            /// Registers an appender that is waiting for a free queue slot and returns the signal it
+            /// has to await. The caller rechecks the queue depth after registering.
+            /// </summary>
+            public Task RegisterCapacityWaiter()
+            {
+                lock (_capacitySync)
+                {
+                    _capacityWaiters++;
+                    return _capacityReleased.Task;
+                }
+            }
+
+            public void UnregisterCapacityWaiter()
+            {
+                lock (_capacitySync)
+                    _capacityWaiters--;
+            }
+
+            /// <summary>
+            /// Wakes every appender waiting for capacity. Callers release it whenever a request
+            /// leaves the queue, so a blocked append can never miss a freed slot.
+            /// </summary>
+            public void NotifyCapacityReleased()
+            {
+                // Dequeues happen for every written record, so keep the no-waiter case allocation free.
+                if (Volatile.Read(ref _capacityWaiters) == 0)
+                    return;
+
+                TaskCompletionSource<object?> released;
+                lock (_capacitySync)
+                {
+                    if (_capacityWaiters == 0)
+                        return;
+
+                    released = _capacityReleased;
+                    _capacityReleased = CreateCapacitySignal();
+                }
+
+                released.TrySetResult(null);
+            }
+
             public void RequestShutdown()
             {
                 _shutdownRequested = true;
                 Signal.Release();
+                NotifyCapacityReleased();
+            }
+
+            private static TaskCompletionSource<object?> CreateCapacitySignal()
+            {
+                return new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
             }
         }
 
@@ -1936,11 +2011,15 @@ namespace Locus.Storage
                 _stateFlushTimer.Dispose();
             }
 
-            foreach (var tenantWriter in _tenantWriters.Values)
+            // One snapshot for every shutdown pass: separate enumerations could observe different
+            // writer sets, so a writer drained in one pass might not be closed in the next.
+            var tenantWriters = _tenantWriters.Values.ToArray();
+
+            foreach (var tenantWriter in tenantWriters)
                 tenantWriter.RequestShutdown();
 
             const int drainTimeoutMs = 30_000;
-            var drainTasks = _tenantWriters.Values.Select(w => w.WorkerTask).ToArray();
+            var drainTasks = tenantWriters.Select(w => w.WorkerTask).ToArray();
             if (!Task.WaitAll(drainTasks, drainTimeoutMs))
             {
                 _logger.LogWarning(
@@ -1949,7 +2028,7 @@ namespace Locus.Storage
                     drainTasks.Count(t => !t.IsCompleted));
             }
 
-            foreach (var tenantWriter in _tenantWriters.Values)
+            foreach (var tenantWriter in tenantWriters)
             {
                 try
                 {
@@ -1962,7 +2041,7 @@ namespace Locus.Storage
                 }
             }
 
-            foreach (var tenantWriter in _tenantWriters.Values)
+            foreach (var tenantWriter in tenantWriters)
                 CloseTenantAppendStream(tenantWriter);
 
             if (!_dirtyStateTenants.IsEmpty)

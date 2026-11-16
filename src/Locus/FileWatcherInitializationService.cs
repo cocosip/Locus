@@ -70,9 +70,9 @@ namespace Locus
                             watcherConfig.MultiTenantMode);
 
                         // Perform initial scan
-                        var importedCount = await _fileWatcher.ScanNowAsync(watcherConfig.WatcherId, stoppingToken);
-                        _logger.LogInformation("Initial scan completed for watcher {WatcherId}: {Count} files imported",
-                            watcherConfig.WatcherId, importedCount);
+                        var scanResult = await _fileWatcher.ScanNowAsync(watcherConfig.WatcherId, stoppingToken);
+                        _logger.LogInformation("Initial scan completed for watcher {WatcherId}: {Count} files imported ({Skipped} skipped, {Failed} failed)",
+                            watcherConfig.WatcherId, scanResult.FilesImported, scanResult.FilesSkipped, scanResult.FilesFailed);
 
                         registeredCount++;
                     }

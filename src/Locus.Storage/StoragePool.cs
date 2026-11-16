@@ -593,10 +593,13 @@ namespace Locus.Storage
                         {
                             await _tenantQuotaManager.DecrementFileCountAsync(tenant.TenantId, default);
                         }
-                        catch
+                        catch (Exception rollbackEx)
                         {
                             StoragePoolMetrics.RecordQuotaRollbackFailure("tenant");
-                            throw;
+                            _logger.LogError(
+                                rollbackEx,
+                                "Failed to rollback tenant quota after write failure: Tenant={TenantId}",
+                                tenant.TenantId);
                         }
                     }
                 }

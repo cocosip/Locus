@@ -37,6 +37,12 @@ namespace Locus.Storage
         /// <inheritdoc/>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken = default)
         {
+            if (!_options.Enabled)
+            {
+                _logger.LogInformation("OrphanFileRecoveryService is disabled by OrphanRecoveryOptions.Enabled");
+                return;
+            }
+
             _logger.LogInformation(
                 "OrphanFileRecoveryService started (RunOnStartup={RunOnStartup}, InitialDelay={InitialDelay}, RecoveryInterval={RecoveryInterval})",
                 _options.RunOnStartup,

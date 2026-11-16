@@ -53,7 +53,7 @@ namespace Locus.IntegrationTests
         }
 
         [Fact]
-        public async Task StartupMountsMultipleVolumesInParallel()
+        public async Task StartupMountsVolumesConcurrently_SoOneFailingVolumeDoesNotBlockTheRest()
         {
             var root = CreateRoot();
             ServiceProvider? serviceProvider = null;
@@ -61,27 +61,37 @@ namespace Locus.IntegrationTests
             {
                 serviceProvider = BuildServiceProvider(root, builder =>
                 {
-                    for (var i = 0; i < 3; i++)
+                    // An unsupported volume type fails immediately. Because every mount is dispatched
+                    // before the first one is awaited, the healthy volumes must still end up mounted.
+                    builder.AddVolume(volume =>
+                    {
+                        volume.VolumeId = "vol-bad";
+                        volume.MountPath = Path.Combine(root, "volume-bad");
+                        volume.VolumeType = "UnsupportedStore";
+                        volume.InitialDelayMs = 0;
+                        volume.HealthCheckDelayMs = 0;
+                    });
+
+                    for (var i = 0; i < 2; i++)
                     {
                         var index = i;
                         builder.AddVolume(volume =>
                         {
-                            volume.VolumeId = $"vol-{index + 1:D3}";
-                            volume.MountPath = Path.Combine(root, $"volume-{index + 1:D3}");
+                            volume.VolumeId = $"vol-ok-{index + 1:D2}";
+                            volume.MountPath = Path.Combine(root, $"volume-ok-{index + 1:D2}");
                             volume.VolumeType = "LocalFileSystem";
-                            volume.InitialDelayMs = 2000;
+                            volume.InitialDelayMs = 0;
                             volume.HealthCheckDelayMs = 0;
                         });
                     }
                 });
 
-                var stopwatch = Stopwatch.StartNew();
-                await StartStorageVolumeInitializationAsync(serviceProvider);
-                stopwatch.Stop();
+                await Assert.ThrowsAnyAsync<Exception>(() => StartStorageVolumeInitializationAsync(serviceProvider));
 
-                Assert.True(
-                    stopwatch.Elapsed < TimeSpan.FromMilliseconds(3500),
-                    $"Expected parallel startup mount to finish well below serial time, actual={stopwatch.Elapsed}.");
+                var volumeRegistry = serviceProvider.GetRequiredService<StorageVolumeRegistry>();
+                var mountedIds = volumeRegistry.GetVolumes().Select(volume => volume.VolumeId).ToArray();
+                Assert.Contains("vol-ok-01", mountedIds);
+                Assert.Contains("vol-ok-02", mountedIds);
             }
             finally
             {

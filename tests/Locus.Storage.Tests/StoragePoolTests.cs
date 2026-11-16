@@ -21,6 +21,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
+    [Collection("sqlite-pool")]
     public class StoragePoolTests : IAsyncLifetime
     {
         private readonly IFileSystem _fileSystem;

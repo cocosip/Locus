@@ -31,7 +31,7 @@ namespace Locus.FileSystem
         private readonly int _copyBufferSize;
         private readonly bool _forceFlushAfterWrite;
         private readonly int _knownDirectoryCacheMaxEntries;
-        private readonly bool _usesMockFileSystem;
+        private readonly bool _usesFileSystemAbstractionForWrites;
 
         // --- Optimization 1: IsHealthy TTL cache ---
         // Avoid file write+delete on every WriteFileAsync call.
@@ -154,7 +154,10 @@ namespace Locus.FileSystem
             _copyBufferSize = copyBufferSize;
             _forceFlushAfterWrite = forceFlushAfterWrite;
             _knownDirectoryCacheMaxEntries = knownDirectoryCacheMaxEntries;
-            _usesMockFileSystem = _fileSystem.GetType().FullName?.IndexOf("MockFileSystem", StringComparison.OrdinalIgnoreCase) >= 0;
+            // The abstraction cannot return a sized asynchronous FileStream, so writes use a raw
+            // FileStream only when the process owns the real file system. Every other
+            // implementation (test doubles, decorators, wrappers) must stay behind the abstraction.
+            _usesFileSystemAbstractionForWrites = _fileSystem.GetType() != typeof(System.IO.Abstractions.FileSystem);
 
             // Default TTL: 30 seconds
             var cacheDuration = healthCheckCacheDuration == default
@@ -410,10 +413,12 @@ namespace Locus.FileSystem
 
             // First refresh should be synchronous for correctness. Without this,
             // startup health probes can observe zero-space before async refresh finishes.
+            // The timestamp is published only after the refresh completes, so concurrent
+            // callers never read the zero-initialized fields (same contract as IsHealthy).
             if (last == 0)
             {
-                if (Interlocked.CompareExchange(ref _lastSpaceCheckTicks, now, 0) == 0)
-                    RefreshSpaceFromDrive();
+                RefreshSpaceFromDrive();
+                Interlocked.CompareExchange(ref _lastSpaceCheckTicks, Stopwatch.GetTimestamp(), 0);
                 return;
             }
 
@@ -1105,8 +1110,8 @@ namespace Locus.FileSystem
 
         private Stream CreateWriteStream(string path, long? expectedBytes)
         {
-            // MockFileSystem does not map to OS file handles; keep using abstraction in tests.
-            if (_usesMockFileSystem)
+            // Test doubles and wrappers do not map to OS file handles; keep using the abstraction.
+            if (_usesFileSystemAbstractionForWrites)
                 return _fileSystem.File.Open(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
 
             var bufferSize = ResolveWriteBufferSize(expectedBytes);
@@ -1121,7 +1126,7 @@ namespace Locus.FileSystem
 
         private Stream CreateSynchronousWriteStream(string path, long? expectedBytes)
         {
-            if (_usesMockFileSystem)
+            if (_usesFileSystemAbstractionForWrites)
                 return _fileSystem.File.Open(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
 
             var bufferSize = ResolveWriteBufferSize(expectedBytes);

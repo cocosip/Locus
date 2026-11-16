@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -85,54 +86,23 @@ namespace Locus.Storage
                     if (stream.Position >= stream.Length)
                         break;
 
-                    if ((stream.Length - stream.Position) < HeaderSize)
+                    if (!TryReadRecordHeader(stream, reader, out var header))
                         return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
 
-                    int magic;
-                    short version;
-                    short flags;
-                    int payloadLength;
-                    long sequenceNumber;
-                    uint payloadChecksum;
-
-                    try
-                    {
-                        magic = reader.ReadInt32();
-                        version = reader.ReadInt16();
-                        flags = reader.ReadInt16();
-                        payloadLength = reader.ReadInt32();
-                        sequenceNumber = reader.ReadInt64();
-                        payloadChecksum = reader.ReadUInt32();
-                    }
-                    catch (EndOfStreamException)
-                    {
-                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
-                    }
-
-                    if (magic != RecordMagic
-                        || version < MinimumRecordVersion
-                        || version > RecordVersion
-                        || flags != RecordFlags
-                        || payloadLength < 0
-                        || (stream.Length - stream.Position) < payloadLength)
-                    {
-                        return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
-                    }
-
-                    var payload = reader.ReadBytes(payloadLength);
-                    if (payload.Length != payloadLength)
+                    var payload = reader.ReadBytes(header.PayloadLength);
+                    if (payload.Length != header.PayloadLength)
                         return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
 
                     nextOffset = stream.Position;
-                    if (QueueEventCrc32.Compute(payload, 0, payload.Length) != payloadChecksum)
+                    if (QueueEventCrc32.Compute(payload, 0, payload.Length) != header.PayloadChecksum)
                         return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
 
                     QueueEventRecord record;
                     try
                     {
-                        record = ReadPayload(payload, version, sequenceNumber, payloadChecksum);
+                        record = ReadPayload(payload, header.Version, header.SequenceNumber, header.PayloadChecksum);
                     }
-                    catch (Exception) when (IsPayloadReadFailure())
+                    catch (Exception ex) when (IsCorruptPayload(ex))
                     {
                         return new QueueEventJournalCodecReadResult(records, recordStartOffset, true, true);
                     }
@@ -158,58 +128,14 @@ namespace Locus.Storage
                 while (stream.Position < stream.Length)
                 {
                     var recordStartOffset = nextOffset;
-                    if ((stream.Length - stream.Position) < HeaderSize)
+                    if (!TryReadRecordHeader(stream, reader, out var header))
                         return new QueueEventJournalCodecScanResult(recordStartOffset, lastSequenceNumber, true);
 
-                    int magic;
-                    short version;
-                    short flags;
-                    int payloadLength;
-                    long sequenceNumber;
-                    uint payloadChecksum;
-
-                    try
-                    {
-                        magic = reader.ReadInt32();
-                        version = reader.ReadInt16();
-                        flags = reader.ReadInt16();
-                        payloadLength = reader.ReadInt32();
-                        sequenceNumber = reader.ReadInt64();
-                        payloadChecksum = reader.ReadUInt32();
-                    }
-                    catch (EndOfStreamException)
-                    {
-                        return new QueueEventJournalCodecScanResult(recordStartOffset, lastSequenceNumber, true);
-                    }
-
-                    if (magic != RecordMagic
-                        || version < MinimumRecordVersion
-                        || version > RecordVersion
-                        || flags != RecordFlags
-                        || payloadLength < 0
-                        || (stream.Length - stream.Position) < payloadLength)
-                    {
-                        return new QueueEventJournalCodecScanResult(recordStartOffset, lastSequenceNumber, true);
-                    }
-
-                    var payload = reader.ReadBytes(payloadLength);
-                    if (payload.Length != payloadLength)
+                    if (!IsValidRecordPayload(stream, reader, header))
                         return new QueueEventJournalCodecScanResult(recordStartOffset, lastSequenceNumber, true);
 
-                    if (QueueEventCrc32.Compute(payload, 0, payload.Length) != payloadChecksum)
-                        return new QueueEventJournalCodecScanResult(recordStartOffset, lastSequenceNumber, true);
-
-                    try
-                    {
-                        ReadPayload(payload, version, sequenceNumber, payloadChecksum);
-                    }
-                    catch (Exception) when (IsPayloadReadFailure())
-                    {
-                        return new QueueEventJournalCodecScanResult(recordStartOffset, lastSequenceNumber, true);
-                    }
-
-                    if (sequenceNumber > lastSequenceNumber)
-                        lastSequenceNumber = sequenceNumber;
+                    if (header.SequenceNumber > lastSequenceNumber)
+                        lastSequenceNumber = header.SequenceNumber;
 
                     nextOffset = stream.Position;
                 }
@@ -237,57 +163,13 @@ namespace Locus.Storage
                 while (stream.Position < stream.Length && nextOffset < startOffset)
                 {
                     var recordStartOffset = nextOffset;
-                    if ((stream.Length - stream.Position) < HeaderSize)
+                    if (!TryReadRecordHeader(stream, reader, out var header))
                         return recordStartOffset;
 
-                    int magic;
-                    short version;
-                    short flags;
-                    int payloadLength;
-                    long sequenceNumber;
-                    uint payloadChecksum;
-
-                    try
-                    {
-                        magic = reader.ReadInt32();
-                        version = reader.ReadInt16();
-                        flags = reader.ReadInt16();
-                        payloadLength = reader.ReadInt32();
-                        sequenceNumber = reader.ReadInt64();
-                        payloadChecksum = reader.ReadUInt32();
-                    }
-                    catch (EndOfStreamException)
-                    {
-                        return recordStartOffset;
-                    }
-
-                    if (magic != RecordMagic
-                        || version < MinimumRecordVersion
-                        || version > RecordVersion
-                        || flags != RecordFlags
-                        || payloadLength < 0
-                        || (stream.Length - stream.Position) < payloadLength)
-                    {
-                        return recordStartOffset;
-                    }
-
-                    var payload = reader.ReadBytes(payloadLength);
-                    if (payload.Length != payloadLength)
+                    if (!IsValidRecordPayload(stream, reader, header))
                         return recordStartOffset;
 
                     var recordEndOffset = stream.Position;
-                    if (QueueEventCrc32.Compute(payload, 0, payload.Length) != payloadChecksum)
-                        return recordStartOffset;
-
-                    try
-                    {
-                        ReadPayload(payload, version, sequenceNumber, payloadChecksum);
-                    }
-                    catch (Exception) when (IsPayloadReadFailure())
-                    {
-                        return recordStartOffset;
-                    }
-
                     if (recordEndOffset >= startOffset)
                         return recordEndOffset == startOffset ? startOffset : recordStartOffset;
 
@@ -502,9 +384,215 @@ namespace Locus.Storage
             return value == int.MinValue ? (FileProcessingStatus?)null : (FileProcessingStatus)value;
         }
 
-        private static bool IsPayloadReadFailure()
+        private static bool IsCorruptPayload(Exception exception)
         {
+            // Only the failures the payload readers raise for truncated or corrupt bytes count as a
+            // corrupt tail. Anything else (I/O faults, allocation failures, unexpected bugs) must
+            // propagate instead of silently truncating a healthy journal.
+            return exception is EndOfStreamException
+                || exception is InvalidDataException
+                || exception is FormatException
+                || exception is ArgumentOutOfRangeException;
+        }
+
+        /// <summary>
+        /// Reads the fixed record header and validates it together with the remaining file length.
+        /// Returns <c>false</c> when the next record cannot be parsed completely.
+        /// </summary>
+        private static bool TryReadRecordHeader(Stream stream, BinaryReader reader, out RecordHeader header)
+        {
+            header = default;
+            if ((stream.Length - stream.Position) < HeaderSize)
+                return false;
+
+            int magic;
+            short version;
+            short flags;
+            int payloadLength;
+            long sequenceNumber;
+            uint payloadChecksum;
+
+            try
+            {
+                magic = reader.ReadInt32();
+                version = reader.ReadInt16();
+                flags = reader.ReadInt16();
+                payloadLength = reader.ReadInt32();
+                sequenceNumber = reader.ReadInt64();
+                payloadChecksum = reader.ReadUInt32();
+            }
+            catch (EndOfStreamException)
+            {
+                return false;
+            }
+
+            if (magic != RecordMagic
+                || version < MinimumRecordVersion
+                || version > RecordVersion
+                || flags != RecordFlags
+                || payloadLength < 0
+                || (stream.Length - stream.Position) < payloadLength)
+            {
+                return false;
+            }
+
+            header = new RecordHeader(version, payloadLength, sequenceNumber, payloadChecksum);
             return true;
+        }
+
+        /// <summary>
+        /// Validates a record payload frame (length, CRC and payload structure) without building a
+        /// <see cref="QueueEventRecord"/>, which the scan and offset-normalization paths discard.
+        /// </summary>
+        private static bool IsValidRecordPayload(Stream stream, BinaryReader reader, in RecordHeader header)
+        {
+            var payloadLength = header.PayloadLength;
+            var buffer = ArrayPool<byte>.Shared.Rent(payloadLength == 0 ? 1 : payloadLength);
+            try
+            {
+                var read = 0;
+                while (read < payloadLength)
+                {
+                    var chunk = reader.Read(buffer, read, payloadLength - read);
+                    if (chunk <= 0)
+                        return false;
+
+                    read += chunk;
+                }
+
+                if (QueueEventCrc32.Compute(buffer, 0, payloadLength) != header.PayloadChecksum)
+                    return false;
+
+                try
+                {
+                    ValidatePayload(buffer, payloadLength, header.Version);
+                }
+                catch (Exception ex) when (IsCorruptPayload(ex))
+                {
+                    return false;
+                }
+
+                return true;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Walks a payload with the same layout the read path expects, without allocating the
+        /// record, its strings or a reader over it.
+        /// </summary>
+        private static void ValidatePayload(byte[] payload, int payloadLength, short recordVersion)
+        {
+            var offset = 0;
+
+            ReadInt32(payload, payloadLength, ref offset); // SchemaVersion
+            ReadInt32(payload, payloadLength, ref offset); // EventType
+            ValidateTimestamp(ReadInt64(payload, payloadLength, ref offset), nullable: false); // OccurredAtUtc
+            ReadInt64(payload, payloadLength, ref offset); // FileSize
+            ReadInt32(payload, payloadLength, ref offset); // Status
+            ReadInt32(payload, payloadLength, ref offset); // RetryCount
+            ValidateTimestamp(ReadInt64(payload, payloadLength, ref offset), nullable: true); // ProcessingStartTimeUtc
+            ValidateTimestamp(ReadInt64(payload, payloadLength, ref offset), nullable: true); // AvailableForProcessingAtUtc
+
+            // EventId, TenantId, FileKey, VolumeId, PhysicalPath, DirectoryPath, ErrorMessage,
+            // OriginalFileName, FileExtension.
+            for (var i = 0; i < 9; i++)
+                SkipNullableString(payload, payloadLength, ref offset);
+
+            if (recordVersion >= 2)
+                SkipNullableString(payload, payloadLength, ref offset); // ImportOperationId
+
+            if (offset != payloadLength)
+                throw new InvalidDataException("Binary queue journal payload contains unread bytes.");
+        }
+
+        private static void ValidateTimestamp(long ticks, bool nullable)
+        {
+            if (nullable && ticks == long.MinValue)
+                return;
+
+            // The read path turns these ticks into a DateTime, so out-of-range values are corrupt.
+            if (ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
+                throw new ArgumentOutOfRangeException(nameof(ticks), "Binary queue journal payload contains an invalid timestamp.");
+        }
+
+        private static void SkipNullableString(byte[] payload, int payloadLength, ref int offset)
+        {
+            if (ReadByte(payload, payloadLength, ref offset) == 0)
+                return;
+
+            var byteCount = Read7BitEncodedInt(payload, payloadLength, ref offset);
+            if (byteCount < 0 || payloadLength - offset < byteCount)
+                throw new EndOfStreamException("Binary queue journal payload is truncated.");
+
+            offset += byteCount;
+        }
+
+        private static byte ReadByte(byte[] payload, int payloadLength, ref int offset)
+        {
+            if (payloadLength - offset < 1)
+                throw new EndOfStreamException("Binary queue journal payload is truncated.");
+
+            return payload[offset++];
+        }
+
+        private static int ReadInt32(byte[] payload, int payloadLength, ref int offset)
+        {
+            if (payloadLength - offset < sizeof(int))
+                throw new EndOfStreamException("Binary queue journal payload is truncated.");
+
+            var value = BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(offset));
+            offset += sizeof(int);
+            return value;
+        }
+
+        private static long ReadInt64(byte[] payload, int payloadLength, ref int offset)
+        {
+            if (payloadLength - offset < sizeof(long))
+                throw new EndOfStreamException("Binary queue journal payload is truncated.");
+
+            var value = BinaryPrimitives.ReadInt64LittleEndian(payload.AsSpan(offset));
+            offset += sizeof(long);
+            return value;
+        }
+
+        private static int Read7BitEncodedInt(byte[] payload, int payloadLength, ref int offset)
+        {
+            var value = 0;
+            var shift = 0;
+            while (true)
+            {
+                var current = ReadByte(payload, payloadLength, ref offset);
+                value |= (current & 0x7F) << shift;
+                if ((current & 0x80) == 0)
+                    return value;
+
+                shift += 7;
+                if (shift >= 35)
+                    throw new FormatException("Binary queue journal payload contains an invalid string length.");
+            }
+        }
+
+        private readonly struct RecordHeader
+        {
+            public RecordHeader(short version, int payloadLength, long sequenceNumber, uint payloadChecksum)
+            {
+                Version = version;
+                PayloadLength = payloadLength;
+                SequenceNumber = sequenceNumber;
+                PayloadChecksum = payloadChecksum;
+            }
+
+            public short Version { get; }
+
+            public int PayloadLength { get; }
+
+            public long SequenceNumber { get; }
+
+            public uint PayloadChecksum { get; }
         }
 
         private readonly struct RecordSerializationLayout

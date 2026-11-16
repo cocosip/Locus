@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -11,6 +11,7 @@ using Locus.Core.Abstractions;
 using Locus.Core.Exceptions;
 using Locus.Core.IO;
 using Locus.Core.Models;
+using Locus.Core.Validation;
 using Locus.MultiTenant.Models;
 using Microsoft.Extensions.Logging;
 
@@ -27,7 +28,7 @@ namespace Locus.MultiTenant
         private readonly TimeSpan _cacheExpiration;
         private readonly bool _autoCreateTenants;
 
-        // Cache: TenantId �?(TenantContext, ExpirationTime)
+        // Cache: TenantId → (TenantContext, ExpirationTime)
         private readonly ConcurrentDictionary<string, (ITenantContext Context, DateTime ExpiresAt)> _cache;
 
         // Locks for file operations per tenant
@@ -89,17 +90,16 @@ namespace Locus.MultiTenant
 
         private async Task<ITenantContext?> GetTenantInternalAsync(string tenantId, bool allowAutoCreate, CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("Tenant ID cannot be null or whitespace.", nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             // Fast path: cache hit (no lock required).
-            // No debug log here �?this is the hot path called on every file operation
+            // No debug log here — this is the hot path called on every file operation
             // and logging on each cache hit generates excessive noise at high throughput.
             if (_cache.TryGetValue(tenantId, out var cached) && DateTime.UtcNow < cached.ExpiresAt)
                 return cached.Context;
 
             // Slow path: cache miss or expiry.
-            // Acquire per-tenant lock so only one thread reads the file �?all other concurrent
+            // Acquire per-tenant lock so only one thread reads the file — all other concurrent
             // callers for the same tenantId wait here and then get the freshly cached value.
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             await tenantLock.WaitAsync(ct);
@@ -174,8 +174,7 @@ namespace Locus.MultiTenant
         /// <inheritdoc/>
         public async Task CreateTenantAsync(string tenantId, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("Tenant ID cannot be null or whitespace.", nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
             await tenantLock.WaitAsync(ct);
@@ -199,25 +198,13 @@ namespace Locus.MultiTenant
             if (_fileSystem.File.Exists(metadataPath))
                 throw new InvalidOperationException($"Tenant '{tenantId}' already exists.");
 
-            // Derive storage path relative to the metadata root's parent directory so the
-            // storage directory stays alongside metadata rather than anchoring to the process CWD.
-            // e.g. _metadataRoot = "/data/locus-metadata" => storage = "/data/storage/{tenantId}"
-            //      _metadataRoot = ".locus/tenants"       => storage = ".locus/storage/{tenantId}"
-            var metadataParent = _fileSystem.Path.GetDirectoryName(_metadataRoot) ?? string.Empty;
-            var resolvedStoragePath = _fileSystem.Path.Combine(metadataParent, "storage", tenantId);
-
             var metadata = new TenantMetadata
             {
                 TenantId = tenantId,
                 Status = TenantStatus.Enabled,
                 CreatedAt = DateTime.UtcNow,
-                UpdatedAt = DateTime.UtcNow,
-                StoragePath = resolvedStoragePath
+                UpdatedAt = DateTime.UtcNow
             };
-
-            var storagePath = metadata.StoragePath;
-            if (!_fileSystem.Directory.Exists(storagePath))
-                _fileSystem.Directory.CreateDirectory(storagePath);
 
             await SaveTenantMetadataAsync(metadata, ct);
 
@@ -248,7 +235,7 @@ namespace Locus.MultiTenant
                     ct.ThrowIfCancellationRequested();
                     try
                     {
-                        // Read the JSON file directly �?bypasses GetTenantAsync's per-tenant lock
+                        // Read the JSON file directly — bypasses GetTenantAsync's per-tenant lock
                         // and avoids N sequential lock acquisitions for large tenant counts.
                         TenantMetadata? metadata;
                         using (var stream = _fileSystem.File.OpenRead(filePath))
@@ -386,10 +373,9 @@ namespace Locus.MultiTenant
 
         private string GetTenantMetadataPath(string tenantId)
         {
-            // Reject tenant IDs that contain path separators or ".." segments to prevent
-            // directory traversal (e.g. tenantId = "../admin" escaping _metadataRoot).
-            if (tenantId.IndexOf('/') >= 0 || tenantId.IndexOf('\\') >= 0 || tenantId.Contains(".."))
-                throw new ArgumentException($"Tenant ID contains invalid path characters: '{tenantId}'", nameof(tenantId));
+            // Reject tenant IDs that contain path separators, relative segments or a root prefix
+            // to prevent directory traversal (e.g. tenantId = "../admin" escaping _metadataRoot).
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             return _fileSystem.Path.Combine(_metadataRoot, $"{tenantId}.json");
         }

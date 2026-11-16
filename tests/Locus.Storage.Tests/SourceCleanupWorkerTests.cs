@@ -36,7 +36,7 @@ namespace Locus.Storage.Tests
                 using (File.Open(source, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
-                var retained = await store.GetActiveAsync(source, job.Fingerprint);
+                var retained = await store.GetActiveAsync("watcher", source);
                 Assert.NotNull(retained);
                 Assert.Equal(id, retained!.Id);
                 Assert.Equal("same-import", retained.ImportOperationId);
@@ -48,7 +48,7 @@ namespace Locus.Storage.Tests
                 await store.UpdateAsync(retained);
                 await worker.ProcessDueJobsAsync(CancellationToken.None);
                 Assert.False(File.Exists(source));
-                Assert.Null(await store.GetActiveAsync(source, job.Fingerprint));
+                Assert.Null(await store.GetActiveAsync("watcher", source));
                 if (movePending || exhausted)
                     Assert.True(File.Exists(Path.Combine(job.FailureDirectory, "watcher", "locked.dcm")));
             }
@@ -78,7 +78,7 @@ namespace Locus.Storage.Tests
 
                 await worker.ProcessDueJobsAsync(CancellationToken.None);
 
-                var retained = await store.GetActiveAsync(source, job.Fingerprint);
+                var retained = await store.GetActiveAsync("watcher", source);
                 Assert.Equal(SourceCleanupJobState.Retrying, retained!.State);
                 Assert.Equal(1, retained.AttemptCount);
                 file.Verify(f => f.Delete(It.IsAny<string>()), Times.Never);
@@ -111,7 +111,7 @@ namespace Locus.Storage.Tests
                 var worker = new SourceCleanupWorker(store, fs.Object,
                     new SourceCleanupOptions { Enabled = true }, NullLogger<SourceCleanupWorker>.Instance);
                 await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.ProcessDueJobsAsync(cancellation.Token));
-                var retained = await store.GetActiveAsync(source, job.Fingerprint);
+                var retained = await store.GetActiveAsync("watcher", source);
                 Assert.Equal(0, retained!.AttemptCount);
                 Assert.Null(retained.LastError);
                 Assert.True(File.Exists(source));
@@ -135,7 +135,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.False(File.Exists(sourcePath));
-                    Assert.Null(await store.GetActiveAsync(sourcePath, fingerprint));
+                    Assert.Null(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -169,7 +169,7 @@ namespace Locus.Storage.Tests
 
                     Assert.False(File.Exists(sourcePath));
                     Assert.True(File.Exists(Path.Combine(failureDirectory, "watcher", "one.dcm")));
-                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.Null(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -195,7 +195,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.True(File.Exists(sourcePath));
-                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.NotNull(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -224,7 +224,7 @@ namespace Locus.Storage.Tests
                     var worker = CreateWorker(store, globalEnabled: false);
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
-                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.NotNull(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -250,7 +250,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.True(File.Exists(sourcePath));
-                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.NotNull(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -279,7 +279,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.True(File.Exists(sourcePath));
-                    Assert.NotNull(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.NotNull(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -306,7 +306,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.False(File.Exists(sourcePath));
-                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.Null(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -375,7 +375,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.True(File.Exists(sourcePath));
-                    var active = await store.GetActiveAsync(sourcePath, job.Fingerprint);
+                    var active = await store.GetActiveAsync("watcher", sourcePath);
                     Assert.NotNull(active);
                     Assert.Equal("interrupted-operation", active!.ImportOperationId);
                 }
@@ -407,7 +407,7 @@ namespace Locus.Storage.Tests
 
                     Assert.True(File.Exists(sourcePath));
                     Assert.False(File.Exists(Path.Combine(job.FailureDirectory!, "watcher", "reused.dcm")));
-                    Assert.Null(await store.GetActiveAsync(sourcePath, job.Fingerprint));
+                    Assert.Null(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -438,7 +438,7 @@ namespace Locus.Storage.Tests
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
                     Assert.True(File.Exists(sourcePath));
-                    Assert.Null(await store.GetActiveAsync(sourcePath, fingerprint));
+                    Assert.Null(await store.GetActiveAsync("watcher", sourcePath));
                 }
             }
             finally
@@ -468,7 +468,7 @@ namespace Locus.Storage.Tests
 
                     await worker.ProcessDueJobsAsync(CancellationToken.None);
 
-                    var active = await store.GetActiveAsync(sourcePath, job.Fingerprint);
+                    var active = await store.GetActiveAsync("watcher", sourcePath);
                     Assert.NotNull(active);
                     Assert.Equal(jobId, active!.Id);
                     Assert.Equal(SourceCleanupJobState.Failed, active.State);

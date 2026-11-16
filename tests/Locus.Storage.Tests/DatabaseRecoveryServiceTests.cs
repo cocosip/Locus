@@ -15,6 +15,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
+    [Collection("sqlite-pool")]
     public class DatabaseRecoveryServiceTests : IDisposable
     {
         private sealed class TestDatabaseRebuildLockHandle : IDatabaseRebuildLockHandle
@@ -153,8 +154,8 @@ namespace Locus.Storage.Tests
                 await tempRepo.AddOrUpdateAsync(metadata, default);
             } // Dispose releases database connection
 
-            // Wait a moment for file system to release locks
-            await Task.Delay(100);
+            // Wait for the file handle to be released
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             // Act
@@ -187,7 +188,7 @@ namespace Locus.Storage.Tests
             }
 
             // Wait for database to be fully written and closed
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             // Now corrupt it by overwriting with random data
@@ -236,7 +237,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             // Corrupt the database
@@ -287,7 +288,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
@@ -433,7 +434,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
@@ -495,7 +496,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
@@ -577,7 +578,7 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(Path.Combine(_metadataDir, tenantId, "metadata.db"));
 
             using (var cts = new CancellationTokenSource())
             {
@@ -657,7 +658,7 @@ namespace Locus.Storage.Tests
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             // Corrupt the database
@@ -712,7 +713,7 @@ namespace Locus.Storage.Tests
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
@@ -882,7 +883,7 @@ namespace Locus.Storage.Tests
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             var garbage = new byte[512];
@@ -934,8 +935,9 @@ namespace Locus.Storage.Tests
                 await tempQuotaRepo.GetOrCreateAsync(tenant2, "/", default);
             }
 
-            // Wait for file system to release locks
-            await Task.Delay(100);
+            // Wait for the file handles to be released
+            await TestFileWaits.ReleaseFileHandlesAsync(Path.Combine(_metadataDir, tenant1, "metadata.db"));
+            await TestFileWaits.ReleaseFileHandlesAsync(Path.Combine(_quotaDir, tenant2, "quotas.db"));
 
             // Act
             var report = await _recoveryService.CheckAllDatabasesAsync(default);
@@ -974,7 +976,8 @@ namespace Locus.Storage.Tests
             }
 
             // Wait for databases to be fully written
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(Path.Combine(_metadataDir, tenant1, "metadata.db"));
+            await TestFileWaits.ReleaseFileHandlesAsync(Path.Combine(_quotaDir, tenant2, "quotas.db"));
             SqliteConnection.ClearAllPools();
 
             // Now corrupt both databases

@@ -19,6 +19,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
+    [Collection("sqlite-pool")]
     public class MetadataRepositoryTests : IDisposable
     {
         private const string ReleasedLeaseStartUtcKey = "queue.released_lease_start_utc";

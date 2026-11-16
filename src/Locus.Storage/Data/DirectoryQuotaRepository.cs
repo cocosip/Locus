@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Dapper;
 using Locus.Core.Models;
+using Locus.Core.Validation;
 using Locus.Storage;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
@@ -68,7 +69,9 @@ namespace Locus.Storage.Data
 
         // ---
 
-        private bool _disposed;
+        // Read from the Write-Behind timer callback without a lock; must be volatile to make the
+        // shutdown handshake with Dispose observable.
+        private volatile bool _disposed;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DirectoryQuotaRepository"/> class.
@@ -137,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// </summary>
         private SqliteConnection GetDatabase(string tenantId)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             // Use Lazy<SqliteConnection> to ensure thread-safe initialization.
             var lazyConn = _databases.GetOrAdd(tenantId, tid => new Lazy<SqliteConnection>(() =>
@@ -349,7 +352,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
 
         private string GetTenantDirectoryPath(string tenantId)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
             return _fileSystem.Path.Combine(_quotaDirectory, tenantId);
         }
 
@@ -468,7 +471,7 @@ CREATE INDEX IF NOT EXISTS idx_quotas_enabled ON quotas(enabled);";
         /// </summary>
         private SemaphoreSlim GetTenantLock(string tenantId)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
             return _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
         }
 
@@ -1469,25 +1472,28 @@ ON CONFLICT(directory_path) DO UPDATE SET
         {
             private readonly DirectoryQuotaRepository _owner;
             private readonly string _tenantId;
+            private readonly bool _ownsLock;
             private int _disposed;
 
             /// <summary>Path to the backup of the corrupted database, or null if no database existed.</summary>
             public string? BackupPath { get; }
 
-            internal DatabaseRebuildLockHandle(DirectoryQuotaRepository owner, string tenantId, string? backupPath)
+            internal DatabaseRebuildLockHandle(DirectoryQuotaRepository owner, string tenantId, string? backupPath, bool ownsLock)
             {
                 _owner = owner;
                 _tenantId = tenantId;
+                _ownsLock = ownsLock;
                 BackupPath = backupPath;
             }
 
             /// <summary>
             /// Releases the exclusive tenant lock, unblocking all pending operations.
-            /// Safe to call multiple times (idempotent).
+            /// Safe to call multiple times (idempotent). Handles returned for a nested rebuild
+            /// of a tenant whose lock the current flow already owns release nothing.
             /// </summary>
             public void Dispose()
             {
-                if (System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0)
+                if (_ownsLock && System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0)
                     _owner.FinishDatabaseRebuild(_tenantId);
             }
         }
@@ -1504,22 +1510,42 @@ ON CONFLICT(directory_path) DO UPDATE SET
         /// A handle whose <see cref="DatabaseRebuildLockHandle.BackupPath"/> is the path to the
         /// corrupted database backup, or <c>null</c> if no database file existed.
         /// </returns>
-        public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct = default)
+        public Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
+            // Rebuild is not reentrant: a nested call (quota re-projection run while database
+            // recovery already holds this tenant's rebuild lock) would wait forever on the
+            // non-reentrant semaphore. Return a handle that neither owns nor releases the lock.
+            if (_tenantLockBypass.Value != null && _tenantLockBypass.Value.Contains(tenantId))
+                return Task.FromResult(new DatabaseRebuildLockHandle(this, tenantId, backupPath: null, ownsLock: false));
+
+            // Resolve the lock first: it validates the tenant id and must not leave a registered
+            // bypass behind when the id is rejected.
+            var tenantLock = GetTenantLock(tenantId);
+
+            // Register the bypass in the caller's execution context *before* awaiting the lock.
+            // Setting it inside the async method would lose it across the await, leaving the
+            // caller's follow-up operations blocked on the lock it already owns.
+            AddTenantLockBypass(tenantId);
+            return BeginDatabaseRebuildCoreAsync(tenantId, tenantLock, ct);
+        }
+
+        private async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildCoreAsync(
+            string tenantId,
+            SemaphoreSlim tenantLock,
+            CancellationToken ct)
+        {
             // Acquire exclusive lock - this will block all operations for this tenant.
             // The lock is released when the caller disposes the returned handle.
-            var tenantLock = GetTenantLock(tenantId);
-            await tenantLock.WaitAsync(ct);
+            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
 
             try
             {
-                AddTenantLockBypass(tenantId);
                 _logger.LogWarning("Beginning quota database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
                 var backupPath = RebuildDatabaseNoLock(tenantId);
-                return new DatabaseRebuildLockHandle(this, tenantId, backupPath);
+                return new DatabaseRebuildLockHandle(this, tenantId, backupPath, ownsLock: true);
             }
             catch
             {

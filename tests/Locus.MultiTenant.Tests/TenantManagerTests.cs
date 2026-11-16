@@ -44,11 +44,6 @@ namespace Locus.MultiTenant.Tests
 
             // Verify metadata file exists
             Assert.True(_fileSystem.File.Exists($".locus/tenants/{tenantId}.json"));
-
-            // Verify storage directory exists alongside the metadata root (not at CWD/storage).
-            // TenantManager derives the storage path from _metadataRoot's parent to avoid CWD dependency:
-            // metadataRoot=".locus/tenants" => storagePath=".locus/storage/{tenantId}"
-            Assert.True(_fileSystem.Directory.Exists($".locus/storage/{tenantId}"));
         }
 
         [Fact]
@@ -65,12 +60,12 @@ namespace Locus.MultiTenant.Tests
         }
 
         [Fact]
-        public async Task CreateTenantAsync_DoesNotPersistMetadataWhenStorageDirectoryCreationFails()
+        public async Task CreateTenantAsync_DoesNotPersistOrCacheTenantWhenMetadataWriteFails()
         {
             var tenantId = "tenant-create-fail";
             var backingFileSystem = new MockFileSystem();
             var metadataRoot = ".locus/tenants";
-            var expectedStoragePath = backingFileSystem.Path.Combine(".locus", "storage", tenantId);
+            var metadataPath = backingFileSystem.Path.Combine(metadataRoot, $"{tenantId}.json");
 
             var directory = new Mock<IDirectory>();
             directory
@@ -78,18 +73,15 @@ namespace Locus.MultiTenant.Tests
                 .Returns((string path) => backingFileSystem.Directory.Exists(path));
             directory
                 .Setup(d => d.CreateDirectory(It.IsAny<string>()))
-                .Returns((string path) =>
-                {
-                    if (string.Equals(path, expectedStoragePath, StringComparison.Ordinal))
-                        throw new IOException("disk full");
-
-                    return backingFileSystem.Directory.CreateDirectory(path);
-                });
+                .Returns((string path) => backingFileSystem.Directory.CreateDirectory(path));
 
             var file = new Mock<IFile>();
             file
                 .Setup(f => f.Exists(It.IsAny<string>()))
                 .Returns((string path) => backingFileSystem.File.Exists(path));
+            file
+                .Setup(f => f.Create(It.IsAny<string>()))
+                .Throws(new IOException("disk full"));
 
             var fileSystem = new Mock<IFileSystem>();
             fileSystem.SetupGet(fs => fs.Directory).Returns(directory.Object);
@@ -105,8 +97,8 @@ namespace Locus.MultiTenant.Tests
                 tenantManager.CreateTenantAsync(tenantId, CancellationToken.None));
 
             Assert.Equal("disk full", exception.Message);
-            Assert.False(backingFileSystem.File.Exists(backingFileSystem.Path.Combine(metadataRoot, $"{tenantId}.json")));
-            Assert.False(backingFileSystem.Directory.Exists(expectedStoragePath));
+            Assert.False(backingFileSystem.File.Exists(metadataPath));
+            Assert.Null(await tenantManager.TryGetTenantAsync(tenantId, CancellationToken.None));
         }
 
         [Fact]

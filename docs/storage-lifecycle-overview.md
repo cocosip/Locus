@@ -35,8 +35,6 @@
    - 热路径读写、调度、配额判断优先依赖内存缓存和索引。
    - SQLite 主要承担持久化投影和重启恢复的职责。
 
-## 正式架构图
-
 ## Metadata Residency Model
 
 Locus keeps only scheduler-critical metadata states resident in process memory:
@@ -68,6 +66,8 @@ This keeps memory proportional to the active processing working set instead of t
 orphan 扫描使用路径快照减少查询，但恢复前仍查询当前元数据。同路径记录已经存在时保留其状态、租约和配额；真正缺失的记录通过可选 `IQueueProjectionRecoveryStore.TryAddRecoveredFileAsync` 条件创建，同时检查热缓存、未结清操作和 SQLite。默认投影存储提供此能力。自定义 `IQueueProjectionStore` 无需新增必实现成员，但如果不实现原子创建能力，orphan 恢复会延后并记录日志。创建未成功时回滚本次已完成的配额补偿；补偿回滚失败会分别记录错误，需要后续配额核对。
 
 源文件指纹检查中的 `IOException`（文件已缺失除外）或权限异常表示暂时无法验证，进入现有清理失败与退避流程，保留任务和 `ImportOperationId`。达到重试上限后的隔离检查也遵循此规则，暂时无法验证时保留 `MovePending`。只有已确认源缺失或指纹不匹配时才结束旧任务；取消不计为普通失败。既有 `Keep`/`Failed` 保留期、数据库结构与 journal 格式不变。
+
+## 正式架构图
 
 ```mermaid
 flowchart LR
@@ -102,6 +102,7 @@ flowchart LR
 - `ProcessingCompleted`
 - `DeleteRequested`
 - `DeleteSucceeded`
+- `DeadLettered`
 
 这些事件会被 `QueueEventProjectionService` 持续回放，并投影到 metadata / quota / snapshot。
 
@@ -413,6 +414,7 @@ SQLite 现在依然非常重要，但它的角色已经从“唯一真相数据�
 - `DeleteRequested`
 - `DeleteSucceeded`
 - `PermanentlyFailed`
+- `DeadLettered`
 
 它用于：
 

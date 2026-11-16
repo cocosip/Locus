@@ -11,12 +11,12 @@ namespace Locus.Storage
     /// </summary>
     public interface ISourceCleanupStore
     {
-        /// <summary>Gets the active job for a source path, if one exists.</summary>
+        /// <summary>Gets the active job for a watcher and source path, if one exists.</summary>
+        /// <param name="watcherId">The watcher that owns the source path. Cleanup rows are keyed by watcher and path.</param>
         /// <param name="sourcePath">The source path to look up.</param>
-        /// <param name="fingerprint">The current source fingerprint.</param>
         /// <param name="ct">Cancellation token.</param>
-        /// <returns>The active job for the path, or <see langword="null"/>.</returns>
-        Task<SourceCleanupJob?> GetActiveAsync(string sourcePath, string fingerprint, CancellationToken ct = default);
+        /// <returns>The active job for the watcher and path, or <see langword="null"/>.</returns>
+        Task<SourceCleanupJob?> GetActiveAsync(string watcherId, string sourcePath, CancellationToken ct = default);
 
         /// <summary>Creates or replaces the active job for a watcher and source path.</summary>
         /// <param name="job">The cleanup job to persist.</param>

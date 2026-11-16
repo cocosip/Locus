@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.IO;
 using Locus.Core.Models;
+using Locus.Core.Validation;
 using Locus.Storage.Data;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -1629,11 +1630,6 @@ namespace Locus.Storage
             return _fileSystem.Path.Combine(_options.QueueDirectory, tenantId, "projector.cursor.json");
         }
 
-        private string GetJournalPath(string tenantId)
-        {
-            return _fileSystem.Path.Combine(_options.QueueDirectory, tenantId, "queue.log");
-        }
-
         private string GetJournalStatePath(string tenantId)
         {
             return _fileSystem.Path.Combine(_options.QueueDirectory, tenantId, "queue.state.json");
@@ -1891,7 +1887,7 @@ namespace Locus.Storage
 
         private static void ValidateTenantId(string tenantId)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
         }
 
         private async Task ResetQuotaProjectionAsync(string tenantId, CancellationToken ct)

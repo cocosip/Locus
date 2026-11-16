@@ -45,11 +45,6 @@ namespace Locus.Storage
             return "/" + string.Join("/", collapsedSegments);
         }
 
-        public static string NormalizeFromRelativePath(string? relativeDirectoryPath)
-        {
-            return Normalize(relativeDirectoryPath);
-        }
-
         public static string NormalizeFromPhysicalPath(string tenantRootPath, string? physicalDirectoryPath)
         {
             if (string.IsNullOrWhiteSpace(physicalDirectoryPath))

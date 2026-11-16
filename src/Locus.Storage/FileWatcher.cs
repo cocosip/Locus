@@ -1478,7 +1478,7 @@ namespace Locus.Storage
                 if (_sourceCleanupStore != null)
                 {
                     var existingCleanup = await _sourceCleanupStore
-                        .GetActiveAsync(filePath, importFingerprint, ct)
+                        .GetActiveAsync(configuration.WatcherId, filePath, ct)
                         .ConfigureAwait(false);
                     if (existingCleanup != null)
                     {

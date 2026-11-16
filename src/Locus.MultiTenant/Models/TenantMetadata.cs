@@ -27,15 +27,5 @@ namespace Locus.MultiTenant.Models
         /// Gets or sets the timestamp when the tenant metadata was last updated.
         /// </summary>
         public DateTime UpdatedAt { get; set; }
-
-        /// <summary>
-        /// Gets or sets the storage root path for this tenant.
-        /// </summary>
-        public string StoragePath { get; set; } = string.Empty;
-
-        /// <summary>
-        /// Gets or sets additional tenant properties.
-        /// </summary>
-        public string? Properties { get; set; }
     }
 }

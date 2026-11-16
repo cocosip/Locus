@@ -49,7 +49,6 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
-    <PackageReference Include="Microsoft.Extensions.Options" />
 
     <!-- Third-party dependencies required by sub-projects -->
     <PackageReference Include="Microsoft.Data.Sqlite" />

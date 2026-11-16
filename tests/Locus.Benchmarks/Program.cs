@@ -12,24 +12,6 @@ namespace Locus.Benchmarks
             if (MetadataColdStartMemoryCommand.ShouldRun(args))
                 return MetadataColdStartMemoryCommand.RunAsync(args).GetAwaiter().GetResult();
 
-            if (AcceptedWriteOverlapCommand.ShouldRun(args))
-                return AcceptedWriteOverlapCommand.RunAsync(args).GetAwaiter().GetResult();
-
-            if (AsyncJournalDrainCommand.ShouldRun(args))
-                return AsyncJournalDrainCommand.RunAsync(args).GetAwaiter().GetResult();
-
-            if (BackgroundCpuDiagnosticCommand.ShouldRun(args))
-                return BackgroundCpuDiagnosticCommand.RunAsync(args).GetAwaiter().GetResult();
-
-            if (VolumeWritePhaseBreakdownCommand.ShouldRun(args))
-                return VolumeWritePhaseBreakdownCommand.RunAsync(args).GetAwaiter().GetResult();
-
-            if (DirectVolumeBreakdownCommand.ShouldRun(args))
-                return DirectVolumeBreakdownCommand.RunAsync(args).GetAwaiter().GetResult();
-
-            if (WritePathBreakdownCommand.ShouldRun(args))
-                return WritePathBreakdownCommand.RunAsync(args).GetAwaiter().GetResult();
-
             BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
             return 0;
         }

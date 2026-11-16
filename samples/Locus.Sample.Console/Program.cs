@@ -1,5 +1,6 @@
 using System.Text;
 using Locus.Core.Abstractions;
+using Locus.Core.Exceptions;
 using Locus.Core.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -281,20 +282,26 @@ class Program
         var currentCount = await quotaManager.GetFileCountAsync(tenantId, testDirPath, default);
         WriteOk($"Quota set. Limit={currentLimit}, CurrentCount={currentCount}");
 
-        // Write test files to the storage pool (quota enforcement on specific dir requires
-        // files to be routed there; global pool writes go through tenant quota, not dir quota)
-        WriteInfo("Writing 4 files to tenant-001 (within global quota) ...");
+        // Files written with an explicit logical directory are tracked by that directory's quota.
+        WriteInfo($"Writing {limit + 1} files into the '{testDirPath}' logical directory ...");
         var keys = new List<string>();
-        for (int i = 1; i <= 4; i++)
+        for (int i = 1; i <= limit + 1; i++)
         {
-            using var ms = new MemoryStream(Encoding.UTF8.GetBytes($"quota-file-{i}"));
-            var k = await pool.WriteFileAsync(tenant, ms, $"qfile-{i}.txt", default);
-            keys.Add(k);
-            WriteOk($"  [{i}] {k[..16]}...");
+            try
+            {
+                using var ms = new MemoryStream(Encoding.UTF8.GetBytes($"quota-file-{i}"));
+                var k = await pool.WriteFileAsync(tenant, ms, $"qfile-{i}.txt", testDirPath, default);
+                keys.Add(k);
+                WriteOk($"  [{i}] {k[..16]}...");
+            }
+            catch (DirectoryQuotaExceededException ex)
+            {
+                WriteOk($"  [{i}] Correctly rejected: {ex.GetType().Name} — {ex.Message}");
+            }
         }
 
-        // Demonstrate global tenant quota enforcement by lowering the default quota
-        WriteInfo("Tip: To test quota exceeded, set DefaultTenantQuota=3 in appsettings.json and restart.");
+        var enforcedCount = await quotaManager.GetFileCountAsync(tenantId, testDirPath, default);
+        WriteInfo($"Directory quota count after writes: {enforcedCount} (limit {currentLimit})");
 
         // Cleanup
         while (true)
@@ -452,8 +459,6 @@ class Program
 
         WriteOk($"File written: {fileKey[..16]}...");
 
-        var prevStatus = FileProcessingStatus.Pending;
-
         for (int attempt = 1; attempt <= 6; attempt++)
         {
             FileLocation? loc = null;
@@ -480,7 +485,6 @@ class Program
                 break;
             }
 
-            prevStatus = afterStatus;
             await Task.Delay(200); // give retry delay a moment
         }
 
@@ -554,8 +558,9 @@ class Program
             await Task.Delay((int)minAge);
 
             WriteInfo($"Triggering manual scan: '{vipWatcher.WatcherId}' ...");
-            var imported = await fileWatcher.ScanNowAsync(vipWatcher.WatcherId, default);
-            WriteOk($"Scan done. Files imported: {imported}");
+            var scanResult = await fileWatcher.ScanNowAsync(vipWatcher.WatcherId, default);
+            WriteOk($"Scan done. Files imported: {scanResult.FilesImported} " +
+                    $"(discovered {scanResult.FilesDiscovered}, skipped {scanResult.FilesSkipped}, failed {scanResult.FilesFailed})");
         }
 
         // Multi-tenant watcher — creates tenant subdirectories and imports files
@@ -563,8 +568,8 @@ class Program
         if (multiWatcher != null)
         {
             WriteInfo($"Triggering multi-tenant watcher '{multiWatcher.WatcherId}' (auto-creates tenant dirs) ...");
-            var imported = await fileWatcher.ScanNowAsync(multiWatcher.WatcherId, default);
-            WriteOk($"Multi-tenant scan done. Files imported: {imported}");
+            var multiScanResult = await fileWatcher.ScanNowAsync(multiWatcher.WatcherId, default);
+            WriteOk($"Multi-tenant scan done. Files imported: {multiScanResult.FilesImported}");
 
             var sharedPath = Path.GetFullPath(multiWatcher.WatchPath);
             if (Directory.Exists(sharedPath))
@@ -608,7 +613,7 @@ class Program
         {
             var quota = await tenantQuotaMgr.GetFileCountAsync(t.TenantId, default);
             var limit = await tenantQuotaMgr.GetGlobalLimitAsync(default);
-            System.Console.WriteLine($"  TenantId={t.TenantId,-20} Status={t.Status,-10} Files={quota}  GlobalLimit={( limit <= 0 ? "unlimited" : limit.ToString())}");
+            System.Console.WriteLine($"  TenantId={t.TenantId,-20} Status={t.Status,-10} Files={quota}  GlobalLimit={(limit <= 0 ? "unlimited" : limit.ToString())}");
         }
 
         Pause();

@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using Dapper;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Core.Validation;
 using Locus.Storage;
 using Locus.Storage.Statistics;
 using Microsoft.Data.Sqlite;
@@ -594,7 +595,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
         /// </summary>
         private SqliteConnection GetDatabase(string tenantId)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             lock (GetDatabaseLock(tenantId))
             {
@@ -706,7 +707,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
 
         private string GetTenantDirectoryPath(string tenantId)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
             return _fileSystem.Path.Combine(_metadataDirectory, tenantId);
         }
 
@@ -1037,7 +1038,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             if (_disposed)
                 throw new ObjectDisposedException(nameof(MetadataRepository));
 
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             return new DirectProjectionBatch(this, tenantId);
         }
@@ -1110,7 +1111,7 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_physical_path ON files(tenant_id, ph
             if (string.IsNullOrWhiteSpace(metadata.TenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(metadata));
 
-            TenantIdPathValidator.Validate(metadata.TenantId, nameof(metadata));
+            TenantIdValidator.Validate(metadata.TenantId, nameof(metadata));
         }
 
         /// <summary>
@@ -2379,61 +2380,6 @@ WHERE tenant_id = @tenant_id
         }
 
         /// <summary>
-        /// Removes a Processing file if it still matches the expected processing lease.
-        /// Returns null when the record was removed or changed concurrently.
-        /// </summary>
-        public async Task<FileMetadata?> TryRemoveProcessingFileAsync(
-            string tenantId,
-            string fileKey,
-            DateTime expectedProcessingStartTimeUtc,
-            CancellationToken ct = default)
-        {
-            if (string.IsNullOrWhiteSpace(tenantId))
-                throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
-
-            if (string.IsNullOrWhiteSpace(fileKey))
-                throw new ArgumentException("FileKey cannot be empty", nameof(fileKey));
-
-            var tenantLock = _tenantLocks.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
-            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
-            try
-            {
-                lock (GetDatabaseLock(tenantId))
-                lock (GetCacheMutationLock(tenantId))
-                {
-                    var cache = GetCache(tenantId);
-                    if (!cache.TryGetValue(fileKey, out var current))
-                        return null;
-
-                    if (current.Status != FileProcessingStatus.Processing
-                        || !current.ProcessingStartTime.HasValue
-                        || current.ProcessingStartTime.Value != expectedProcessingStartTimeUtc)
-                    {
-                        return null;
-                    }
-
-                    var removed = ((ICollection<KeyValuePair<string, FileMetadata>>)cache)
-                        .Remove(new KeyValuePair<string, FileMetadata>(fileKey, current));
-                    if (!removed)
-                        return null;
-
-                    _fileKeyTenantIndex.TryRemove(fileKey, out _);
-                    RemovePhysicalPathCandidate(tenantId, fileKey, current.PhysicalPath);
-                    InvalidatePendingGeneration(tenantId, fileKey);
-                    EnqueuePersistence(CreatePersistenceDelete(tenantId, fileKey));
-                    _logger.LogDebug(
-                        "Conditionally removed processing metadata for file: {FileKey}, Tenant: {TenantId}, LeaseStart: {LeaseStart}",
-                        fileKey, tenantId, expectedProcessingStartTimeUtc);
-                    return current.Clone();
-                }
-            }
-            finally
-            {
-                tenantLock.Release();
-            }
-        }
-
-        /// <summary>
         /// Updates a Processing file if it still matches the expected processing lease.
         /// Returns null when the record was removed or changed concurrently.
         /// </summary>
@@ -2633,13 +2579,6 @@ WHERE tenant_id = @tenant_id
                 tenantLock.Release();
             }
         }
-
-        /// <summary>
-        /// Returns the IDs of all tenants that currently have an active in-memory cache.
-        /// Used by maintenance operations to iterate tenants one at a time instead of
-        /// loading all files across all tenants into a single collection.
-        /// </summary>
-        public IEnumerable<string> GetActiveTenantIds() => _activeFiles.Keys;
 
         /// <summary>
         /// Gets all file metadata for a specific tenant.
@@ -3739,71 +3678,6 @@ LIMIT @limit;";
             queue.Enqueue(metadata);
         }
         /// <summary>
-        /// Resets files that have been in Processing status for longer than the timeout.
-        /// Uses Write-Behind (same as AddOrUpdateAsync) for consistency with the rest of the
-        /// repository: memory is updated first, SQLite persistence is async via the background loop.
-        /// </summary>
-        /// <remarks>
-        /// This method performs a bulk scan across all tenants. Production code should prefer
-        /// <see cref="TryResetTimedOutFileAsync"/> which operates per-file and is called by
-        /// <see cref="StorageCleanupService"/> after its own timed-out-file scan.
-        /// </remarks>
-        [Obsolete("Use TryResetTimedOutFileAsync for per-file timeout resets. This bulk method is not called by production code.")]
-        public Task<int> ResetTimedOutFilesAsync(TimeSpan timeout, CancellationToken ct = default)
-        {
-            var cutoffTime = DateTime.UtcNow - timeout;
-            var count = 0;
-
-            foreach (var kvp in _activeFiles)
-            {
-                var tenantId = kvp.Key;
-                var cache = kvp.Value;
-
-                lock (GetDatabaseLock(tenantId))
-                lock (GetCacheMutationLock(tenantId))
-                {
-                    // ConcurrentDictionary.Values enumeration is thread-safe without snapshotting.
-                    foreach (var file in cache.Values)
-                    {
-                        if (file.Status != FileProcessingStatus.Processing
-                            || !file.ProcessingStartTime.HasValue
-                            || file.ProcessingStartTime.Value >= cutoffTime)
-                            continue;
-
-                        var processingDuration = DateTime.UtcNow - file.ProcessingStartTime.Value;
-
-                        // Clone before mutating - keeps the cache entry consistent for lock-free readers.
-                        var updated = file.Clone();
-                        updated.Status = FileProcessingStatus.Pending;
-                        QueueProjectionMetadataState.MarkReleasedLease(updated, file.ProcessingStartTime.Value);
-                        updated.ProcessingStartTime = null;
-                        updated.AvailableForProcessingAt = null;
-
-                        // Use TryUpdate (CAS) so that if a concurrent GetNextPendingFileAsync or
-                        // MarkAsFailedAsync already changed this entry since we read it above, we
-                        // skip rather than overwriting with stale data. The `file` reference acts
-                        // as the expected-current-value sentinel.
-                        if (!cache.TryUpdate(updated.FileKey, updated, file))
-                            continue;
-
-                        _pendingFileCounts.AddOrUpdate(tenantId, 1, (_, c) => c + 1);
-                        IndexStatusCandidate(file, updated);
-                        EnqueuePersistence(CreatePersistenceUpsert(updated));
-
-                        // Re-enqueue in the pending queue so the allocator can find it immediately.
-                        EnqueuePendingCandidate(updated, refreshGeneration: false);
-
-                        count++;
-                        _logger.LogWarning("Reset timed-out file: {FileKey}, Tenant: {TenantId}, was processing for {Duration}",
-                            updated.FileKey, tenantId, processingDuration);
-                    }
-                }
-            }
-
-            return Task.FromResult(count);
-        }
-
-        /// <summary>
         /// Finds file metadata by fileKey using a global O(1) index.
         /// Falls back to a tenant scan only to self-heal stale index entries.
         /// </summary>
@@ -4223,7 +4097,7 @@ LIMIT @limit;";
         /// </returns>
         public async Task<DatabaseRebuildLockHandle> BeginDatabaseRebuildAsync(string tenantId, CancellationToken ct = default)
         {
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             var dbPath = GetDatabasePath(tenantId);
 
@@ -4578,10 +4452,18 @@ LIMIT @limit;";
 
         private async Task WaitForPersistenceWorkAsync(CancellationToken ct = default)
         {
+            // One linked source per wait releases the losing task immediately. Without it the
+            // periodic timer keeps its registration alive after the channel wins, so a busy write
+            // path accumulates one orphaned timer per drained cycle.
+            using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
             // Periodic timeout keeps coalesced-only writes moving even when no new channel items arrive.
-            var waitToReadTask = _persistenceReader.WaitToReadAsync(ct).AsTask();
-            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(_persistenceIntervalSeconds), ct);
+            var waitToReadTask = _persistenceReader.WaitToReadAsync(waitCts.Token).AsTask();
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(_persistenceIntervalSeconds), waitCts.Token);
             var completed = await Task.WhenAny(waitToReadTask, timeoutTask).ConfigureAwait(false);
+
+            waitCts.Cancel();
+
             if (ct.IsCancellationRequested)
                 throw new OperationCanceledException(ct);
 
@@ -5295,20 +5177,30 @@ ON CONFLICT(file_key) DO UPDATE SET
                 // On K8s graceful shutdown (SIGTERM), this window allows in-flight writes to reach SQLite.
                 // If SQLite is unavailable or the queue is too large to drain in time, remaining items
                 // are discarded -- physical files are safe on disk and recovered by OrphanFileRecoveryService on restart.
+                var drained = false;
                 try
                 {
-                    _persistenceTask.Wait(TimeSpan.FromSeconds(_shutdownDrainTimeoutSeconds));
+                    drained = _persistenceTask.Wait(TimeSpan.FromSeconds(_shutdownDrainTimeoutSeconds));
                 }
                 catch (AggregateException)
                 {
                     // OperationCanceledException wrapped in AggregateException -- expected on cancellation
                 }
 
+                if (!drained)
+                {
+                    // The loop is still running and may touch the connections disposed below. This is
+                    // the shutdown-with-backlog path: files stay on disk and are recovered as orphans.
+                    _logger.LogWarning(
+                        "Persistence loop did not stop within {TimeoutSeconds}s; it may still be draining while the repository shuts down",
+                        _shutdownDrainTimeoutSeconds);
+                }
+
                 var queueDepthAfter = Volatile.Read(ref _persistenceChannelDepth);
                 var coalescedAfter = Volatile.Read(ref _coalescedDepth);
                 if (queueDepthAfter == 0 && coalescedAfter == 0)
                 {
-                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully �� all queued writes persisted to SQLite");
+                    _logger.LogInformation("MetadataRepository shutdown drain completed successfully — all queued writes persisted to SQLite");
                 }
                 else
                 {
@@ -5374,4 +5266,3 @@ ON CONFLICT(file_key) DO UPDATE SET
         }
     }
 }
-

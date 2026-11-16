@@ -17,6 +17,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
+    [Collection("sqlite-pool")]
     public class FileSchedulerTests : IDisposable
     {
         private readonly IFileSystem _fileSystem;

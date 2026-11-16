@@ -33,7 +33,6 @@
     <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="$(LocusMicrosoftVersionRange)" />
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="$(LocusMicrosoftVersionRange)" />
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="$(LocusMicrosoftVersionRange)" />
-    <PackageVersion Include="Microsoft.Extensions.Options" Version="$(LocusMicrosoftVersionRange)" />
     <PackageVersion Include="Microsoft.Extensions.Logging" Version="$(LocusMicrosoftVersionRange)" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="$(LocusMicrosoftVersionRange)" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="$(LocusMicrosoftVersionRange)" />
@@ -53,7 +52,6 @@
     <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="[8.0.0,9.0.0)" />
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="[8.0.0,9.0.0)" />
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="[8.0.0,9.0.0)" />
-    <PackageVersion Include="Microsoft.Extensions.Options" Version="[8.0.0,9.0.0)" />
     <PackageVersion Include="Microsoft.Extensions.Logging" Version="[8.0.0,9.0.0)" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="[8.0.0,9.0.0)" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="[8.0.0,9.0.0)" />

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
+using Locus.Core.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -19,6 +20,8 @@ namespace Locus.Storage
         private readonly CleanupOptions _options;
         private readonly LocusStartupCoordinator _startupCoordinator;
         private DateTime _lastJunkFileCleanup;
+        // Baseline for per-run cleanup deltas: the cumulative counters read at the previous cycle.
+        private CleanupStatistics? _previousCleanupTotals;
         // Initialized to UtcNow so the first optimization is deferred by a full
         // DatabaseOptimizationInterval rather than running immediately on startup.
         private DateTime _lastDatabaseOptimization;
@@ -159,17 +162,36 @@ namespace Locus.Storage
                         }
                     }
 
-                    // Get and log statistics
+                    // Get and log statistics. StorageCleanupService counters are cumulative since
+                    // startup, so the previous cycle's snapshot is the baseline: the leading values
+                    // describe this run and the totals since startup are logged alongside them.
                     var stats = await _cleanupService.GetCleanupStatisticsAsync(stoppingToken);
+                    var previous = _previousCleanupTotals ?? new CleanupStatistics();
+                    _previousCleanupTotals = stats;
+
                     _logger.LogInformation(
-                        "Cleanup completed: " +
+                        "Cleanup completed (this run; totals since startup follow): " +
                         "EmptyDirs={EmptyDirs}, " +
                         "FailedFiles={FailedFiles}, " +
                         "TimedOut={TimedOut}, " +
                         "CompletedRecords={CompletedRecords}, " +
                         "OrphanedFilesRemoved={OrphanedFilesRemoved}, " +
                         "OrphanedFilesRecovered={OrphanedFilesRecovered}, " +
-                        "SpaceFreed={SpaceFreedMB} MB",
+                        "SpaceFreed={SpaceFreedMB} MB, " +
+                        "TotalEmptyDirs={TotalEmptyDirs}, " +
+                        "TotalFailedFiles={TotalFailedFiles}, " +
+                        "TotalTimedOut={TotalTimedOut}, " +
+                        "TotalCompletedRecords={TotalCompletedRecords}, " +
+                        "TotalOrphanedFilesRemoved={TotalOrphanedFilesRemoved}, " +
+                        "TotalOrphanedFilesRecovered={TotalOrphanedFilesRecovered}, " +
+                        "TotalSpaceFreed={TotalSpaceFreedMB} MB",
+                        stats.EmptyDirectoriesRemoved - previous.EmptyDirectoriesRemoved,
+                        stats.PermanentlyFailedFilesRemoved - previous.PermanentlyFailedFilesRemoved,
+                        stats.TimedOutFilesReset - previous.TimedOutFilesReset,
+                        stats.CompletedRecordsRemoved - previous.CompletedRecordsRemoved,
+                        stats.OrphanedFilesRemoved - previous.OrphanedFilesRemoved,
+                        stats.OrphanedFilesRecovered - previous.OrphanedFilesRecovered,
+                        (stats.SpaceFreed - previous.SpaceFreed) / 1024 / 1024,
                         stats.EmptyDirectoriesRemoved,
                         stats.PermanentlyFailedFilesRemoved,
                         stats.TimedOutFilesReset,

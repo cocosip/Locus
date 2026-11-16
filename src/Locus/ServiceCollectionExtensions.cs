@@ -416,7 +416,7 @@ namespace Locus
                     logger,
                     options.MetadataDirectory,
                     options.QuotaDirectory,
-                    options.Volumes.ToDictionary(v => v.MountPath, v => v.VolumeId, StringComparer.OrdinalIgnoreCase),
+                    options.Volumes.ToDictionary(v => v.MountPath, v => v.VolumeId),
                     queueProjectionMaintenanceService,
                     storageCleanupService,
                     projectionStore,
@@ -426,7 +426,6 @@ namespace Locus
 
             if (options.QueueEventJournal.Enabled)
             {
-                services.AddSingleton(options.QueueEventJournal);
                 services.AddSingleton<IQueueEventJournal>(sp =>
                 {
                     var fileSystem = sp.GetRequiredService<IFileSystem>();
@@ -468,10 +467,6 @@ namespace Locus
                     services.AddHostedService(sp => sp.GetRequiredService<QueueEventProjectionService>());
             }
 
-            services.AddSingleton(options.CleanupOptions);
-
-            services.AddSingleton(options.SourceCleanup);
-
             if (options.SourceCleanup.Enabled)
             {
                 services.AddSingleton<ISourceCleanupStore>(sp =>
@@ -501,7 +496,6 @@ namespace Locus
             // Register orphan file recovery service if enabled
             if (options.OrphanRecoveryOptions.Enabled)
             {
-                services.AddSingleton(options.OrphanRecoveryOptions);
                 services.AddHostedService(sp => new OrphanFileRecoveryService(
                     sp.GetRequiredService<IStorageCleanupService>(),
                     options.OrphanRecoveryOptions,

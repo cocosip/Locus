@@ -204,12 +204,12 @@ Compaction only runs when all of the following are true:
 2. The processed byte range since the current base offset is at least `MinBytesBeforeCompaction`
 3. A projection snapshot has been saved so rebuild can continue from snapshot + journal tail replay
 
-Default behavior:
+Default behavior (library defaults; the sample configuration raises the byte thresholds):
 
 - `EnableCompaction = true`
 - `EnableAutomaticSnapshots = true`
-- `MinBytesBeforeCompaction = 32 MB` in the current sample configuration
-- `MinBytesBeforeAutomaticSnapshot = 8 MB`
+- `MinBytesBeforeCompaction = 4 MB` (`32 MB` in the sample configuration)
+- `MinBytesBeforeAutomaticSnapshot = 1 MB` (`8 MB` in the sample configuration)
 
 When compaction runs, the already-projected prefix of `queue.log` is trimmed away. If the entire file has
 already been projected, the tenant journal is truncated to an empty file and its base/tail offsets advance.
@@ -224,7 +224,7 @@ fsyncs each written file to the storage device before the write completes.
 
 Runtime options are bound from the `Locus` section. Keep these files aligned when option shapes change:
 
-- [`src/Locus/appsettings.sample.json`](src/Locus/appsettings.sample.json) - package-level sample
+- [`src/Locus/appsettings.sample.json`](src/Locus/appsettings.sample.json) - repository sample, not packed into the NuGet package
 - [`samples/Locus.Sample.Console/appsettings.json`](samples/Locus.Sample.Console/appsettings.json) - runnable sample
 - [`docs/appsettings-sample-reference.md`](docs/appsettings-sample-reference.md) - field-by-field reference
 - [`docs/statistics.md`](docs/statistics.md) - statistics model, measurement names, and query/output examples
@@ -292,6 +292,10 @@ public interface IStoragePool
     // Optional: provide originalFileName (e.g., "invoice.pdf") to preserve file extension
     Task<string> WriteFileAsync(ITenantContext tenant, Stream content, string? originalFileName, CancellationToken ct);
 
+    // Write file with an explicit logical directory (used for directory quotas and projections)
+    Task<string> WriteFileAsync(
+        ITenantContext tenant, Stream content, string? originalFileName, string? logicalDirectoryPath, CancellationToken ct);
+
     // Read file by fileKey
     Task<Stream> ReadFileAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
 
@@ -310,14 +314,15 @@ public interface IStoragePool
     Task<IEnumerable<FileLocation>> GetNextBatchForProcessingAsync(
         ITenantContext tenant, int batchSize, CancellationToken ct);
 
-    // Mark file as completed → deletes file and metadata (requires the processing lease)
+    // Mark file as completed → moves to Completed, then the cleanup reaper deletes file and metadata
+    // (requires the processing lease)
     Task MarkAsCompletedAsync(FileProcessingLease lease, CancellationToken ct = default);
 
     // Mark file as failed → returns to queue for retry (requires the processing lease)
     Task MarkAsFailedAsync(FileProcessingLease lease, string errorMessage, CancellationToken ct = default);
 
     // Get current file status
-    Task<FileProcessingStatus> GetFileStatusAsync(string fileKey, CancellationToken ct);
+    Task<FileProcessingStatus> GetFileStatusAsync(ITenantContext tenant, string fileKey, CancellationToken ct);
 
     // ===== Capacity Management =====
 
@@ -336,6 +341,9 @@ public interface ITenantManager
 {
     // Get tenant context (auto-create if enabled)
     Task<ITenantContext> GetTenantAsync(string tenantId, CancellationToken ct);
+
+    // Get tenant context without auto-creating it
+    Task<ITenantContext?> TryGetTenantAsync(string tenantId, CancellationToken ct);
 
     // Check if tenant is enabled
     Task<bool> IsTenantEnabledAsync(string tenantId, CancellationToken ct);
@@ -479,8 +487,6 @@ Measured on Intel Core i5-9400 CPU 2.90GHz (Coffee Lake), 6 cores, .NET 10.0.0, 
 | 50 concurrent writers | 113.463 ms | 10.608 ms | 701.02 KB | All 50 writes in parallel |
 | 100 concurrent writers | 228.952 ms | 11.859 ms | 1163.76 KB | All 100 writes in parallel |
 
-Performance benchmarks run with BenchmarkDotNet; each table notes the machine and date it was measured on.
-
 #### Metadata Operations (Write-Behind + `_pendingKeys` Index)
 
 Latest local run: Intel Core Ultra 9 185H, .NET 10.0.14, 2026-11-11 (BenchmarkDotNet v0.15.8, IterationCount=5, WarmupCount=3).
@@ -609,14 +615,14 @@ Locus/
 │   │   │   ├── FileProcessingStatus.cs
 │   │   │   ├── TenantStatus.cs
 │   │   │   ├── FileRetryPolicy.cs
-│   │   │   ├── DirectoryQuotaConfig.cs
 │   │   │   └── CleanupStatistics.cs
-│   │   └── Exceptions/
-│   │       ├── TenantDisabledException.cs
-│   │       ├── TenantNotFoundException.cs
-│   │       ├── DirectoryQuotaExceededException.cs
-│   │       ├── NoFilesAvailableException.cs
-│   │       └── InsufficientStorageException.cs
+│   │   ├── Exceptions/
+│   │   │   ├── TenantDisabledException.cs
+│   │   │   ├── TenantNotFoundException.cs
+│   │   │   ├── DirectoryQuotaExceededException.cs
+│   │   │   └── InsufficientStorageException.cs
+│   │   └── Validation/
+│   │       └── TenantIdValidator.cs
 │   ├── Locus.FileSystem/        # Local file system implementation
 │   │   ├── LocalFileSystemVolume.cs
 │   │   └── FileSystemPathSanitizer.cs
@@ -634,16 +640,16 @@ Locus/
 │   ├── Locus.MultiTenant/       # Multi-tenant isolation
 │   │   ├── TenantManager.cs
 │   │   ├── TenantContext.cs
-│   │   └── Data/
+│   │   └── Models/
 │   │       └── TenantMetadata.cs
 │   └── Locus/                   # Main library (aggregates all components)
 │       ├── LocusBuilder.cs
 │       └── ServiceCollectionExtensions.cs
 ├── tests/
-│   ├── Locus.FileSystem.Tests/  # 62 tests ✅
-│   ├── Locus.Storage.Tests/     # 621 tests ✅
+│   ├── Locus.FileSystem.Tests/  # 40 tests ✅
+│   ├── Locus.Storage.Tests/     # 635 tests ✅
 │   ├── Locus.MultiTenant.Tests/ # 17 tests ✅
-│   ├── Locus.IntegrationTests/  # 13 tests ✅
+│   ├── Locus.IntegrationTests/  # 9 tests ✅
 │   └── Locus.Benchmarks/        # Performance benchmarks
 │       ├── MetadataRepositoryBenchmarks.cs
 │       ├── DirectoryQuotaBenchmarks.cs
@@ -694,7 +700,7 @@ configuration reference kept in the repository:
 - Background cleanup for completed files, timed-out processing rows, permanently failed rows,
   invalid database backups, and junk files
 - FileWatcher auto-import with single-tenant and multi-tenant modes
-- Sample console application with current appsettings defaults
+- Sample console application with the current sample appsettings
 - Optional in-process statistics with external querying and configurable Locus-owned logging output
 
 ## Build Commands

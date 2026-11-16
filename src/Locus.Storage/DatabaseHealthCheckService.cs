@@ -71,29 +71,36 @@ namespace Locus.Storage
 
             try
             {
-                var report = await CheckWithRetryAsync(cancellationToken);
+                // A single scan is enough: every reported corruption was already proven by
+                // PRAGMA integrity_check or by SQLITE_CORRUPT/SQLITE_NOTADB, while transient
+                // busy/locked/I/O failures are classified as healthy. Re-scanning every tenant
+                // database would only repeat that verdict at up to 3x the startup I/O cost.
+                var report = await _recoveryService.CheckAllDatabasesAsync(cancellationToken).ConfigureAwait(false);
 
+                // Log the detected corruption once, at detection time: it is the only point where the
+                // finding is guaranteed to be reported (a successful rebuild replaces it with a
+                // healthy report), and logging it again after the recovery pass duplicated it.
                 if (!report.AllHealthy)
                 {
                     LogCorruptionReport(report);
+                }
 
-                    if (_autoRecoverCorruptedDatabases && report.CorruptedDatabases.Count > 0)
+                if (_autoRecoverCorruptedDatabases && report.CorruptedDatabases.Count > 0)
+                {
+                    var (attempted, failed) = await RecoverCorruptedDatabasesAsync(report, cancellationToken);
+
+                    if (attempted > 0)
                     {
-                        var (attempted, failed) = await RecoverCorruptedDatabasesAsync(report, cancellationToken);
+                        _logger.LogInformation(
+                            "Startup database auto-recovery completed. Attempted={Attempted}, Failed={Failed}. Re-running health check...",
+                            attempted, failed);
+                        report = await _recoveryService.CheckAllDatabasesAsync(cancellationToken).ConfigureAwait(false);
+                    }
 
-                        if (attempted > 0)
-                        {
-                            _logger.LogInformation(
-                                "Startup database auto-recovery completed. Attempted={Attempted}, Failed={Failed}. Re-running health check...",
-                                attempted, failed);
-                            report = await CheckWithRetryAsync(cancellationToken);
-                        }
-
-                        if (_failFastOnRecoveryFailure && (failed > 0 || !report.AllHealthy))
-                        {
-                            throw new InvalidOperationException(
-                                "Database auto-recovery failed during startup and fail-fast mode is enabled.");
-                        }
+                    if (_failFastOnRecoveryFailure && (failed > 0 || !report.AllHealthy))
+                    {
+                        throw new InvalidOperationException(
+                            "Database auto-recovery failed during startup and fail-fast mode is enabled.");
                     }
                 }
 
@@ -106,10 +113,6 @@ namespace Locus.Storage
                 {
                     _logger.LogInformation("Database health check completed. All {Count} databases are healthy.",
                         report.HealthyDatabases);
-                }
-                else
-                {
-                    LogCorruptionReport(report);
                 }
 
                 _startupCoordinator.MarkDatabaseHealthReady();
@@ -222,53 +225,6 @@ namespace Locus.Storage
             }
 
             return (attempted, failed);
-        }
-
-        /// <summary>
-        /// Checks all databases with retry mechanism to handle startup timing conflicts.
-        /// </summary>
-        private async Task<DatabaseHealthReport> CheckWithRetryAsync(CancellationToken cancellationToken = default)
-        {
-            const int maxRetries = 3;
-            const int retryDelayMs = 1000;
-
-            DatabaseHealthReport? lastReport = null;
-
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
-            {
-                lastReport = await _recoveryService.CheckAllDatabasesAsync(cancellationToken);
-
-                // If all healthy, no need to retry
-                if (lastReport.AllHealthy)
-                {
-                    if (attempt > 1)
-                    {
-                        _logger.LogInformation(
-                            "Database health check succeeded on attempt {Attempt}/{MaxRetries}",
-                            attempt, maxRetries);
-                    }
-                    return lastReport;
-                }
-
-                // If this is not the last attempt, retry
-                if (attempt < maxRetries)
-                {
-                    _logger.LogDebug(
-                        "Database health check found {CorruptedCount} potentially locked databases on attempt {Attempt}/{MaxRetries}. " +
-                        "Retrying in {DelayMs}ms to rule out startup timing conflicts...",
-                        lastReport.CorruptedDatabases.Count, attempt, maxRetries, retryDelayMs);
-
-                    await Task.Delay(retryDelayMs, cancellationToken);
-                }
-            }
-
-            // After all retries, return the last report (guaranteed to be non-null after loop)
-            _logger.LogWarning(
-                "Database health check completed after {MaxRetries} attempts. " +
-                "Still found {CorruptedCount} corrupted database(s).",
-                maxRetries, lastReport!.CorruptedDatabases.Count);
-
-            return lastReport;
         }
 
         /// <summary>

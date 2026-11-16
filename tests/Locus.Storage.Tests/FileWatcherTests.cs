@@ -255,7 +255,7 @@ namespace Locus.Storage.Tests
                 Assert.Equal(1, second.FilesSkipped);
                 _storagePool.Verify(s => s.WriteFileAsync(
                     It.IsAny<ITenantContext>(), It.IsAny<Stream>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
-                var active = await store.GetActiveAsync(filePath, "ignored");
+                var active = await store.GetActiveAsync("cleanup-watcher", filePath);
                 Assert.NotNull(active);
                 Assert.Equal("file-key", active!.FileKey);
             }
@@ -296,7 +296,7 @@ namespace Locus.Storage.Tests
 
                 await watcher.RegisterWatcherAsync(configuration);
                 var first = await watcher.ScanNowAsync(configuration.WatcherId);
-                var active = await store.GetActiveAsync(filePath, "ignored");
+                var active = await store.GetActiveAsync("cleanup-reuse-watcher", filePath);
                 Assert.Equal(1, first.FilesImported);
                 Assert.NotNull(active);
                 await store.RemoveAsync(active!.Id);
@@ -1584,7 +1584,7 @@ namespace Locus.Storage.Tests
                 Assert.Equal(0, first.FilesFailed);
                 Assert.Empty(first.Errors);
 
-                var active = await store.GetActiveAsync(filePath, "ignored");
+                var active = await store.GetActiveAsync("pruned-operation-watcher", filePath);
                 Assert.NotNull(active);
                 active!.UpdatedAtUtc = DateTime.UtcNow.AddDays(-2);
                 await store.UpdateAsync(active);
@@ -1653,7 +1653,7 @@ namespace Locus.Storage.Tests
                 Assert.Equal(1, first.FilesFailed);
                 Assert.Contains(first.Errors, error => error.Contains("interrupted import", StringComparison.Ordinal));
 
-                var reservation = await store.GetActiveAsync(filePath, "ignored");
+                var reservation = await store.GetActiveAsync("resumed-operation-watcher", filePath);
                 Assert.NotNull(reservation);
                 Assert.False(string.IsNullOrWhiteSpace(reservation!.ImportOperationId));
                 reservation.UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-1);

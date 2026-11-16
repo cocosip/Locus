@@ -2,9 +2,18 @@ using System.Diagnostics.Metrics;
 
 namespace Locus.Storage
 {
+    /// <summary>
+    /// Owns the single meter shared by every queue journal instrument, so the journal is not
+    /// published as two separate meters with the same name.
+    /// </summary>
+    internal static class QueueJournalMeter
+    {
+        public static readonly Meter Instance = new Meter("Locus.Storage.QueueJournal", "1.0.0");
+    }
+
     internal static class QueueJournalMetrics
     {
-        private static readonly Meter Meter = new Meter("Locus.Storage.QueueJournal", "1.0.0");
+        private static readonly Meter Meter = QueueJournalMeter.Instance;
         private static readonly Counter<long> SequenceGapDetectedCounter = Meter.CreateCounter<long>(
             "locus.queue_journal.sequence_gap.detected",
             unit: "{event}",

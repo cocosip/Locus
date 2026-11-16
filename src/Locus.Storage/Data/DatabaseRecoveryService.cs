@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Locus.Core.Abstractions;
 using Locus.Core.Models;
+using Locus.Core.Validation;
 using Locus.Storage;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
@@ -105,11 +106,12 @@ namespace Locus.Storage.Data
             }
             catch (SqliteException ex)
             {
-                // Only SQLITE_CORRUPT (11) and SQLITE_NOTADB (26) prove corruption. Everything
-                // else (busy/locked/I/O) is transient: rebuilding would destroy cold history and
-                // would not fix the underlying device problem, so report "not corrupted" and let
-                // the runtime retry with backoff.
-                if (ex.SqliteErrorCode == 11 || ex.SqliteErrorCode == 26)
+                // Classification lives in SqliteFailureClassifier so this health check and the
+                // repositories agree: only SQLITE_CORRUPT (11) and SQLITE_NOTADB (26) prove
+                // corruption. Everything classified transient (busy/locked/I/O) must stay "not
+                // corrupted": rebuilding would destroy cold history and would not fix the
+                // underlying device problem, so let the runtime retry with backoff.
+                if (SqliteFailureClassifier.IsCorruption(ex))
                 {
                     _logger.LogError(ex,
                         "SQLite database corruption detected: {DatabasePath}. ErrorCode: {ErrorCode}",
@@ -117,11 +119,11 @@ namespace Locus.Storage.Data
                     return true;
                 }
 
-                if (ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6)
+                if (SqliteFailureClassifier.IsTransient(ex))
                 {
                     _logger.LogDebug(
-                        "SQLite database is temporarily locked (not corrupted): {DatabasePath}",
-                        dbPath);
+                        "SQLite database is temporarily unavailable (busy/locked/I/O), not corrupted: {DatabasePath}. ErrorCode: {ErrorCode}",
+                        dbPath, ex.SqliteErrorCode);
                     return false;
                 }
 
@@ -156,7 +158,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             var dbPath = _fileSystem.Path.Combine(_metadataDirectory, tenantId, "metadata.db");
             var result = new DatabaseRebuildResult
@@ -300,7 +302,7 @@ namespace Locus.Storage.Data
             if (string.IsNullOrWhiteSpace(tenantId))
                 throw new ArgumentException("TenantId cannot be empty", nameof(tenantId));
 
-            TenantIdPathValidator.Validate(tenantId, nameof(tenantId));
+            TenantIdValidator.Validate(tenantId, nameof(tenantId));
 
             var dbPath = _fileSystem.Path.Combine(_quotaDirectory, tenantId, "quotas.db");
             var result = new DatabaseRebuildResult
@@ -426,6 +428,11 @@ namespace Locus.Storage.Data
         /// </summary>
         public async Task<DatabaseHealthReport> CheckAllDatabasesAsync(CancellationToken ct = default)
         {
+            // PRAGMA integrity_check and the directory walks around it are synchronous SQLite/file
+            // calls, so yield first to keep the hosted-service startup thread free while this scan
+            // runs (same idiom as the other background services in this assembly).
+            await Task.Yield();
+
             var report = new DatabaseHealthReport();
 
             // Check metadata databases: each tenant has its own subdirectory {metadataDirectory}/{tenantId}/metadata.db
@@ -494,16 +501,21 @@ namespace Locus.Storage.Data
                 }
             }
 
-            return await Task.FromResult(report);
+            return report;
         }
 
         private static IReadOnlyDictionary<string, string> NormalizeVolumePathMap(
             IReadOnlyDictionary<string, string>? volumeIdByPath)
         {
-            if (volumeIdByPath == null || volumeIdByPath.Count == 0)
-                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // Mount paths are case-insensitive on Windows only; on Unix they are distinct paths.
+            var comparison = Path.DirectorySeparatorChar == '\\'
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
 
-            var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (volumeIdByPath == null || volumeIdByPath.Count == 0)
+                return new Dictionary<string, string>(comparison);
+
+            var normalized = new Dictionary<string, string>(comparison);
             foreach (var kvp in volumeIdByPath)
             {
                 if (string.IsNullOrWhiteSpace(kvp.Key) || string.IsNullOrWhiteSpace(kvp.Value))

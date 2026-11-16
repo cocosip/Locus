@@ -1,140 +1,13 @@
 using System;
 using System.IO;
-using System.Linq;
 
 namespace Locus.FileSystem
 {
     /// <summary>
-    /// Provides path sanitization and validation to prevent directory traversal attacks.
+    /// Validates paths to prevent directory traversal.
     /// </summary>
     public static class FileSystemPathSanitizer
     {
-        private static readonly char[] InvalidPathChars = Path.GetInvalidPathChars();
-
-        // Use a cross-platform set of invalid filename characters
-        // Path.GetInvalidFileNameChars() returns different chars on Windows vs Linux
-        // Windows: <>:"/\|?*  Linux: /\0
-        // We use the union of both to ensure consistency across platforms
-        private static readonly char[] InvalidFileNameChars = new char[]
-        {
-            '<', '>', ':', '"', '/', '\\', '|', '?', '*', '\0',
-            '\u0001', '\u0002', '\u0003', '\u0004', '\u0005', '\u0006', '\u0007',
-            '\u0008', '\u0009', '\u000A', '\u000B', '\u000C', '\u000D', '\u000E',
-            '\u000F', '\u0010', '\u0011', '\u0012', '\u0013', '\u0014', '\u0015',
-            '\u0016', '\u0017', '\u0018', '\u0019', '\u001A', '\u001B', '\u001C',
-            '\u001D', '\u001E', '\u001F'
-        };
-
-        /// <summary>
-        /// Validates that a path is safe and does not contain directory traversal attempts.
-        /// </summary>
-        /// <param name="basePath">The base directory path that should contain the file.</param>
-        /// <param name="relativePath">The relative path to validate.</param>
-        /// <returns>True if the path is safe, false otherwise.</returns>
-        public static bool IsPathSafe(string basePath, string relativePath)
-        {
-            if (string.IsNullOrWhiteSpace(basePath))
-                throw new ArgumentException("Base path cannot be empty", nameof(basePath));
-
-            if (string.IsNullOrWhiteSpace(relativePath))
-                throw new ArgumentException("Relative path cannot be empty", nameof(relativePath));
-
-            try
-            {
-                // Get full paths and normalize separators
-                var fullBasePath = Path.GetFullPath(basePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                var combinedPath = Path.Combine(basePath, relativePath);
-                var fullCombinedPath = Path.GetFullPath(combinedPath);
-
-                // Ensure the combined path starts with the base path (prevents traversal)
-                // Use case-sensitive comparison on Unix, case-insensitive on Windows
-                var comparison = Path.DirectorySeparatorChar == '/'
-                    ? StringComparison.Ordinal
-                    : StringComparison.OrdinalIgnoreCase;
-
-                return fullCombinedPath.StartsWith(fullBasePath + Path.DirectorySeparatorChar, comparison) ||
-                       fullCombinedPath.Equals(fullBasePath, comparison);
-            }
-            catch
-            {
-                // Any exception means the path is invalid
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Sanitizes a file name by removing invalid characters.
-        /// </summary>
-        /// <param name="fileName">The file name to sanitize.</param>
-        /// <returns>A sanitized file name.</returns>
-        public static string SanitizeFileName(string fileName)
-        {
-            if (string.IsNullOrWhiteSpace(fileName))
-                throw new ArgumentException("File name cannot be empty", nameof(fileName));
-
-            // Remove invalid characters
-            var sanitized = string.Concat(fileName.Split(InvalidFileNameChars));
-
-            // Remove any path separators
-            sanitized = sanitized.Replace("/", "").Replace("\\", "");
-
-            // Remove leading/trailing dots and spaces
-            sanitized = sanitized.Trim('.', ' ');
-
-            if (string.IsNullOrWhiteSpace(sanitized))
-                throw new ArgumentException("File name contains only invalid characters", nameof(fileName));
-
-            return sanitized;
-        }
-
-        /// <summary>
-        /// Validates and sanitizes a relative path.
-        /// </summary>
-        /// <param name="relativePath">The relative path to sanitize.</param>
-        /// <returns>A sanitized relative path.</returns>
-        public static string SanitizeRelativePath(string relativePath)
-        {
-            if (string.IsNullOrWhiteSpace(relativePath))
-                throw new ArgumentException("Relative path cannot be empty", nameof(relativePath));
-
-            // Remove invalid path characters
-            var sanitized = string.Concat(relativePath.Split(InvalidPathChars));
-
-            // Normalize path separators to forward slashes
-            sanitized = sanitized.Replace('\\', '/');
-
-            // Remove any ".." or "." segments
-            var segments = sanitized.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)
-                .Where(s => s != "." && s != "..")
-                .ToArray();
-
-            sanitized = string.Join("/", segments);
-
-            if (string.IsNullOrWhiteSpace(sanitized))
-                throw new ArgumentException("Relative path contains only invalid characters", nameof(relativePath));
-
-            return sanitized;
-        }
-
-        /// <summary>
-        /// Combines a base path with a relative path safely.
-        /// Validates that the result does not escape the base path.
-        /// </summary>
-        /// <param name="basePath">The base directory path.</param>
-        /// <param name="relativePath">The relative path to combine.</param>
-        /// <returns>The combined full path.</returns>
-        /// <exception cref="InvalidOperationException">Thrown if the path would escape the base path.</exception>
-        public static string CombinePathSafely(string basePath, string relativePath)
-        {
-            if (!IsPathSafe(basePath, relativePath))
-            {
-                throw new InvalidOperationException(
-                    $"Path traversal attempt detected: base='{basePath}', relative='{relativePath}'");
-            }
-
-            return Path.Combine(basePath, relativePath);
-        }
-
         /// <summary>
         /// Validates that a full path is within the allowed base path.
         /// </summary>
@@ -166,27 +39,6 @@ namespace Locus.FileSystem
             {
                 return false;
             }
-        }
-
-        /// <summary>
-        /// Generates a safe file path for storing a file key within a base path.
-        /// </summary>
-        /// <param name="basePath">The base directory path.</param>
-        /// <param name="fileKey">The unique file key.</param>
-        /// <returns>A safe full path for the file.</returns>
-        public static string GenerateSafeFilePath(string basePath, string fileKey)
-        {
-            if (string.IsNullOrWhiteSpace(basePath))
-                throw new ArgumentException("Base path cannot be empty", nameof(basePath));
-
-            if (string.IsNullOrWhiteSpace(fileKey))
-                throw new ArgumentException("File key cannot be empty", nameof(fileKey));
-
-            // Sanitize the file key
-            var sanitizedKey = SanitizeFileName(fileKey);
-
-            // Combine with base path
-            return Path.Combine(basePath, sanitizedKey);
         }
     }
 }

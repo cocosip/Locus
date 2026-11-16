@@ -5,7 +5,7 @@ namespace Locus.Storage
 {
     internal static class QueueJournalOperationMetrics
     {
-        private static readonly Meter Meter = new Meter("Locus.Storage.QueueJournal", "1.0.0");
+        private static readonly Meter Meter = QueueJournalMeter.Instance;
         private static readonly Counter<long> AppendBatchCounter = Meter.CreateCounter<long>(
             "locus.queue_journal.append.batch.count",
             unit: "{batch}",

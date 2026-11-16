@@ -107,7 +107,14 @@ namespace Locus.Storage
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Source cleanup worker cycle failed");
-                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
                 }
             }
         }

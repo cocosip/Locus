@@ -1,5 +1,9 @@
 # Locus 写入链路后续优化清单
 
+> **阅读提示**：本文件是历史测量记录。文中出现的 `write-path-breakdown`、`direct-volume-breakdown`、
+> `accepted-write-overlap` 等一次性诊断命令已从 `tests/Locus.Benchmarks` 移除，其中的数字保留作为当时的结论依据；
+> 需要复测时请使用 `tests/Locus.Benchmarks` 中现存的 BenchmarkDotNet 基准（见 `tests/Locus.Benchmarks/README.md`）。
+
 ## 文档目的
 
 这份文档用于沉淀当前写入链路在性能方面仍值得继续投入的方向，以及暂时不建议继续深挖的方向。
@@ -189,9 +193,6 @@ Intel Core Ultra 9 185H，.NET 10.0.14）：
 - `locus.storage_pool.write.volume_write.duration`
 - `locus.storage_pool.write.acceptance.duration`
 - `locus.storage_pool.write.projection_enqueue.duration`
-
-如果需要继续拆开 `acceptance` 内部阶段，优先再看这些更细的子阶段指标：
-
 
 如果 `acceptance.duration` 长期偏高，应优先判断：
 

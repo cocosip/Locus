@@ -17,6 +17,7 @@ namespace Locus.Storage.Tests
     /// failures must never be treated as corruption, because the corruption path deletes the
     /// tenant database and rebuilds it from the hot cache only.
     /// </summary>
+    [Collection("sqlite-pool")]
     public class SqliteFailureClassificationTests : IDisposable
     {
         private readonly IFileSystem _fileSystem = new System.IO.Abstractions.FileSystem();

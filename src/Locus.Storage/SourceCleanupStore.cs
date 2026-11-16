@@ -45,9 +45,9 @@ namespace Locus.Storage
         }
 
         /// <inheritdoc />
-        public Task<SourceCleanupJob?> GetActiveAsync(string sourcePath, string fingerprint, CancellationToken ct = default)
+        public Task<SourceCleanupJob?> GetActiveAsync(string watcherId, string sourcePath, CancellationToken ct = default)
         {
-            return Task.FromResult(GetActive(sourcePath, fingerprint, ct));
+            return Task.FromResult(GetActive(watcherId, sourcePath, ct));
         }
 
         /// <inheritdoc />
@@ -188,9 +188,9 @@ CREATE INDEX IF NOT EXISTS idx_source_cleanup_source_path
             return false;
         }
 
-        private SourceCleanupJob? GetActive(string sourcePath, string fingerprint, CancellationToken ct)
+        private SourceCleanupJob? GetActive(string watcherId, string sourcePath, CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(fingerprint))
+            if (string.IsNullOrWhiteSpace(watcherId) || string.IsNullOrWhiteSpace(sourcePath))
                 return null;
 
             lock (_gate)
@@ -198,8 +198,11 @@ CREATE INDEX IF NOT EXISTS idx_source_cleanup_source_path
                 ct.ThrowIfCancellationRequested();
                 using (var command = _connection.CreateCommand())
                 {
+                    // Cleanup rows are unique per (watcher_id, source_path). Filtering only by path
+                    // could return another watcher's row, and the caller would then remove it.
                     command.CommandText = @"SELECT * FROM source_cleanup_jobs
-WHERE source_path = $source_path LIMIT 1";
+WHERE watcher_id = $watcher_id AND source_path = $source_path LIMIT 1";
+                    command.Parameters.AddWithValue("$watcher_id", watcherId);
                     command.Parameters.AddWithValue("$source_path", sourcePath);
                     using (var reader = command.ExecuteReader())
                         return reader.Read() ? ReadJob(reader) : null;

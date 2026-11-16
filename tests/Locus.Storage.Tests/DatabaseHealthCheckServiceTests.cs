@@ -16,6 +16,7 @@ using Xunit;
 
 namespace Locus.Storage.Tests
 {
+    [Collection("sqlite-pool")]
     public class DatabaseHealthCheckServiceTests : IDisposable
     {
         private readonly IFileSystem _fileSystem;
@@ -98,8 +99,8 @@ namespace Locus.Storage.Tests
                 }, default);
             }
 
-            // Wait for file system to release locks
-            await Task.Delay(100);
+            // Wait for the file handle to be released
+            await TestFileWaits.ReleaseFileHandlesAsync(Path.Combine(_metadataDir, tenant1, "metadata.db"));
 
             var recoveryService = CreateRecoveryService();
 
@@ -144,7 +145,7 @@ namespace Locus.Storage.Tests
             }
 
             // Wait for database to be fully written
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             // Now corrupt it
@@ -369,7 +370,7 @@ namespace Locus.Storage.Tests
                 await tempRepo.GetOrCreateAsync(tenantId, "/", default);
             }
 
-            await Task.Delay(100);
+            await TestFileWaits.ReleaseFileHandlesAsync(dbPath);
             SqliteConnection.ClearAllPools();
 
             // Corrupt it
