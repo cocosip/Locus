@@ -37,6 +37,29 @@ public sealed class DirectoryQuotaRepositoryRebuildLockTests : IDisposable
         Assert.Equal(3, (await repository.GetAsync(TenantId, "docs"))!.CurrentCount);
     }
 
+    [Fact]
+    public async Task BeginDatabaseRebuildAsync_WhenLockAcquisitionIsCancelled_LeavesRepositoryUsable()
+    {
+        using var repository = CreateRepository();
+        await repository.GetOrCreateAsync(TenantId, "docs");
+
+        // The rebuild only produces a backup path when it really ran against the database file.
+        var databasePath = Path.Combine(_directory, TenantId, "quotas.db");
+        Assert.True(File.Exists(databasePath));
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => repository.BeginDatabaseRebuildAsync(TenantId, cancelled.Token));
+
+        // A cancelled acquisition must neither strand the tenant lock nor leave the flow behind, so
+        // the next rebuild still runs against the file instead of returning a non-owning handle.
+        using var handle = await repository.BeginDatabaseRebuildAsync(TenantId).WaitAsync(DeadlockTimeout);
+
+        Assert.NotNull(handle.BackupPath);
+        Assert.True(File.Exists(handle.BackupPath));
+    }
+
     private DirectoryQuotaRepository CreateRepository()
     {
         return new DirectoryQuotaRepository(

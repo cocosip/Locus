@@ -1539,19 +1539,24 @@ ON CONFLICT(directory_path) DO UPDATE SET
         {
             // Acquire exclusive lock - this will block all operations for this tenant.
             // The lock is released when the caller disposes the returned handle.
-            await tenantLock.WaitAsync(ct).ConfigureAwait(false);
-
+            var acquired = false;
             try
             {
+                await tenantLock.WaitAsync(ct).ConfigureAwait(false);
+                acquired = true;
+
                 _logger.LogWarning("Beginning quota database rebuild for tenant {TenantId}. All operations will be BLOCKED.", tenantId);
                 var backupPath = RebuildDatabaseNoLock(tenantId);
                 return new DatabaseRebuildLockHandle(this, tenantId, backupPath, ownsLock: true);
             }
             catch
             {
-                // If anything fails, release the lock immediately before propagating the exception.
+                // If anything fails (including a cancelled lock acquisition), drop the bypass again
+                // before propagating the exception so this flow keeps taking the real tenant lock.
                 RemoveTenantLockBypass(tenantId);
-                tenantLock.Release();
+                if (acquired)
+                    tenantLock.Release();
+
                 throw;
             }
         }

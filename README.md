@@ -647,7 +647,7 @@ Locus/
 │       └── ServiceCollectionExtensions.cs
 ├── tests/
 │   ├── Locus.FileSystem.Tests/  # 40 tests ✅
-│   ├── Locus.Storage.Tests/     # 635 tests ✅
+│   ├── Locus.Storage.Tests/     # 636 tests ✅
 │   ├── Locus.MultiTenant.Tests/ # 17 tests ✅
 │   ├── Locus.IntegrationTests/  # 9 tests ✅
 │   └── Locus.Benchmarks/        # Performance benchmarks
