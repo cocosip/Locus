@@ -3,7 +3,8 @@
     <!-- Common package metadata -->
     <Authors>cocosip</Authors>
     <Company>cocosip</Company>
-    <Copyright>Copyright © $(Company) $([System.DateTime]::Now.Year)</Copyright>
+    <!-- Fixed year keeps builds deterministic; bump it together with <Version>. -->
+    <Copyright>Copyright © $(Company) 2026</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/cocosip/Locus</PackageProjectUrl>
     <RepositoryUrl>https://github.com/cocosip/Locus</RepositoryUrl>
@@ -13,7 +14,7 @@
     <Description>A high-performance, multi-tenant file storage pool system with queue-based processing and SQLite metadata management.</Description>
 
     <!-- Version information -->
-    <Version>2.1.1</Version>
+    <Version>2.2.0</Version>
 
     <!-- Build configuration -->
     <!-- Consumers pick the matching TFM asset and dependency line: netstandard2.0/net10.0 use 10.x, net9.0 uses 9.x, net8.0 uses 8.x. -->
